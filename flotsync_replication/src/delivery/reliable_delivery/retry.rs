@@ -8,18 +8,30 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum RetryKey {
+    /// A plaintext submission that has not yet passed security admission and
+    /// therefore has no stored encrypted envelope.
+    Unpersisted(MessageId),
+    /// A persisted outbound envelope waiting for retry or semantic ack timeout.
     Sender(MessageId),
+    /// A sender row whose removal failed and must be retried without making the
+    /// corresponding message transport-eligible again.
+    SenderRemoval(MessageId),
+    /// A receiver-generated semantic acknowledgement waiting for a route retry.
     InboundAck(MessageId),
 }
 
-/// Monotonic retry scheduler shared across all sender and recipient-ack retries.
+/// Monotonic scheduler shared by unpersisted admission, persisted sender,
+/// stored-row cleanup, and recipient-ack retries.
 ///
-/// This keeps per-message due times but only arms one Kompact timer for the
+/// This keeps per-message due times but only schedules one Kompact timer for the
 /// earliest known retry, which scales better than holding one timer per
 /// outstanding reliable-delivery work item.
 #[derive(Debug)]
 pub(super) struct RetryQueue {
+    /// Authoritative due time for every currently scheduled retry key.
     due_by_key: HashMap<RetryKey, Instant>,
+    /// Earliest-first candidates; rescheduling may leave stale entries that
+    /// queue operations discard by comparing them with `due_by_key`.
     due_heap: BinaryHeap<Reverse<(Instant, RetryKey)>>,
 }
 
@@ -85,5 +97,11 @@ impl RetryQueue {
             ready.push(key);
         }
         ready
+    }
+
+    /// Return whether one retry key currently has a live due time.
+    #[cfg(test)]
+    pub(super) fn contains(&self, key: RetryKey) -> bool {
+        self.due_by_key.contains_key(&key)
     }
 }

@@ -24,7 +24,6 @@ use kompact::{
     prelude::{ActorRefStrong, Ask, debug, error, trace},
 };
 use std::{net::SocketAddr, sync::Arc};
-use uuid::Uuid;
 
 /// Current shared UDP endpoint binding available for endpoint-discovery traffic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +99,7 @@ pub(crate) async fn submit_endpoint_discovery_frame(
 ) -> bool {
     let route = udp_route_transport_candidate(endpoint, target);
     let send = RouteTransportSend {
-        send_id: RouteSendId(Uuid::new_v4()),
+        send_id: RouteSendId::new_random(),
         route,
         payload,
     };

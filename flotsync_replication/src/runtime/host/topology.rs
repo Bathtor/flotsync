@@ -273,6 +273,7 @@ impl DeliveryTopology {
         local_member: MemberIdentity,
         manager_ref: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         security: DeliverySecurity,
+        reliable_delivery_store: Arc<dyn ReliableDeliveryStore>,
     ) -> Self {
         let ingress = DeliveryIngressComponent::new(DeliveryInterestConfig {
             group_memberships: group_memberships.clone(),
@@ -283,7 +284,8 @@ impl DeliveryTopology {
         let group_broadcast =
             GroupBroadcastComponent::new(group_memberships, manager_ref.clone(), security.clone());
         let group_broadcast = system.create(move || group_broadcast);
-        let reliable_delivery = ReliableDeliveryComponent::new(manager_ref, security);
+        let reliable_delivery =
+            ReliableDeliveryComponent::new(manager_ref, security, reliable_delivery_store);
         let reliable_delivery = system.create(move || reliable_delivery);
         Self {
             ingress,
@@ -788,6 +790,7 @@ impl RuntimeTopology {
             local_member: input.local_member.clone(),
             group_memberships: input.group_memberships.clone(),
         };
+        let reliable_delivery_store: Arc<dyn ReliableDeliveryStore> = input.store.clone();
         let services = RuntimeApplicationServices {
             store: input.store,
             listener: input.listener,
@@ -802,6 +805,7 @@ impl RuntimeTopology {
             input.local_member.clone(),
             manager_ref.clone(),
             input.security.clone(),
+            reliable_delivery_store,
         );
         let discovery = DiscoveryTopology::build(
             system,

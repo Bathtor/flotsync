@@ -93,6 +93,14 @@ pub struct RouteSendId(
     pub Uuid,
 );
 
+impl RouteSendId {
+    /// Create a fresh random identifier for one route-transport send.
+    #[must_use]
+    pub fn new_random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// Whether semantic delivery may collapse equal candidates into one shared send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RouteSharingKind {

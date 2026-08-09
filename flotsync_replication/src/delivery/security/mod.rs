@@ -380,6 +380,11 @@ impl DeliverySecurity {
         &self.local_keys
     }
 
+    /// Return the authoritative local sender/recipient identity for delivery checks.
+    pub(crate) fn local_member(&self) -> &MemberIdentity {
+        &self.local_member
+    }
+
     /// Return the local member's shareable public key bundle.
     pub(crate) fn local_public_key_bundle(&self) -> PublicKeyBundle {
         self.local_keys.public_keys().public_key_bundle()

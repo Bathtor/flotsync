@@ -2,20 +2,68 @@ id = "019f0542-b0cc-70a2-9d97-5aa133ae5801"
 ref = "flotsync-b6lc"
 title = "Persist reliable outbound state and bound sealed bootstrap fan-out"
 body = """
-Follow-up from flotsync-sec.4. Reliable bootstrap payloads can eventually contain substantial group state, so reliable delivery must not build and retain every per-recipient sealed bootstrap message in memory. Combine the prerequisite and the fan-out fix in one slice: persist reliable outbound pending-send state first, then change bootstrap fan-out so it stores recipient work durably and seals at most one or a bounded set of envelopes at a time. Retry and restart handling should resume from persisted sender work instead of requiring all sealed envelopes to remain in memory.
+Follow-up from flotsync-sec.4. Reliable bootstrap payloads can contain substantial group state, so reliable delivery must persist unacknowledged outbound work and bound the number of recipient envelopes retained for active sends.
+
+Reliable delivery remains one-to-one. Each submitted message is HPKE-sealed and sender-signed independently, then the complete encoded recipient envelope is persisted before its first transport submission. Retries and restart recovery reuse the exact stored bytes for the same message id. Stored metadata contains the message id, recipient, and the UTC wall-clock time when reliable delivery first began processing the submission.
+
+A focused ReliableDeliveryStore capability is composed into ReplicationStore and passed to delivery as a narrower trait object. SQLite stores one row per message. Startup loads all lightweight metadata in unspecified order; OutboundState builds the in-memory scheduling order. Full envelope blobs are loaded only when a usable route and an outbound-attempt slot are both available. No speculative database index is part of this task.
+
+ReliableDeliveryComponent keeps only its Kompact context and ports plus four concise private state groups: Config, InboundState, OutboundState, and SharedState. Config loads its complete value from Kompact at startup. OutboundState owns persistence, admission, sender work, ready and waiting indexes, active attempts, cleanup, and warning suppression. Its implementation lives in reliable_delivery/outbound.rs. ReliableDeliveryComponent retains all Kompact execution-mode decisions, timers, transport asks, and visible Handled::block_on and spawn_local boundaries.
+
+Every persisted message remains represented by one ReliableDeliveryWorkItem through its complete lifecycle. The lifecycle distinguishes waiting for a route, queued, retry scheduled, attempting direct transport, awaiting recipient acknowledgement, and stored-row cleanup. Cleanup state records its reason, whether row removal is pending, and any outstanding send id. A work item is removed only after stored cleanup and any outstanding transport result have both converged. Late transport results for cleanup work release capacity but have no semantic effect. This keeps the message id reserved against duplicate admission.
+
+OutboundState retains attempts_in_flight as a HashSet<MessageId>. It is an explicit capacity index whose size enforces the configured concurrency limit without arithmetic drift. Each work item remains authoritative for lifecycle and send-id state; ready, waiting, and attempts_in_flight are validated indexes. Ack-timeout warning state belongs to the work item. The obsolete retry_after field is removed: RetryQueue alone owns retry due times, while the work lifecycle records whether a retry is scheduled.
+
+The active outbound-attempt limit is declared through Kompact with a greater-than-zero validation expression and defaults to ten. Outbound selection is synchronous, oldest-first, bounded directly in the loop condition, and returns SmallVec<[OutboundAttempt; 1]> in stack order with the oldest attempt at the end. Items with available routes enter ready; other route-eligible items enter waiting. Retry-scheduled work remains outside both until its timer fires. Route withdrawal consumes and partitions the ready set.
+
+Ready and waiting indexes share one mutable validation helper for work presence, ReadyKey identity, and expected lifecycle state. Mismatches log at error level, purge only the affected message, cancel its retries, and allow unrelated work to continue. Validation and movement return explicit success-or-purged outcomes rather than inverted booleans. Waiting work for a newly available route is moved by ready_waiting_items_for_route. Route-index removal always receives the exact ReadyKey and recipient from authoritative work and mutates only that ready entry and recipient waiting set. Indexed callers detach an observed stale entry before validating it, so missing authoritative work never triggers a whole-index scan.
+
+TrieMap gains a documented and tested insertion-oriented mutable accessor equivalent to HashMap entry-or-default behaviour. Reliable delivery uses it to update one recipient waiting set in place rather than remove and reinsert the value.
+
+Admission distinguishes plaintext awaiting security processing from an already encoded encrypted envelope awaiting persistence. A named outbound helper seals plaintext and constructs stored work. Retryable security or persistence failures retain their current representation, warn immediately about shutdown loss, and retry. Once sealing succeeds, persistence retries reuse only the encoded envelope. Permanent security failures remove admission state and are reported visibly.
+
+Transport-result transitions, permanent-failure transitions, and stored-row removal attempts are implemented on OutboundState and return explicit effects to the component. Stored-envelope loading and verified acknowledgement removal use visible Handled::block_on boundaries at component call sites so cleanup cannot interleave with a suspended store load. Route-transport result futures remain non-blocking only after encoded bytes are owned in memory. Callers reserve the initial oldest-first attempt batch synchronously before entering blocking mode; the loading helper consumes that batch in stack order, refills released slots internally, and uses one loop termination condition.
+
+The current StoreError API erases failure disposition behind StoreExternal { BoxError }. As a temporary stepping stone, this task treats every StoreError from per-message load or removal as retryable and carries TODOs linked to P0 task flotsync-7g5. A load failure releases its attempt slot, retains the work item in retry-scheduled state, and schedules backoff. A removal failure retains cleanup state and schedules a dedicated removal retry. Ok(None) is a separate invariant mismatch that logs and purges all in-memory references for the message id.
+
+The ReliableDeliveryStore public documentation is implementor-first and positive. Each method first states what a backend must do and then when reliable delivery calls it. Metadata retrieval has no ordering requirement. Full-work lookup documents Ok(None). Removal returns true when a row was removed and false otherwise.
+
+Pre-encoded envelope bytes are submitted with PayloadWriter::splice_bytes and a cheap Bytes clone. Random route-send identifiers are created through RouteSendId::new_random(). Implementation must inspect and reuse established project APIs before introducing bespoke mechanisms.
+
+The replication runtime continues to trigger independent bootstrap messages through the fire-and-forget delivery port. Trigger sites document the accepted limitation that shutdown can occur after only a subset of recipient messages has been sealed and persisted. This task does not add persistence acknowledgements or make group creation wait for the complete recipient set.
+
+Reliable-delivery tests use one configurable store wrapper for observations, queued persistence/load/removal faults, missing-row injection, and full-load gates. Existing coverage is preserved and extended for acknowledgement during an active resend, strict slot retention until a late result, duplicate-id rejection during cleanup, cleanup completion in either result/removal order, explicit retry-scheduled state, targeted index purge, and TrieMap insertion-oriented mutable access.
 
 ## Acceptance Criteria
 
-Reliable delivery persists pending outbound sender work needed to resume retries after runtime restart; bootstrap fan-out stores recipient work durably before transport submission; sealing is performed lazily or in a bounded batch instead of pre-sealing every recipient envelope; retry and recipient-ack timeout paths can reconstruct or continue work from persisted state; tests cover restart/resume, bounded sealing behaviour, retry after transient send failure, and completion cleanup.
+Reliable delivery persists every successfully sealed outbound envelope before transport submission and resumes unacknowledged work after restart. Stored envelopes are recipient-confidential HPKE payloads and are reused unchanged for retry. Retryable pre-persistence failures are retained in memory, warned about immediately, and retried without repeating completed sealing. Startup and route-pending handling do not load full envelopes without usable routes. At most the validated configured number of attempts remain active, defaulting to ten. Retry-scheduled work cannot become ready before its timer fires.
 
-## Notes
+Every persisted message has one authoritative work item through active sending and cleanup. The in-flight set remains a capacity index and agrees with attempting or cleanup work carrying an outstanding send id. Pending cleanup cannot resend completed work or permit duplicate message-id admission. Late transport results for cleanup work only release capacity. Missing rows and index mismatches are observable and isolate one message.
 
-Explore the idea of a Multicast-like request type to reliable delivery so that the individual messages don't have to be created all at once at the replication component level."""
-status = "open"
+Component state is grouped by responsibility. Outbound behaviour lives on OutboundState in outbound.rs, while Kompact blocking and spawning remain visible in the component implementation. Waiting work uses TrieMap with in-place entry mutation, route withdrawal partitions the ready set, and encoded Bytes reach egress without copying. Store metadata order is unspecified and SQLite performs no ordering for that load.
+
+Tests cover SQLite round-trips, unordered metadata loads, restart/resume, the configured N versus N+1 bound, starvation avoidance, retryable and permanent security outcomes, persistence retry without resealing, acknowledgement/load serialisation, acknowledgement timeout, completion cleanup, zero config validation, missing-row isolation, retryable load and removal failures, cleanup during active transport, invariant mismatch cleanup, waiting-trie transitions, route-withdrawal partitioning, and consolidated store-test instrumentation.
+
+## Implementation Plan
+
+1. Add TrieMap insertion-oriented mutable access and tests; make ReliableDeliveryStore documentation implementor-first and unordered; remove SQLite ORDER BY and order-dependent assertions.
+2. Make Config load itself and consolidate reliable-delivery store test wrappers.
+3. Redesign ReliableDeliveryWorkItem lifecycle, retaining attempts_in_flight as a HashSet capacity index while moving pending removal and warning state into work items; remove retry_after in favour of explicit waiting and retry-scheduled states.
+4. Centralise indexed-work validation around one mutable lookup, use explicit outcomes, rename waiting-to-ready behaviour, and make route-reference removal accept an exact ReadyKey and recipient without any whole-index fallback scan.
+5. Move sealing, transport completion, permanent failure, and removal behaviour onto OutboundState while keeping all Kompact execution boundaries visible.
+6. Rewrite the outbound load/refill loop around one termination condition, have selection return stack-ordered attempts with the oldest at the end, preserve synchronous pre-blocking reservation, and preserve per-message error isolation.
+7. Add RouteActiveState send-id access and complete boolean, removal-state, and transport-result documentation.
+8. Adapt and extend focused tests, then run formatting, sequential focused and package tests with one test thread, pedantic Clippy, the Rust instruction audit, whitespace checks, and a final FB-46 through FB-77 audit.
+
+The aligned fourth- and fifth-round corrections are implemented in one pass each. The fifth-round correction is estimated at roughly 85–180 touched LOC and retains the previously agreed architecture."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 created_at = "2026-05-17T06:59:09Z"
-updated_at = "2026-07-26T09:50:56.234104Z"
+updated_at = "2026-08-09T11:15:21.916995Z"
+closed_at = "2026-08-09T11:15:21.916995Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-55b3320f74ae"
@@ -26,3 +74,123 @@ id = "019f9dd5-b4ea-7a20-8dfb-f61b698fdd87"
 author = "Codex"
 body = "Promoted from P2 to P1 after manual replicated-checklist testing confirmed that creator restarts lose unacknowledged group invitations, preventing automatic resend and making normal multi-node workflows unnecessarily fragile."
 created_at = "2026-07-26T09:50:56.234104Z"
+
+[[comments]]
+id = "019fbd49-a359-7373-9301-80e218b9aba5"
+author = "Codex"
+body = "Plan review established that reliable delivery remains strictly one-to-one. The agreed implementation persists the complete recipient HPKE envelope per message, uses a focused ReliableDeliveryStore capability, retains a first-submitted timestamp for inspection, defaults the Kompact outbound-attempt limit to ten, route-gates envelope loading, and documents the accepted partial-fan-out window of the current fire-and-forget port."
+created_at = "2026-08-01T12:25:47.609851Z"
+
+[[comments]]
+id = "019fbd68-680d-7f63-9355-b99340c462c1"
+author = "Codex"
+body = "Implementation is ready for review. Added focused SQLite persistence, encoded-envelope reuse, metadata-only restart recovery, route-gated bounded dispatch, acknowledgement cleanup, runtime wiring, and bootstrap API limitation comments. Coverage includes store ordering/removal, restart/resume, configured slot retention, unreachable-work starvation avoidance, transient failure retention, acknowledgement-timeout retry, and completion cleanup. The full flotsync_replication suite passes (246 tests), formatting is clean, and pedantic Clippy passes."
+created_at = "2026-08-01T12:59:24.045439Z"
+
+[[comments]]
+id = "019fbd9f-a00a-7df3-89bc-2f22746e5ec3"
+author = "Codex"
+body = "Review resolution: retryable unpersisted sealing work will be retained with an immediate shutdown-loss warning; permanent failures will be removed explicitly; retry timers alone promote backoff work; stored-envelope loads and acknowledgement cleanup will use a documented blocking component boundary; and one ordered ready set plus per-recipient waiting sets will replace repeated global scans without redundant membership state."
+created_at = "2026-08-01T13:59:42.858071Z"
+
+[[comments]]
+id = "019fbdbd-e6d2-70f0-a055-db21b0a53c0c"
+author = "lkroll"
+body = "Review corrections are implemented and audited. Sender-side state now uses a documented oldest-first ready index, per-recipient waiting indexes, explicit unpersisted submissions, in-flight ownership, and retry-only backoff state. Store loads and acknowledgement cleanup are serialised with Handled::block_on; transport completion remains asynchronous only after envelope ownership transfers to the attempt. Retryable pre-persistence failures warn immediately and remain retryable, while permanent pre- and post-persistence failures are removed visibly. Focused reliable-delivery coverage passes (27 tests), the full flotsync_replication suite passes (251 tests), formatting and pedantic Clippy pass, and no captured review item remains unresolved."
+created_at = "2026-08-01T14:32:47.058295Z"
+
+[[comments]]
+id = "019fbe12-9d64-7993-a1e4-5f3fbb069e1b"
+author = "lkroll"
+body = "Second-round review resolution: remove the unrequested SQLite index; replace the selector-only limit test with gated component-level coverage; report missing-row cleanup invariants; remove dead observed-ack state; add identifying store-error context; retain already sealed bytes across insertion retries; extract persisted sender scheduling into its own module; and complete timer and structure documentation."
+created_at = "2026-08-01T16:05:18.820501Z"
+
+[[comments]]
+id = "019fbe24-e1c3-74d2-af8e-738542782156"
+author = "lkroll"
+body = "Second-round corrections are complete. The unrequested SQLite index is removed with no replacement. Sender admission and scheduling are split into sender.rs; persistence retries retain the exact encoded envelope; cleanup reports missing-row invariants; dead RecipientAckStatus state is gone; store failures include identifying context; and timer/state responsibilities are documented. The configured two-slot test now holds two real transport completions and proves the third envelope remains unloaded until one slot is released. Focused reliable-delivery coverage passes (28 tests), the full flotsync_replication suite passes (252 tests), formatting and pedantic Clippy pass, and the review checklist has no unresolved items."
+created_at = "2026-08-01T16:25:15.971602Z"
+
+[[comments]]
+id = "019fc24b-27db-7f30-8c16-96f97d5d7873"
+author = "lkroll"
+body = "Third-round review received: all 18 comments are captured as FB-25 through FB-42 in the review working note. The task has returned to planning. The holistic issue body and implementation plan remain unchanged until we align on the full resolution after the user's flight; no production changes were made for this review round."
+created_at = "2026-08-02T11:45:33.147595Z"
+
+[[comments]]
+id = "019fc2b6-785b-7920-a853-8259baf9a06f"
+author = "lkroll"
+body = "Third-round plan agreed. ReliableDeliveryComponent will be decomposed into concise Config, InboundState, OutboundState, and SharedState groups; sender.rs becomes outbound.rs with behaviour implemented on OutboundState; selection happens synchronously before visible blocking boundaries; waiting work uses TrieMap; ready withdrawal partitions the set; queue mismatches isolate and purge one message; RouteSendId::new_random() and splice_bytes replace bespoke construction/copying. StoreErrors are temporarily treated as retryable with pending-removal retries and a TODO to P0 follow-up flotsync-7g5. No implementation has begun."
+created_at = "2026-08-02T13:42:46.107778Z"
+
+[[comments]]
+id = "019fc758-5611-78b1-9b49-f223fbb9ea43"
+author = "Codex"
+body = "Third-round corrections are implemented and audited. ReliableDeliveryComponent now groups Config, InboundState, OutboundState, and SharedState; outbound.rs implements OutboundState while component blocking decisions remain visible in mod.rs. Waiting work uses TrieMap, bounded selection uses SmallVec and a short-circuit let-chain, route withdrawal partitions the ready set, RouteSendId::new_random() replaces direct tuple construction, and stored Bytes use splice_bytes. Missing rows and index mismatches purge only one message; opaque full-load and removal errors follow the agreed retryable stepping stone with dedicated cleanup state and flotsync-7g5 TODOs. New coverage exercises zero config validation, missing-row isolation, load backoff, removal retry without resend, invariant cleanup, and route partitioning. The full flotsync_replication suite passes 258 tests, flotsync_routes passes 66 tests, formatting and pedantic Clippy pass for both affected packages, and the Rust/review audits have no unresolved current-task items."
+created_at = "2026-08-03T11:18:03.025209Z"
+
+[[comments]]
+id = "019fc76e-9f08-7ec2-b005-24190e856eed"
+author = "Codex"
+body = "Fourth-round review has begun. Five comments are captured as FB-46 through FB-50: extract the plaintext admission helper; rewrite the outbound load/refill loop; move transport completion, permanent-failure, and stored-removal behaviour onto OutboundState; and move configuration loading onto Config. The longer review is still pending, so production code and the holistic issue body remain unchanged."
+created_at = "2026-08-03T11:42:23.496545Z"
+
+[[comments]]
+id = "019fdb94-6f4c-7ca1-82a4-b182524c6e26"
+author = "Codex"
+body = "Fourth-round review capture is complete: FB-46 through FB-69 are recorded together. The added comments cover authoritative post-persistence lifecycle state, retry-state semantics, shared indexed-entry validation, targeted TrieMap mutation and API support, outbound ownership boundaries, configuration loading, consolidated reliable-store test support, positive public store documentation, and removal of storage-level metadata ordering. The task is back in planning; production code and the holistic issue body remain unchanged pending user alignment."
+created_at = "2026-08-07T09:36:05.964247Z"
+
+[[comments]]
+id = "019fdb97-1c0c-76c2-89e9-8c97f70bd3c8"
+author = "Codex"
+body = "Proposed fourth-round plan: make each persisted work item authoritative through active sending and cleanup; retain only aggregate attempt capacity; replace the unused retry_after field with explicit waiting and retry-scheduled states; move sender transitions/store operations onto OutboundState while keeping Kompact boundaries visible; rewrite the refill loop; centralise indexed-entry validation; add insertion-oriented mutable TrieMap access; load Config cohesively; consolidate four reliable-store test wrappers; and remove metadata ordering from the public contract and SQLite. Estimated 790-1,245 touched LOC with flat or reduced net size, split into two reviewable implementation passes. Awaiting user alignment; issue body unchanged."
+created_at = "2026-08-07T09:39:01.260093Z"
+
+[[comments]]
+id = "019fdba0-4f83-7430-a40d-2c6fbd545519"
+author = "Codex"
+body = "Fourth-round review plan aligned. The implementation will keep attempts_in_flight as a HashSet capacity index, make each work item authoritative for the persisted lifecycle through cleanup, apply the agreed API/documentation/test-store refinements, and proceed in one pass."
+created_at = "2026-08-07T09:49:04.259865Z"
+
+[[comments]]
+id = "019fdbbb-1fe0-7c93-bdca-54639c9a8540"
+author = "Codex"
+body = "Implemented the aligned fourth-round review plan in one pass. Persisted work now owns cleanup and acknowledgement-warning lifecycle state; attempts_in_flight remains the agreed MessageId set capacity index; route waiting/retry states are explicit; indexed-work validation and TrieMap insertion are shared; the reliable-delivery test stores are consolidated; and public/SQLite storage ordering requirements were removed. Validation: flotsync_replication 259 tests, focused reliable-delivery 37 tests, flotsync_core 54 tests, pedantic Clippy for both crates, rustfmt check, and git diff check all pass."
+created_at = "2026-08-07T10:18:21.536916Z"
+
+[[comments]]
+id = "019fdbe1-5d6c-72e1-9052-607c001431e8"
+author = "Codex"
+body = "Fifth-round review received and captured as FB-70 through FB-77. The comments cover selected-attempt ordering and the pre-blocking reservation boundary, RouteActiveState send-id access, pending-removal and boolean documentation, removal of the remaining whole-TrieMap purge scan, a single mutable indexed-work lookup, and clearer transport-result terminology. The task has returned to planning; no production changes were made."
+created_at = "2026-08-07T11:00:07.66064Z"
+
+[[comments]]
+id = "019fdbea-baee-7e32-8c0f-3e5d7be82c37"
+author = "Codex"
+body = "Fifth-round plan agreed. Selection will return attempts in stack order with the oldest at the end while retaining synchronous reservation before Handled::block_on. Route-reference removal will require an exact ReadyKey and recipient; missing authoritative work will never scan either complete scheduling index. The remaining helper and documentation refinements will be implemented and audited as FB-70 through FB-77."
+created_at = "2026-08-07T11:10:21.422362Z"
+
+[[comments]]
+id = "019fe617-6ed0-7e42-97e8-6558a164fed8"
+author = "Codex"
+body = "Fifth-round corrections are implemented and audited. Selection now constructs a pop-ready SmallVec with the oldest attempt at the end and the loading helper preserves the synchronous pre-blocking reservation contract without reversing. RouteActiveState owns active send-id extraction; indexed validation uses one mutable lookup; route-reference removal requires an exact ReadyKey and recipient; and the whole-index fallback scan is deleted. Documentation uses explicit removal, boolean, and transport-result semantics. Validation: 38 focused reliable-delivery tests, all 260 flotsync_replication tests, pedantic Clippy, rustfmt check, and git diff check pass."
+created_at = "2026-08-09T10:35:23.216396Z"
+
+[[comments]]
+id = "019fe634-3935-7b22-82cb-41ea5e53bc57"
+author = "Codex"
+body = "Sixth-round review received and captured as FB-78. Existing configured-slot coverage indirectly observes load order, but the SelectedAttempts pop contract lacks a deterministic focused test. The task is back in planning; manual refactors are preserved, no production changes were made, and no Clippy exception will be introduced."
+created_at = "2026-08-09T11:06:50.037958Z"
+
+[[comments]]
+id = "019fe63b-f926-7eb1-8e5f-c148a7ee4728"
+author = "Codex"
+body = "FB-78 resolved without additional changes: the user confirmed that the existing configured-slot integration test fails when oldest-first selection via pop_first() is undone and accepted that as sufficient coverage. Final workspace-wide, all-targets pedantic Clippy passes with warnings denied. One unnecessary semicolon in purge_message was removed; no Clippy exception was added."
+created_at = "2026-08-09T11:15:17.926467Z"
+
+[[comments]]
+id = "019fe63c-08bd-7522-b22f-a97a697ea090"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-09T11:15:21.916995Z"

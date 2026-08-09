@@ -6,9 +6,9 @@
 //! - group-scoped fan-out via `GroupBroadcast`
 //! - recipient-addressed reliable delivery via `ReliableDelivery`
 //!
-//! The current implementation covers the minimal runtime wiring needed for
-//! direct group broadcast and reliable delivery. Relay, mailbox, and persisted
-//! queue integration remain follow-up work.
+//! The current implementation covers direct group broadcast and persisted
+//! one-to-one reliable delivery. Relay and mailbox integration remain
+//! follow-up work.
 
 pub mod contracts;
 pub mod group_broadcast;

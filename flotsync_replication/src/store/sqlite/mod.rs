@@ -57,6 +57,11 @@ use crate::{
             encode_pending_group_decision_payload,
         },
     },
+    delivery::contracts::{
+        ReliableDeliveryStore,
+        StoredReliableDeliveryWork,
+        StoredReliableDeliveryWorkMetadata,
+    },
 };
 use flotsync_core::{
     GroupId,
@@ -354,6 +359,55 @@ impl ReplicationStore for SqliteReplicationStore {
                 schema_sources,
                 SqliteReplicationTransactionKind::Read,
             )) as Box<dyn ReplicationStoreReadTransaction>)
+        }
+        .boxed()
+    }
+}
+
+impl ReliableDeliveryStore for SqliteReplicationStore {
+    fn load_reliable_delivery_work_metadata(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
+        let pool = self.pool.clone();
+        async move {
+            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            load_reliable_delivery_work_metadata(&mut connection).await
+        }
+        .boxed()
+    }
+
+    fn load_reliable_delivery_work(
+        &self,
+        message_id: crate::delivery::shared::MessageId,
+    ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, StoreError>> {
+        let pool = self.pool.clone();
+        async move {
+            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            load_reliable_delivery_work(&mut connection, message_id).await
+        }
+        .boxed()
+    }
+
+    fn store_reliable_delivery_work(
+        &self,
+        work: StoredReliableDeliveryWork,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        let pool = self.pool.clone();
+        async move {
+            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            store_reliable_delivery_work(&mut connection, &work).await
+        }
+        .boxed()
+    }
+
+    fn remove_reliable_delivery_work(
+        &self,
+        message_id: crate::delivery::shared::MessageId,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        let pool = self.pool.clone();
+        async move {
+            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            remove_reliable_delivery_work(&mut connection, message_id).await
         }
         .boxed()
     }
@@ -975,6 +1029,14 @@ CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
 );
 ",
     "
+CREATE TABLE IF NOT EXISTS reliable_delivery_work (
+    message_id TEXT PRIMARY KEY NOT NULL,
+    recipient TEXT NOT NULL,
+    first_submitted_at TEXT NOT NULL,
+    encoded_envelope BLOB NOT NULL
+);
+",
+    "
 CREATE TABLE IF NOT EXISTS pending_group_work (
     new_group_id TEXT PRIMARY KEY NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('decision', 'activation')),
@@ -998,6 +1060,7 @@ async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(),
 
 mod groups;
 mod pending_groups;
+mod reliable_delivery;
 mod rows;
 mod security;
 mod shared;
@@ -1013,6 +1076,12 @@ use groups::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use pending_groups::*;
+use reliable_delivery::{
+    load_reliable_delivery_work,
+    load_reliable_delivery_work_metadata,
+    remove_reliable_delivery_work,
+    store_reliable_delivery_work,
+};
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."

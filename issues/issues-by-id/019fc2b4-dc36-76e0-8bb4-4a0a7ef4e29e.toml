@@ -1,0 +1,29 @@
+id = "019fc2b4-dc36-76e0-8bb4-4a0a7ef4e29e"
+ref = "flotsync-7g5"
+title = "Classify store failures across the persistence API"
+body = """
+The project-wide StoreError API currently exposes only StoreExternal { source: BoxError }. Boxing backend failures at that boundary erases whether an operation failed because of retryable access/resource pressure, invalid persisted data, or a permanent configuration/programming condition. Callers therefore guess: delivery security currently treats store access as retryable, and flotsync-b6lc must temporarily treat all per-message reliable-delivery StoreErrors as retryable.
+
+Redesign the store error contract so failure disposition is explicit before backend errors are erased. Preserve source chains, identifying context, and Snafu conventions. The classification must cover at least retryable failures, invalid persisted data, and permanent failures; names and exact representation should be selected after inventorying all store backends and consumers.
+
+Update SQLite to classify errors at their source, including lock/contention and transient I/O, pool/lifecycle failures, SQL/query contract failures, and stored-value decoding or invariant failures. Update consumers to make an explicit decision for every class rather than relying on a catch-all default. Reliable delivery should replace its temporary retry-all TODO with classified load, admission, cleanup, and restart behaviour. Delivery security and other existing StoreError consumers must be audited as part of the same design.
+
+Acceptance criteria:
+- Store failures retain an explicit disposition across the project-wide API boundary.
+- SQLite decoding and invalid stored values are never silently treated as transient.
+- Retryable access failures preserve existing backoff/retry behaviour.
+- Permanent and invalid-data failures have deliberate, observable consumer policies.
+- Existing error sources and operation-specific context remain inspectable.
+- Focused tests cover representative retryable, invalid-data, and permanent failures.
+- All StoreError producers and consumers are audited and no temporary retry-all TODO remains.
+
+Initial work should begin with an inventory and an aligned design. The change is likely to touch roughly 700–1,300 LOC across the API, SQLite backend, consumers, and tests. If the inventory confirms more than 1,000 LOC of implementation, split it into self-contained child tasks for the error contract/backend classification and consumer adoption, with explicit ordering between them."""
+status = "open"
+type = "task"
+priority = 0
+created_at = "2026-08-02T13:41:00.59806Z"
+updated_at = "2026-08-02T13:41:28.118522Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5aa133ae5801"
+label = "discovered from"

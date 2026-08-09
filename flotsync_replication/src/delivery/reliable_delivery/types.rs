@@ -5,6 +5,7 @@
     reason = "The private delivery helper shares its parent's local implementation vocabulary."
 )]
 use super::*;
+use crate::delivery::contracts::StoredReliableDeliveryWorkMetadata;
 
 /// Plaintext recipient-addressed envelope header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,20 +76,20 @@ where
     type Indication = ReliableDeliveryInboundDeliver<R>;
 }
 
-/// Queue-owned in-memory state for one accepted reliable-delivery message.
+/// In-memory lifecycle state for one persisted reliable-delivery message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReliableDeliveryWorkItem {
-    pub submit: ReliableDeliverySubmit,
+    /// Persisted scheduling metadata; the full envelope remains in the store
+    /// until a usable route and outbound-attempt slot are both available.
+    pub metadata: StoredReliableDeliveryWorkMetadata,
+    /// Direct-recipient route state for queue, attempt, and acknowledgement transitions.
     pub recipient_route: ActiveRouteRecord,
+    /// Reserved relay-route state; empty until relay delivery is implemented.
     pub relay_routes: Vec<ActiveRouteRecord>,
-    pub recipient_ack: RecipientAckStatus,
-}
-
-/// Sender-side completion tracking for recipient-addressed reliable delivery.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RecipientAckStatus {
-    Pending,
-    Observed { ack: RecipientAck },
+    /// Whether the first missing-recipient-ack timeout has already been reported.
+    pub(super) reported_ack_timeout: bool,
+    /// Final cleanup state, present after sending has stopped for this message.
+    pub(super) pending_removal: Option<PendingRemoval>,
 }
 
 /// Plaintext recipient-ack header.
@@ -160,4 +161,34 @@ pub struct MailboxAck {
     pub relay: RelayIdentity,
     pub recipient: MemberIdentity,
     pub acknowledgements: Vec<MailboxAckHandle>,
+}
+
+/// Stored-row cleanup state retained as part of the persisted work lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingRemoval {
+    /// Why active sending stopped.
+    pub(super) reason: PendingRemovalReason,
+    /// Whether the persisted row still needs to be removed.
+    pub(super) stored_row_pending: bool,
+    /// Transport result that must still release its reserved capacity slot.
+    pub(super) outstanding_send_id: Option<RouteSendId>,
+}
+
+/// Why active sending stopped while the stored row awaits removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingRemovalReason {
+    /// The intended recipient returned a verified semantic acknowledgement.
+    RecipientAcknowledged,
+    /// Route transport permanently rejected the unchanged stored envelope.
+    PermanentTransportFailure,
+}
+
+impl PendingRemovalReason {
+    /// Human-readable context retained across cleanup retries.
+    pub(super) const fn description(self) -> &'static str {
+        match self {
+            Self::RecipientAcknowledged => "verified recipient acknowledgement",
+            Self::PermanentTransportFailure => "permanent transport failure",
+        }
+    }
 }

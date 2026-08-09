@@ -499,7 +499,9 @@ pub trait LocalIdentityProvisioningStore: Send + Sync {
 }
 
 /// Persistence extension point.
-pub trait ReplicationStore: Send + Sync {
+pub trait ReplicationStore:
+    crate::delivery::contracts::ReliableDeliveryStore + Send + Sync
+{
     /// Return the member identity hosted by this replication runtime instance.
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>>;
 

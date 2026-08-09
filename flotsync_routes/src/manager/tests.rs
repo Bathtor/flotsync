@@ -38,7 +38,6 @@ use std::{
     num::NonZeroUsize,
     time::Duration,
 };
-use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
 struct TestSendRateControl {
@@ -490,7 +489,7 @@ fn udp_manager_sends_payload_over_real_socket() {
         scope: DatagramRouteScope::Unicast,
         local_bind: None,
     };
-    let send_id = RouteSendId(Uuid::new_v4());
+    let send_id = RouteSendId::new_random();
     let coverage_key = harness.wait_for_send_ack(route_send(
         send_id,
         route,
@@ -547,7 +546,7 @@ fn udp_manager_delivers_oversized_payload_over_real_udpour_socket() {
         scope: DatagramRouteScope::Unicast,
         local_bind: None,
     };
-    let send_id = RouteSendId(Uuid::new_v4());
+    let send_id = RouteSendId::new_random();
     let submit = sender_harness.send_async(route_send(send_id, route, oversized_payload.clone()));
     let (_sender_socket_id, sender_addr) = sender_harness.wait_for_new_bound_socket();
     let delivery_future = inbound_probe_ref.observe_indication(move |deliver| {
@@ -604,8 +603,8 @@ fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
         scope: DatagramRouteScope::Unicast,
         local_bind: None,
     };
-    let send_id1 = RouteSendId(Uuid::new_v4());
-    let send_id2 = RouteSendId(Uuid::new_v4());
+    let send_id1 = RouteSendId::new_random();
+    let send_id2 = RouteSendId::new_random();
 
     let submit1 = harness.send_async(route_send(send_id1, route1, b"first target".to_vec()));
     let submit2 = harness.send_async(route_send(send_id2, route2, b"second target".to_vec()));
@@ -713,7 +712,7 @@ fn udp_manager_starts_dormant_socket_on_first_inbound_udpour_message() {
         scope: DatagramRouteScope::Unicast,
         local_bind: None,
     };
-    let send_id = RouteSendId(Uuid::new_v4());
+    let send_id = RouteSendId::new_random();
     let multipart_payload = vec![0x5a; 64 * 16];
 
     let submit = sender_harness.send_async(route_send(send_id, route, multipart_payload));
@@ -849,7 +848,7 @@ fn udp_manager_restores_dormant_external_socket_after_activation_failure() {
         scope: DatagramRouteScope::Unicast,
         local_bind: Some(local_addr),
     };
-    let send_id = RouteSendId(Uuid::new_v4());
+    let send_id = RouteSendId::new_random();
     let (promise, submit) = promise::<TransportRouteTransportSubmitResult>();
 
     harness.manager.on_definition(|component| {
