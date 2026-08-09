@@ -61,7 +61,6 @@ impl<V> TrieMap<V> {
         removed
     }
 
-    #[allow(dead_code)] // for later
     #[must_use]
     pub fn get_mut<I: IdentifierLike>(&mut self, key: &I) -> Option<&mut V> {
         let mut node = &mut self.root;
@@ -69,6 +68,24 @@ impl<V> TrieMap<V> {
             node = node.children.get_mut(segment)?;
         }
         node.value.as_mut()
+    }
+
+    /// Return the value for `key`, inserting its default value when absent.
+    pub fn get_mut_or_default<I: IdentifierLike>(&mut self, key: &I) -> &mut V
+    where
+        V: Default,
+    {
+        let mut node = &mut self.root;
+        for segment in key.segments() {
+            node = node
+                .children
+                .entry(segment.clone())
+                .or_insert_with(|| TrieNode {
+                    value: None,
+                    children: AHashMap::new(),
+                });
+        }
+        node.value.get_or_insert_with(V::default)
     }
 
     /// Traverse all entries with keys borrowed from the iterator's reusable path buffer.
@@ -455,6 +472,18 @@ mod tests {
         assert!(trie_set.contains(&d));
         assert_eq!(trie_map.get(&id(["x"])), None);
         assert!(!trie_set.contains(&id(["x"])));
+    }
+
+    #[test]
+    fn test_get_mut_or_default() {
+        let mut trie_map = TrieMap::<Vec<usize>>::new();
+        let nested = id(["a", "b"]);
+
+        trie_map.get_mut_or_default(&nested).push(1);
+        trie_map.get_mut_or_default(&nested).push(2);
+
+        assert_eq!(trie_map.get(&nested), Some(&vec![1, 2]));
+        assert_eq!(trie_map.len(), 1);
     }
 
     #[test]

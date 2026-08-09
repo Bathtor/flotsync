@@ -131,7 +131,15 @@ use crate::{
         UpdateBatchMessage,
         UpdateMessage,
     },
-    delivery::security::{DeliverySecurity, DeliverySecurityError},
+    delivery::{
+        contracts::{
+            ReliableDeliveryStore,
+            StoredReliableDeliveryWork,
+            StoredReliableDeliveryWorkMetadata,
+        },
+        security::{DeliverySecurity, DeliverySecurityError},
+        shared::MessageId,
+    },
     provision_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
     test_support::{
@@ -310,6 +318,38 @@ where
             }) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
+    }
+}
+
+impl<S> ReliableDeliveryStore for FailingStore<S>
+where
+    S: ReplicationStore + 'static,
+{
+    fn load_reliable_delivery_work_metadata(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
+        self.inner.load_reliable_delivery_work_metadata()
+    }
+
+    fn load_reliable_delivery_work(
+        &self,
+        message_id: MessageId,
+    ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, StoreError>> {
+        self.inner.load_reliable_delivery_work(message_id)
+    }
+
+    fn store_reliable_delivery_work(
+        &self,
+        work: StoredReliableDeliveryWork,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner.store_reliable_delivery_work(work)
+    }
+
+    fn remove_reliable_delivery_work(
+        &self,
+        message_id: MessageId,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        self.inner.remove_reliable_delivery_work(message_id)
     }
 }
 

@@ -23,7 +23,7 @@ use crate::{
         ReplicationStore,
     },
     delivery::{
-        contracts::{GroupBroadcastPort, ReliableDeliveryPort},
+        contracts::{GroupBroadcastPort, ReliableDeliveryPort, ReliableDeliveryStore},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
         ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},

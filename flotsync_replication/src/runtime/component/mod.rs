@@ -1604,6 +1604,10 @@ impl ReplicationRuntimeComponent {
         group_setup: &GroupSetupMessage,
         payload: &bytes::Bytes,
     ) {
+        // The current fire-and-forget delivery port cannot confirm that every
+        // invitation was persisted before group creation returns. A crash can
+        // therefore leave a locally created group with only a subset of its
+        // remote bootstrap invitations recorded for delivery.
         let local_member = self.local_member.clone();
         for recipient in group_setup
             .members()
@@ -1617,6 +1621,9 @@ impl ReplicationRuntimeComponent {
 
     /// Send old-group migration proposals and new-group invitations for one change.
     fn submit_membership_migration_messages(&mut self, dispatch: &PreparedMembershipDispatch) {
+        // The current fire-and-forget delivery port cannot confirm that every
+        // bootstrap message was persisted before this fan-out returns. A crash
+        // can therefore leave only a subset of the migration dispatch recorded.
         let proposed_members = dispatch.group_setup.members();
         // Index zero is the local member. Dispatch classifies only remote
         // recipients; every remote index absent from `added_member_indices`

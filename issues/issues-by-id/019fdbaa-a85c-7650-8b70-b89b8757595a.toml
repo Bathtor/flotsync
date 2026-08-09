@@ -1,0 +1,25 @@
+id = "019fdbaa-a85c-7650-8b70-b89b8757595a"
+ref = "flotsync-z4s"
+title = "Design pluggable member key discovery and exchange"
+body = """
+Design a future plugin/provider boundary for discovering and exchanging Flotsync member public key material without changing the current key provisioning or bootstrap implementation.
+
+Motivation:
+Support several discovery mechanisms, including third-party-hosted identity infrastructure such as a user’s GitHub .keys endpoint where policy regards that provider/account binding as trustworthy. A provider may initially yield only a signing key, then obtain a member’s X25519 HPKE key through an Ed25519-signed statement; the design must distinguish this from an atomic Flotsync public-key bundle.
+
+Design questions:
+- Define the provider/plugin interface, result types, provenance, and local trust-policy inputs.
+- Specify authenticated encryption-key discovery from a trusted Ed25519 verification key, including domain separation, member identity binding, key scheme/role, versioning, freshness/replay handling, revocation or replacement, and cache semantics.
+- Define how discovery results integrate with existing observed-key, trust, and block state, while preserving explicit user trust decisions.
+- Evaluate GitHub-style SSH-key endpoints and similar providers: supported key algorithms, account-to-member binding, transport/provider trust assumptions, rotation, and failure modes.
+- Decide whether providers expose a complete public bundle, a signing key only, or both; specify user-visible consent/diagnostics.
+- Document security boundaries and a test strategy before implementation.
+
+Non-goals:
+- No implementation, changes to current provisioning/bootstrap behaviour, or integration with an external provider in this task.
+- Do not assume a third-party endpoint is inherently authoritative; its trust must be an explicit policy decision."""
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-08-07T10:00:22.364871Z"
+updated_at = "2026-08-07T10:00:22.364871Z"

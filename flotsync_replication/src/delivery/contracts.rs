@@ -5,9 +5,11 @@ use super::{
     reliable_delivery::{ReliableDeliveryDeliver, ReliableDeliverySubmit},
     shared::MessageId,
 };
+use crate::api::StoreError;
+use bytes::Bytes;
+use flotsync_core::MemberIdentity;
 use flotsync_utils::BoxFuture;
 use kompact::prelude::Port;
-use snafu::prelude::*;
 use std::time::SystemTime;
 
 pub use flotsync_routes::DiscoveryRouteUpdate;
@@ -54,58 +56,60 @@ pub enum ReliableDeliveryPortIndication {
     Deliver(ReliableDeliveryDeliver),
 }
 
-/// Durable store record for one accepted group-broadcast request.
+/// Lightweight persisted sender-work metadata used before loading an envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredGroupBroadcastWork {
-    pub submit: GroupBroadcastSubmit,
+pub struct StoredReliableDeliveryWorkMetadata {
+    /// Stable identity shared by the stored envelope, retry state, and recipient ack.
+    pub message_id: MessageId,
+    /// Recipient used to gate full-envelope loading on current route availability.
+    pub recipient: MemberIdentity,
+    /// Wall-clock time when reliable delivery first began processing the submit.
     pub first_submitted_at: SystemTime,
 }
 
-/// Durable store record for one accepted reliable-delivery request.
+/// Complete recipient-confidential envelope retained until semantic acknowledgement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredReliableDeliveryWork {
-    pub submit: ReliableDeliverySubmit,
-    pub first_submitted_at: SystemTime,
+    /// Metadata that can be loaded without reading the potentially large envelope.
+    pub metadata: StoredReliableDeliveryWorkMetadata,
+    /// Canonically encoded reliable-delivery endpoint envelope.
+    pub encoded_envelope: Bytes,
 }
 
-/// Async storage error type for durable work records.
-#[derive(Debug, Snafu)]
-pub enum DeliveryWorkStoreError {
-    #[snafu(display("Delivery persistence failed: {message}"))]
-    Persistence { message: String },
-}
-
-/// Async persistence contract for durable work records.
+/// Narrow persistence capability required by reliable delivery.
 ///
-/// Routes are intentionally not part of the persisted state. After restart the
-/// runtime should reload the durable submit records and rebuild current routes
-/// from discovery.
-pub trait DeliveryWorkStore: Send + Sync {
-    fn load_group_broadcast_work(
+/// Implementations retain each accepted encoded envelope and expose its small
+/// scheduling projection separately so startup need not read all envelope bytes.
+pub trait ReliableDeliveryStore: Send + Sync {
+    /// Load metadata for every unacknowledged outbound item.
+    fn load_reliable_delivery_work_metadata(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredGroupBroadcastWork>, DeliveryWorkStoreError>>;
+    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>>;
 
+    /// Load the complete encoded envelope for `message_id`. Return `Ok(None)`
+    /// when no such item exists.
+    ///
+    /// Reliable delivery calls this after the item becomes route-eligible.
     fn load_reliable_delivery_work(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWork>, DeliveryWorkStoreError>>;
+        message_id: MessageId,
+    ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, StoreError>>;
 
-    fn store_group_broadcast_work(
-        &self,
-        work: StoredGroupBroadcastWork,
-    ) -> BoxFuture<'_, Result<(), DeliveryWorkStoreError>>;
-
+    /// Idempotently store one newly sealed envelope before transport submission.
+    ///
+    /// Repeating the same message id replaces the row with the supplied
+    /// recipient, timestamp, and encoded envelope so an ambiguous insertion
+    /// result can be retried safely.
     fn store_reliable_delivery_work(
         &self,
         work: StoredReliableDeliveryWork,
-    ) -> BoxFuture<'_, Result<(), DeliveryWorkStoreError>>;
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    fn remove_group_broadcast_work(
-        &self,
-        message_id: MessageId,
-    ) -> BoxFuture<'_, Result<(), DeliveryWorkStoreError>>;
-
+    /// Remove the encoded envelope and metadata for `message_id`.
+    ///
+    /// Return `true` when an item was removed and `false` otherwise.
     fn remove_reliable_delivery_work(
         &self,
         message_id: MessageId,
-    ) -> BoxFuture<'_, Result<(), DeliveryWorkStoreError>>;
+    ) -> BoxFuture<'_, Result<bool, StoreError>>;
 }

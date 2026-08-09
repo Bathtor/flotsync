@@ -22,9 +22,11 @@ use crate::{
         SnapshotRef,
         current_slice_placeholder_group_security_material,
     },
+    delivery::shared::MessageId,
     provision_local_identity,
     test_support::{test_public_member_keys, test_replication_security_secrets},
 };
+use bytes::Bytes;
 use flotsync_core::member::MAX_IDENTIFIER_SEGMENTS;
 use flotsync_data_types::{
     Field,
@@ -38,7 +40,7 @@ use itertools::Itertools;
 use std::{
     assert_matches,
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -108,6 +110,60 @@ fn remote_member() -> MemberIdentity {
 
 fn third_member() -> MemberIdentity {
     MemberIdentity::from_array(["app", "carol"])
+}
+
+#[test]
+fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
+    let store = in_memory_store(local_member());
+    let earlier = StoredReliableDeliveryWork {
+        metadata: StoredReliableDeliveryWorkMetadata {
+            message_id: MessageId(Uuid::from_u128(701)),
+            recipient: remote_member(),
+            first_submitted_at: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        },
+        encoded_envelope: Bytes::from_static(b"earlier encoded envelope"),
+    };
+    let later = StoredReliableDeliveryWork {
+        metadata: StoredReliableDeliveryWorkMetadata {
+            message_id: MessageId(Uuid::from_u128(702)),
+            recipient: third_member(),
+            first_submitted_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+        },
+        encoded_envelope: Bytes::from_static(b"later encoded envelope"),
+    };
+
+    wait_for_store_future(store.store_reliable_delivery_work(later.clone()))
+        .expect("later work should store");
+    wait_for_store_future(store.store_reliable_delivery_work(later.clone()))
+        .expect("repeating the same reliable work should store idempotently");
+    wait_for_store_future(store.store_reliable_delivery_work(earlier.clone()))
+        .expect("earlier work should store");
+
+    let mut metadata = wait_for_store_future(store.load_reliable_delivery_work_metadata())
+        .expect("metadata should load");
+    metadata.sort_by_key(|item| (item.first_submitted_at, item.message_id));
+    assert_eq!(
+        metadata,
+        vec![earlier.metadata.clone(), later.metadata.clone()]
+    );
+    assert_eq!(
+        wait_for_store_future(store.load_reliable_delivery_work(later.metadata.message_id))
+            .expect("full work should load"),
+        Some(later.clone())
+    );
+    assert!(
+        wait_for_store_future(store.remove_reliable_delivery_work(earlier.metadata.message_id))
+            .expect("stored work should remove")
+    );
+    assert!(
+        !wait_for_store_future(store.remove_reliable_delivery_work(earlier.metadata.message_id))
+            .expect("repeated removal should be a no-op")
+    );
+    assert_eq!(
+        wait_for_store_future(store.load_reliable_delivery_work_metadata())
+            .expect("remaining metadata should load"),
+        vec![later.metadata]
+    );
 }
 
 fn insert_raw_local_member(

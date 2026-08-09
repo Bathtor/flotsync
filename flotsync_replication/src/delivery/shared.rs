@@ -131,7 +131,6 @@ pub enum WorkScopeKey {
     Reliable {
         recipient: MemberIdentity,
         message_id: MessageId,
-        message_scope: ReliableMessageScope,
     },
 }
 
@@ -155,10 +154,30 @@ pub enum RouteActiveState {
     AwaitingRelayStore {
         send_id: RouteSendId,
     },
-    PendingRoute {
-        retry_after: Option<SystemTime>,
+    /// No current route can carry this work, so discovery must make it eligible again.
+    WaitingForRoute {
         reason: PendingRouteReason,
     },
+    /// A retry timer owns the due time before this work becomes eligible again.
+    RetryScheduled {
+        reason: PendingRouteReason,
+    },
+}
+
+impl RouteActiveState {
+    /// Return the send id while this route has an active transport operation.
+    #[must_use]
+    pub fn active_send_id(&self) -> Option<RouteSendId> {
+        match self {
+            Self::AttemptingDirect { send_id } | Self::AwaitingRelayStore { send_id } => {
+                Some(*send_id)
+            }
+            Self::Queued
+            | Self::AwaitingRecipientAck
+            | Self::WaitingForRoute { .. }
+            | Self::RetryScheduled { .. } => None,
+        }
+    }
 }
 
 /// Why a retained route remains pending instead of actively sending right now.

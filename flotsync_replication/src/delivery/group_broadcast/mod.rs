@@ -330,7 +330,7 @@ impl GroupBroadcastComponent {
         // one-shot submission and observability for this direct-only slice.
         self.spawn_local(move |async_self| async move {
             let send = RouteTransportSend {
-                send_id: RouteSendId(Uuid::new_v4()),
+                send_id: RouteSendId::new_random(),
                 route,
                 payload,
             };
