@@ -2,28 +2,92 @@ id = "019fc2b4-dc36-76e0-8bb4-4a0a7ef4e29e"
 ref = "flotsync-7g5"
 title = "Classify store failures across the persistence API"
 body = """
-The project-wide StoreError API currently exposes only StoreExternal { source: BoxError }. Boxing backend failures at that boundary erases whether an operation failed because of retryable access/resource pressure, invalid persisted data, or a permanent configuration/programming condition. Callers therefore guess: delivery security currently treats store access as retryable, and flotsync-b6lc must temporarily treat all per-message reliable-delivery StoreErrors as retryable.
+The project-wide StoreError API currently exposes only StoreExternal with a boxed source. The repository inventory found one concrete production backend, SQLite, public store extension traits, roughly thirty SQLite semantic error variants, and one raw SQLx variant that currently combines connection, pool, query, decoding, transaction, commit, and rollback failures. Delivery security treats every store access failure as retryable; reliable delivery retries admission, selected-row loads, and cleanup without classification; restart loading is fatal; most runtime transaction paths propagate or escalate; catch-up logs and continues.
 
-Redesign the store error contract so failure disposition is explicit before backend errors are erased. Preserve source chains, identifying context, and Snafu conventions. The classification must cover at least retryable failures, invalid persisted data, and permanent failures; names and exact representation should be selected after inventorying all store backends and consumers.
+Agreed design
 
-Update SQLite to classify errors at their source, including lock/contention and transient I/O, pool/lifecycle failures, SQL/query contract failures, and stored-value decoding or invariant failures. Update consumers to make an explicit decision for every class rather than relying on a catch-all default. Reliable delivery should replace its temporary retry-all TODO with classified load, admission, cleanup, and restart behaviour. Delivery security and other existing StoreError consumers must be audited as part of the same design.
+StoreError will retain the original boxed source and identifying context while adding an authoritative typed StoreErrorClassification. The classification initially contains three private enum-valued dimensions:
 
-Acceptance criteria:
-- Store failures retain an explicit disposition across the project-wide API boundary.
+- class: what happened, covering contention, unavailability, resource exhaustion, invalid data, conflict, configuration, contract failure, and unknown conditions;
+- scope: the smallest affected or recovery domain, covering operation, transaction, connection, record, store, environment, and unknown scope;
+- resolution: what must happen before repeating work is meaningful, covering retry, restart, repair, reconfiguration, conflict resolution, implementation correction, external intervention, and unknown resolution.
+
+Consumers evaluate enum fields and named predicates directly. Retryability is derived rather than stored as the primary classification. The public classification keeps private fields, const accessors, and supported construction so future dimensions can be added without exposing struct literals. Public dimension enums should be non-exhaustive for external store implementations while in-crate policy matches remain explicit.
+
+StoreError and higher-level error types that preserve store failures will support a dyn-compatible public classification-access trait. The trait is object-safe, extends Error, and exposes an optional StoreErrorClassification. StoreError implements the base contract in the first child. Delivery, security-store, runtime, public escalation, and other wrapper errors delegate through their store-bearing variants in the second child. Printed source chains retain the classification code through StoreError Display, while programmatic higher-level handling can inspect the typed dimensions without downcasting to backend errors. Classification must not be erased into a plain BoxError at an escalation boundary where typed access is required.
+
+Opaque display code and public documentation
+
+StoreErrorClassification Display renders an allocation-free, fixed-width seven-character code. The positions are scope:2 alphabetic characters, class:3 numeric characters, and resolution:2 alphabetic characters, concatenated without separators or a version prefix. Alphabetic positions use X and numeric positions use 0 for padding or reserved values as appropriate. The exact assignments remain reviewable but every literal assignment must be defined in one canonical declaration only.
+
+Every public dimension variant documents its semantics and permanent code assignment. The classification module also provides a consolidated Rustdoc table for discovering all assignments and the fixed-width layout. The implementation should generate variant documentation, the overview table or registry, and Display mappings from one canonical declaration where practical so documentation cannot silently drift from code. Tests cover allocation uniqueness, width, padding, and documentation-facing registries.
+
+Assigned code positions are stable and never reinterpreted or reused. Future dimensions append fixed-width trailing segments without changing the established seven-character prefix. Later external processing, if any, must ignore unrecognised trailing padding and may match the stable prefix. No parsing API is required for the current work; ordinary in-process policy must never parse the display code.
+
+Backend classification
+
+SQLite will classify semantic errors and raw SQLx errors at their source. The mapping must distinguish at least operation contention, transaction-restart contention, connection or pool lifecycle failure, temporary access failure, resource exhaustion, invalid individual records, store-wide corruption, domain conflicts, configuration failures, and query or implementation contract failures. Raw SQLx handling will gain enough operation-phase context to avoid treating column decoding, pool acquisition, query execution, commit, and rollback as one condition. SQLite and SQLx source errors and extended database codes remain inspectable through the source chain. Unknown future SQLx conditions receive a conservative unknown classification and are not automatically retried.
+
+The SQLite error type, operation-phase context, semantic-variant classification, backend result-code mapping, and focused tests belong in a dedicated documented store::sqlite error/classification module rather than expanding sqlite/mod.rs.
+
+Consumer policy
+
+- Reliable delivery preserves existing backoff for classifications that explicitly permit repeating the relevant operation.
+- Invalid data scoped to one selected reliable-delivery record is reported visibly and isolated through deliberate cleanup.
+- Invalid data scoped to the store, configuration failures, contract failures, lifecycle failures that require restart, external-intervention failures, and unknown classifications fail the affected component or operation instead of spinning or deleting arbitrary work.
+- Bulk reliable-delivery restart loading remains visibly fatal when an invalid row cannot be isolated through the current bulk API.
+- Delivery security preserves store classification through its error chain so reliable delivery can distinguish retry, payload or record rejection, and component failure instead of receiving one binary answer.
+- Catch-up may warn and continue for repeatable operation-level access failures, but store-wide invalid data and configuration or implementation failures escalate.
+- Startup, provisioning, public API, runtime transaction, security-store, example, and test-store consumers will be audited and will deliberately propagate, retry, isolate, or escalate every classification family.
+- Generic mutation retries remain operation-specific. A classified retry condition does not itself prove that an arbitrary write is safe to repeat; reliable-delivery upsert and delete behaviour is assessed using their idempotent contracts.
+
+Implementation order
+
+Child flotsync-7g5.1 defines the typed classification contract, central and publicly documented code allocation, dyn-compatible classification-access trait, StoreError integration, dedicated SQLite error/classification module, complete SQLite and SQLx mapping, and focused contract/backend tests.
+
+Child flotsync-7g5.2 remains blocked by flotsync-7g5.1. It will be aligned separately after the first child is reviewed. Its broad scope is consumer policy adoption, delegation of typed classification through delivery/runtime wrapper chains, removal of retry-all behaviour, wider consumer audit, and behavioural tests.
+
+Estimated size and split
+
+The repository-grounded estimate is approximately 1,100-1,850 LOC after adding public code documentation, the dyn-compatible access contract, and explicit wrapper delegation. Child flotsync-7g5.1 is estimated at 550-900 LOC. Child flotsync-7g5.2 is estimated at 550-950 LOC and remains blocked by the first child.
+
+Acceptance criteria
+
+- Store failures carry typed class, scope, and resolution across the project-wide API boundary.
+- Higher-level store-bearing errors can preserve and expose the classification through a dyn-compatible public trait.
+- Printed source chains retain the opaque classification code.
+- The seven-character opaque code is derived on request, fixed width, centrally allocated, publicly documented, and stable by position.
+- SQLite classification resides in a dedicated documented module.
 - SQLite decoding and invalid stored values are never silently treated as transient.
-- Retryable access failures preserve existing backoff/retry behaviour.
-- Permanent and invalid-data failures have deliberate, observable consumer policies.
-- Existing error sources and operation-specific context remain inspectable.
-- Focused tests cover representative retryable, invalid-data, and permanent failures.
-- All StoreError producers and consumers are audited and no temporary retry-all TODO remains.
-
-Initial work should begin with an inventory and an aligned design. The change is likely to touch roughly 700–1,300 LOC across the API, SQLite backend, consumers, and tests. If the inventory confirms more than 1,000 LOC of implementation, split it into self-contained child tasks for the error contract/backend classification and consumer adoption, with explicit ordering between them."""
-status = "open"
+- Repeatable access failures preserve existing bounded backoff behaviour at the correct operation or transaction scope.
+- Invalid-data, configuration, contract, resource, lifecycle, and unknown failures have deliberate observable policies.
+- Existing error sources, backend codes, and operation-specific identifying context remain inspectable.
+- Focused tests cover representative classification and consumer-policy combinations.
+- All StoreError producers and consumers are audited and no temporary retry-all TODO remains."""
+status = "in-progress"
+status_reason = "plan agreed"
 type = "task"
 priority = 0
+assignee = "codex"
+children = [
+    "019fec1b-2b9b-7171-807f-8b0d50c8ed9e",
+    "019fec1b-5a35-72f2-a498-2c2c526db28f",
+]
 created_at = "2026-08-02T13:41:00.59806Z"
-updated_at = "2026-08-02T13:41:28.118522Z"
+updated_at = "2026-08-10T15:02:53.69332Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5aa133ae5801"
 label = "discovered from"
+
+[[comments]]
+id = "019fec1b-ad3e-7032-a77b-62a296c1c931"
+author = "codex"
+body = "Plan alignment on 2026-08-10 replaced a scalar retryable/non-retryable disposition with typed class, scope, and resolution dimensions. Their allocation-free Display projection is a centrally defined seven-character opaque code: scope:2 alphabetic + class:3 numeric + resolution:2 alphabetic, padded with X and 0. Future dimensions append padded fixed-width suffixes while the established prefix remains stable. The work is split into flotsync-o4y for the contract and SQLite classification, followed by blocked child flotsync-p6y for consumer adoption and behavioural tests."
+created_at = "2026-08-10T14:37:44.638287Z"
+
+[[comments]]
+id = "019fec32-b3fd-7542-b2f9-a3107e43c142"
+author = "codex"
+body = "Plan refinement on 2026-08-10 renamed the children to flotsync-7g5.1 and flotsync-7g5.2. Stable code assignments will be publicly documented on the classification types plus a consolidated Rustdoc overview, generated from one canonical allocation where practical. SQLite error and SQLx result-code classification moves into a dedicated documented module. The first child also defines an object-safe classification-access trait and implements it for StoreError; the second child will later be aligned to delegate classification through delivery/runtime wrapper chains and avoid typed-information erasure."
+created_at = "2026-08-10T15:02:53.69332Z"

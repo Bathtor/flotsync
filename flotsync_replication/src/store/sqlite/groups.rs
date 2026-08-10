@@ -540,7 +540,11 @@ fn validate_group_material_for_storage(
     ensure!(material.group_id != GroupId::NIL, NilGroupIdSnafu);
     let member_count =
         NonZeroUsize::new(material.member_keys.len()).context(EmptyGroupMembersSnafu)?;
-    ensure_member_index_in_bounds(material.local_member_index, member_count)?;
+    ensure_member_index_in_bounds(
+        material.local_member_index,
+        member_count,
+        MemberIndexOrigin::Caller,
+    )?;
     ensure!(
         material.security_material != invalid_default_group_security_material(),
         InvalidDefaultGroupSecurityMaterialSnafu {

@@ -102,12 +102,12 @@ use crate::{
         RowKey,
         RowKeyIterator,
         RowMutation,
+        STORE_EXTERNAL_UNCLASSIFIED_SNAFU,
         SchemaSource,
         SnapshotRef,
         SnapshotRowsRequest,
         SnapshotValueRow,
         StoreError,
-        StoreExternalSnafu,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
         SummaryRequest,
@@ -647,7 +647,9 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             return async move {
                 let source =
                     std::io::Error::other("failing store intentionally rejected group activation");
-                Err::<(), _>(source).boxed().context(StoreExternalSnafu)
+                Err::<(), _>(source)
+                    .boxed()
+                    .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
             }
             .boxed();
         }
@@ -746,7 +748,9 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                     "failing store intentionally failed dataset row patch apply for '{}'",
                     patch.dataset_id
                 ));
-                return Err::<(), _>(source).boxed().context(StoreExternalSnafu);
+                return Err::<(), _>(source)
+                    .boxed()
+                    .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
             }
             self.inner
                 .as_mut()
@@ -854,7 +858,9 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                 let source = std::io::Error::other(
                     "failing store intentionally failed after committing pending group work",
                 );
-                return Err::<(), _>(source).boxed().context(StoreExternalSnafu);
+                return Err::<(), _>(source)
+                    .boxed()
+                    .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
             }
             Ok(())
         }

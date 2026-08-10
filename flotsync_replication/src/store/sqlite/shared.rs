@@ -17,6 +17,15 @@ pub(super) enum StoredGroupLifecycleError {
     Unknown { raw: String },
 }
 
+/// Origin of a member index being checked against its associated member set.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum MemberIndexOrigin {
+    /// The index came from caller-provided group material.
+    Caller,
+    /// The index was decoded from persisted group material.
+    Stored,
+}
+
 pub(super) async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -381,9 +390,9 @@ pub(super) fn decode_encrypted_store_secret(
 }
 
 pub(super) fn decode_non_zero_member_count(member_count: i64) -> Result<NonZeroUsize, StoreError> {
-    let member_count = usize::try_from(member_count).context(MemberCountOverflowSnafu)?;
+    let member_count = usize::try_from(member_count).context(StoredMemberCountOverflowSnafu)?;
     NonZeroUsize::new(member_count)
-        .context(EmptyGroupMembersSnafu)
+        .context(StoredEmptyGroupMembersSnafu)
         .map_err(StoreError::from)
 }
 
@@ -396,17 +405,31 @@ pub(super) fn sqlite_limit_value(limit: NonZeroUsize) -> i64 {
     i64::try_from(limit.get()).unwrap_or(i64::MAX)
 }
 
+/// Ensure a member index fits its member set and classify failure by its origin.
 pub(super) fn ensure_member_index_in_bounds(
     member_index: MemberIndex,
     member_count: NonZeroUsize,
+    origin: MemberIndexOrigin,
 ) -> Result<(), StoreError> {
-    ensure!(
-        (member_index.as_u32() as usize) < member_count.get(),
-        InvalidLocalMemberIndexSnafu {
-            local_member_index: member_index.as_u32(),
-            member_count: member_count.get(),
-        }
-    );
+    let local_member_index = member_index.as_u32();
+    let member_count = member_count.get();
+    let in_bounds = (local_member_index as usize) < member_count;
+    match origin {
+        MemberIndexOrigin::Caller => ensure!(
+            in_bounds,
+            InvalidLocalMemberIndexSnafu {
+                local_member_index,
+                member_count,
+            }
+        ),
+        MemberIndexOrigin::Stored => ensure!(
+            in_bounds,
+            InvalidStoredLocalMemberIndexSnafu {
+                local_member_index,
+                member_count,
+            }
+        ),
+    }
     Ok(())
 }
 
@@ -416,7 +439,7 @@ pub(super) fn decode_member_index(
 ) -> Result<MemberIndex, StoreError> {
     let member_index = u32::try_from(raw).context(MemberIndexOverflowSnafu)?;
     let member_index = MemberIndex::new(member_index);
-    ensure_member_index_in_bounds(member_index, member_count)?;
+    ensure_member_index_in_bounds(member_index, member_count, MemberIndexOrigin::Stored)?;
     Ok(member_index)
 }
 
@@ -510,5 +533,49 @@ where
         Err(ProtoInputDecodeError::Convert { source }) => {
             Err(invalid_stored_object(object, source))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::StoreErrorClass;
+
+    #[test]
+    fn member_index_bounds_failure_reflects_the_index_origin() {
+        let member_count = NonZeroUsize::new(1).expect("test member count is non-zero");
+        let member_index = MemberIndex::new(1);
+
+        let caller_error =
+            ensure_member_index_in_bounds(member_index, member_count, MemberIndexOrigin::Caller)
+                .expect_err("caller index should be out of bounds");
+        assert!(matches!(
+            sqlite_source(&caller_error),
+            SqliteStoreError::InvalidLocalMemberIndex { .. }
+        ));
+        assert_eq!(
+            caller_error.classification().class,
+            StoreErrorClass::Contract
+        );
+
+        let stored_error =
+            ensure_member_index_in_bounds(member_index, member_count, MemberIndexOrigin::Stored)
+                .expect_err("stored index should be out of bounds");
+        assert!(matches!(
+            sqlite_source(&stored_error),
+            SqliteStoreError::InvalidStoredLocalMemberIndex { .. }
+        ));
+        assert_eq!(
+            stored_error.classification().class,
+            StoreErrorClass::InvalidData
+        );
+    }
+
+    /// Return the concrete SQLite source retained by a store error.
+    fn sqlite_source(error: &StoreError) -> &SqliteStoreError {
+        let StoreError::StoreExternal { source, .. } = error;
+        source
+            .downcast_ref::<SqliteStoreError>()
+            .expect("store error should retain its SQLite source")
     }
 }

@@ -67,7 +67,6 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     MemberIndex,
-    member::IdentifierParseError,
     versions::{UpdateId, VersionVector},
 };
 use flotsync_messages::{
@@ -94,7 +93,7 @@ use std::{
     error::Error as StdError,
     fs::OpenOptions,
     num::NonZeroUsize,
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -267,8 +266,11 @@ impl SqliteReplicationStoreProvisioner {
             .max_lifetime(None)
             .connect_with(connect_options)
             .await
-            .context(SqlxSnafu)?;
-        let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            .context(SQLX_CONNECT_SNAFU)?;
+        let mut connection = pool
+            .acquire()
+            .await
+            .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
         initialise_schema(&mut connection).await?;
         drop(connection);
 
@@ -283,7 +285,10 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
     fn local_member_identity(&self) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>> {
         let pool = self.pool.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            let mut connection = pool
+                .acquire()
+                .await
+                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             load_local_member_identity(&mut connection).await
         }
         .boxed()
@@ -298,7 +303,7 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
             let connection = pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
-                .context(SqlxSnafu)?;
+                .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 schema_sources,
@@ -337,7 +342,7 @@ impl ReplicationStore for SqliteReplicationStore {
             let connection = pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
-                .context(SqlxSnafu)?;
+                .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 schema_sources,
@@ -353,7 +358,10 @@ impl ReplicationStore for SqliteReplicationStore {
         let pool = self.pool.clone();
         let schema_sources = self.schema_sources.clone();
         async move {
-            let connection = pool.begin_with("BEGIN").await.context(SqlxSnafu)?;
+            let connection = pool
+                .begin_with("BEGIN")
+                .await
+                .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 schema_sources,
@@ -370,7 +378,10 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
         let pool = self.pool.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            let mut connection = pool
+                .acquire()
+                .await
+                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             load_reliable_delivery_work_metadata(&mut connection).await
         }
         .boxed()
@@ -382,7 +393,10 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, StoreError>> {
         let pool = self.pool.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            let mut connection = pool
+                .acquire()
+                .await
+                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             load_reliable_delivery_work(&mut connection, message_id).await
         }
         .boxed()
@@ -394,7 +408,10 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let pool = self.pool.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            let mut connection = pool
+                .acquire()
+                .await
+                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             store_reliable_delivery_work(&mut connection, &work).await
         }
         .boxed()
@@ -406,7 +423,10 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
         let pool = self.pool.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            let mut connection = pool
+                .acquire()
+                .await
+                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             remove_reliable_delivery_work(&mut connection, message_id).await
         }
         .boxed()
@@ -686,7 +706,10 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
                 .connection
                 .take()
                 .expect("sqlite replication read transaction must not release twice");
-            connection.rollback().await.context(SqlxSnafu)?;
+            connection
+                .rollback()
+                .await
+                .context(SQLX_ROLLBACK_TRANSACTION_SNAFU)?;
             Ok(())
         }
         .boxed()
@@ -868,7 +891,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not commit twice");
-            connection.commit().await.context(SqlxSnafu)?;
+            connection
+                .commit()
+                .await
+                .context(SQLX_COMMIT_TRANSACTION_SNAFU)?;
             Ok(())
         }
         .boxed()
@@ -880,7 +906,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not roll back twice");
-            connection.rollback().await.context(SqlxSnafu)?;
+            connection
+                .rollback()
+                .await
+                .context(SQLX_ROLLBACK_TRANSACTION_SNAFU)?;
             Ok(())
         }
         .boxed()
@@ -1053,11 +1082,12 @@ async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(),
         sqlx::query(*statement)
             .execute(&mut *connection)
             .await
-            .context(SqlxSnafu)?;
+            .context(SQLX_INITIALISE_SCHEMA_SNAFU)?;
     }
     Ok(())
 }
 
+mod error;
 mod groups;
 mod pending_groups;
 mod reliable_delivery;
@@ -1066,6 +1096,11 @@ mod security;
 mod shared;
 mod updates;
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
+use error::*;
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
@@ -1102,177 +1137,6 @@ use shared::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use updates::*;
-
-#[derive(Debug, Snafu)]
-enum SqliteStoreError {
-    #[snafu(display("SQLite operation failed: {source}"))]
-    Sqlx { source: sqlx::Error },
-    #[snafu(display("SQLite connection URL '{database_url}' was invalid: {source}"))]
-    ParseSqliteUrl {
-        database_url: String,
-        source: sqlx::Error,
-    },
-    #[snafu(display("Failed to create new SQLite database file '{}': {source}", path.display()))]
-    CreateDatabaseFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[snafu(display("The replication store has no provisioned local member identity."))]
-    MissingLocalMemberIdentity,
-    #[snafu(display(
-        "The replication store contains local-private key material for several member identities: '{first}' and '{second}'."
-    ))]
-    AmbiguousLocalMemberIdentities {
-        first: MemberIdentity,
-        second: MemberIdentity,
-    },
-    #[snafu(display(
-        "The replication store is provisioned for local member '{existing}' and cannot store local-private key material for '{requested}'."
-    ))]
-    ConflictingLocalMemberIdentity {
-        existing: MemberIdentity,
-        requested: MemberIdentity,
-    },
-    #[snafu(display("Stored group id was not a valid UUID: {source}"))]
-    InvalidGroupId { source: uuid::Error },
-    #[snafu(display("A stored replication group requires a non-nil group id."))]
-    NilGroupId,
-    #[snafu(display("Stored row key was not a valid UUID: {source}"))]
-    InvalidRowKey { source: uuid::Error },
-    #[snafu(display("Stored store-secret key id was invalid: {source}"))]
-    InvalidStoreSecretKeyId {
-        source: flotsync_security::StoreSecretKeyIdParseError,
-    },
-    #[snafu(display("Stored member identity '{raw}' was invalid: {source}"))]
-    InvalidMemberIdentity {
-        raw: String,
-        source: IdentifierParseError,
-    },
-    #[snafu(display("A stored replication group requires at least one member."))]
-    EmptyGroupMembers,
-    #[snafu(display(
-        "Replication group {group_id} still carries invalid default security material."
-    ))]
-    InvalidDefaultGroupSecurityMaterial { group_id: GroupId },
-    #[snafu(display("Stored member count overflowed the supported range: {source}"))]
-    MemberCountOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Stored member index overflowed the supported range: {source}"))]
-    MemberIndexOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Stored secret crypto version overflowed the supported range: {source}"))]
-    SecretCryptoVersionOverflow { source: std::num::TryFromIntError },
-    #[snafu(display(
-        "Stored local member index {local_member_index} is out of bounds for {member_count} members."
-    ))]
-    InvalidLocalMemberIndex {
-        local_member_index: u32,
-        member_count: usize,
-    },
-    #[snafu(display(
-        "Replication group {group_id} has {version_member_count} active version-vector members, but its material has {member_count} members."
-    ))]
-    ActiveVersionMemberCountMismatch {
-        group_id: GroupId,
-        version_member_count: usize,
-        member_count: usize,
-    },
-    #[snafu(display(
-        "Replication group {group_id} has {version_member_count} lifecycle-cut members, but its material has {member_count} members."
-    ))]
-    LifecycleVersionMemberCountMismatch {
-        group_id: GroupId,
-        version_member_count: usize,
-        member_count: usize,
-    },
-    #[snafu(display(
-        "Stored group '{group_id}' expected {expected_member_count} members, but loaded {actual_member_count}."
-    ))]
-    StoredGroupMemberCountMismatch {
-        group_id: GroupId,
-        expected_member_count: usize,
-        actual_member_count: usize,
-    },
-    #[snafu(display(
-        "Stored schema source for dataset '{dataset_id}' in group '{group_id}' was missing."
-    ))]
-    MissingSchema {
-        group_id: GroupId,
-        dataset_id: DatasetId,
-    },
-    #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
-    DecodeStoredProto {
-        object: &'static str,
-        source: flotsync_messages::buffa::DecodeError,
-    },
-    #[snafu(display("Stored {object} was invalid: {source}"))]
-    InvalidStoredObject {
-        object: &'static str,
-        source: Box<dyn StdError + Send + Sync>,
-    },
-    #[snafu(display("Stored {object} sort key had invalid length {len}."))]
-    InvalidStoredSortKey { object: &'static str, len: usize },
-    #[snafu(display(
-        "Stored {object} for member '{member_id}' conflicts with requested material."
-    ))]
-    ConflictingMemberSecurityMaterial {
-        object: &'static str,
-        member_id: MemberIdentity,
-    },
-    #[snafu(display(
-        "Stored group material for group '{group_id}' conflicts with requested material."
-    ))]
-    ConflictingGroupMaterial { group_id: GroupId },
-    #[snafu(display(
-        "Stored pending work for target group '{group_id}' conflicts with requested work."
-    ))]
-    ConflictingPendingGroupWork { group_id: GroupId },
-    #[snafu(display(
-        "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
-    ))]
-    StoredUpdateGroupMismatch {
-        expected_group_id: GroupId,
-        actual_group_id: GroupId,
-    },
-    #[snafu(display(
-        "Stored update contained update id '{actual_update_id:?}', expected '{expected_update_id:?}'."
-    ))]
-    StoredUpdateIdMismatch {
-        expected_update_id: UpdateId,
-        actual_update_id: UpdateId,
-    },
-    #[snafu(display(
-        "Stored schema payload for group '{group}' was keyed as dataset '{key_dataset}' but contained dataset '{payload_dataset}'."
-    ))]
-    StoredDatasetSchemaKeyMismatch {
-        group: GroupId,
-        key_dataset: DatasetId,
-        payload_dataset: DatasetId,
-    },
-    #[snafu(display("Stored group '{group_id}' was missing."))]
-    MissingStoredGroup { group_id: GroupId },
-    #[snafu(display(
-        "Stored dataset row '{group_id}/{dataset_id}/{row_key}' cannot transition from {from} to {to}."
-    ))]
-    InvalidDatasetRowStateTransition {
-        group_id: GroupId,
-        dataset_id: DatasetId,
-        row_key: RowKey,
-        from: &'static str,
-        to: &'static str,
-    },
-    #[snafu(display("Stored update '{group_id}/{update_id:?}' was missing."))]
-    MissingStoredUpdate {
-        group_id: GroupId,
-        update_id: UpdateId,
-    },
-}
-
-impl From<SqliteStoreError> for StoreError {
-    fn from(value: SqliteStoreError) -> Self {
-        StoreError::StoreExternal {
-            source: Box::new(value),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests;

@@ -64,13 +64,6 @@ pub enum ApiError {
     UnsupportedOperation { operation: &'static str },
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
-pub enum StoreError {
-    #[snafu(display("Replication store failed: {source}"))]
-    StoreExternal { source: BoxError },
-}
-
 /// Security setup failures reported by public replication runtime loading.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]

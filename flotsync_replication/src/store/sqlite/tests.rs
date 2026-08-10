@@ -27,7 +27,7 @@ use crate::{
     test_support::{test_public_member_keys, test_replication_security_secrets},
 };
 use bytes::Bytes;
-use flotsync_core::member::MAX_IDENTIFIER_SEGMENTS;
+use flotsync_core::member::{IdentifierParseError, MAX_IDENTIFIER_SEGMENTS};
 use flotsync_data_types::{
     Field,
     RowValues,
@@ -208,7 +208,7 @@ fn sqlite_store_activation_requires_one_provisioned_identity() {
     };
     assert!(matches!(
         error,
-        StoreError::StoreExternal { ref source }
+        StoreError::StoreExternal { ref source, .. }
             if matches!(
                 source.downcast_ref::<SqliteStoreError>(),
                 Some(SqliteStoreError::MissingLocalMemberIdentity)
@@ -249,7 +249,7 @@ fn sqlite_store_activation_rejects_several_distinct_local_identities() {
     };
     assert!(matches!(
         error,
-        StoreError::StoreExternal { ref source }
+        StoreError::StoreExternal { ref source, .. }
             if matches!(
                 source.downcast_ref::<SqliteStoreError>(),
                 Some(SqliteStoreError::AmbiguousLocalMemberIdentities { first, second })
@@ -270,7 +270,7 @@ fn sqlite_store_activation_rejects_malformed_local_identity() {
     };
     assert!(matches!(
         error,
-        StoreError::StoreExternal { ref source }
+        StoreError::StoreExternal { ref source, .. }
             if matches!(
                 source.downcast_ref::<SqliteStoreError>(),
                 Some(SqliteStoreError::InvalidMemberIdentity { raw, .. }) if raw == "bad!"
@@ -773,7 +773,7 @@ fn stored_member_identity_rejects_overlong_identifier() {
     let error = decode_member_identity(&raw).unwrap_err();
 
     assert_matches!(error, StoreError::StoreExternal { .. });
-    let StoreError::StoreExternal { source } = error;
+    let StoreError::StoreExternal { source, .. } = error;
     let sqlite_error = source
         .downcast_ref::<SqliteStoreError>()
         .expect("store external error should preserve sqlite store error");
@@ -859,7 +859,7 @@ fn assert_sqlite_store_error(
     error: &StoreError,
     predicate: impl FnOnce(&SqliteStoreError) -> bool,
 ) {
-    let StoreError::StoreExternal { source } = error;
+    let StoreError::StoreExternal { source, .. } = error;
     let sqlite_error = source
         .downcast_ref::<SqliteStoreError>()
         .expect("store error should retain SQLite context");
@@ -890,7 +890,7 @@ fn is_conflicting_member_security_material(
     member_id: &MemberIdentity,
 ) -> bool {
     match error {
-        StoreError::StoreExternal { source } => matches!(
+        StoreError::StoreExternal { source, .. } => matches!(
             source.downcast_ref::<SqliteStoreError>(),
             Some(SqliteStoreError::ConflictingMemberSecurityMaterial {
                 object: stored_object,
@@ -902,7 +902,7 @@ fn is_conflicting_member_security_material(
 
 fn is_conflicting_pending_group_work(error: &StoreError, group_id: GroupId) -> bool {
     match error {
-        StoreError::StoreExternal { source } => matches!(
+        StoreError::StoreExternal { source, .. } => matches!(
             source.downcast_ref::<SqliteStoreError>(),
             Some(SqliteStoreError::ConflictingPendingGroupWork {
                 group_id: stored_group_id,
@@ -1534,7 +1534,7 @@ fn sqlite_store_rejects_private_keys_for_a_second_local_identity() {
     .expect_err("second local identity should fail");
     assert!(matches!(
         error,
-        StoreError::StoreExternal { ref source }
+        StoreError::StoreExternal { ref source, .. }
             if matches!(
                 source.downcast_ref::<SqliteStoreError>(),
                 Some(SqliteStoreError::ConflictingLocalMemberIdentity {
@@ -1929,7 +1929,7 @@ fn sqlite_store_rejects_tombstone_to_active_row_transition() {
 
     assert!(matches!(
         error,
-        StoreError::StoreExternal { ref source }
+        StoreError::StoreExternal { ref source, .. }
             if source.to_string().contains("cannot transition from tombstone to active")
     ));
 }

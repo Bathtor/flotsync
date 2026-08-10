@@ -730,7 +730,7 @@ impl ReliableDeliveryStore for TestReliableDeliveryStore {
 fn injected_store_error(description: &'static str) -> crate::api::StoreError {
     Err::<(), _>(std::io::Error::other(description))
         .boxed()
-        .context(crate::api::StoreExternalSnafu)
+        .context(crate::api::STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
         .expect_err("injected store failure should remain an error")
 }
 
@@ -1403,7 +1403,7 @@ fn unpersisted_security_failures_keep_only_retryable_submissions() {
 
         let store_error = Err::<(), _>(std::io::Error::other("injected store failure"))
             .boxed()
-            .context(crate::api::StoreExternalSnafu)
+            .context(crate::api::STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
             .expect_err("injected store failure should remain an error");
         let retryable_error = Err::<(), _>(store_error)
             .context(crate::delivery::security::StoreAccessSnafu)
