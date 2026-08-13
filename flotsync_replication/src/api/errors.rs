@@ -1,4 +1,9 @@
-use super::StoreSecretKeyId;
+use super::{
+    StoreError,
+    StoreErrorClassification,
+    StoreErrorClassificationSource,
+    StoreSecretKeyId,
+};
 use flotsync_core::{ApplicationId, GroupId, MemberIdentity, membership::GroupMembersError};
 use flotsync_security::LocalStoreSecretError;
 pub use flotsync_utils::BoxError;
@@ -47,10 +52,19 @@ impl From<BoxError> for ListenerError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module(api_error))]
 pub enum ApiError {
     #[snafu(display("Replication API operation failed: {source}"))]
     ApiExternal { source: BoxError },
+    /// A replication API operation failed due to a store error.
+    /// The error chain supplied a classification for this error.
+    #[snafu(display("Replication API store operation failed [{classification}]: {source}"))]
+    StoreExternal {
+        /// Typed store classification retained before boxing the concrete source.
+        classification: StoreErrorClassification,
+        /// Concrete operation error retained for diagnostics and downcasting.
+        source: BoxError,
+    },
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
     #[snafu(display("Replication runtime lifecycle state was poisoned while {operation}."))]
@@ -64,10 +78,56 @@ pub enum ApiError {
     UnsupportedOperation { operation: &'static str },
 }
 
+impl ApiError {
+    /// Box one error while preserving an explicitly exposed store classification.
+    ///
+    /// Call sites opt into this conversion only for error types whose store-bearing variants
+    /// should remain programmatically visible. An unclassified source remains an ordinary
+    /// [`Self::ApiExternal`] error; it is not assigned an unknown store classification.
+    pub(crate) fn from_store_classification_source<E>(source: E) -> Self
+    where
+        E: StoreErrorClassificationSource + Into<BoxError>,
+    {
+        if let Some(classification) = source.store_error_classification() {
+            // Snapshot the small classification at this type-erasure boundary so this variant is
+            // always classified while `BoxError` retains ordinary Snafu sourcing and downcasting.
+            Self::StoreExternal {
+                classification,
+                source: source.into(),
+            }
+        } else {
+            Self::ApiExternal {
+                source: source.into(),
+            }
+        }
+    }
+}
+
+impl StoreErrorClassificationSource for ApiError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreExternal { classification, .. } => Some(*classification),
+            Self::ApiExternal { .. }
+            | Self::RuntimeUnavailable
+            | Self::RuntimeLifecyclePoisoned { .. }
+            | Self::SummaryTimedOut { .. }
+            | Self::UnsupportedOperation { .. } => None,
+        }
+    }
+}
+
 /// Security setup failures reported by public replication runtime loading.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module(load_security_error))]
 pub enum LoadSecurityError {
+    /// Replication-store access failed while loading security state.
+    #[snafu(display("Failed to access replication security records [{classification}]: {source}"))]
+    StoreAccess {
+        /// Typed classification retained before boxing the internal security wrapper.
+        classification: StoreErrorClassification,
+        /// Concrete security-loading error retained for diagnostics and downcasting.
+        source: BoxError,
+    },
     /// Device-local store-secret profile loading failed before store records could be opened.
     #[snafu(display("Failed to load local store secret: {source}"))]
     LocalStoreSecret {
@@ -158,9 +218,36 @@ pub enum LoadSecurityError {
     },
 }
 
+impl StoreErrorClassificationSource for LoadSecurityError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { classification, .. } => Some(*classification),
+            Self::LocalStoreSecret { .. }
+            | Self::InvalidLocalPrivateKeys { .. }
+            | Self::StoredGroupInvalidMembers { .. }
+            | Self::StoredGroupMissingPermittedPublicKeys { .. }
+            | Self::StoredGroupAmbiguousPermittedPublicKeys { .. }
+            | Self::StoredGroupInvalidMemberPublicKeyLength { .. }
+            | Self::StoredGroupInvalidMemberPublicKeys { .. }
+            | Self::StoredGroupKeyIdMismatch { .. }
+            | Self::StoredGroupUnsupportedStoreSecretVersion { .. }
+            | Self::StoredGroupInvalidGroupSecretNonceLength { .. }
+            | Self::Other { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module(load_error))]
 pub enum LoadError {
+    /// Replication-store access failed before the runtime could start.
+    #[snafu(display(
+        "Failed to access the replication store for application '{application_id}': {source}"
+    ))]
+    StoreAccess {
+        application_id: ApplicationId,
+        source: StoreError,
+    },
     #[snafu(display("Failed to load replication for application '{application_id}': {source}"))]
     Runtime {
         application_id: ApplicationId,
@@ -175,4 +262,109 @@ pub enum LoadError {
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
     Unavailable { application_id: ApplicationId },
+}
+
+impl StoreErrorClassificationSource for LoadError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::Security { source, .. } => source.store_error_classification(),
+            Self::Runtime { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{StoreErrorClass, StoreErrorResolution, StoreErrorScope};
+    use std::{error::Error as StdError, fmt};
+
+    /// Test error which explicitly reports that it has no store classification.
+    #[derive(Debug)]
+    struct UnclassifiedError;
+
+    impl fmt::Display for UnclassifiedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("unclassified test error")
+        }
+    }
+
+    impl StdError for UnclassifiedError {}
+
+    impl StoreErrorClassificationSource for UnclassifiedError {
+        fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+            None
+        }
+    }
+
+    /// Return one distinctive classification used to verify wrapper delegation.
+    fn test_classification() -> StoreErrorClassification {
+        StoreErrorClassification::UNKNOWN
+            .with_scope(StoreErrorScope::Record)
+            .with_class(StoreErrorClass::InvalidData)
+            .with_resolution(StoreErrorResolution::Repair)
+    }
+
+    /// Build one classified store source without depending on a concrete backend.
+    fn test_store_error() -> StoreError {
+        StoreError::new(
+            test_classification(),
+            std::io::Error::other("injected classified store failure"),
+        )
+    }
+
+    #[test]
+    fn explicit_api_conversion_preserves_classification_and_concrete_source() {
+        let error = ApiError::from_store_classification_source(test_store_error());
+
+        assert_eq!(
+            error.store_error_classification(),
+            Some(test_classification())
+        );
+        assert_eq!(
+            error.to_string(),
+            "Replication API store operation failed [RX400PX]: Replication store failed [RX400PX]: injected classified store failure"
+        );
+        match error {
+            ApiError::StoreExternal {
+                classification,
+                source,
+            } => {
+                assert_eq!(classification, test_classification());
+                assert!(source.downcast_ref::<StoreError>().is_some());
+            }
+            other => panic!("unexpected API error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_api_conversion_does_not_invent_an_unknown_classification() {
+        let error = ApiError::from_store_classification_source(UnclassifiedError);
+
+        assert_eq!(error.store_error_classification(), None);
+        match error {
+            ApiError::ApiExternal { source } => {
+                assert!(source.downcast_ref::<UnclassifiedError>().is_some());
+            }
+            other => panic!("unexpected API error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn public_load_errors_delegate_through_security_store_access() {
+        let security_error = LoadSecurityError::StoreAccess {
+            classification: test_classification(),
+            source: test_store_error().into(),
+        };
+        let error = LoadError::Security {
+            application_id: ApplicationId::from_array(["test-application"]),
+            source: Box::new(security_error),
+        };
+
+        assert_eq!(
+            error.store_error_classification(),
+            Some(test_classification())
+        );
+    }
 }

@@ -10,6 +10,8 @@ use crate::{
         MemberPublicKeysRecord,
         ReplicationSecuritySecrets,
         StoreError,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
     },
     delivery::security::{LOGICAL_LOCAL_MEMBER_TABLE, LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN},
 };
@@ -148,6 +150,18 @@ pub enum ProvisionLocalIdentityError {
         member_id: MemberIdentity,
         source: BoxError,
     },
+}
+
+impl StoreErrorClassificationSource for ProvisionLocalIdentityError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source } => source.store_error_classification(),
+            Self::AlreadyProvisioned { .. }
+            | Self::Generate { .. }
+            | Self::InvalidPrivateBundle { .. }
+            | Self::Seal { .. } => None,
+        }
+    }
 }
 
 /// Decode one private bundle and bind it to the authoritative local member.

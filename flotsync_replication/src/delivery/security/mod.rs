@@ -10,6 +10,8 @@ use crate::{
         MemberPublicKeysRecord,
         PermissionDenialReason,
         StoreError,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
         StoreSecretKeyId,
         security::{
             AssessPublicKeyBundleRequest,
@@ -313,6 +315,47 @@ impl DeliverySecurityError {
             Self::OpenLocalPrivateKeys { .. } => false,
             // Group-secret sealing also depends on OS randomness and may recover on retry.
             Self::SealGroupSecret { .. } => true,
+        }
+    }
+}
+
+impl StoreErrorClassificationSource for DeliverySecurityError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::SecurityStore { source } => source.store_error_classification(),
+            Self::MissingLocalPrivateKeys { .. }
+            | Self::MissingGroupSecurity { .. }
+            | Self::GroupSetupKeyMismatch { .. }
+            | Self::ReliableSelfMessage { .. }
+            | Self::UnexpectedReliableSender { .. }
+            | Self::UnexpectedReliableRecipient { .. }
+            | Self::UnexpectedRecipientAckOriginalSender { .. }
+            | Self::UnexpectedRecipientAckRecipient { .. }
+            | Self::InvalidRecipientAckSignatureLength { .. }
+            | Self::UnexpectedGroupSender { .. }
+            | Self::GroupSenderNotInGroup { .. }
+            | Self::GroupSenderKeyFingerprintMismatch { .. }
+            | Self::MissingBootstrapMemberKey { .. }
+            | Self::BootstrapKeyFingerprintMismatch { .. }
+            | Self::MemberKeyPermissionDenied { .. }
+            | Self::UnexpectedBootstrapMemberKey { .. }
+            | Self::InvalidBootstrapPublicKeyBundle { .. }
+            | Self::UnsupportedStoreSecretVersion { .. }
+            | Self::InvalidStoreSecretNonce { .. }
+            | Self::GroupSecretKeyIdMismatch { .. }
+            | Self::InvalidLocalPrivateKeys { .. }
+            | Self::GenerateGroupKey { .. }
+            | Self::SealReliablePayload { .. }
+            | Self::OpenReliablePayload { .. }
+            | Self::SignRecipientAck { .. }
+            | Self::VerifyRecipientAck { .. }
+            | Self::VerifyDiscoveryClaim { .. }
+            | Self::OpenGroupSecret { .. }
+            | Self::SealGroupPayload { .. }
+            | Self::OpenGroupPayload { .. }
+            | Self::OpenLocalPrivateKeys { .. }
+            | Self::SealGroupSecret { .. } => None,
         }
     }
 }

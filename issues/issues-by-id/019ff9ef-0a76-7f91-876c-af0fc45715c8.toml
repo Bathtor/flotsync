@@ -1,0 +1,41 @@
+id = "019ff9ef-0a76-7f91-876c-af0fc45715c8"
+ref = "flotsync-6at0"
+title = "Apply classified store-failure policies in delivery and catch-up"
+body = """
+Child of flotsync-7g5.2. This task implements the approved consumer-policy half after classification propagation is available.
+
+Reliable-delivery policy
+
+- Admission persistence retries only Retry and WaitForResume classifications, retaining the already encoded idempotent work. Other store failures fail the component instead of spinning or silently discarding accepted work.
+- Delivery-security store failures during admission use the same classified retry versus component-failure decision. Non-store security failures retain the existing per-message rejection behaviour.
+- Selected-row load uses the existing sender retry for Retry and WaitForResume. Exactly Record + InvalidData + Repair is isolated by marking that message for cleanup and deleting only that row. Every other store failure fails the component. Unknown or partially classified errors never authorise deletion.
+- Cleanup deletion retains the message exclusion and retries Retry and WaitForResume. Every other failure fails the component so the row cannot silently resurrect after restart.
+- Bulk reliable-delivery metadata loading remains fatal for every store error because the current bulk API cannot safely identify and isolate one bad row.
+- Recreate escalates because reliable delivery does not own the affected connection or pool resource.
+
+Catch-up policy
+
+- Catch-up serving is best effort. Store failures while fulfilling one NeedRange are logged and ignored because an individual member need not serve that request. Do not add a second local retry mechanism; the protocol may request the range again.
+- Escalate only truly global fatal classifications indicating that the store can no longer be read at all. Define this through a small catch-up-local policy helper using typed scope, class, and resolution rather than opaque display codes, and cover the boundary with tests.
+- Startup and bulk availability hydration remain fatal because the component cannot establish its authoritative local availability view.
+
+Other consumers
+
+- Runtime transactions and provisioning continue to propagate classified failures; do not add generic mutation retries.
+- Existing inbound payload rejection versus fatal-component policy remains unchanged except where typed delegation is required by the preceding child.
+- Remove the remaining flotsync-7g5 retry-all TODOs and audit examples and test stores for deliberate behaviour.
+
+Tests
+
+- Add table-driven tests for each consumer-local policy, including unknown and incomplete classifications.
+- Add reliable-delivery behavioural tests for retryable and fatal admission, retryable selected load, invalid-record isolation, permanent selected-load failure, retryable cleanup, and permanent cleanup failure.
+- Add catch-up tests showing ordinary per-request store failures are non-fatal and only globally unusable store classifications escalate.
+
+Estimated size: 510-820 LOC."""
+status = "open"
+type = "task"
+priority = 3
+blocked_by = ["019ff9ea-2b06-7e71-8412-193bcfcd510c"]
+parent = "019fec1b-5a35-72f2-a498-2c2c526db28f"
+created_at = "2026-08-13T07:03:40.406648Z"
+updated_at = "2026-08-13T07:24:37.66463Z"

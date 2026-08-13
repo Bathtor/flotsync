@@ -1,5 +1,11 @@
 use crate::{
-    api::{ReplicationStore, ReplicationUpdateFilter, StoreError},
+    api::{
+        ReplicationStore,
+        ReplicationUpdateFilter,
+        StoreError,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
+    },
     codecs::messages::{
         NeedRangeMessage,
         RuntimeMessage,
@@ -108,6 +114,14 @@ enum CatchUpError {
         #[snafu(implicit)]
         location: Location,
     },
+}
+
+impl StoreErrorClassificationSource for CatchUpError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+        }
+    }
 }
 
 /// Exact producer-version intervals grouped by canonical member index.

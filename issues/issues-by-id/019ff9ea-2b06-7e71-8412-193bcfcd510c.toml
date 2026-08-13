@@ -1,0 +1,57 @@
+id = "019ff9ea-2b06-7e71-8412-193bcfcd510c"
+ref = "flotsync-n7j"
+title = "Preserve store classifications through consumer error boundaries"
+body = """
+Child of flotsync-7g5.2. This task implements the approved classification-propagation half before consumer policy adoption.
+
+Scope
+
+- Implement StoreErrorClassificationSource on store-bearing security-store, delivery-security, provisioning, catch-up, runtime, public escalation, and other relevant wrapper errors. Delegate only through variants that retain a classified store source; non-store variants return None.
+- Replace classification-erasing BoxedError fields where the concrete source is DeliverySecurityError, especially group preparation, membership changes, and inbound group setup. Keep sources boxed when useful for enum size, but retain the concrete type.
+- Add ApiError::StoreExternal with StoreErrorClassification plus the original BoxError source. Provide an explicit conversion from StoreErrorClassificationSource: Some becomes StoreExternal and None remains ApiExternal. Do not apply a None-to-UNKNOWN fallback and do not add a blanket From implementation.
+- Add typed StoreAccess variants to LoadError and LoadSecurityError for direct or wrapped store failures currently boxed as generic runtime or security errors. Implement classification delegation through these public boundaries while retaining generic Runtime and Other variants for genuinely unclassified failures.
+- Snapshot the small Copy classification only at the two deliberate type-erasure boundaries, ApiError::StoreExternal and LoadSecurityError::StoreAccess. Keep short developer comments at both copy sites explaining that this preserves an explicitly classified variant, ordinary Snafu source handling, and direct concrete-source downcasting; a boxed optional classification-source trait object would weaken those properties and require adapter machinery.
+- Audit runtime API conversion sites so store-bearing wrapper errors opt into the classified conversion while unrelated errors retain the existing unclassified context. Preserve concrete source downcasting and the opaque classification code in printed source chains.
+- Update examples, public extension fixtures, and test support affected by the public error shape.
+- Add focused tests proving classifications survive security, runtime, ApiError, and load-error wrapper chains and that unclassified sources remain unclassified.
+
+Review refinements
+
+- Describe ApiError::StoreExternal in plain language: the API operation failed due to a store error and the error chain supplied its classification.
+- Retain classification copying at the two erasure boundaries after evaluating the trait-object alternative.
+
+Constraints
+
+- This task changes propagation only. It does not add retry, isolation, or catch-up behaviour.
+- Generic mutation retries remain out of scope.
+- Automatic classification is explicit at each escalation boundary.
+
+Estimated size: 400-650 LOC for the original implementation plus a 1-3 LOC review delta; the realised task is near but not expected to materially exceed 1000 changed lines."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocks = ["019ff9ef-0a76-7f91-876c-af0fc45715c8"]
+parent = "019fec1b-5a35-72f2-a498-2c2c526db28f"
+created_at = "2026-08-13T06:58:21.062701Z"
+updated_at = "2026-08-13T11:55:21.50405Z"
+closed_at = "2026-08-13T11:55:21.50405Z"
+
+[[comments]]
+id = "019ffa02-806a-71e1-a57b-0da8542984dd"
+author = "lkroll"
+body = "Implemented classification propagation through security-store, delivery-security, provisioning, catch-up, runtime wrappers, ApiError, LoadSecurityError, and LoadError. Store-bearing API conversions are explicit, None remains unclassified, group-security wrappers retain DeliverySecurityError, and public source downcasting plus printed codes are covered by focused tests. Validation: full flotsync_replication test suite, workspace check, formatting, and pedantic Clippy all pass."
+created_at = "2026-08-13T07:24:55.786042Z"
+
+[[comments]]
+id = "019ffaf0-d76f-7da3-9abd-4a43a5d70946"
+author = "lkroll"
+body = "Review delta: simplify ApiError::StoreExternal documentation and retain the explicit classification snapshots at the API and security-load erasure boundaries. The boxed classification-source alternative was rejected because the optional trait object cannot itself guarantee a classified variant, needs Snafu adapter machinery, and makes concrete-source downcasting less direct. Add short developer comments at both copy sites to preserve this rationale."
+created_at = "2026-08-13T11:45:15.631497Z"
+
+[[comments]]
+id = "019ffafa-1620-76e0-b313-e245c71859cd"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-13T11:55:21.50405Z"

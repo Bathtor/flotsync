@@ -1,8 +1,15 @@
-#[cfg(any(test, feature = "test-support"))]
-use crate::delivery::security::DeliverySecurityError;
 use crate::{
-    api::{DatasetId, ListenerError, ReplicationGroupLifecycle, RowId, StoreError},
+    api::{
+        DatasetId,
+        ListenerError,
+        ReplicationGroupLifecycle,
+        RowId,
+        StoreError,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
+    },
     codecs::messages::RuntimeMessageError,
+    delivery::security::DeliverySecurityError,
 };
 use flotsync_core::{
     GroupId,
@@ -21,7 +28,7 @@ use kompact::prelude::PromiseErr;
 use snafu::{Location, prelude::*};
 use uuid::Uuid;
 
-/// Boxed source for errors that would otherwise make high-level runtime errors large.
+/// Boxed source for errors that do not expose a useful typed runtime boundary.
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Snafu)]
@@ -66,6 +73,16 @@ pub(crate) enum AcceptMigrationError {
     },
 }
 
+impl StoreErrorClassificationSource for AcceptMigrationError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::PrepareTarget { source } => source.store_error_classification(),
+            Self::StoreAccess { source } => source.store_error_classification(),
+            Self::Lifecycle { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum CreateGroupError {
@@ -78,7 +95,25 @@ pub(super) enum CreateGroupError {
     #[snafu(display("Group member list is invalid: {source}"))]
     InvalidMembers { source: GroupMembersError },
     #[snafu(display("Failed to prepare secure group bootstrap material: {source}"))]
-    Security { source: BoxedError },
+    Security {
+        #[snafu(source(from(DeliverySecurityError, Box::new)))]
+        source: Box<DeliverySecurityError>,
+    },
+    #[snafu(display("Failed to build the group-setup runtime message: {source}"))]
+    BuildGroupSetup { source: RuntimeMessageError },
+}
+
+impl StoreErrorClassificationSource for CreateGroupError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::Security { source } => source.store_error_classification(),
+            Self::EmptyGroupName
+            | Self::LocalMemberMissing { .. }
+            | Self::CreatorNotInMembers { .. }
+            | Self::InvalidMembers { .. }
+            | Self::BuildGroupSetup { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -100,6 +135,18 @@ pub(super) enum SnapshotRowsError {
     },
 }
 
+impl StoreErrorClassificationSource for SnapshotRowsError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::EmptyDatasets
+            | Self::UnknownGroup { .. }
+            | Self::GroupClosed { .. }
+            | Self::MissingDatasetSchema { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(summary))]
 pub(super) enum SummaryError {
@@ -118,6 +165,17 @@ pub(super) enum SummaryError {
         #[snafu(implicit)]
         location: Location,
     },
+}
+
+impl StoreErrorClassificationSource for SummaryError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::UnknownGroup { .. }
+            | Self::GroupClosed { .. }
+            | Self::TargetNotInGroup { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -178,6 +236,23 @@ pub(crate) enum GroupInstallError {
     },
 }
 
+impl StoreErrorClassificationSource for GroupInstallError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreGroup { source, .. } => source.store_error_classification(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::TestGroupSecurity { source, .. } => source.store_error_classification(),
+            Self::ConflictingExistingGroup { .. }
+            | Self::DuplicateStoredGroup { .. }
+            | Self::InstallMissingLocalMember { .. }
+            | Self::InvalidPersistedMembers { .. }
+            | Self::PersistedLocalMemberIndexMismatch { .. }
+            | Self::PersistedVersionVectorMemberCountMismatch { .. }
+            | Self::PersistedFinalVersionVectorMemberCountMismatch { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum RuntimeStartupError {
@@ -208,6 +283,18 @@ pub(super) enum RuntimeStartupError {
         #[snafu(source(from(GroupActivationError, Box::new)))]
         source: Box<GroupActivationError>,
     },
+}
+
+impl StoreErrorClassificationSource for RuntimeStartupError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreStartup { source, .. } => source.store_error_classification(),
+            Self::InvalidGroup { source, .. } => source.store_error_classification(),
+            Self::PendingGroupActivationResume { source } => source.store_error_classification(),
+            Self::ReplayPendingDecision { .. }
+            | Self::PendingGroupActivationResumeUnsupported { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -253,7 +340,12 @@ pub(crate) enum ChangeGroupMembershipError {
         dataset_id: DatasetId,
     },
     #[snafu(display("Failed to prepare secure migration bootstrap material: {source}"))]
-    Security { source: BoxedError },
+    Security {
+        #[snafu(source(from(DeliverySecurityError, Box::new)))]
+        source: Box<DeliverySecurityError>,
+    },
+    #[snafu(display("Failed to build the migration group-setup runtime message: {source}"))]
+    BuildGroupSetup { source: RuntimeMessageError },
     #[snafu(display("Failed to activate locally prepared membership state: {source}"))]
     ActivateGroup {
         #[snafu(source(from(GroupActivationError, Box::new)))]
@@ -261,6 +353,27 @@ pub(crate) enum ChangeGroupMembershipError {
     },
     #[snafu(display("Listener rejected one local migration data-change event: {source}"))]
     NotifyListener { source: ListenerError },
+}
+
+impl StoreErrorClassificationSource for ChangeGroupMembershipError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::InvalidPersistedGroup { source, .. } => source.store_error_classification(),
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::Security { source } => source.store_error_classification(),
+            Self::ActivateGroup { source } => source.store_error_classification(),
+            Self::EmptyGroupName
+            | Self::NilGroupId
+            | Self::UnknownGroup { .. }
+            | Self::GroupNotWritable { .. }
+            | Self::InvalidMembers { .. }
+            | Self::LocalMemberMissing { .. }
+            | Self::SnapshotRowValue { .. }
+            | Self::IncompleteInitialSnapshotScan { .. }
+            | Self::BuildGroupSetup { .. }
+            | Self::NotifyListener { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -321,6 +434,26 @@ pub(crate) enum GroupActivationError {
     },
     #[snafu(display("Listener rejected one activation data-change event: {source}"))]
     NotifyListener { source: ListenerError },
+}
+
+impl StoreErrorClassificationSource for GroupActivationError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::InvalidPersistedGroup { source, .. } | Self::InstallGroup { source, .. } => {
+                source.store_error_classification()
+            }
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::MissingGroupMaterial { .. }
+            | Self::UnsupportedInitialSnapshot { .. }
+            | Self::InvalidMembers { .. }
+            | Self::LocalMemberMissing { .. }
+            | Self::ConflictingGroupMaterial { .. }
+            | Self::MissingInitialDatasetSchema { .. }
+            | Self::EmbedInitialRows { .. }
+            | Self::CloseOldGroup { .. }
+            | Self::NotifyListener { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -410,6 +543,32 @@ pub(crate) enum PublishChangesError {
     ExhaustedUpdateIds { group_id: GroupId },
 }
 
+impl StoreErrorClassificationSource for PublishChangesError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::InvalidPersistedGroup { source, .. } => source.store_error_classification(),
+            Self::StoreAccess { source, .. } | Self::LoadDatasetSchema { source, .. } => {
+                source.store_error_classification()
+            }
+            Self::EmptyChanges
+            | Self::MixedGroups { .. }
+            | Self::UnknownGroup { .. }
+            | Self::GroupNotWritable { .. }
+            | Self::ReadTokenMissingGroup { .. }
+            | Self::ReadTokenMemberCountMismatch { .. }
+            | Self::ReadTokenAheadOfLocalState { .. }
+            | Self::Replay { .. }
+            | Self::MissingDatasetSchema { .. }
+            | Self::UnknownSchemaField { .. }
+            | Self::InvalidFieldValue { .. }
+            | Self::ApplyLocalMutation { .. }
+            | Self::EncodeOperation { .. }
+            | Self::NoEffectiveChanges { .. }
+            | Self::ExhaustedUpdateIds { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(replay))]
 pub(crate) enum ReplayError {
@@ -435,7 +594,10 @@ pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to decode inbound runtime message: {source}"))]
     DecodeMessage { source: RuntimeMessageError },
     #[snafu(display("Inbound group setup failed security checks: {source}"))]
-    GroupSetupSecurity { source: BoxedError },
+    GroupSetupSecurity {
+        #[snafu(source(from(DeliverySecurityError, Box::new)))]
+        source: Box<DeliverySecurityError>,
+    },
     #[snafu(display("Inbound migration acceptance failed: {source}"))]
     AcceptMigration {
         #[snafu(source(from(AcceptMigrationError, Box::new)))]
@@ -592,6 +754,46 @@ pub(crate) enum InboundDeliveryError {
     NotifyListener { source: ListenerError },
 }
 
+impl StoreErrorClassificationSource for InboundDeliveryError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::GroupSetupSecurity { source } => source.store_error_classification(),
+            Self::AcceptMigration { source } => source.store_error_classification(),
+            Self::InstallGroupSetup { source, .. } | Self::InvalidPersistedGroup { source, .. } => {
+                source.store_error_classification()
+            }
+            Self::StoreAccess { source, .. } | Self::LoadDatasetSchema { source, .. } => {
+                source.store_error_classification()
+            }
+            Self::PendingGroupActivation { source } => source.store_error_classification(),
+            Self::DecodeMessage { .. }
+            | Self::UnexpectedReliableMessage
+            | Self::ReliableMessageGroupMismatch { .. }
+            | Self::ReliableMessageMissingGroupScope { .. }
+            | Self::UnexpectedGroupMessage
+            | Self::InvalidGroupSetupMembers { .. }
+            | Self::GroupSetupMissingLocalMember { .. }
+            | Self::GroupSetupSenderNotInGroup { .. }
+            | Self::GroupSetupSenderNotFirstMember { .. }
+            | Self::UnknownHostedGroup { .. }
+            | Self::InvalidPendingGroupMembers { .. }
+            | Self::PendingGroupMissingLocalMember { .. }
+            | Self::MissingDatasetSchema { .. }
+            | Self::UpdateSenderNotInGroup { .. }
+            | Self::UpdateSenderIndexMismatch { .. }
+            | Self::UpdateProducerIndexNotInGroup { .. }
+            | Self::SelfDependentReadVersions { .. }
+            | Self::ConflictingPersistedUpdate { .. }
+            | Self::UpdateOperationIdMismatch { .. }
+            | Self::DecodeSchemaOperation { .. }
+            | Self::ApplyInboundMutation { .. }
+            | Self::CompleteProcessedPromise { .. }
+            | Self::NotifyPendingGroupDecision { .. }
+            | Self::NotifyListener { .. } => None,
+        }
+    }
+}
+
 impl InboundDeliveryError {
     pub(crate) fn failure_action(&self) -> InboundFailureAction {
         match self {
@@ -637,4 +839,64 @@ pub(crate) enum InboundFailureAction {
     Drop,
     /// Treat the failure as a component fault and let Kompact supervision handle it.
     Fatal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{ApiError, StoreErrorClass, StoreErrorResolution, StoreErrorScope};
+
+    /// Build one classified store error for wrapper-delegation tests.
+    fn test_store_error() -> StoreError {
+        let classification = StoreErrorClassification::UNKNOWN
+            .with_scope(StoreErrorScope::Connection)
+            .with_class(StoreErrorClass::Unavailable)
+            .with_resolution(StoreErrorResolution::WaitForResume);
+        StoreError::new(
+            classification,
+            std::io::Error::other("injected runtime store failure"),
+        )
+    }
+
+    #[test]
+    fn runtime_and_delivery_security_wrappers_delegate_store_classification() {
+        let delivery_error = Err::<(), _>(test_store_error())
+            .context(crate::delivery::security::StoreAccessSnafu)
+            .expect_err("injected store failure should remain an error");
+        let create_error = Err::<(), _>(delivery_error)
+            .context(SecuritySnafu)
+            .expect_err("injected security failure should remain an error");
+
+        assert_eq!(
+            create_error.store_error_classification(),
+            Some(
+                StoreErrorClassification::UNKNOWN
+                    .with_scope(StoreErrorScope::Connection)
+                    .with_class(StoreErrorClass::Unavailable)
+                    .with_resolution(StoreErrorResolution::WaitForResume)
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_store_wrapper_preserves_classification_at_api_boundary() {
+        let publish_error = Err::<(), _>(test_store_error())
+            .context(publish::StoreAccessSnafu)
+            .expect_err("injected store failure should remain an error");
+        let error = ApiError::from_store_classification_source(publish_error);
+
+        assert_eq!(
+            error.store_error_classification(),
+            Some(
+                StoreErrorClassification::UNKNOWN
+                    .with_scope(StoreErrorScope::Connection)
+                    .with_class(StoreErrorClass::Unavailable)
+                    .with_resolution(StoreErrorResolution::WaitForResume)
+            )
+        );
+        let ApiError::StoreExternal { source, .. } = error else {
+            panic!("unexpected API error")
+        };
+        assert!(source.downcast_ref::<PublishChangesError>().is_some());
+    }
 }
