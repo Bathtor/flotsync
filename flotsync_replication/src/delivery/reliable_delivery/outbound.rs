@@ -24,6 +24,7 @@ use super::{
     TransportRouteKey,
     WorkScopeKey,
 };
+use crate::api::StoreError;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_io::prelude::{EgressAsyncWriter, PayloadWriter as _};
@@ -463,17 +464,32 @@ impl OutboundState {
                 self.mark_retry_scheduled(message_id, PendingRouteReason::LocalResourcePressure);
                 AttemptCompletion::RetryScheduled
             }
+            OutboundAttemptResult::InvalidStoredRecord => {
+                self.begin_removal_with_outstanding_attempt(
+                    message_id,
+                    PendingRemovalReason::InvalidStoredRecord,
+                    None,
+                );
+                AttemptCompletion::PermanentFailure
+            }
         }
     }
 
-    /// Attempt cleanup of one stored row while keeping retry policy outside this state owner.
+    /// Attempt cleanup of one stored row and classify whether a failed removal may be retried.
+    ///
+    /// The owning component remains responsible for scheduling an authorised retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable store error so the owning component can fail without making the
+    /// excluded message sendable again.
     pub(super) async fn attempt_stored_removal(
         &mut self,
         message_id: MessageId,
         logger: &KompactLogger,
-    ) -> StoredRemovalAttempt {
+    ) -> Result<StoredRemovalAttempt, StoreError> {
         let Some(reason) = self.pending_removal_reason(message_id) else {
-            return StoredRemovalAttempt::Stale;
+            return Ok(StoredRemovalAttempt::Stale);
         };
         match self.store.remove_reliable_delivery_work(message_id).await {
             Ok(removed) => {
@@ -486,19 +502,21 @@ impl OutboundState {
                         reason.description()
                     );
                 }
-                StoredRemovalAttempt::Completed
+                Ok(StoredRemovalAttempt::Completed)
             }
             Err(error) => {
-                // TODO(flotsync-7g5): Classify store errors so permanent
-                // removal failures can terminate cleanup explicitly.
-                error!(
-                    logger,
-                    "Reliable delivery failed to remove stored outbound message_id={} after {}; treating the store error as retryable and keeping the message excluded from sending: {}",
-                    message_id,
-                    reason.description(),
-                    error
-                );
-                StoredRemovalAttempt::Retry
+                if super::store_failure_can_retry_later(error.classification()) {
+                    error!(
+                        logger,
+                        "Reliable delivery failed to remove stored outbound message_id={} after {}; scheduling cleanup retry while keeping the message excluded from sending: {}",
+                        message_id,
+                        reason.description(),
+                        error
+                    );
+                    Ok(StoredRemovalAttempt::Retry)
+                } else {
+                    Err(error)
+                }
             }
         }
     }
@@ -663,6 +681,8 @@ pub(super) enum AttemptCompletion {
 pub(super) enum OutboundAttemptResult {
     /// The stored envelope could not be loaded before transport submission.
     LoadFailed,
+    /// The stored envelope record was invalid and must be isolated through cleanup.
+    InvalidStoredRecord,
     /// The transport promise was dropped before returning a submission result.
     PromiseDropped,
     /// Route transport returned its submission result.

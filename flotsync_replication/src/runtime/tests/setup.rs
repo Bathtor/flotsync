@@ -26,13 +26,13 @@ fn create_group_rejects_missing_permitted_keys_without_storing_group() {
             Some(CreateGroupError::Security { source }) => {
                 assert!(
                     matches!(
-                        source.downcast_ref::<DeliverySecurityError>(),
-                        Some(DeliverySecurityError::SecurityStore {
+                        source.as_ref(),
+                        DeliverySecurityError::SecurityStore {
                             source: SecurityStoreError::NoPermittedMemberPublicKeys {
                                 member_id,
                                 ..
                             },
-                        })
+                        }
                             if member_id == &bob_member
                     ),
                     "unexpected security source: {source:?}"

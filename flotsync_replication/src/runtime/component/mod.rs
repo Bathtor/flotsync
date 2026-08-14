@@ -9,6 +9,7 @@ use super::{
     config_keys,
     errors::{
         AcceptMigrationError,
+        BuildGroupSetupSnafu,
         ChangeGroupMembershipError,
         ConflictingExistingGroupSnafu,
         CreateGroupError,
@@ -64,7 +65,6 @@ use crate::{
     MAX_VERSION_VALUE,
     api::{
         ApiError,
-        ApiExternalSnafu,
         BatchProvider,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
@@ -118,6 +118,7 @@ use crate::{
         Summary,
         SummaryRequest,
         WritableReplicationGroupVersionRecord,
+        api_error::ApiExternalSnafu,
         providers::VecRowProvider,
         security::{
             AssessPublicKeyBundleRequest,
@@ -181,7 +182,7 @@ use itertools::Itertools;
 use kompact::prelude::*;
 use roaring::RoaringBitmap;
 use smallvec::{SmallVec, smallvec};
-use snafu::prelude::*;
+use snafu::{IntoError, prelude::*};
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
@@ -1420,8 +1421,7 @@ impl ReplicationRuntimeComponent {
         let pending_work = transaction
             .load_pending_group_decision(&group_id)
             .await
-            .boxed()
-            .context(ApiExternalSnafu)?;
+            .map_err(ApiError::from_store_classification_source)?;
         let Some(work) = pending_work.filter(|value| value.key() == key) else {
             return Ok(PendingGroupAcceptOutcome::Missing);
         };
@@ -1429,13 +1429,11 @@ impl ReplicationRuntimeComponent {
             transaction
                 .remove_pending_group_decision(key)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu)?;
+                .map_err(ApiError::from_store_classification_source)?;
             transaction
                 .remove_inactive_replication_group_material(group_id)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu)?;
+                .map_err(ApiError::from_store_classification_source)?;
             return Ok(PendingGroupAcceptOutcome::UnsupportedSnapshot(group_id));
         }
         let activation = match work {
@@ -1444,15 +1442,13 @@ impl ReplicationRuntimeComponent {
                 transaction
                     .upsert_pending_group_activation(activation.clone())
                     .await
-                    .boxed()
-                    .context(ApiExternalSnafu)?;
+                    .map_err(ApiError::from_store_classification_source)?;
                 activation
             }
             PendingGroupDecisionRecord::MigrationProposal(proposal) => {
                 Self::accept_migration_proposal(transaction, proposal)
                     .await
-                    .boxed()
-                    .context(ApiExternalSnafu)?
+                    .map_err(ApiError::from_store_classification_source)?
             }
         };
         Ok(PendingGroupAcceptOutcome::Activation(Box::new(activation)))
@@ -1469,8 +1465,7 @@ impl ReplicationRuntimeComponent {
             .store
             .begin_transaction()
             .await
-            .boxed()
-            .context(ApiExternalSnafu)?;
+            .map_err(ApiError::from_store_classification_source)?;
         match response.response {
             PendingGroupDecisionResponseKind::Accept => {
                 match Self::accept_pending_group_work(transaction.as_mut(), response.key).await? {
@@ -1501,20 +1496,17 @@ impl ReplicationRuntimeComponent {
                 transaction
                     .remove_pending_group_decision(response.key)
                     .await
-                    .boxed()
-                    .context(ApiExternalSnafu)?;
+                    .map_err(ApiError::from_store_classification_source)?;
                 transaction
                     .remove_inactive_replication_group_material(rejected_group_id)
                     .await
-                    .boxed()
-                    .context(ApiExternalSnafu)?;
+                    .map_err(ApiError::from_store_classification_source)?;
             }
         }
         let active_groups = transaction
             .load_replication_groups()
             .await
-            .boxed()
-            .context(ApiExternalSnafu)?;
+            .map_err(ApiError::from_store_classification_source)?;
         let next_group_state =
             RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
                 .boxed()
@@ -1522,8 +1514,7 @@ impl ReplicationRuntimeComponent {
         transaction
             .commit()
             .await
-            .boxed()
-            .context(ApiExternalSnafu)?;
+            .map_err(ApiError::from_store_classification_source)?;
         self.group_memberships.replace(next_group_state);
         if let Some(PendingGroupActivationRecord::MigrationProposal(proposal)) =
             accepted_activation.as_deref()
@@ -1543,8 +1534,7 @@ impl ReplicationRuntimeComponent {
             let outcome = self
                 .activate_pending_group_record(*activation)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu)?;
+                .map_err(ApiError::from_store_classification_source)?;
             notify_pending_activation_data_changes(self.listener.clone(), outcome)
                 .await
                 .boxed()
@@ -1748,13 +1738,10 @@ impl ReplicationRuntimeComponent {
         group_id: GroupId,
         members: &GroupMembers,
     ) -> Result<PreparedGroupSetup, CreateGroupError> {
-        let group_key = DeliverySecurity::generate_group_key()
-            .boxed()
-            .context(SecuritySnafu)?;
+        let group_key = DeliverySecurity::generate_group_key().context(SecuritySnafu)?;
         let public_keys = security
             .public_keys_for_members(members)
             .await
-            .boxed()
             .context(SecuritySnafu)?;
         let inline_public_bundles = members.len() <= max_inline_public_key_bundles;
         let setup_member_keys = public_keys.map_values(|public_keys| {
@@ -1766,7 +1753,6 @@ impl ReplicationRuntimeComponent {
         });
         let security_material = security
             .seal_group_secret(group_id.0, &group_key)
-            .boxed()
             .context(SecuritySnafu)?;
         let group_setup = GroupSetupMessage::new(
             members.ordered_members(),
@@ -1774,8 +1760,7 @@ impl ReplicationRuntimeComponent {
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             GroupSetupKey::from_group_key(group_key),
         )
-        .boxed()
-        .context(SecuritySnafu)?;
+        .context(BuildGroupSetupSnafu)?;
         Ok(PreparedGroupSetup {
             security_material,
             group_setup: Arc::new(group_setup),
@@ -1799,6 +1784,9 @@ impl ReplicationRuntimeComponent {
             }
             CreateGroupError::Security { source } => {
                 ChangeGroupMembershipError::Security { source }
+            }
+            CreateGroupError::BuildGroupSetup { source } => {
+                ChangeGroupMembershipError::BuildGroupSetup { source }
             }
         }
     }
@@ -2519,7 +2507,6 @@ impl ReplicationRuntimeComponent {
                     &existing_material.security_material,
                 )
                 .await
-                .boxed()
                 .context(inbound::GroupSetupSecuritySnafu)?;
             existing_material.group_name = group_name;
             existing_material
@@ -2528,7 +2515,6 @@ impl ReplicationRuntimeComponent {
                 .security
                 .prepare_security_material_from_group_setup(group_id, group_setup, sender)
                 .await
-                .boxed()
                 .context(inbound::GroupSetupSecuritySnafu)?;
             ReplicationGroupMaterialRecord {
                 group_id,
@@ -3296,7 +3282,7 @@ impl ReplicationRuntimeComponent {
                         Err(error) => Err(error).boxed().context(ApiExternalSnafu),
                     }
                 }
-                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+                Err(error) => Err(ApiError::from_store_classification_source(error)),
             };
             async_self.reply_api(promise, "publish_changes", reply);
             Handled::OK
@@ -3313,8 +3299,7 @@ impl ReplicationRuntimeComponent {
             let reply = security
                 .assess_public_key_bundle(request)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu);
+                .map_err(ApiError::from_store_classification_source);
             async_self.reply_api(promise, "assess_public_key_bundle", reply);
             Handled::OK
         });
@@ -3331,8 +3316,7 @@ impl ReplicationRuntimeComponent {
             let reply = security
                 .record_public_key_bundle_feedback(request)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu);
+                .map_err(ApiError::from_store_classification_source);
             async_self.reply_api(promise, "record_public_key_bundle_feedback", reply);
             Handled::OK
         });
@@ -3359,8 +3343,7 @@ impl ReplicationRuntimeComponent {
             let reply = security
                 .known_member_keys_report()
                 .await
-                .boxed()
-                .context(ApiExternalSnafu);
+                .map_err(ApiError::from_store_classification_source);
             async_self.reply_api(promise, "known_member_keys", reply);
             Handled::OK
         });
@@ -3376,8 +3359,7 @@ impl ReplicationRuntimeComponent {
             let reply = async_self
                 .snapshot_rows_from_store(request)
                 .await
-                .boxed()
-                .context(ApiExternalSnafu);
+                .map_err(ApiError::from_store_classification_source);
             async_self.reply_api(promise, "snapshot_rows", reply);
             Handled::OK
         })
@@ -3389,7 +3371,7 @@ impl ReplicationRuntimeComponent {
     ) -> HandlerResult {
         let (promise, request) = ask.take();
         if let Err(error) = self.validate_summary_request(&request) {
-            let reply = Err(error).boxed().context(ApiExternalSnafu);
+            let reply = Err(ApiError::from_store_classification_source(error));
             self.reply_api(promise, "request_summary", reply);
             return Handled::OK;
         }
@@ -3433,7 +3415,7 @@ impl ReplicationRuntimeComponent {
                     );
                 }
                 Err(error) => {
-                    let reply = Err(error).boxed().context(ApiExternalSnafu);
+                    let reply = Err(ApiError::from_store_classification_source(error));
                     async_self.reply_api(promise, "request_summary", reply);
                 }
             }
@@ -3529,8 +3511,7 @@ impl ReplicationRuntimeComponent {
         let persisted_group = self
             .store_new_replication_group(record)
             .await
-            .boxed()
-            .context(ApiExternalSnafu)?;
+            .map_err(ApiError::from_store_classification_source)?;
         let read_token = Self::read_token_from_groups(std::iter::once(persisted_group.clone()));
         notify_listener_data_change(
             self.listener.clone(),
@@ -3555,7 +3536,7 @@ impl ReplicationRuntimeComponent {
         let created_group = match created_group {
             Ok(created_group) => created_group,
             Err(error) => {
-                let reply = Err(error).boxed().context(ApiExternalSnafu);
+                let reply = Err(ApiError::from_store_classification_source(error));
                 self.reply_api(promise, "create_group", reply);
                 return Handled::OK;
             }
@@ -3578,7 +3559,7 @@ impl ReplicationRuntimeComponent {
             let prepared_setup = match prepared_setup {
                 Ok(prepared_setup) => prepared_setup,
                 Err(error) => {
-                    let reply = Err(error).boxed().context(ApiExternalSnafu);
+                    let reply = Err(ApiError::from_store_classification_source(error));
                     async_self.reply_api(promise, "create_group", reply);
                     return Handled::OK;
                 }
@@ -3588,9 +3569,8 @@ impl ReplicationRuntimeComponent {
             ) {
                 Ok(member_keys) => member_keys,
                 Err(source) => {
-                    let reply = Err(CreateGroupError::InvalidMembers { source })
-                        .boxed()
-                        .context(ApiExternalSnafu);
+                    let error = CreateGroupError::InvalidMembers { source };
+                    let reply = Err(ApiError::from_store_classification_source(error));
                     async_self.reply_api(promise, "create_group", reply);
                     return Handled::OK;
                 }
@@ -3661,24 +3641,25 @@ impl ReplicationRuntimeComponent {
                                     match notification_result {
                                         Ok(()) => Ok(migration_id),
                                         Err(error) => {
-                                            Err(ChangeGroupMembershipError::NotifyListener {
-                                                source: error,
-                                            })
-                                            .boxed()
-                                            .context(ApiExternalSnafu)
+                                            let error =
+                                                ChangeGroupMembershipError::NotifyListener {
+                                                    source: error,
+                                                };
+                                            Err(ApiError::from_store_classification_source(error))
                                         }
                                     }
                                 }
-                                Err(error) => Err(error)
-                                    .context(change_membership::ActivateGroupSnafu)
-                                    .boxed()
-                                    .context(ApiExternalSnafu),
+                                Err(error) => {
+                                    let error =
+                                        change_membership::ActivateGroupSnafu.into_error(error);
+                                    Err(ApiError::from_store_classification_source(error))
+                                }
                             }
                         }
-                        Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+                        Err(error) => Err(ApiError::from_store_classification_source(error)),
                     }
                 }
-                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+                Err(error) => Err(ApiError::from_store_classification_source(error)),
             };
             async_self.reply_api(promise, "change_group_membership", reply);
             Handled::OK

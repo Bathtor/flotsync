@@ -1,0 +1,56 @@
+id = "019fec1b-5a35-72f2-a498-2c2c526db28f"
+ref = "flotsync-7g5.2"
+title = "Adopt classified store-failure policies across consumers"
+body = """
+Child of flotsync-7g5. The classification contract and SQLite mappings are complete in flotsync-7g5.1. The consumer adoption work has been fully aligned and split into two ordered children because the repository-grounded estimate is approximately 910-1,470 LOC.
+
+Agreed policy
+
+- Reliable-delivery admission retries only Retry and WaitForResume for the idempotent stored-work upsert. Other store failures fail the component.
+- Delivery-security store failures during admission follow the same typed policy; non-store security failures retain per-message rejection.
+- Selected reliable-delivery row loads retry Retry and WaitForResume. Exactly Record + InvalidData + Repair is isolated by cleanup of that exact row. All other failures fail the component.
+- Cleanup deletes retry Retry and WaitForResume while keeping the message excluded. All other failures fail the component.
+- Bulk reliable-delivery restart hydration remains fatal for all store errors.
+- Catch-up serving is best effort: ordinary per-request store failures are logged and ignored, and only truly global fatal classifications showing that the store cannot be read again escalate. Catch-up startup and bulk hydration remain fatal.
+- Runtime transactions and provisioning propagate classified failures without adding generic mutation retry.
+- Recreate escalates where the consumer does not own the resource. Unknown or incomplete classifications never authorise record deletion.
+
+Split
+
+- flotsync-n7j preserves classification through security, runtime, API, and public load error boundaries. Estimated 400-650 LOC.
+- flotsync-6at0 adopts reliable-delivery and catch-up behaviour and is blocked by flotsync-n7j. Estimated 510-820 LOC.
+
+Acceptance criteria
+
+- Typed classification survives every relevant wrapper and public escalation boundary without a lossy None-to-UNKNOWN fallback.
+- Existing source downcasting and printed stable codes remain available.
+- Reliable delivery no longer retries all store errors or deletes work based on an unknown classification.
+- Catch-up serving remains available on a best-effort basis and escalates only globally fatal store-read conditions.
+- No generic mutation retry is introduced.
+- Focused delegation and behavioural tests cover classified and unclassified paths."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["019fec1b-2b9b-7171-807f-8b0d50c8ed9e"]
+parent = "019fc2b4-dc36-76e0-8bb4-4a0a7ef4e29e"
+children = [
+    "019ff9ea-2b06-7e71-8412-193bcfcd510c",
+    "019ff9ef-0a76-7f91-876c-af0fc45715c8",
+]
+created_at = "2026-08-10T14:37:23.381812Z"
+updated_at = "2026-08-14T06:17:55.851364Z"
+closed_at = "2026-08-14T06:17:55.851364Z"
+
+[[comments]]
+id = "019ff9ef-778a-7150-be22-494de430b649"
+author = "lkroll"
+body = "Planning alignment on 2026-08-13 refined catch-up serving to be best effort: individual NeedRange failures are logged and ignored, while only globally fatal classifications indicating that the store cannot be read again escalate. The approved work was split into flotsync-n7j for propagation and flotsync-6at0 for consumer policies, with the latter blocked by the former."
+created_at = "2026-08-13T07:04:08.330145Z"
+
+[[comments]]
+id = "019ffeeb-858b-7571-8706-6132ae7d5693"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-14T06:17:55.851364Z"

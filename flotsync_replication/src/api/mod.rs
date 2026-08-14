@@ -36,6 +36,7 @@ mod errors;
 mod ids;
 pub mod providers;
 pub mod security;
+pub mod store_error;
 
 pub use errors::*;
 pub use flotsync_data_types::{
@@ -85,3 +86,4 @@ pub(crate) use security_material::invalid_default_group_security_material;
 pub use security_material::*;
 pub use snapshots::*;
 pub use store::*;
+pub use store_error::*;

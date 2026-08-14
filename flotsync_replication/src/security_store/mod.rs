@@ -14,6 +14,8 @@ use crate::api::{
     ReplicationStoreReadTransaction,
     ReplicationStoreTransaction,
     StoreError,
+    StoreErrorClassification,
+    StoreErrorClassificationSource,
     TrustPolicy,
     security::{
         AssessPublicKeyBundleRequest,
@@ -477,6 +479,21 @@ pub(crate) enum SecurityStoreError {
         member_id: MemberIdentity,
         fingerprint: KeyFingerprint,
     },
+}
+
+impl StoreErrorClassificationSource for SecurityStoreError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::NoPermittedMemberPublicKeys { .. }
+            | Self::MemberKeyPublicKeysUnavailable { .. }
+            | Self::ExactMemberKeyPublicKeysUnavailable { .. }
+            | Self::AmbiguousPermittedMemberPublicKeys { .. }
+            | Self::InvalidMemberPublicKeys { .. }
+            | Self::MemberPublicKeyFingerprintMismatch { .. }
+            | Self::BlockedKeyTrust { .. } => None,
+        }
+    }
 }
 
 /// Decode one borrowed opaque public-key store record into typed security keys.

@@ -13,7 +13,6 @@ use super::{
 use crate::{
     api::{
         ApiError,
-        ApiExternalSnafu,
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
@@ -29,11 +28,12 @@ use crate::{
         ReplicationSecuritySecrets,
         ReplicationStore,
         RouteEstablishmentDiagnostics,
-        RuntimeSnafu,
         SnapshotRowsRequest,
         SnapshotValueRows,
         Summary,
         SummaryRequest,
+        api_error,
+        load_error,
         security::{
             AssessPublicKeyBundleRequest,
             KnownMemberKeysReport,
@@ -142,13 +142,13 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     security_secrets: ReplicationSecuritySecrets,
     runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
-    let local_member = store
-        .local_member_identity()
-        .await
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let local_member =
+        store
+            .local_member_identity()
+            .await
+            .context(load_error::StoreAccessSnafu {
+                application_id: application_id.clone(),
+            })?;
     let security_store = SecurityStore::new(store.clone(), config.trust_policy.clone());
     let security_f = DeliverySecurity::load(
         security_store,
@@ -208,13 +208,13 @@ async fn load_replication_runtime_typed_with_security(
     security: DeliverySecurity,
     runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
-    let local_member = store
-        .local_member_identity()
-        .await
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let local_member =
+        store
+            .local_member_identity()
+            .await
+            .context(load_error::StoreAccessSnafu {
+                application_id: application_id.clone(),
+            })?;
     let host = DeliveryRuntimeHost::start_with_runtime_config_toml(
         &local_member,
         store,
@@ -225,7 +225,7 @@ async fn load_replication_runtime_typed_with_security(
     )
     .await
     .boxed()
-    .context(RuntimeSnafu {
+    .context(load_error::RuntimeSnafu {
         application_id: application_id.clone(),
     })?;
     let runtime_component = host.runtime_component().clone();
@@ -376,7 +376,10 @@ impl ReplicationApi for ReplicationRuntime {
             let Some(RuntimeLifecycle { mut host, .. }) = lifecycle else {
                 return Ok(());
             };
-            host.shutdown().await.boxed().context(ApiExternalSnafu)
+            host.shutdown()
+                .await
+                .boxed()
+                .context(api_error::ApiExternalSnafu)
         }
         .boxed()
     }

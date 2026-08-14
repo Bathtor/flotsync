@@ -1,0 +1,122 @@
+id = "019fec1b-2b9b-7171-807f-8b0d50c8ed9e"
+ref = "flotsync-7g5.1"
+title = "Define typed store errors and classify SQLite failures"
+body = """
+Child of flotsync-7g5. Establish the typed store-failure contract and complete SQLite classification before any consumer-policy implementation.
+
+Current agreed plan
+
+A. Public classification contract
+
+- Keep StoreError and classification API in the focused, publicly visible api::store_error module while preserving the flat api::StoreError re-export.
+- Store StoreErrorScope, StoreErrorClass, and StoreErrorResolution directly in StoreErrorClassification.
+- Make those fields public for direct inspection, but keep StoreErrorClassification non-exhaustive so downstream patterns must include .. and future dimensions can be added compatibly.
+- Replace the exhaustive positional constructor with the associated UNKNOWN constant and const with_scope, with_class, and with_resolution methods. Default returns UNKNOWN. Remove redundant field accessors and the premature has_retry_resolution predicate.
+- Keep all dimension enums non-exhaustive. Retain public ALL registries and document that membership may grow, ordering and indices are not protocol values, and consumers must tolerate new entries.
+- Retain the boxed backend source, backend result code, identifying context, and complete source chain in StoreError.
+
+B. Dyn-compatible preservation and explicit conversion
+
+- Keep the public object-safe StoreErrorClassificationSource error supertrait and its base StoreError implementation.
+- Ensure StoreError Display includes the opaque code so source-chain printing preserves it.
+- Add an explicitly named StoreError constructor that extracts classification from a StoreErrorClassificationSource and maps None to UNKNOWN while preserving the source.
+- Do not add a blanket From implementation: automatic extraction is intentionally opt-in because the None fallback loses information, and a blanket implementation has coherence overlap.
+- Leave higher-level wrapper delegation and consumer policy in flotsync-7g5.2.
+
+C. Canonical hierarchical code allocation and documentation
+
+- Render exactly seven characters as scope:2 alphabetic + class:3 numeric + resolution:2 alphabetic, with no separator or version marker.
+- Allocate current top-level values systematically. Use an unambiguous mnemonic first position where helpful, but do not consume later positions merely for mnemonic value.
+- Use X as alphabetic root padding and unknown, and 0 as numeric right-padding and unknown. Reserve later positions for future subcategories.
+- Rename Conflict to ConflictingState. Distinguish it clearly from temporary ConcurrentAccess and document concise examples where they clarify a class; keep Unknown self-explanatory.
+- Describe resolution as suggested remediation rather than an assertion that work will later be retried.
+- Rename Restart to Recreate and FixImplementation to FixBug. Keep WaitForResume policy-neutral. Retain distinct Repair for stored state and Reconfigure for configuration or environment, with concrete examples where useful. Remove ExternalIntervention and use unknown resolution for catch-all I/O failures; keep Unknown self-explanatory.
+- Keep every production dimension-to-code literal in one canonical declaration used by accessors, Display, documentation, and registry enumeration.
+- Keep the consolidated public Rustdoc layout and assignment documentation. Do not add parsing without a concrete consumer.
+
+D. SQLite classification and call-site ergonomics
+
+- Keep SqliteStoreError, SQLx operation context, semantic classification, result-code mapping, and focused tests in store::sqlite::error.
+- Preserve all currently agreed conservative mappings: interrupted connections wait for resume; rollback aborts and busy or locked conditions retry the complete transaction; heterogeneous families retain known dimensions and unknown uncertain resolutions.
+- Update mappings and tests for renamed classes, resolutions, UNKNOWN construction, and hierarchical codes without flattening original SQLx sources.
+- Add one module-private typed SqlxPhaseSnafu constant per SQLite operation and replace repeated selector struct construction.
+- Add a crate-visible STORE_EXTERNAL_UNCLASSIFIED_SNAFU selector constant for test and wrapper call sites.
+- Preserve one member-index bounds helper. Pass an explicit origin so the shared invariant selects InvalidLocalMemberIndex for caller material and InvalidStoredLocalMemberIndex for persisted corruption.
+
+E. Focused contract tests
+
+- Check exact unknown code literals directly.
+- Check segment width and character shape across each public ALL registry.
+- Pin one representative complete classification string instead of slicing it into independently tested segments.
+- Use a helper that inserts codes sequentially, drops one set before checking the next dimension, and reports the first duplicate code.
+- Pin the complete StoreError display string and retain source-chain assertions.
+- Remove tests for has_retry_resolution and other standalone stable-code assertions already covered by the registry and representative display checks.
+- Cover the named classification-source conversion, including Some preservation and None fallback.
+
+F. Validation and completion
+
+- Run rustfmt checks, focused API and SQLite tests, the complete flotsync_replication test suite serially, all-target pedantic Clippy, warning-free Rustdoc, diff checks, and the project Rust instruction audit.
+- Compare the result against this complete issue plan and the review ledger before returning it for review.
+- Keep flotsync-7g5.2 untouched until separately aligned.
+
+Estimated review revision size
+
+The full child remains approximately 240-400 touched LOC. The third-review cleanup changes only about 10-15 LOC within the existing classification documentation and tests. The work remains below 1,000 LOC and does not justify another split.
+
+Completion criteria
+
+- Classification fields are directly readable while future dimensions remain non-exhaustive.
+- Construction is const-capable, explicit, and compatible with added dimensions.
+- Public code assignments are hierarchical, centrally declared, documented, fixed-width, and uniquely tested.
+- Class and resolution names and useful examples make temporary concurrency, conflicting state, repair, reconfiguration, recreation, and bugs distinguishable without over-explaining self-evident unknown values.
+- Automatic source classification is explicit and preserves the original source.
+- Repeated Snafu contexts use typed constants.
+- Caller and stored member-index failures reuse one invariant while retaining distinct classifications.
+- SQLite mapping remains conservative and source-preserving.
+- The child passes the agreed validation and is ready for another user review before consumer-policy work begins."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocks = ["019fec1b-5a35-72f2-a498-2c2c526db28f"]
+parent = "019fc2b4-dc36-76e0-8bb4-4a0a7ef4e29e"
+created_at = "2026-08-10T14:37:11.451068Z"
+updated_at = "2026-08-10T18:49:30.674009Z"
+closed_at = "2026-08-10T18:49:30.674009Z"
+
+[[comments]]
+id = "019fec4f-9ed7-76c2-966a-fe8ce67629a1"
+author = "codex"
+body = "Implemented the agreed typed scope/class/resolution contract, canonical seven-character Display registry and public Rustdoc, object-safe base accessor, dedicated SQLite error/classification module, phase and numeric result-code mapping, source preservation, and focused classification coverage. Stored-value and caller-contract variants are classified separately where the same invariant can fail at either boundary. Validation passed: rustfmt check, all 275 flotsync_replication tests plus doc tests, all-target pedantic Clippy, diff checks, and the repository Rust instruction audit. flotsync-7g5.2 remains intentionally untouched pending separate alignment."
+created_at = "2026-08-10T15:34:28.823936Z"
+
+[[comments]]
+id = "019fec89-86a6-7980-a3dc-2f05ee46317c"
+author = "codex"
+body = "Review fixes implemented: added connection-scoped WaitForResume for SQLITE_INTERRUPT; limited ordinary retry to explicit retry resolutions; classified SQLITE_ABORT_ROLLBACK and all busy/locked cases as complete transaction retries; retained partial knowledge with Unknown resolution for ambiguous abort, constraint, resource, and I/O families; exposed the documented store_error module; documented the open-ended public ALL registries; and aligned NilGroupId wording. Added focused regression coverage. Validation passed: rustfmt check, 281 flotsync_replication tests plus doc tests, all-target pedantic Clippy, warning-free Rustdoc, diff checks, and the repository Rust instruction audit."
+created_at = "2026-08-10T16:37:43.718576Z"
+
+[[comments]]
+id = "019fecd7-866f-7940-a558-8e70500197f3"
+author = "codex"
+body = "Second review aligned: public non-exhaustive classification fields with const fluent construction; hierarchical right-padded codes; clearer class and resolution semantics; explicit classified-source conversion; reusable typed Snafu contexts; origin-aware member-index validation; and exact stable-contract tests. The full issue body now integrates these changes with all still-valid original goals and deferrals."
+created_at = "2026-08-10T18:02:55.471556Z"
+
+[[comments]]
+id = "019fece5-5ba3-74c1-9b29-14d8b206a775"
+author = "lkroll"
+body = "Implemented the agreed second-review refinements: public non-exhaustive classification fields with const fluent construction, hierarchical codes and revised names/examples, explicit classification-source conversion, typed Snafu context constants, and origin-aware shared member-index validation. Validation: 284 crate tests passed; formatting, pedantic Clippy, warning-denied rustdoc, and diff whitespace checks are clean."
+created_at = "2026-08-10T18:18:02.019376Z"
+
+[[comments]]
+id = "019fed00-c428-7e11-88a3-46b9bb6c7407"
+author = "codex"
+body = "Third-review cleanup implemented: generalised the contract example, removed unnecessary Unknown examples, replaced segment slicing with an exact OX100RX assertion, and removed the redundant WaitForResume code test. Five focused API tests pass; formatting, all-target pedantic Clippy, warning-denied rustdoc, diff checks, and the Rust instruction audit are clean."
+created_at = "2026-08-10T18:47:58.24834Z"
+
+[[comments]]
+id = "019fed02-2d32-7862-b0b5-959145bddede"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-10T18:49:30.674009Z"

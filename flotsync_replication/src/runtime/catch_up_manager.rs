@@ -1,5 +1,14 @@
 use crate::{
-    api::{ReplicationStore, ReplicationUpdateFilter, StoreError},
+    api::{
+        ReplicationStore,
+        ReplicationUpdateFilter,
+        StoreError,
+        StoreErrorClass,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
+        StoreErrorResolution,
+        StoreErrorScope,
+    },
     codecs::messages::{
         NeedRangeMessage,
         RuntimeMessage,
@@ -99,6 +108,30 @@ pub(super) struct ObservedAvailable {
     pub(super) ranges: Vec<UpdateRangeMessage>,
 }
 
+/// Return whether one catch-up read failure proves that the store is globally unusable.
+const fn catch_up_store_failure_is_fatal(classification: StoreErrorClassification) -> bool {
+    matches!(
+        (
+            classification.scope,
+            classification.class,
+            classification.resolution
+        ),
+        (
+            StoreErrorScope::Store,
+            StoreErrorClass::InvalidData,
+            StoreErrorResolution::Repair
+        ) | (
+            StoreErrorScope::Store | StoreErrorScope::Environment,
+            StoreErrorClass::Configuration,
+            StoreErrorResolution::Reconfigure
+        ) | (
+            StoreErrorScope::Store,
+            StoreErrorClass::Contract,
+            StoreErrorResolution::FixBug
+        )
+    )
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)), module(catch_up))]
 enum CatchUpError {
@@ -108,6 +141,14 @@ enum CatchUpError {
         #[snafu(implicit)]
         location: Location,
     },
+}
+
+impl StoreErrorClassificationSource for CatchUpError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+        }
+    }
 }
 
 /// Exact producer-version intervals grouped by canonical member index.
@@ -667,18 +708,21 @@ impl CatchUpManagerComponent {
         self.spawn_local(move |mut async_self| async move {
             async_self
                 .fulfil_need_range_from_store(group_id, answerable_ranges)
-                .await;
-            Handled::OK
+                .await
         });
         Handled::OK
     }
 
     /// Load and broadcast one catch-up response for ranges believed locally available.
+    ///
+    /// Request-local store failures are logged and ignored because the peer may ask again. Exact
+    /// global-fatal classifications terminate the component. An empty result invalidates the
+    /// availability cache; failure to rebuild that complete cache is also fatal.
     async fn fulfil_need_range_from_store(
         &mut self,
         group_id: GroupId,
         answerable_ranges: Vec<UpdateRangeMessage>,
-    ) {
+    ) -> HandlerResult {
         let reply = self
             .load_update_batch_from_store(group_id, answerable_ranges)
             .await;
@@ -689,14 +733,12 @@ impl CatchUpManagerComponent {
                     "known catch-up availability should produce at least one update"
                 );
                 if let Err(error) = self.refresh_known_available_from_store().await {
-                    warn!(
-                        self.log(),
-                        "failed to refresh stale catch-up availability after empty response for group {}: {}",
-                        group_id,
-                        error
-                    );
+                    return Err(error).whatever_unrecoverable(format!(
+                        "failed to refresh stale catch-up availability after empty response for group {group_id}"
+                    ));
                 }
                 // Don't try to fulfill again now. We can answer it next time they ask.
+                Handled::OK
             }
             Ok(updates) => {
                 let message = RuntimeMessage::UpdateBatch(UpdateBatchMessage { group_id, updates });
@@ -705,12 +747,22 @@ impl CatchUpManagerComponent {
                         .for_member_in_group(self.local_member.clone(), group_id)
                         .with_payload(message.encode_proto_to_bytes()),
                 );
+                Handled::OK
             }
             Err(error) => {
+                let fatal = error
+                    .store_error_classification()
+                    .is_some_and(catch_up_store_failure_is_fatal);
+                if fatal {
+                    return Err(error).whatever_unrecoverable(format!(
+                        "catch-up store became globally unusable while fulfilling NeedRange for group {group_id}"
+                    ));
+                }
                 warn!(
                     self.log(),
                     "failed to fulfil NeedRange for group {}: {}", group_id, error
                 );
+                Handled::OK
             }
         }
     }
@@ -886,6 +938,7 @@ mod tests {
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
+        store::test_support::ControlledStore,
         test_support::{TestGroupMemberships, provisioned_sqlite_store, test_public_member_keys},
     };
     use flotsync_core::{membership::GroupMembers, versions::VersionVector};
@@ -969,6 +1022,42 @@ mod tests {
         }
     }
 
+    /// Build one complete classification for catch-up policy tests.
+    fn store_classification(
+        scope: StoreErrorScope,
+        class: StoreErrorClass,
+        resolution: StoreErrorResolution,
+    ) -> StoreErrorClassification {
+        StoreErrorClassification::UNKNOWN
+            .with_scope(scope)
+            .with_class(class)
+            .with_resolution(resolution)
+    }
+
+    /// Run one direct per-request catch-up store read through the component policy boundary.
+    fn fulfil_with_store_failure(classification: StoreErrorClassification) -> HandlerResult {
+        let group_id = GroupId(Uuid::from_u128(80_103));
+        let system = build_test_kompact_system();
+        let local_member = local_member();
+        let members = GroupMembers::from_ordered_members([local_member.clone(), remote_member()])
+            .expect("test group members should build");
+        let memberships = TestGroupMemberships::from_groups([(group_id, members)]).shared();
+        let inner = provisioned_sqlite_store(&local_member);
+        let store: Arc<dyn ReplicationStore> = Arc::new(
+            ControlledStore::failing_first_read_transaction(inner, classification),
+        );
+        let manager =
+            system.create(move || CatchUpManagerComponent::new(local_member, memberships, store));
+
+        let result = manager.on_definition(|component| {
+            wait_for_store_future(
+                component.fulfil_need_range_from_store(group_id, vec![update_range(0, 1, 1)]),
+            )
+        });
+        system.shutdown().wait().expect("Kompact shutdown");
+        result
+    }
+
     fn persist_group_with_updates(
         store: &Arc<dyn ReplicationStore>,
         group_id: GroupId,
@@ -1008,6 +1097,91 @@ mod tests {
             versions.to_message_ranges(),
             vec![update_range(0, 1, 2), update_range(0, 5, 6)]
         );
+    }
+
+    #[test]
+    fn catch_up_store_policy_escalates_only_fully_classified_global_failures() {
+        let globally_fatal = [
+            store_classification(
+                StoreErrorScope::Store,
+                StoreErrorClass::InvalidData,
+                StoreErrorResolution::Repair,
+            ),
+            store_classification(
+                StoreErrorScope::Store,
+                StoreErrorClass::Configuration,
+                StoreErrorResolution::Reconfigure,
+            ),
+            store_classification(
+                StoreErrorScope::Environment,
+                StoreErrorClass::Configuration,
+                StoreErrorResolution::Reconfigure,
+            ),
+            store_classification(
+                StoreErrorScope::Store,
+                StoreErrorClass::Contract,
+                StoreErrorResolution::FixBug,
+            ),
+        ];
+        let per_request = [
+            StoreErrorClassification::UNKNOWN,
+            StoreErrorClassification::UNKNOWN
+                .with_scope(StoreErrorScope::Store)
+                .with_class(StoreErrorClass::InvalidData),
+            store_classification(
+                StoreErrorScope::Record,
+                StoreErrorClass::InvalidData,
+                StoreErrorResolution::Repair,
+            ),
+            store_classification(
+                StoreErrorScope::Connection,
+                StoreErrorClass::Unavailable,
+                StoreErrorResolution::Recreate,
+            ),
+            store_classification(
+                StoreErrorScope::Environment,
+                StoreErrorClass::ResourceExhaustion,
+                StoreErrorResolution::Unknown,
+            ),
+            store_classification(
+                StoreErrorScope::Transaction,
+                StoreErrorClass::ConcurrentAccess,
+                StoreErrorResolution::Retry,
+            ),
+        ];
+
+        for classification in globally_fatal {
+            assert!(catch_up_store_failure_is_fatal(classification));
+        }
+        for classification in per_request {
+            assert!(!catch_up_store_failure_is_fatal(classification));
+        }
+    }
+
+    #[test]
+    fn ordinary_need_range_store_failure_is_non_fatal() {
+        let classification = store_classification(
+            StoreErrorScope::Record,
+            StoreErrorClass::InvalidData,
+            StoreErrorResolution::Repair,
+        );
+
+        let result = fulfil_with_store_failure(classification);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn globally_unusable_store_failure_escalates_need_range() {
+        let classification = store_classification(
+            StoreErrorScope::Store,
+            StoreErrorClass::InvalidData,
+            StoreErrorResolution::Repair,
+        );
+
+        let result = fulfil_with_store_failure(classification);
+
+        assert!(matches!(result, Err(HandlerError::Unrecoverable(_))));
     }
 
     #[test]

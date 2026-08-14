@@ -2,16 +2,17 @@ use crate::{
     api::{
         BoxError,
         EncryptedGroupSecurityMaterial,
-        InvalidLocalPrivateKeysSnafu,
         LoadError,
         LoadSecurityError,
-        OtherSnafu,
         ReplicationGroupRecord,
         ReplicationStore,
         STORE_SECRET_CRYPTO_V1,
-        SecuritySnafu,
         StoreError,
+        StoreErrorClassification,
+        StoreErrorClassificationSource,
         StoreSecretKeyId,
+        load_error,
+        load_security_error,
     },
     delivery::security::DeliverySecurityError,
 };
@@ -56,7 +57,7 @@ pub(super) fn security_load_error(
     source: LoadSecurityError,
 ) -> LoadError {
     let source: Box<LoadSecurityError> = source.into();
-    SecuritySnafu { application_id }.into_error(source)
+    load_error::SecuritySnafu { application_id }.into_error(source)
 }
 
 /// Translate local-member security setup failures into caller-actionable public errors.
@@ -72,7 +73,7 @@ pub(super) fn load_security_error_from_local_member(
         | DeliverySecurityError::InvalidStoreSecretNonce { .. } => {
             invalid_local_private_keys(local_member.clone(), source)
         }
-        other => other_load_security_error(other),
+        other => classified_or_other_load_security_error(other),
     }
 }
 
@@ -112,7 +113,9 @@ pub(super) fn load_security_error_from_runtime(
             expected,
             actual,
         },
-        other @ RuntimeSecurityLoadError::StoreAccess { .. } => other_load_security_error(other),
+        other @ RuntimeSecurityLoadError::StoreAccess { .. } => {
+            classified_or_other_load_security_error(other)
+        }
     }
 }
 
@@ -178,7 +181,7 @@ fn invalid_local_private_keys(
     source: DeliverySecurityError,
 ) -> LoadSecurityError {
     let source: BoxError = source.into();
-    InvalidLocalPrivateKeysSnafu { member_id }.into_error(source)
+    load_security_error::InvalidLocalPrivateKeysSnafu { member_id }.into_error(source)
 }
 
 /// Preserve non-actionable internals as source context without making them public API.
@@ -187,7 +190,26 @@ fn other_load_security_error(
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> LoadSecurityError {
     let source: BoxError = source.into();
-    OtherSnafu.into_error(source)
+    load_security_error::OtherSnafu.into_error(source)
+}
+
+/// Preserve a store classification when `source` exposes one, or retain it as an ordinary internal
+/// security-loading error otherwise.
+#[track_caller]
+fn classified_or_other_load_security_error<E>(source: E) -> LoadSecurityError
+where
+    E: StoreErrorClassificationSource + Into<BoxError> + 'static,
+{
+    if let Some(classification) = source.store_error_classification() {
+        // Snapshot the small classification at this type-erasure boundary so this variant is
+        // always classified while `BoxError` retains ordinary Snafu sourcing and downcasting.
+        LoadSecurityError::StoreAccess {
+            classification,
+            source: source.into(),
+        }
+    } else {
+        other_load_security_error(source)
+    }
 }
 
 /// Internal security-readiness failure wrapped by the public [`LoadError::Security`] variant.
@@ -234,4 +256,53 @@ pub(super) enum RuntimeSecurityLoadError {
         expected: usize,
         actual: usize,
     },
+}
+
+impl StoreErrorClassificationSource for RuntimeSecurityLoadError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::InvalidGroupMembers { .. }
+            | Self::KeyIdMismatch { .. }
+            | Self::UnsupportedStoreSecretVersion { .. }
+            | Self::InvalidNonceLength { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{StoreErrorClass, StoreErrorResolution, StoreErrorScope};
+
+    #[test]
+    fn runtime_security_store_failure_reaches_public_load_error() {
+        let classification = StoreErrorClassification::UNKNOWN
+            .with_scope(StoreErrorScope::Store)
+            .with_class(StoreErrorClass::InvalidData)
+            .with_resolution(StoreErrorResolution::Repair);
+        let store_error = StoreError::new(
+            classification,
+            std::io::Error::other("injected security store failure"),
+        );
+        let runtime_error = RuntimeSecurityLoadError::StoreAccess {
+            application_id: ApplicationId::from_array(["test-application"]),
+            source: store_error,
+        };
+
+        let security_error = load_security_error_from_runtime(runtime_error);
+        let error = security_load_error(
+            ApplicationId::from_array(["test-application"]),
+            security_error,
+        );
+
+        assert_eq!(error.store_error_classification(), Some(classification));
+        let LoadError::Security { source, .. } = error else {
+            panic!("unexpected load error")
+        };
+        let LoadSecurityError::StoreAccess { source, .. } = source.as_ref() else {
+            panic!("unexpected security load error")
+        };
+        assert!(source.downcast_ref::<RuntimeSecurityLoadError>().is_some());
+    }
 }

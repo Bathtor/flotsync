@@ -1,6 +1,6 @@
 use super::errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary};
 use crate::{
-    api::{ApiError, ApiExternalSnafu, Summary, SummaryRequest},
+    api::{ApiError, Summary, SummaryRequest},
     codecs::messages::{
         RuntimeMessage,
         RuntimeMessageDecodeContext,
@@ -320,7 +320,7 @@ impl SummaryRequestManagerComponent {
     ) -> HandlerResult {
         let (promise, request) = ask.take();
         if let Err(error) = self.validate_summary_request(&request) {
-            let reply = Err(error).boxed().context(ApiExternalSnafu);
+            let reply = Err(ApiError::from_store_classification_source(error));
             self.reply_api(promise, "request_summary", reply);
             return Handled::OK;
         }
