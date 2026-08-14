@@ -6,18 +6,31 @@ Child of flotsync-7g5.2. This task implements the approved consumer-policy half 
 
 Reliable-delivery policy
 
-- Admission persistence retries only Retry and WaitForResume classifications, retaining the already encoded idempotent work. Other store failures fail the component instead of spinning or silently discarding accepted work.
-- Delivery-security store failures during admission use the same classified retry versus component-failure decision. Non-store security failures retain the existing per-message rejection behaviour.
-- Selected-row load uses the existing sender retry for Retry and WaitForResume. Exactly Record + InvalidData + Repair is isolated by marking that message for cleanup and deleting only that row. Every other store failure fails the component. Unknown or partially classified errors never authorise deletion.
-- Cleanup deletion retains the message exclusion and retries Retry and WaitForResume. Every other failure fails the component so the row cannot silently resurrect after restart.
+- Use a consumer-local typed policy that retries only classifications whose resolution equals Retry or WaitForResume.
+- Admission persistence retains already encoded idempotent work for retryable classifications. Other store failures fail the component instead of spinning or silently discarding accepted work.
+- Delivery-security store failures during admission use the same classified retry versus component-failure decision. Retryable non-store security failures remain retained; permanent non-store failures retain the existing per-message rejection behaviour.
+- Selected-row load uses the existing sender retry for retryable classifications. Isolate only the exact classification whose scope equals Record, class equals InvalidData, and resolution equals Repair: mark that message for cleanup and delete only that row. Every other store failure fails the component. Unknown or partially classified errors never authorise deletion.
+- Cleanup deletion retains the message exclusion for retryable classifications. Every other failure fails the component so the failure is visible. Escalate the error before matching the successful cleanup outcome.
+- Cleanup state remains in memory rather than extending the stored schema in this task. Reliable delivery is explicitly at-least-once: if stored-row cleanup is incomplete when the component or process stops, startup may redeliver a message that was already processed or deliberately abandoned.
+- Present the public interface as reliable message delivery. Document duplicate delivery as a rare recovery outcome, such as after a crash before cleanup completes, and require semantic consumers to handle duplicate message ids safely without implying that routine delivery duplicates messages.
 - Bulk reliable-delivery metadata loading remains fatal for every store error because the current bulk API cannot safely identify and isolate one bad row.
 - Recreate escalates because reliable delivery does not own the affected connection or pool resource.
 
 Catch-up policy
 
 - Catch-up serving is best effort. Store failures while fulfilling one NeedRange are logged and ignored because an individual member need not serve that request. Do not add a second local retry mechanism; the protocol may request the range again.
-- Escalate only truly global fatal classifications indicating that the store can no longer be read at all. Define this through a small catch-up-local policy helper using typed scope, class, and resolution rather than opaque display codes, and cover the boundary with tests.
+- Escalate only these exact, fully classified global failures: scope Store plus class InvalidData plus resolution Repair; scope Store or Environment plus class Configuration plus resolution Reconfigure; or scope Store plus class Contract plus resolution FixBug. The first case means store-wide invalidity, not record-level invalid data.
+- Record-scoped invalid data, unknown or incomplete classifications, connection recreation, resource exhaustion, and transient availability failures are logged and ignored for that individual NeedRange request.
+- Define the boundary through a small catch-up-local policy helper using typed fields rather than opaque display codes, and document and test the lifecycle outcomes.
 - Startup and bulk availability hydration remain fatal because the component cannot establish its authoritative local availability view.
+
+Shared store test support
+
+- Maintain one controllable store wrapper in the store module's own test support so store fault injection is discoverable at the boundary it models.
+- The wrapper implements both ReplicationStore and ReliableDeliveryStore, delegates ordinary operations to SQLite, retains the reliable-delivery observations, gates, and classified faults, and adds classified read-transaction failure injection for catch-up.
+- Remove the reliable-delivery-local and catch-up-local store wrapper implementations and use the shared controlled store from both suites.
+- Do not expose this internal fixture as public production API.
+- Keep the delegated store outside one state mutex that protects all test controls and observations. Each intercepted call updates observations and consumes configured behaviour under one lock, then releases it before delegating or awaiting.
 
 Other consumers
 
@@ -29,13 +42,65 @@ Tests
 
 - Add table-driven tests for each consumer-local policy, including unknown and incomplete classifications.
 - Add reliable-delivery behavioural tests for retryable and fatal admission, retryable selected load, invalid-record isolation, permanent selected-load failure, retryable cleanup, and permanent cleanup failure.
-- Add catch-up tests showing ordinary per-request store failures are non-fatal and only globally unusable store classifications escalate.
+- Explicitly document restart redelivery after incomplete cleanup at the consumer contract boundary.
+- Add catch-up tests showing ordinary per-request store failures are non-fatal and only the exact globally unusable store classifications escalate.
+- Run focused suites, the complete replication suite, Rustdoc, formatting, and pedantic Clippy.
 
-Estimated size: 510-820 LOC."""
-status = "open"
+Estimated size
+
+- Policy helpers and integration: 240-430 LOC.
+- Shared test wrapper: about 240 moved LOC plus 50-90 LOC of ReplicationStore controls.
+- Tests and documentation: 280-430 LOC.
+- Logical source remains below 1000 LOC, though moving the existing wrapper may produce roughly 450-650 diff lines."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 3
+assignee = "codex"
 blocked_by = ["019ff9ea-2b06-7e71-8412-193bcfcd510c"]
 parent = "019fec1b-5a35-72f2-a498-2c2c526db28f"
 created_at = "2026-08-13T07:03:40.406648Z"
-updated_at = "2026-08-13T07:24:37.66463Z"
+updated_at = "2026-08-14T06:17:51.281428Z"
+closed_at = "2026-08-14T06:17:51.281428Z"
+
+[[comments]]
+id = "019ffaff-3501-7f71-a328-4af4597d3669"
+author = "lkroll"
+body = "Alignment clarification: catch-up escalates Store + InvalidData + Repair only when the scope field is exactly StoreErrorScope::Store, meaning store-wide invalidity. Record-scoped invalid data is an individual-request failure and does not stop catch-up."
+created_at = "2026-08-13T12:00:57.089452Z"
+
+[[comments]]
+id = "019ffb0f-e826-7251-9f1a-d49c8097e020"
+author = "codex"
+body = "Implemented the agreed classified consumer policies. Reliable delivery now retries only Retry/WaitForResume, isolates only exact Record+InvalidData+Repair selected rows, and terminates on other persistence/load/cleanup store failures. Catch-up NeedRange serving ignores ordinary/local failures and escalates only the approved fully classified global failures; bulk availability refresh remains fatal. Removed the retry-all TODOs and added policy plus behavioural coverage. Validation: formatting clean, 42 reliable-delivery tests passed, 10 catch-up tests passed, full 298-test flotsync_replication suite passed, and pedantic Clippy passed."
+created_at = "2026-08-13T12:19:11.526832Z"
+
+[[comments]]
+id = "019ffbab-54c2-7671-8695-4351098425b9"
+author = "codex"
+body = "Review disposition: accepted cleanup resurrection as an explicit at-least-once trade-off. If cleanup has not removed the stored row before the component or process stops, restart may redeliver an already processed or deliberately abandoned message. This task will document the duplicate-delivery obligation at the reliable-delivery consumer interface rather than persisting cleanup state. Also correcting the three stale or incomplete helper comments found during review."
+created_at = "2026-08-13T15:08:57.41045Z"
+
+[[comments]]
+id = "019ffbac-64e9-7810-820b-fc5bcf3b75cf"
+author = "codex"
+body = "Review follow-up implemented: ReliableDeliveryPortIndication::Deliver and ReliableDeliveryDeliver now state the at-least-once duplicate-delivery contract, including restart after incomplete acknowledgement cleanup, and require duplicate-safe processing by message id. Corrected the non-store security, stored-removal ownership, and catch-up lifecycle documentation. Validation: cargo fmt check, cargo check for flotsync_replication, and cargo doc for flotsync_replication all pass."
+created_at = "2026-08-13T15:10:07.081062Z"
+
+[[comments]]
+id = "019ffbd2-f313-7f50-92ac-88d158a2f1ce"
+author = "codex"
+body = "Second review follow-up implemented. Stored-removal escalation now unwraps before matching successful outcomes. Replaced both use-site-local fault wrappers with one generic ControlledStore<S> in store::test_support; it implements both store traits and centralises read, persistence, load, removal, observation, and gating controls. Duplicate-delivery docs now lead with reliable delivery and frame duplicates as rare recovery outcomes that need only a safe exceptional path. Validation: 42 reliable-delivery tests, 10 catch-up tests, all 298 replication tests, Rustdoc, formatting, test compilation, and pedantic Clippy pass."
+created_at = "2026-08-13T15:52:13.843258Z"
+
+[[comments]]
+id = "019ffee7-9df8-7151-9a55-77470ea48ebb"
+author = "codex"
+body = "Third review follow-up implemented. ControlledStore now keeps its delegated store outside a single mutex-protected state containing all controls and observations. Each intercepted call records and consumes configured behaviour under one short-lived lock, which is released before delegation or awaiting. Removed the atomic removal counter and per-field mutexes. Validation: test compilation, 42 reliable-delivery tests, 10 catch-up tests, all 298 replication tests, formatting, and pedantic Clippy pass."
+created_at = "2026-08-14T06:13:39.960944Z"
+
+[[comments]]
+id = "019ffeeb-73b1-7cf3-82a6-2477817b59c3"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-14T06:17:51.281428Z"

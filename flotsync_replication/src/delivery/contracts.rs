@@ -53,6 +53,11 @@ pub enum ReliableDeliveryPortRequest {
 /// Indications emitted by the reliable-delivery component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReliableDeliveryPortIndication {
+    /// Deliver one plaintext message reliably.
+    ///
+    /// In rare recovery circumstances, such as a crash before acknowledgement cleanup finishes,
+    /// the same message id may be delivered again. Consumers must process duplicate message ids
+    /// safely, but need not optimise that exceptional path.
     Deliver(ReliableDeliveryDeliver),
 }
 

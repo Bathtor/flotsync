@@ -3,6 +3,7 @@
 use super::*;
 use crate::{
     delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
+    store::test_support::{ControlledStore, ReliableDeliveryLoadFault, classified_store_error},
     test_support::{
         TestGroupMemberships,
         load_test_delivery_security,
@@ -16,6 +17,7 @@ use flotsync_io::{
     test_support::{
         WAIT_TIMEOUT,
         assert_never,
+        eventually,
         eventually_component_state,
         localhost,
         start_component,
@@ -37,22 +39,15 @@ use flotsync_routes::{
         member_identity,
     },
 };
-use flotsync_utils::{
-    BoxFuture,
-    kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt},
-};
+use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
 use futures_util::{pin_mut, task::noop_waker_ref};
 use snafu::ResultExt as _;
 use std::{
     cell::Cell,
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashSet},
     future::Future as _,
     net::SocketAddr,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     task::Context,
     time::{Duration, Instant, SystemTime},
 };
@@ -514,224 +509,43 @@ impl FullStackHarness {
     }
 }
 
-/// One-shot full-load result injected before delegating later calls.
-#[derive(Clone, Copy)]
-enum FullLoadFault {
-    /// Report that the selected row is unexpectedly absent.
-    Missing,
-    /// Return the current opaque store error type.
-    Error,
+/// Build one complete test classification.
+fn store_classification(
+    scope: StoreErrorScope,
+    class: StoreErrorClass,
+    resolution: StoreErrorResolution,
+) -> StoreErrorClassification {
+    StoreErrorClassification::UNKNOWN
+        .with_scope(scope)
+        .with_class(class)
+        .with_resolution(resolution)
 }
 
-/// Configurable reliable-delivery store wrapper for observation, faults, and load gating.
-struct TestReliableDeliveryStore {
-    /// Store receiving every call not intercepted by a configured test behaviour.
-    inner: Arc<crate::SqliteReplicationStore>,
-    /// Exact work values observed at the persistence boundary.
-    store_attempts: Mutex<Vec<StoredReliableDeliveryWork>>,
-    /// Number of initial persistence calls that return an injected error.
-    store_failure_count: usize,
-    /// Number of persistence calls observed by this wrapper.
-    store_calls: AtomicUsize,
-    /// Message ids supplied to every full-envelope load in call order.
-    full_loads: Mutex<Vec<MessageId>>,
-    /// Ordered full-load results injected before delegating later calls.
-    full_load_faults: Mutex<VecDeque<FullLoadFault>>,
-    /// Ordered gates consumed by the first full-envelope loads.
-    full_load_releases: Mutex<VecDeque<KFuture<()>>>,
-    /// Optional observation channel notified before each full-envelope load.
-    full_load_started: Option<mpsc::Sender<MessageId>>,
-    /// Number of initial removal calls that return an injected error.
-    removal_failure_count: usize,
-    /// Number of stored-row removal calls observed by this wrapper.
-    removal_calls: AtomicUsize,
+/// Build the ordinary transient classification used by retry behaviour tests.
+fn retryable_store_classification() -> StoreErrorClassification {
+    store_classification(
+        StoreErrorScope::Transaction,
+        StoreErrorClass::ConcurrentAccess,
+        StoreErrorResolution::Retry,
+    )
 }
 
-impl TestReliableDeliveryStore {
-    /// Build an observing wrapper that delegates all operations.
-    fn new(inner: Arc<crate::SqliteReplicationStore>) -> Self {
-        Self {
-            inner,
-            store_attempts: Mutex::new(Vec::new()),
-            store_failure_count: 0,
-            store_calls: AtomicUsize::new(0),
-            full_loads: Mutex::new(Vec::new()),
-            full_load_faults: Mutex::new(VecDeque::new()),
-            full_load_releases: Mutex::new(VecDeque::new()),
-            full_load_started: None,
-            removal_failure_count: 0,
-            removal_calls: AtomicUsize::new(0),
-        }
-    }
-
-    /// Inject an error for the first persistence call.
-    fn failing_first_persistence(inner: Arc<crate::SqliteReplicationStore>) -> Self {
-        Self {
-            store_failure_count: 1,
-            ..Self::new(inner)
-        }
-    }
-
-    /// Inject one full-envelope load result before delegating later calls.
-    fn with_full_load_fault(
-        inner: Arc<crate::SqliteReplicationStore>,
-        fault: FullLoadFault,
-    ) -> Self {
-        let store = Self::new(inner);
-        store
-            .full_load_faults
-            .lock()
-            .expect("full-load fault lock should not be poisoned")
-            .push_back(fault);
-        store
-    }
-
-    /// Inject an error for the first stored-row removal.
-    fn failing_first_removal(inner: Arc<crate::SqliteReplicationStore>) -> Self {
-        Self {
-            removal_failure_count: 1,
-            ..Self::new(inner)
-        }
-    }
-
-    /// Gate a prefix of full-envelope loads and return their controls.
-    fn gating_full_loads(
-        inner: Arc<crate::SqliteReplicationStore>,
-        gate_count: usize,
-    ) -> (Self, mpsc::Receiver<MessageId>, Vec<KPromise<()>>) {
-        let mut full_load_releases = VecDeque::with_capacity(gate_count);
-        let mut gate_promises = Vec::with_capacity(gate_count);
-        for _gate_index in 0..gate_count {
-            let (gate_promise, gate_future) = promise();
-            gate_promises.push(gate_promise);
-            full_load_releases.push_back(gate_future);
-        }
-        let (full_load_started, full_load_started_rx) = mpsc::channel();
-        let store = Self {
-            full_load_releases: Mutex::new(full_load_releases),
-            full_load_started: Some(full_load_started),
-            ..Self::new(inner)
-        };
-        (store, full_load_started_rx, gate_promises)
-    }
-
-    /// Return every encoded work value supplied to persistence in call order.
-    fn store_attempts(&self) -> Vec<StoredReliableDeliveryWork> {
-        self.store_attempts
-            .lock()
-            .expect("persistence-attempt observation lock should not be poisoned")
-            .clone()
-    }
-
-    /// Return every full-envelope message id supplied in call order.
-    fn full_loads(&self) -> Vec<MessageId> {
-        self.full_loads
-            .lock()
-            .expect("full-load observation lock should not be poisoned")
-            .clone()
-    }
-
-    /// Return how many full-envelope loads crossed the wrapper boundary.
-    fn full_load_calls(&self) -> usize {
-        self.full_loads
-            .lock()
-            .expect("full-load observation lock should not be poisoned")
-            .len()
-    }
-
-    /// Return how many stored-row removals crossed the wrapper boundary.
-    fn removal_calls(&self) -> usize {
-        self.removal_calls.load(Ordering::SeqCst)
-    }
+/// Build one non-retryable failure which cannot safely be isolated to one stored row.
+fn fatal_store_classification() -> StoreErrorClassification {
+    store_classification(
+        StoreErrorScope::Store,
+        StoreErrorClass::Configuration,
+        StoreErrorResolution::Reconfigure,
+    )
 }
 
-impl ReliableDeliveryStore for TestReliableDeliveryStore {
-    fn load_reliable_delivery_work_metadata(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, crate::api::StoreError>>
-    {
-        self.inner.load_reliable_delivery_work_metadata()
-    }
-
-    fn load_reliable_delivery_work(
-        &self,
-        message_id: MessageId,
-    ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, crate::api::StoreError>> {
-        self.full_loads
-            .lock()
-            .expect("full-load observation lock should not be poisoned")
-            .push(message_id);
-        let fault = self
-            .full_load_faults
-            .lock()
-            .expect("full-load fault lock should not be poisoned")
-            .pop_front();
-        match fault {
-            Some(FullLoadFault::Missing) => return async move { Ok(None) }.boxed(),
-            Some(FullLoadFault::Error) => {
-                let error = injected_store_error("injected full-load failure");
-                return async move { Err(error) }.boxed();
-            }
-            None => {}
-        }
-        let full_load_release = self
-            .full_load_releases
-            .lock()
-            .expect("full-load release lock should not be poisoned")
-            .pop_front();
-        let full_load_started = self.full_load_started.clone();
-        let inner = self.inner.clone();
-        async move {
-            if let Some(full_load_started) = full_load_started {
-                full_load_started
-                    .send(message_id)
-                    .expect("full-load observer must stay live");
-            }
-            if let Some(full_load_release) = full_load_release {
-                full_load_release
-                    .await
-                    .expect("full-load release promise must complete");
-            }
-            inner.load_reliable_delivery_work(message_id).await
-        }
-        .boxed()
-    }
-
-    fn store_reliable_delivery_work(
-        &self,
-        work: StoredReliableDeliveryWork,
-    ) -> BoxFuture<'_, Result<(), crate::api::StoreError>> {
-        self.store_attempts
-            .lock()
-            .expect("persistence-attempt observation lock should not be poisoned")
-            .push(work.clone());
-        let call_index = self.store_calls.fetch_add(1, Ordering::SeqCst);
-        if call_index < self.store_failure_count {
-            let error = injected_store_error("injected persistence failure");
-            return async move { Err(error) }.boxed();
-        }
-        self.inner.store_reliable_delivery_work(work)
-    }
-
-    fn remove_reliable_delivery_work(
-        &self,
-        message_id: MessageId,
-    ) -> BoxFuture<'_, Result<bool, crate::api::StoreError>> {
-        let call_index = self.removal_calls.fetch_add(1, Ordering::SeqCst);
-        if call_index < self.removal_failure_count {
-            let error = injected_store_error("injected stored-row removal failure");
-            return async move { Err(error) }.boxed();
-        }
-        self.inner.remove_reliable_delivery_work(message_id)
-    }
-}
-
-/// Construct the current opaque store error for one injected test failure.
-fn injected_store_error(description: &'static str) -> crate::api::StoreError {
-    Err::<(), _>(std::io::Error::other(description))
-        .boxed()
-        .context(crate::api::STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
-        .expect_err("injected store failure should remain an error")
+/// Build the exact selected-row classification which authorises record isolation.
+fn invalid_record_classification() -> StoreErrorClassification {
+    store_classification(
+        StoreErrorScope::Record,
+        StoreErrorClass::InvalidData,
+        StoreErrorResolution::Repair,
+    )
 }
 
 impl Drop for FullStackHarness {
@@ -1122,7 +936,7 @@ fn configured_outbound_attempt_limit_defers_the_third_full_envelope_load() {
     let controlled_transport =
         system.create(move || ControlledRouteTransportComponent::new(transport_submits));
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let observed_store = Arc::new(TestReliableDeliveryStore::new(sqlite_store.clone()));
+    let observed_store = Arc::new(ControlledStore::new(sqlite_store.clone()));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = observed_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
         alice.clone(),
@@ -1380,17 +1194,62 @@ fn route_withdrawal_partitions_ready_work_by_recipient() {
 }
 
 #[test]
+fn classified_store_failures_select_only_explicit_reliable_delivery_actions() {
+    let retry = retryable_store_classification();
+    let wait_for_resume = store_classification(
+        StoreErrorScope::Connection,
+        StoreErrorClass::Unavailable,
+        StoreErrorResolution::WaitForResume,
+    );
+    let invalid_record = invalid_record_classification();
+    let incomplete_invalid_record = StoreErrorClassification::UNKNOWN
+        .with_scope(StoreErrorScope::Record)
+        .with_class(StoreErrorClass::InvalidData);
+    let recreate_connection = store_classification(
+        StoreErrorScope::Connection,
+        StoreErrorClass::Unavailable,
+        StoreErrorResolution::Recreate,
+    );
+
+    for classification in [retry, wait_for_resume] {
+        assert!(store_failure_can_retry_later(classification));
+        assert_eq!(
+            selected_load_failure_policy(classification),
+            SelectedLoadFailurePolicy::RetryLater
+        );
+    }
+    for classification in [
+        StoreErrorClassification::UNKNOWN,
+        incomplete_invalid_record,
+        recreate_connection,
+        fatal_store_classification(),
+    ] {
+        assert!(!store_failure_can_retry_later(classification));
+        assert_eq!(
+            selected_load_failure_policy(classification),
+            SelectedLoadFailurePolicy::FailComponent
+        );
+    }
+    assert_eq!(
+        selected_load_failure_policy(invalid_record),
+        SelectedLoadFailurePolicy::RemoveInvalidRecord
+    );
+}
+
+#[test]
 fn unpersisted_security_failures_keep_only_retryable_submissions() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
     let sender = FullStackHarness::new(alice.clone());
     let retryable_message_id = MessageId(Uuid::from_u128(424));
     let permanent_message_id = MessageId(Uuid::from_u128(425));
+    let retryable_non_store_message_id = MessageId(Uuid::from_u128(426));
 
     sender.reliable.on_definition(|component| {
         for (message_id, recipient) in [
             (retryable_message_id, bob.clone()),
             (permanent_message_id, alice.clone()),
+            (retryable_non_store_message_id, bob.clone()),
         ] {
             component.outbound.unpersisted_submissions.insert(
                 message_id,
@@ -1401,14 +1260,14 @@ fn unpersisted_security_failures_keep_only_retryable_submissions() {
             );
         }
 
-        let store_error = Err::<(), _>(std::io::Error::other("injected store failure"))
-            .boxed()
-            .context(crate::api::STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
-            .expect_err("injected store failure should remain an error");
+        let store_error =
+            classified_store_error(retryable_store_classification(), "injected store failure");
         let retryable_error = Err::<(), _>(store_error)
             .context(crate::delivery::security::StoreAccessSnafu)
             .expect_err("injected delivery-security failure should remain an error");
-        component.handle_unpersisted_security_error(retryable_message_id, &bob, &retryable_error);
+        let _handled = component
+            .handle_unpersisted_security_error(retryable_message_id, &bob, retryable_error)
+            .expect("retryable security failure should remain benign");
         assert!(
             component
                 .outbound
@@ -1425,7 +1284,9 @@ fn unpersisted_security_failures_keep_only_retryable_submissions() {
         let permanent_error = DeliverySecurityError::ReliableSelfMessage {
             member_id: alice.clone(),
         };
-        component.handle_unpersisted_security_error(permanent_message_id, &alice, &permanent_error);
+        let _handled = component
+            .handle_unpersisted_security_error(permanent_message_id, &alice, permanent_error)
+            .expect("non-store security rejection should remain benign");
         assert!(
             !component
                 .outbound
@@ -1438,6 +1299,70 @@ fn unpersisted_security_failures_keep_only_retryable_submissions() {
                 .retry_queue
                 .contains(RetryKey::Unpersisted(permanent_message_id))
         );
+
+        let retryable_non_store_error = DeliverySecurityError::GenerateGroupKey {
+            source: std::io::Error::other("injected random source failure").into(),
+        };
+        let _handled = component
+            .handle_unpersisted_security_error(
+                retryable_non_store_message_id,
+                &bob,
+                retryable_non_store_error,
+            )
+            .expect("retryable non-store security failure should remain benign");
+        assert!(
+            component
+                .outbound
+                .unpersisted_submissions
+                .contains_key(&retryable_non_store_message_id)
+        );
+        assert!(
+            component
+                .shared
+                .retry_queue
+                .contains(RetryKey::Unpersisted(retryable_non_store_message_id))
+        );
+    });
+}
+
+#[test]
+fn permanent_unpersisted_store_security_failure_is_unrecoverable() {
+    let alice = member_identity(&["alice"]);
+    let bob = member_identity(&["bob"]);
+    let sender = FullStackHarness::new(alice.clone());
+    let message_id = MessageId(Uuid::from_u128(427));
+
+    sender.reliable.on_definition(|component| {
+        component.outbound.unpersisted_submissions.insert(
+            message_id,
+            UnpersistedSubmission::Plaintext {
+                submit: reliable_submit(alice, bob.clone(), message_id, b"pending"),
+                first_submitted_at: SystemTime::now(),
+            },
+        );
+        let store_error = classified_store_error(
+            fatal_store_classification(),
+            "injected permanent security-store failure",
+        );
+        let error = Err::<(), _>(store_error)
+            .context(crate::delivery::security::StoreAccessSnafu)
+            .expect_err("injected delivery-security failure should remain an error");
+
+        let handled = component.handle_unpersisted_security_error(message_id, &bob, error);
+
+        assert!(matches!(handled, Err(HandlerError::Unrecoverable(_))));
+        assert!(
+            component
+                .outbound
+                .unpersisted_submissions
+                .contains_key(&message_id)
+        );
+        assert!(
+            !component
+                .shared
+                .retry_queue
+                .contains(RetryKey::Unpersisted(message_id))
+        );
     });
 }
 
@@ -1446,8 +1371,9 @@ fn persistence_retry_reuses_the_already_encoded_envelope() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let fail_first_store = Arc::new(TestReliableDeliveryStore::failing_first_persistence(
+    let fail_first_store = Arc::new(ControlledStore::failing_first_persistence(
         sqlite_store.clone(),
+        retryable_store_classification(),
     ));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = fail_first_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
@@ -1508,13 +1434,53 @@ fn persistence_retry_reuses_the_already_encoded_envelope() {
 }
 
 #[test]
+fn permanent_persistence_failure_terminates_reliable_delivery() {
+    let alice = member_identity(&["alice"]);
+    let bob = member_identity(&["bob"]);
+    let (security, sqlite_store) = test_delivery_security_and_store(&alice);
+    let fault_store = Arc::new(ControlledStore::failing_first_persistence(
+        sqlite_store.clone(),
+        fatal_store_classification(),
+    ));
+    let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
+    let sender = FullStackHarness::with_system_security_and_store(
+        alice.clone(),
+        build_delivery_test_system(),
+        security,
+        sqlite_store.clone(),
+        reliable_store,
+        None,
+    );
+    let message_id = MessageId(Uuid::from_u128(428_001));
+
+    sender.submit(reliable_submit(
+        alice,
+        bob,
+        message_id,
+        b"permanent persistence failure",
+    ));
+
+    eventually(
+        WAIT_TIMEOUT,
+        || sender.reliable.is_destroyed(),
+        "permanent persistence failure did not terminate reliable delivery",
+    );
+    assert_eq!(fault_store.store_attempts().len(), 1);
+    assert!(
+        block_on(sqlite_store.load_reliable_delivery_work(message_id))
+            .expect("underlying store should remain readable")
+            .is_none()
+    );
+}
+
+#[test]
 fn missing_stored_envelope_purges_only_the_affected_outbound_state() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let fault_store = Arc::new(TestReliableDeliveryStore::with_full_load_fault(
+    let fault_store = Arc::new(ControlledStore::with_full_load_fault(
         sqlite_store.clone(),
-        FullLoadFault::Missing,
+        ReliableDeliveryLoadFault::Missing,
     ));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
@@ -1555,9 +1521,9 @@ fn full_load_store_error_releases_the_slot_and_schedules_sender_backoff() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let fault_store = Arc::new(TestReliableDeliveryStore::with_full_load_fault(
+    let fault_store = Arc::new(ControlledStore::with_full_load_fault(
         sqlite_store.clone(),
-        FullLoadFault::Error,
+        ReliableDeliveryLoadFault::Error(retryable_store_classification()),
     ));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
@@ -1602,12 +1568,95 @@ fn full_load_store_error_releases_the_slot_and_schedules_sender_backoff() {
 }
 
 #[test]
+fn invalid_selected_record_is_removed_without_faulting_reliable_delivery() {
+    let alice = member_identity(&["alice"]);
+    let bob = member_identity(&["bob"]);
+    let (security, sqlite_store) = test_delivery_security_and_store(&alice);
+    let fault_store = Arc::new(ControlledStore::with_full_load_fault(
+        sqlite_store.clone(),
+        ReliableDeliveryLoadFault::Error(invalid_record_classification()),
+    ));
+    let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
+    let sender = FullStackHarness::with_system_security_and_store(
+        alice.clone(),
+        build_delivery_test_system(),
+        security,
+        sqlite_store.clone(),
+        reliable_store,
+        None,
+    );
+    let message_id = MessageId(Uuid::from_u128(430_001));
+    sender.submit(reliable_submit(
+        alice,
+        bob.clone(),
+        message_id,
+        b"remove invalid stored record",
+    ));
+    sender.wait_for_stored_envelope(message_id);
+
+    sender.publish_direct_route(bob, localhost(9));
+
+    eventually_component_state(
+        WAIT_TIMEOUT,
+        &sender.reliable,
+        |component| !component.outbound.contains_message(message_id),
+        "timed out waiting for invalid stored work to be isolated and removed",
+    );
+    assert!(sender.reliable.is_active());
+    assert_eq!(fault_store.full_load_calls(), 1);
+    assert_eq!(fault_store.removal_calls(), 1);
+    assert!(
+        block_on(sqlite_store.load_reliable_delivery_work(message_id))
+            .expect("underlying store should remain readable")
+            .is_none()
+    );
+}
+
+#[test]
+fn permanent_selected_load_failure_terminates_reliable_delivery() {
+    let alice = member_identity(&["alice"]);
+    let bob = member_identity(&["bob"]);
+    let (security, sqlite_store) = test_delivery_security_and_store(&alice);
+    let fault_store = Arc::new(ControlledStore::with_full_load_fault(
+        sqlite_store.clone(),
+        ReliableDeliveryLoadFault::Error(fatal_store_classification()),
+    ));
+    let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
+    let sender = FullStackHarness::with_system_security_and_store(
+        alice.clone(),
+        build_delivery_test_system(),
+        security,
+        sqlite_store,
+        reliable_store,
+        None,
+    );
+    let message_id = MessageId(Uuid::from_u128(430_002));
+    sender.submit(reliable_submit(
+        alice,
+        bob.clone(),
+        message_id,
+        b"permanent selected load failure",
+    ));
+    sender.wait_for_stored_envelope(message_id);
+
+    sender.publish_direct_route(bob, localhost(9));
+
+    eventually(
+        WAIT_TIMEOUT,
+        || sender.reliable.is_destroyed(),
+        "permanent selected-load failure did not terminate reliable delivery",
+    );
+    assert_eq!(fault_store.full_load_calls(), 1);
+}
+
+#[test]
 fn stored_row_removal_error_keeps_cleanup_pending_without_resending() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let fault_store = Arc::new(TestReliableDeliveryStore::failing_first_removal(
+    let fault_store = Arc::new(ControlledStore::failing_first_removal(
         sqlite_store.clone(),
+        retryable_store_classification(),
     ));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
@@ -1666,6 +1715,62 @@ fn stored_row_removal_error_keeps_cleanup_pending_without_resending() {
         block_on(sqlite_store.load_reliable_delivery_work(message_id))
             .expect("stored row should remain readable after cleanup"),
         None
+    );
+}
+
+#[test]
+fn permanent_stored_row_removal_failure_terminates_reliable_delivery() {
+    let alice = member_identity(&["alice"]);
+    let bob = member_identity(&["bob"]);
+    let (security, sqlite_store) = test_delivery_security_and_store(&alice);
+    let fault_store = Arc::new(ControlledStore::failing_first_removal(
+        sqlite_store.clone(),
+        fatal_store_classification(),
+    ));
+    let reliable_store: Arc<dyn ReliableDeliveryStore> = fault_store.clone();
+    let sender = FullStackHarness::with_system_security_and_store(
+        alice.clone(),
+        build_delivery_test_system(),
+        security,
+        sqlite_store.clone(),
+        reliable_store,
+        None,
+    );
+    let bob_security = test_delivery_security(&bob);
+    let message_id = MessageId(Uuid::from_u128(431_001));
+    sender.submit(reliable_submit(
+        alice.clone(),
+        bob.clone(),
+        message_id,
+        b"permanent stored-row removal failure",
+    ));
+    sender.wait_for_stored_envelope(message_id);
+
+    sender.inject_recipient_ack(&recipient_ack(&bob_security, &alice, &bob, message_id));
+
+    eventually(
+        WAIT_TIMEOUT,
+        || sender.reliable.is_destroyed(),
+        "permanent stored-row removal failure did not terminate reliable delivery",
+    );
+    sender.reliable.on_definition(|component| {
+        assert!(
+            component
+                .sender_work_item(message_id)
+                .is_some_and(|work_item| work_item.pending_removal.is_some())
+        );
+        assert!(
+            !component
+                .shared
+                .retry_queue
+                .contains(RetryKey::SenderRemoval(message_id))
+        );
+    });
+    assert_eq!(fault_store.removal_calls(), 1);
+    assert!(
+        block_on(sqlite_store.load_reliable_delivery_work(message_id))
+            .expect("underlying store should remain readable")
+            .is_some()
     );
 }
 
@@ -1836,7 +1941,7 @@ fn route_selection_skips_full_load_for_older_unreachable_work() {
     let bob = member_identity(&["bob"]);
     let charlie = member_identity(&["charlie"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
-    let observed_store = Arc::new(TestReliableDeliveryStore::new(sqlite_store.clone()));
+    let observed_store = Arc::new(ControlledStore::new(sqlite_store.clone()));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = observed_store.clone();
     let sender = FullStackHarness::with_system_security_and_store(
         alice.clone(),
@@ -1883,7 +1988,7 @@ fn acknowledgement_cleanup_waits_for_the_blocking_envelope_load() {
     let bob = member_identity(&["bob"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
     let (blocking_store, load_started, mut load_releases) =
-        TestReliableDeliveryStore::gating_full_loads(sqlite_store.clone(), 1);
+        ControlledStore::gating_full_loads(sqlite_store.clone(), 1);
     let load_release = load_releases
         .pop()
         .expect("one configured load gate must exist");
@@ -1959,7 +2064,7 @@ fn restart_restores_metadata_and_reuses_the_stored_envelope_after_route_discover
     let original_envelope = first_sender.wait_for_stored_envelope(message_id);
     drop(first_sender);
 
-    let observed_store = Arc::new(TestReliableDeliveryStore::new(sqlite_store.clone()));
+    let observed_store = Arc::new(ControlledStore::new(sqlite_store.clone()));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = observed_store.clone();
     let restarted_sender = FullStackHarness::with_system_security_and_store(
         alice,

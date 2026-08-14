@@ -41,7 +41,11 @@ pub struct ReliableDeliverySubmit {
     pub envelope: ReliableMessageEnvelope<PlaintextPayload>,
 }
 
-/// Inbound reliable-delivery message delivered by the network-facing service.
+/// Inbound message delivered reliably by the network-facing service.
+///
+/// In rare recovery circumstances, such as a crash before acknowledgement or stored-row cleanup
+/// finishes, a message may be delivered again. Consumers must process duplicate
+/// [`ReliableMessageHeader::message_id`] values safely, but need not optimise that exceptional path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReliableDeliveryDeliver {
     pub envelope: ReliableMessageEnvelope<PlaintextPayload>,
@@ -179,6 +183,8 @@ pub(super) struct PendingRemoval {
 pub(super) enum PendingRemovalReason {
     /// The intended recipient returned a verified semantic acknowledgement.
     RecipientAcknowledged,
+    /// The selected stored envelope record was invalid and cannot be sent.
+    InvalidStoredRecord,
     /// Route transport permanently rejected the unchanged stored envelope.
     PermanentTransportFailure,
 }
@@ -188,6 +194,7 @@ impl PendingRemovalReason {
     pub(super) const fn description(self) -> &'static str {
         match self {
             Self::RecipientAcknowledged => "verified recipient acknowledgement",
+            Self::InvalidStoredRecord => "invalid stored envelope record",
             Self::PermanentTransportFailure => "permanent transport failure",
         }
     }

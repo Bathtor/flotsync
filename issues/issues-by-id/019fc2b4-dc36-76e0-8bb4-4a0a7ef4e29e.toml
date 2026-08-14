@@ -64,8 +64,8 @@ Acceptance criteria
 - Existing error sources, backend codes, and operation-specific identifying context remain inspectable.
 - Focused tests cover representative classification and consumer-policy combinations.
 - All StoreError producers and consumers are audited and no temporary retry-all TODO remains."""
-status = "in-progress"
-status_reason = "plan agreed"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 assignee = "codex"
@@ -74,7 +74,8 @@ children = [
     "019fec1b-5a35-72f2-a498-2c2c526db28f",
 ]
 created_at = "2026-08-02T13:41:00.59806Z"
-updated_at = "2026-08-10T15:02:53.69332Z"
+updated_at = "2026-08-14T06:18:00.618659Z"
+closed_at = "2026-08-14T06:18:00.618659Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5aa133ae5801"
@@ -91,3 +92,9 @@ id = "019fec32-b3fd-7542-b2f9-a3107e43c142"
 author = "codex"
 body = "Plan refinement on 2026-08-10 renamed the children to flotsync-7g5.1 and flotsync-7g5.2. Stable code assignments will be publicly documented on the classification types plus a consolidated Rustdoc overview, generated from one canonical allocation where practical. SQLite error and SQLx result-code classification moves into a dedicated documented module. The first child also defines an object-safe classification-access trait and implements it for StoreError; the second child will later be aligned to delegate classification through delivery/runtime wrapper chains and avoid typed-information erasure."
 created_at = "2026-08-10T15:02:53.69332Z"
+
+[[comments]]
+id = "019ffeeb-982a-73a2-8f25-fcdfcf6f725c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-14T06:18:00.618659Z"

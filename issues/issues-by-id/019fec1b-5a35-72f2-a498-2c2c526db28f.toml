@@ -28,8 +28,8 @@ Acceptance criteria
 - Catch-up serving remains available on a best-effort basis and escalates only globally fatal store-read conditions.
 - No generic mutation retry is introduced.
 - Focused delegation and behavioural tests cover classified and unclassified paths."""
-status = "in-progress"
-status_reason = "split into aligned child tasks"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 assignee = "codex"
@@ -40,10 +40,17 @@ children = [
     "019ff9ef-0a76-7f91-876c-af0fc45715c8",
 ]
 created_at = "2026-08-10T14:37:23.381812Z"
-updated_at = "2026-08-13T07:24:55.773038Z"
+updated_at = "2026-08-14T06:17:55.851364Z"
+closed_at = "2026-08-14T06:17:55.851364Z"
 
 [[comments]]
 id = "019ff9ef-778a-7150-be22-494de430b649"
 author = "lkroll"
 body = "Planning alignment on 2026-08-13 refined catch-up serving to be best effort: individual NeedRange failures are logged and ignored, while only globally fatal classifications indicating that the store cannot be read again escalate. The approved work was split into flotsync-n7j for propagation and flotsync-6at0 for consumer policies, with the latter blocked by the former."
 created_at = "2026-08-13T07:04:08.330145Z"
+
+[[comments]]
+id = "019ffeeb-858b-7571-8706-6132ae7d5693"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-14T06:17:55.851364Z"

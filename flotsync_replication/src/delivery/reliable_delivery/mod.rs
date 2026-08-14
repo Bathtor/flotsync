@@ -29,6 +29,13 @@ use super::{
         WorkScopeKey,
     },
 };
+use crate::api::{
+    StoreErrorClass,
+    StoreErrorClassification,
+    StoreErrorClassificationSource,
+    StoreErrorResolution,
+    StoreErrorScope,
+};
 use bytes::Bytes;
 use flotsync_core::{MemberIdentity, member::TrieMap};
 use flotsync_messages::{
@@ -216,8 +223,8 @@ impl ReliableDeliveryComponent {
                 {
                     Ok(stored) => stored,
                     Err(error) => {
-                        self.handle_unpersisted_security_error(message_id, &recipient, &error);
-                        return Handled::OK;
+                        return self
+                            .handle_unpersisted_security_error(message_id, &recipient, error);
                     }
                 };
                 self.outbound.unpersisted_submissions.insert(
@@ -237,6 +244,11 @@ impl ReliableDeliveryComponent {
             .store_reliable_delivery_work(stored.clone())
             .await
         {
+            if !store_failure_can_retry_later(error.classification()) {
+                return Err(error).whatever_unrecoverable(format!(
+                    "Reliable delivery failed to persist outbound message_id={message_id}"
+                ));
+            }
             self.schedule_retry(RetryKey::Unpersisted(message_id), self.config.retry_delay);
             warn!(
                 self.log(),
@@ -265,14 +277,20 @@ impl ReliableDeliveryComponent {
         Handled::OK
     }
 
-    /// Retain retryable plaintext work or remove a permanently rejected item.
+    /// Retain retryable plaintext work, reject permanent non-store failures, or fail on permanent
+    /// store failures.
     fn handle_unpersisted_security_error(
         &mut self,
         message_id: MessageId,
         recipient: &MemberIdentity,
-        error: &DeliverySecurityError,
-    ) {
-        if error.is_retryable() {
+        error: DeliverySecurityError,
+    ) -> HandlerResult {
+        let store_classification = error.store_error_classification();
+        let retryable = match store_classification {
+            Some(classification) => store_failure_can_retry_later(classification),
+            None => error.is_retryable(),
+        };
+        if retryable {
             self.schedule_retry(RetryKey::Unpersisted(message_id), self.config.retry_delay);
             warn!(
                 self.log(),
@@ -282,6 +300,11 @@ impl ReliableDeliveryComponent {
                 self.config.retry_delay,
                 error
             );
+            Handled::OK
+        } else if store_classification.is_some() {
+            Err(error).whatever_unrecoverable(format!(
+                "Reliable delivery failed to prepare outbound message_id={message_id} recipient={recipient} because store access cannot be retried"
+            ))
         } else {
             self.cancel_retry(RetryKey::Unpersisted(message_id));
             self.outbound.unpersisted_submissions.remove(&message_id);
@@ -292,6 +315,7 @@ impl ReliableDeliveryComponent {
                 recipient,
                 error
             );
+            Handled::OK
         }
     }
 
@@ -360,22 +384,49 @@ impl ReliableDeliveryComponent {
                         self.cancel_outbound_retries(attempt.message_id);
                     }
                     Err(error) => {
-                        // TODO(flotsync-7g5): Classify store errors so permanent
-                        // failures can be purged instead of retried indefinitely.
-                        let logger = self.log().clone();
-                        let completion = self.outbound.finish_outbound_attempt(
-                            attempt.message_id,
-                            attempt.send_id,
-                            OutboundAttemptResult::LoadFailed,
-                            &logger,
-                        );
-                        self.apply_attempt_completion(attempt.message_id, completion);
-                        error!(
-                            self.log(),
-                            "Reliable delivery failed to load outbound message_id={} from storage; treating the store error as retryable and continuing: {}",
-                            attempt.message_id,
-                            error
-                        );
+                        match selected_load_failure_policy(error.classification()) {
+                            SelectedLoadFailurePolicy::RetryLater => {
+                                let logger = self.log().clone();
+                                let completion = self.outbound.finish_outbound_attempt(
+                                    attempt.message_id,
+                                    attempt.send_id,
+                                    OutboundAttemptResult::LoadFailed,
+                                    &logger,
+                                );
+                                self.apply_attempt_completion(attempt.message_id, completion);
+                                error!(
+                                    self.log(),
+                                    "Reliable delivery failed to load outbound message_id={} from storage; scheduling sender retry: {}",
+                                    attempt.message_id,
+                                    error
+                                );
+                            }
+                            SelectedLoadFailurePolicy::RemoveInvalidRecord => {
+                                error!(
+                                    self.log(),
+                                    "Reliable delivery isolated invalid stored outbound message_id={} and will remove only that record: {}",
+                                    attempt.message_id,
+                                    error
+                                );
+                                let logger = self.log().clone();
+                                let completion = self.outbound.finish_outbound_attempt(
+                                    attempt.message_id,
+                                    attempt.send_id,
+                                    OutboundAttemptResult::InvalidStoredRecord,
+                                    &logger,
+                                );
+                                self.apply_attempt_completion(attempt.message_id, completion);
+                                let _handled = self
+                                    .attempt_stored_sender_removal(attempt.message_id)
+                                    .await?;
+                            }
+                            SelectedLoadFailurePolicy::FailComponent => {
+                                return Err(error).whatever_unrecoverable(format!(
+                                    "Reliable delivery failed to load outbound message_id={}",
+                                    attempt.message_id
+                                ));
+                            }
+                        }
                     }
                 }
                 if attempts.is_empty() {
@@ -455,11 +506,14 @@ impl ReliableDeliveryComponent {
     /// Attempt one pending stored-row removal without making the message sendable again.
     async fn attempt_stored_sender_removal(&mut self, message_id: MessageId) -> HandlerResult {
         let logger = self.log().clone();
-        match self
+        let attempt = self
             .outbound
             .attempt_stored_removal(message_id, &logger)
             .await
-        {
+            .whatever_unrecoverable(format!(
+                "Reliable delivery failed to remove stored outbound message_id={message_id}"
+            ))?;
+        match attempt {
             StoredRemovalAttempt::Completed => {
                 self.cancel_retry(RetryKey::SenderRemoval(message_id));
             }
@@ -1229,6 +1283,49 @@ impl Actor for ReliableDeliveryComponent {
 type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<TransportRouteKey>;
 type TransportRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
 type TransportDiscoveryRouteUpdate = super::contracts::DiscoveryRouteUpdate<TransportRouteKey>;
+
+/// Return whether reliable delivery may repeat already-retained idempotent store work later.
+const fn store_failure_can_retry_later(classification: StoreErrorClassification) -> bool {
+    matches!(
+        classification.resolution,
+        StoreErrorResolution::Retry | StoreErrorResolution::WaitForResume
+    )
+}
+
+/// Choose how reliable delivery handles one failed selected-row load.
+const fn selected_load_failure_policy(
+    classification: StoreErrorClassification,
+) -> SelectedLoadFailurePolicy {
+    if store_failure_can_retry_later(classification) {
+        SelectedLoadFailurePolicy::RetryLater
+    } else if matches!(
+        (
+            classification.scope,
+            classification.class,
+            classification.resolution
+        ),
+        (
+            StoreErrorScope::Record,
+            StoreErrorClass::InvalidData,
+            StoreErrorResolution::Repair
+        )
+    ) {
+        SelectedLoadFailurePolicy::RemoveInvalidRecord
+    } else {
+        SelectedLoadFailurePolicy::FailComponent
+    }
+}
+
+/// Component action for one selected outbound-row load failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedLoadFailurePolicy {
+    /// Retain the work and use the existing sender retry schedule.
+    RetryLater,
+    /// Exclude and remove only the invalid stored record.
+    RemoveInvalidRecord,
+    /// Fail the component because continuing would violate reliable-delivery guarantees.
+    FailComponent,
+}
 
 /// Runtime values loaded from the Kompact configuration when the component starts.
 struct Config {
