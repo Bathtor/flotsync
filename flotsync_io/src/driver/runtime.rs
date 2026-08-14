@@ -14,6 +14,7 @@ use crate::{
 };
 use mio::Registry;
 use slog::{debug, error, info, warn};
+use std::time::{Duration, Instant};
 
 /// Commands passed across the control plane into the dedicated driver thread.
 #[derive(Debug)]
@@ -270,18 +271,23 @@ impl DriverRuntimeState {
         Ok(())
     }
 
-    /// Returns `true` when the next poll must submit a newly registered TCP connection.
-    pub(super) fn has_tcp_connect_probe_pending(&self) -> bool {
-        self.tcp.has_connect_probe_pending()
+    /// Restricts the next driver poll to scheduled runtime work when necessary.
+    pub(super) fn constrain_poll_timeout(
+        &self,
+        configured: Option<Duration>,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.tcp.constrain_poll_timeout(configured, now)
     }
 
-    /// Probes newly registered TCP connections after their first Mio poll submission.
-    pub(super) fn probe_pending_tcp_connects(
+    /// Runs scheduled work that became due after the driver returned from polling.
+    pub(super) fn run_due_work(
         &mut self,
+        now: Instant,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
-        self.tcp.probe_pending_connects(registry, event_sink)
+        self.tcp.probe_due_connects(now, registry, event_sink)
     }
 
     pub(super) fn resume_suspended_tcp_reads(

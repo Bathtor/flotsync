@@ -28,20 +28,31 @@ use mio::{
 };
 use slog::{debug, error, warn};
 use snafu::ResultExt;
-use socket2::{Protocol, SockAddr, SockRef, Socket, Type};
+use socket2::{Protocol, SockAddr, Socket, Type};
 use std::{
     io,
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+    net::{SocketAddr, TcpListener as StdTcpListener},
+    time::{Duration, Instant},
 };
 
 /// Backlog used when the reuse-enabled test bind path has to construct listeners via `socket2`.
 const TCP_LISTEN_BACKLOG: i32 = 1024;
 
+mod connect;
 #[cfg(test)]
 mod tests;
 mod types;
 
+use connect::{
+    ConnectCompletion,
+    ConnectCompletionMonitor,
+    MonitoredConnectSignal,
+    PendingConnectMonitor,
+    TcpConnectStatus,
+    inspect_tcp_connect,
+    start_tcp_connect,
+};
 pub(in crate::driver) use types::{AcceptedTcpConnection, ReleasedTcpListener};
 use types::{PendingTcpSend, TcpConnectionEntry, TcpListenerEntry};
 
@@ -54,6 +65,7 @@ pub(super) struct TcpRuntimeState {
     bind_reuse_address: bool,
     listeners: SlotRegistry<TcpListenerEntry>,
     connections: SlotRegistry<TcpConnectionEntry>,
+    connect_monitor: ConnectCompletionMonitor,
 }
 
 impl TcpRuntimeState {
@@ -63,6 +75,7 @@ impl TcpRuntimeState {
             bind_reuse_address,
             listeners: SlotRegistry::default(),
             connections: SlotRegistry::default(),
+            connect_monitor: ConnectCompletionMonitor::default(),
         }
     }
 
@@ -132,6 +145,7 @@ impl TcpRuntimeState {
             .connections
             .remove(connection_id.0)
             .ok_or(Error::UnknownConnection { connection_id })?;
+        self.connect_monitor.remove(connection_id);
         let mut stream = entry.stream;
         if let Some(stream) = stream.as_mut()
             && entry.registered
@@ -186,9 +200,9 @@ impl TcpRuntimeState {
             return Ok(());
         }
 
-        let stream_result = connect_tcp_stream(local_addr, remote_addr);
-        let stream = match stream_result {
-            Ok(stream) => stream,
+        let connect_result = start_tcp_connect(local_addr, remote_addr);
+        let started = match connect_result {
+            Ok(started) => started,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
                     connection_id,
@@ -199,23 +213,32 @@ impl TcpRuntimeState {
             }
         };
 
-        entry.stream = Some(stream);
+        entry.stream = Some(started.stream);
         entry.remote_addr = Some(remote_addr);
-        // Mio requires registration and readiness before portable connect-completion checks.
         entry.connect_pending = true;
-        entry.connect_probe_pending = true;
         entry.read_suspended = false;
         entry.pending_send = None;
         entry.close_after_flush = false;
-        let apply_result = apply_connection_interest(entry, registry);
-        if let Err(error) = apply_result {
-            entry.reset_to_reserved();
-            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
-                connection_id,
-                remote_addr,
-                error_kind: error.kind(),
-            }))?;
-            return Ok(());
+
+        match started.completion {
+            ConnectCompletion::MioReadiness => {
+                let apply_result = apply_connection_interest(entry, registry);
+                if let Err(error) = apply_result {
+                    entry.reset_to_reserved();
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                        connection_id,
+                        remote_addr,
+                        error_kind: error.kind(),
+                    }))?;
+                    return Ok(());
+                }
+            }
+            ConnectCompletion::Monitored => {
+                self.connect_monitor.track(connection_id, Instant::now());
+            }
+            ConnectCompletion::Complete => {
+                self.finish_connect(connection_id, registry, event_sink)?;
+            }
         }
 
         Ok(())
@@ -573,10 +596,7 @@ impl TcpRuntimeState {
             None => false,
         };
         if should_complete_connect {
-            let closed_record = self.finish_connect(connection_id, registry, event_sink)?;
-            if closed_record.is_some() {
-                return Ok(closed_record);
-            }
+            self.finish_connect(connection_id, registry, event_sink)?;
         }
 
         if is_writable {
@@ -592,72 +612,88 @@ impl TcpRuntimeState {
         Ok(None)
     }
 
-    /// Returns `true` when at least one outbound connection needs its first post-poll probe.
-    pub(super) fn has_connect_probe_pending(&self) -> bool {
-        self.connections
-            .entries()
-            .iter()
-            .flatten()
-            .any(|entry| entry.connect_probe_pending)
+    /// Restricts the next poll to scheduled platform connect-completion work when necessary.
+    pub(super) fn constrain_poll_timeout(
+        &self,
+        configured: Option<Duration>,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.connect_monitor.constrain_poll_timeout(configured, now)
     }
 
-    /// Checks newly registered outbound connections after Mio submitted their first poll.
-    ///
-    /// Windows queues the AFD registration until `Poll::poll` runs. Probing before that point can
-    /// miss a fast refusal between socket registration and AFD submission, so each outbound
-    /// connection receives exactly one error check immediately after its first poll. Absence of an
-    /// error does not establish success; normal readiness still completes the connection.
-    pub(super) fn probe_pending_connects(
+    /// Runs due platform connect-completion checks and routes ready sockets through the shared
+    /// completion transition.
+    pub(super) fn probe_due_connects(
         &mut self,
+        now: Instant,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
-        let connection_ids: Vec<ConnectionId> = self
-            .connections
-            .entries()
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, entry)| {
-                let entry = entry.as_ref()?;
-                option_when!(entry.connect_probe_pending, ConnectionId(slot))
-            })
-            .collect();
+        let connection_ids = self.connect_monitor.take_due(now);
         for connection_id in connection_ids {
-            let entry = self
-                .connections
-                .get_mut(connection_id.0)
-                .expect("TCP connection awaiting its first probe disappeared");
-            entry.connect_probe_pending = false;
-            if !entry.connect_pending {
-                continue;
-            }
-
-            let stream = entry
-                .stream
-                .as_ref()
-                .expect("TCP connection awaiting its first probe has no stream");
-            let Some(error_kind) = take_tcp_connect_error(stream) else {
-                continue;
+            let signal = match self.connections.get(connection_id.0) {
+                Some(entry) if entry.connect_pending => {
+                    let stream = entry
+                        .stream
+                        .as_ref()
+                        .expect("monitored TCP connection missing stream handle");
+                    ConnectCompletionMonitor::probe(stream)
+                }
+                Some(_) | None => {
+                    self.connect_monitor.remove(connection_id);
+                    continue;
+                }
             };
-            let remote_addr = entry
-                .remote_addr
-                .expect("TCP connection awaiting its first probe has no remote address");
-            let reset_error = reset_connection_after_failure(entry, registry);
-            if let Err(error) = reset_error {
-                warn!(
-                    self.logger,
-                    "failed to reset TCP connection {} after connect failure: {}",
-                    connection_id,
-                    error
-                );
+
+            match signal {
+                MonitoredConnectSignal::Pending => {}
+                MonitoredConnectSignal::Ready => {
+                    self.finish_connect(connection_id, registry, event_sink)?;
+                }
+                MonitoredConnectSignal::Failed { error_kind } => {
+                    self.fail_connect(connection_id, registry, event_sink, error_kind)?;
+                }
             }
-            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
-                connection_id,
-                remote_addr,
-                error_kind,
-            }))?;
         }
 
+        Ok(())
+    }
+
+    /// Completes one failed outbound connection and restores its entry to the reserved state.
+    fn fail_connect(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+        error_kind: ErrorKind,
+    ) -> Result<()> {
+        self.connect_monitor.remove(connection_id);
+        let Some(entry) = self.connections.get_mut(connection_id.0) else {
+            debug!(
+                self.logger,
+                "ignoring stale TCP connect failure for unknown connection {}", connection_id
+            );
+            return Ok(());
+        };
+        if !entry.connect_pending {
+            return Ok(());
+        }
+
+        let remote_addr = entry
+            .remote_addr
+            .expect("failed TCP connection missing remote address");
+        let reset_error = reset_connection_after_failure(entry, registry);
+        if let Err(error) = reset_error {
+            warn!(
+                self.logger,
+                "failed to reset TCP connection {} after connect failure: {}", connection_id, error
+            );
+        }
+        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+            connection_id,
+            remote_addr,
+            error_kind,
+        }))?;
         Ok(())
     }
 
@@ -730,56 +766,43 @@ impl TcpRuntimeState {
         connection_id: ConnectionId,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
-    ) -> Result<Option<ResourceRecord>> {
-        let Some(entry) = self.connections.get_mut(connection_id.0) else {
+    ) -> Result<()> {
+        let Some(entry) = self.connections.get(connection_id.0) else {
             debug!(
                 self.logger,
                 "ignoring stale TCP readiness for unknown connection {}", connection_id
             );
-            return Ok(None);
+            self.connect_monitor.remove(connection_id);
+            return Ok(());
         };
         if !entry.connect_pending {
-            return Ok(None);
+            self.connect_monitor.remove(connection_id);
+            return Ok(());
         }
 
-        let remote_addr = entry
-            .remote_addr
-            .expect("connecting TCP entry missing remote address");
-        let connect_result = {
-            let stream = entry
-                .stream
-                .as_ref()
-                .expect("connecting TCP entry missing stream handle");
-            check_tcp_connect_result(stream)
-        };
-        match connect_result {
-            Ok(false) => Ok(None),
-            Ok(true) => {
+        let stream = entry
+            .stream
+            .as_ref()
+            .expect("connecting TCP entry missing stream handle");
+        match inspect_tcp_connect(stream) {
+            TcpConnectStatus::Pending => Ok(()),
+            TcpConnectStatus::Connected { peer_addr } => {
+                self.connect_monitor.remove(connection_id);
+                let entry = self
+                    .connections
+                    .get_mut(connection_id.0)
+                    .expect("connected TCP entry disappeared during completion");
                 entry.connect_pending = false;
                 let update_interest_result = apply_connection_interest(entry, registry);
                 update_interest_result.context(UpdateTcpInterestSnafu { connection_id })?;
                 event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Connected {
                     connection_id,
-                    peer_addr: remote_addr,
+                    peer_addr,
                 }))?;
-                Ok(None)
+                Ok(())
             }
-            Err(error_kind) => {
-                let reset_error = reset_connection_after_failure(entry, registry);
-                if let Err(error) = reset_error {
-                    warn!(
-                        self.logger,
-                        "failed to reset TCP connection {} after connect failure: {}",
-                        connection_id,
-                        error
-                    );
-                }
-                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
-                    connection_id,
-                    remote_addr,
-                    error_kind,
-                }))?;
-                Ok(None)
+            TcpConnectStatus::Failed { error_kind } => {
+                self.fail_connect(connection_id, registry, event_sink, error_kind)
             }
         }
     }
@@ -1046,6 +1069,7 @@ impl TcpRuntimeState {
             .connections
             .remove(connection_id.0)
             .ok_or(Error::UnknownConnection { connection_id })?;
+        self.connect_monitor.remove(connection_id);
         let mut stream = entry.stream;
         if let Some(stream) = stream.as_mut()
             && entry.registered
@@ -1107,45 +1131,6 @@ fn reset_connection_after_failure(
     Ok(())
 }
 
-/// Checks non-blocking TCP connect completion according to `mio::TcpStream::connect` semantics.
-///
-/// `mio` requires callers to:
-/// 1. inspect `take_error()` first
-/// 2. then inspect `peer_addr()`
-/// 3. treat `ErrorKind::NotConnected` from `peer_addr()` as \"still pending\"
-///
-/// The helper returns `Ok(true)` when the stream is connected, `Ok(false)` when it is still
-/// pending, and `Err(kind)` when the connect attempt has failed.
-fn check_tcp_connect_result(stream: &MioTcpStream) -> std::result::Result<bool, ErrorKind> {
-    if let Some(error_kind) = take_tcp_connect_error(stream) {
-        return Err(error_kind);
-    }
-
-    match stream.peer_addr() {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotConnected => Ok(false),
-        Err(error) => Err(error.kind()),
-    }
-}
-
-/// Returns the pending connect error, including failure to inspect `SO_ERROR`, when present.
-fn take_tcp_connect_error(stream: &MioTcpStream) -> Option<ErrorKind> {
-    match stream.take_error() {
-        Ok(error) => error.map(|error| error.kind()),
-        Err(error) => Some(error.kind()),
-    }
-}
-
-fn connect_tcp_stream(
-    local_addr: Option<SocketAddr>,
-    remote_addr: SocketAddr,
-) -> io::Result<MioTcpStream> {
-    if let Some(local_addr) = local_addr {
-        return connect_tcp_stream_with_local_addr(local_addr, remote_addr);
-    }
-    MioTcpStream::connect(remote_addr)
-}
-
 /// Binds one TCP listener, optionally opting into platform socket re-use for test-only port
 /// reservation.
 fn bind_tcp_listener(
@@ -1164,32 +1149,4 @@ fn bind_tcp_listener(
 
     let listener: StdTcpListener = socket.into();
     Ok(MioTcpListener::from_std(listener))
-}
-
-/// Connects one TCP stream after first binding it to a caller-selected local address.
-///
-/// `mio` does not currently expose this path directly, so the implementation uses `socket2` and
-/// converts the resulting non-blocking `std::net::TcpStream` back into `mio`.
-fn connect_tcp_stream_with_local_addr(
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
-) -> io::Result<MioTcpStream> {
-    let socket = Socket::new(
-        socket_domain(remote_addr),
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(local_addr))?;
-
-    let stream: StdTcpStream = socket.into();
-    let stream = MioTcpStream::from_std(stream);
-    let socket_ref = SockRef::from(&stream);
-    match socket_ref.connect(&SockAddr::from(remote_addr)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-        Err(error) => return Err(error),
-    }
-
-    Ok(stream)
 }
