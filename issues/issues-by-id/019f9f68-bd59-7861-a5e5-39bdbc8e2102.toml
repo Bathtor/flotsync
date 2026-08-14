@@ -55,7 +55,7 @@ type = "task"
 priority = 1
 assignee = "Codex"
 created_at = "2026-07-26T17:11:09.401951Z"
-updated_at = "2026-08-14T15:12:10.0568688Z"
+updated_at = "2026-08-14T15:18:14.6426374Z"
 
 [[links]]
 target = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
@@ -90,3 +90,9 @@ id = "01a000d2-0393-70b3-9a22-6c6659b10f13"
 author = "Codex"
 body = "Implementation progress on 2026-08-14: explicitly-bound pending Windows connects now remain outside Mio and are checked every 10 ms with zero-timeout WSAPoll. Reported status routes through the shared take_error-then-peer_addr completion transition before Mio registration. Added scheduler, early-wake, timeout-preservation, successful bound-connect/data-exchange, deterministic failure-reporting, and pending-release coverage. The complete serial flotsync_io suite passes (77 passed across targets, 5 existing Windows ignores), all 8 netcat smoke tests pass, changed Rust files pass direct rustfmt check, and flotsync_io is pedantic-Clippy clean apart from two pre-existing flotsync_utils warnings. The locked workspace command is currently blocked before tests because this local Windows machine has no libclang.dll for bonjour-sys; the platforms.yml cache-on-failure exception remains unchanged pending an actual clean CI-equivalent workspace run."
 created_at = "2026-08-14T15:09:18.6119746Z"
+
+[[comments]]
+id = "01a000da-3172-7143-abdf-1352e7970943"
+author = "Codex"
+body = "PR #35's Linux Clippy job found that the common connect-completion abstraction left Windows-only variants dead on portable targets and modelled the portable monitor as a unit struct whose Default construction triggers a lint. Kept the shared state-machine shape, added narrowly target-specific dead-code allowances with reasons, and made the portable zero-sized monitor a braced struct. The exact flotsync_io all-targets no-deps pedantic Clippy target and serial tests pass locally."
+created_at = "2026-08-14T15:18:14.6426374Z"

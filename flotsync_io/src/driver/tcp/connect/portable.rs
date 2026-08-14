@@ -12,7 +12,7 @@ use std::{
 
 /// No-op monitor used where explicitly-bound pending connects are Mio-readable.
 #[derive(Debug, Default)]
-pub(in crate::driver::tcp) struct ConnectCompletionMonitor;
+pub(in crate::driver::tcp) struct ConnectCompletionMonitor {}
 
 pub(super) fn start_bound_tcp_connect(
     local_addr: SocketAddr,

@@ -27,6 +27,13 @@ pub(super) use platform::ConnectCompletionMonitor;
 
 /// How the driver should learn that one newly-started connection may have completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "platform completion variants stay common across targets"
+    )
+)]
 pub(super) enum ConnectCompletion {
     /// The connect syscall completed synchronously.
     Complete,
@@ -56,6 +63,13 @@ pub(super) enum TcpConnectStatus {
 
 /// Advisory result from the platform monitor before authoritative socket inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "platform monitor signals stay common across targets"
+    )
+)]
 pub(super) enum MonitoredConnectSignal {
     /// The platform has not reported completion yet.
     Pending,
