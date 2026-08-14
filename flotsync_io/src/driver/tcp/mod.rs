@@ -28,7 +28,7 @@ use mio::{
 };
 use slog::{debug, error, warn};
 use snafu::ResultExt;
-use socket2::{Protocol, SockAddr, Socket, Type};
+use socket2::{Protocol, SockAddr, SockRef, Socket, Type};
 use std::{
     io,
     io::{ErrorKind, Read, Write},
@@ -203,6 +203,7 @@ impl TcpRuntimeState {
         entry.remote_addr = Some(remote_addr);
         // Mio requires registration and readiness before portable connect-completion checks.
         entry.connect_pending = true;
+        entry.connect_probe_pending = true;
         entry.read_suspended = false;
         entry.pending_send = None;
         entry.close_after_flush = false;
@@ -215,36 +216,6 @@ impl TcpRuntimeState {
                 error_kind: error.kind(),
             }))?;
             return Ok(());
-        }
-
-        // A non-blocking connect can fail between `connect` and Mio registration, particularly
-        // for a refused loopback connection on Windows. Inspect `SO_ERROR` once after registration
-        // to cover that gap; otherwise the normal readiness path remains responsible.
-        let initial_error_kind = {
-            let stream = entry
-                .stream
-                .as_ref()
-                .expect("registered TCP connection missing stream handle");
-            match stream.take_error() {
-                Ok(error) => error.map(|error| error.kind()),
-                Err(error) => Some(error.kind()),
-            }
-        };
-        if let Some(error_kind) = initial_error_kind {
-            let reset_error = reset_connection_after_failure(entry, registry);
-            if let Err(error) = reset_error {
-                warn!(
-                    self.logger,
-                    "failed to reset TCP connection {} after connect failure: {}",
-                    connection_id,
-                    error
-                );
-            }
-            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
-                connection_id,
-                remote_addr,
-                error_kind,
-            }))?;
         }
 
         Ok(())
@@ -619,6 +590,75 @@ impl TcpRuntimeState {
         }
 
         Ok(None)
+    }
+
+    /// Returns `true` when at least one outbound connection needs its first post-poll probe.
+    pub(super) fn has_connect_probe_pending(&self) -> bool {
+        self.connections
+            .entries()
+            .iter()
+            .flatten()
+            .any(|entry| entry.connect_probe_pending)
+    }
+
+    /// Checks newly registered outbound connections after Mio submitted their first poll.
+    ///
+    /// Windows queues the AFD registration until `Poll::poll` runs. Probing before that point can
+    /// miss a fast refusal between socket registration and AFD submission, so each outbound
+    /// connection receives exactly one error check immediately after its first poll. Absence of an
+    /// error does not establish success; normal readiness still completes the connection.
+    pub(super) fn probe_pending_connects(
+        &mut self,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        let connection_ids: Vec<ConnectionId> = self
+            .connections
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| {
+                let entry = entry.as_ref()?;
+                option_when!(entry.connect_probe_pending, ConnectionId(slot))
+            })
+            .collect();
+        for connection_id in connection_ids {
+            let entry = self
+                .connections
+                .get_mut(connection_id.0)
+                .expect("TCP connection awaiting its first probe disappeared");
+            entry.connect_probe_pending = false;
+            if !entry.connect_pending {
+                continue;
+            }
+
+            let stream = entry
+                .stream
+                .as_ref()
+                .expect("TCP connection awaiting its first probe has no stream");
+            let Some(error_kind) = take_tcp_connect_error(stream) else {
+                continue;
+            };
+            let remote_addr = entry
+                .remote_addr
+                .expect("TCP connection awaiting its first probe has no remote address");
+            let reset_error = reset_connection_after_failure(entry, registry);
+            if let Err(error) = reset_error {
+                warn!(
+                    self.logger,
+                    "failed to reset TCP connection {} after connect failure: {}",
+                    connection_id,
+                    error
+                );
+            }
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                connection_id,
+                remote_addr,
+                error_kind,
+            }))?;
+        }
+
+        Ok(())
     }
 
     pub(super) fn resume_suspended_reads(
@@ -1077,19 +1117,22 @@ fn reset_connection_after_failure(
 /// The helper returns `Ok(true)` when the stream is connected, `Ok(false)` when it is still
 /// pending, and `Err(kind)` when the connect attempt has failed.
 fn check_tcp_connect_result(stream: &MioTcpStream) -> std::result::Result<bool, ErrorKind> {
-    let take_error_result = stream.take_error();
-    let pending_error = match take_error_result {
-        Ok(error) => error,
-        Err(error) => return Err(error.kind()),
-    };
-    if let Some(error) = pending_error {
-        return Err(error.kind());
+    if let Some(error_kind) = take_tcp_connect_error(stream) {
+        return Err(error_kind);
     }
 
     match stream.peer_addr() {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotConnected => Ok(false),
         Err(error) => Err(error.kind()),
+    }
+}
+
+/// Returns the pending connect error, including failure to inspect `SO_ERROR`, when present.
+fn take_tcp_connect_error(stream: &MioTcpStream) -> Option<ErrorKind> {
+    match stream.take_error() {
+        Ok(error) => error.map(|error| error.kind()),
+        Err(error) => Some(error.kind()),
     }
 }
 
@@ -1139,12 +1182,14 @@ fn connect_tcp_stream_with_local_addr(
     socket.set_nonblocking(true)?;
     socket.bind(&SockAddr::from(local_addr))?;
 
-    match socket.connect(&SockAddr::from(remote_addr)) {
+    let stream: StdTcpStream = socket.into();
+    let stream = MioTcpStream::from_std(stream);
+    let socket_ref = SockRef::from(&stream);
+    match socket_ref.connect(&SockAddr::from(remote_addr)) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::WouldBlock => {}
         Err(error) => return Err(error),
     }
 
-    let stream: StdTcpStream = socket.into();
-    Ok(MioTcpStream::from_std(stream))
+    Ok(stream)
 }

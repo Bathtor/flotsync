@@ -291,13 +291,18 @@ fn tcp_listener_reject_closes_pending_connection() {
 }
 
 #[test]
-fn tcp_connect_send_and_receive_work() {
+fn tcp_connect_with_explicit_local_addr_sends_and_receives() {
     init_test_logger();
 
-    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut socket_lease = reserve_sockets(&[
+        ReservedSocketKind::TcpListener,
+        ReservedSocketKind::TcpListener,
+    ]);
+    let local_addr = socket_lease.addr(0);
     let listener =
-        bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
-    listener_lease.release_binding(0);
+        bind_reserved_tcp_listener(&socket_lease, 1).expect("bind reserved TCP listener");
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
     let remote_addr = listener.local_addr().expect("listener addr");
     let (server_tx, server_rx) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
@@ -314,7 +319,7 @@ fn tcp_connect_send_and_receive_work() {
     driver
         .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
             connection_id,
-            local_addr: None,
+            local_addr: Some(local_addr),
             remote_addr,
         }))
         .expect("dispatch TCP connect");
@@ -369,8 +374,11 @@ fn tcp_connect_send_and_receive_work() {
     assert_eq!(received_payload.expect("received payload"), b"world"[..]);
 
     server.join().expect("join server thread");
-    listener_lease
+    socket_lease
         .rebind_binding(0)
+        .expect("rebind reserved local TCP socket");
+    socket_lease
+        .rebind_binding(1)
         .expect("rebind reserved TCP listener");
     driver.shutdown().expect("driver shuts down");
 }

@@ -50,6 +50,8 @@ pub(super) struct TcpConnectionEntry {
     pub(super) remote_addr: Option<SocketAddr>,
     pub(super) accepted_from: Option<ListenerId>,
     pub(super) connect_pending: bool,
+    /// Whether this outbound connection still needs its completion probe after the first poll.
+    pub(super) connect_probe_pending: bool,
     pub(super) pending_adoption: bool,
     pub(super) read_suspended: bool,
     pub(super) write_suspended: bool,
@@ -66,6 +68,7 @@ impl TcpConnectionEntry {
             remote_addr: None,
             accepted_from: None,
             connect_pending: false,
+            connect_probe_pending: false,
             pending_adoption: false,
             read_suspended: false,
             write_suspended: false,
@@ -87,6 +90,7 @@ impl TcpConnectionEntry {
             remote_addr: Some(peer_addr),
             accepted_from: Some(listener_id),
             connect_pending: false,
+            connect_probe_pending: false,
             pending_adoption: true,
             read_suspended: false,
             write_suspended: false,
@@ -118,6 +122,7 @@ impl TcpConnectionEntry {
         self.remote_addr = None;
         self.accepted_from = None;
         self.connect_pending = false;
+        self.connect_probe_pending = false;
         self.pending_adoption = false;
         self.read_suspended = false;
         self.write_suspended = false;

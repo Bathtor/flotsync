@@ -2,22 +2,34 @@ id = "019f9f68-bd59-7861-a5e5-39bdbc8e2102"
 ref = "flotsync-j3v"
 title = "Remove temporary Windows failure caching"
 body = """
-Objective
-
-Remove the temporary Windows-only rust-cache failure-saving exception once Windows CI is stabilised.
-
-Plan
-
-- Confirm the Windows platforms job completes successfully and populates the normal cache.
-- Remove the cache-on-failure input and its temporary TODO from .github/workflows/platforms.yml.
-- Validate the workflow configuration.
-
-Expected implementation size: approximately 3 LOC, below 1000 LOC."""
-status = "open"
+Objective\r
+\r
+Stabilise the Windows TCP connection-failure lifecycle, verify the Windows test path, and then remove the temporary Windows-only rust-cache failure-saving exception.\r
+\r
+Plan\r
+\r
+- Track newly registered outbound TCP connections that still require their first post-poll completion probe.\r
+- Make the next driver poll non-blocking while such probes are pending so Mio submits its Windows AFD poll before Flotsync checks completion.\r
+- Probe those connections immediately after that poll with the existing connect-completion logic, then retain normal readiness-driven completion for connections still pending.\r
+- Remove the current post-registration SO_ERROR probe because it runs before the first Windows AFD poll is submitted.\r
+- Preserve deterministic explicit local and remote socket reservation in the refused-connection regression test.\r
+- Add coverage for a successful explicitly bound outbound connection through the same lifecycle.\r
+- Validate focused TCP tests repeatedly on Windows, the complete serial flotsync_io suite, netcat smoke tests, formatting, and pedantic Clippy.\r
+- Run the Windows workspace test path. Once it is clean, remove cache-on-failure and its TODO from .github/workflows/platforms.yml and validate the workflow configuration.\r
+\r
+Constraints\r
+\r
+- Keep normal readiness-driven connect completion after the single first-post-poll probe.\r
+- Do not introduce a periodic driver wake-up or general connection timeout merely to close this registration race.\r
+- Preserve explicit local-address binding support.\r
+- Expected implementation size remains below 1000 LOC."""
+status = "in-progress"
+status_reason = "planning"
 type = "task"
 priority = 1
+assignee = "Codex"
 created_at = "2026-07-26T17:11:09.401951Z"
-updated_at = "2026-07-26T17:23:06.781853Z"
+updated_at = "2026-08-14T08:57:58.3538185Z"
 
 [[links]]
 target = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
@@ -28,3 +40,21 @@ id = "019f9f73-af9d-70d3-962c-0a4ffc3d7786"
 author = "codex"
 body = "Raised to priority 1 at user request so the temporary cache exception is removed promptly once Windows CI is stable again."
 created_at = "2026-07-26T17:23:06.781853Z"
+
+[[comments]]
+id = "019fff65-bc7d-7d83-9ea7-87f729dc2d18"
+author = "Codex"
+body = "Windows-local reproduction on 2026-08-14: cargo test -p flotsync_io driver::tcp::tests::tcp_connect_failure_is_reported -- --exact --nocapture --test-threads=1 fails consistently after registering WRITABLE interest; no driver event arrives and the two-second wait expires. The complete serial flotsync_io suite reports 61 passed, 1 failed (the same test), and 2 intentionally ignored Windows backpressure tests. The historical Ubuntu netcat failure \tcp_listener_empty_scripted_line_closes_cleanly passes locally on Windows. Current diagnosis: on Windows, Mio registration queues the first AFD poll for the next Poll::poll; Flotsync's post-registration SO_ERROR probe runs before that submission, leaving a race where a fast loopback refusal can complete before AFD polling starts and then produce no readiness notification. Proposed direction awaiting plan agreement: force one immediate post-registration poll cycle and probe pending connects only after that first poll has been submitted, retain readiness-driven completion thereafter, add focused lifecycle coverage, then remove the temporary Windows cache-on-failure setting only after the Windows suite is clean."
+created_at = "2026-08-14T08:31:25.3096596Z"
+
+[[comments]]
+id = "019fff65-e6fb-71f0-9a10-97b1f5a584a8"
+author = "Codex"
+body = "Correction to the preceding comment: the historical Ubuntu test name is tcp_listener_empty_scripted_line_closes_cleanly; it passes locally on Windows."
+created_at = "2026-08-14T08:31:36.1878562Z"
+
+[[comments]]
+id = "019fff7d-e344-7320-aa71-0c5118ebeaa6"
+author = "Codex"
+body = "Implementation diagnosis update: the first-post-poll probe removes the false success but Windows still emits no Mio readiness and SO_ERROR remains empty. Mio documents from_std for streams already connected via another mechanism, whereas Flotsync passes it an explicitly bound non-blocking stream whose connect is still pending. Mio connect cannot specify a local bind. Winsock documents non-blocking connect success through writable select readiness and failure through exceptional select readiness followed by SO_ERROR. The agreed one-shot Mio probe therefore cannot robustly implement explicit local binds on Windows; the plan needs a Windows completion-monitor choice before continuing."
+created_at = "2026-08-14T08:57:48.1008848Z"
