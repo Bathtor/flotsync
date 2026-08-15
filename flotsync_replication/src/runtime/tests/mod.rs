@@ -143,9 +143,11 @@ use crate::{
     provision_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
     test_support::{
+        SqliteStoreTestOwner,
         load_test_delivery_security,
         provision_test_identity as provision_shared_test_identity,
         provision_test_security as provision_shared_test_security,
+        provisioned_sqlite_store,
         test_public_member_keys,
         test_replication_security_secrets,
         wait_for_test_future,
@@ -201,6 +203,14 @@ struct RuntimeFixture<S> {
     runtime: Arc<ReplicationRuntime>,
     listener: Arc<ListenerStub>,
     store: Arc<S>,
+    sqlite_owner: TestSqliteStore,
+}
+
+impl<S> Drop for RuntimeFixture<S> {
+    fn drop(&mut self) {
+        wait_for_test_reply(self.runtime.shutdown()).expect("test runtime should shut down");
+        wait_for_test_future(self.sqlite_owner.close()).expect("runtime test store should close");
+    }
 }
 
 /// Test-only store wrapper that can fail selected future writes while

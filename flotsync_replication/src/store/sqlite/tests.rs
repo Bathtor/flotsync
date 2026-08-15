@@ -20,11 +20,16 @@ use crate::{
         ReplicationRowStateRecord,
         ReplicationUpdateFilter,
         SnapshotRef,
+        StoreErrorClass,
         current_slice_placeholder_group_security_material,
     },
     delivery::shared::MessageId,
     provision_local_identity,
-    test_support::{test_public_member_keys, test_replication_security_secrets},
+    test_support::{
+        SqliteStoreTestOwner,
+        test_public_member_keys,
+        test_replication_security_secrets,
+    },
 };
 use bytes::Bytes;
 use flotsync_core::member::{IdentifierParseError, MAX_IDENTIFIER_SEGMENTS};
@@ -36,10 +41,12 @@ use flotsync_data_types::{
     schema::datamodel::RowOperation,
 };
 use flotsync_messages::codecs::datamodel::encode_schema_operation;
+use futures_util::future;
 use itertools::Itertools;
 use std::{
     assert_matches,
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -56,7 +63,9 @@ where
     )
 }
 
-fn in_memory_store(local_member: MemberIdentity) -> SqliteReplicationStore {
+type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
+
+fn in_memory_store(local_member: MemberIdentity) -> TestSqliteStore {
     let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::in_memory())
         .expect("provisioner should build");
     wait_for_store_future(provision_local_identity(
@@ -65,8 +74,9 @@ fn in_memory_store(local_member: MemberIdentity) -> SqliteReplicationStore {
         &test_replication_security_secrets(),
     ))
     .expect("identity should provision");
-    wait_for_store_future(provisioner.into_replication_store())
-        .expect("provisioned store should activate")
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate");
+    SqliteStoreTestOwner::from_store(Arc::new(store))
 }
 
 fn in_memory_provisioner() -> SqliteReplicationStoreProvisioner {
@@ -77,7 +87,7 @@ fn in_memory_provisioner() -> SqliteReplicationStoreProvisioner {
 fn in_memory_store_with_schema_sources<I, S>(
     local_member: MemberIdentity,
     schema_sources: I,
-) -> SqliteReplicationStore
+) -> TestSqliteStore
 where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
@@ -92,8 +102,9 @@ where
         &test_replication_security_secrets(),
     ))
     .expect("identity should provision");
-    wait_for_store_future(provisioner.into_replication_store())
-        .expect("provisioned store should activate")
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate");
+    SqliteStoreTestOwner::from_store(Arc::new(store))
 }
 
 fn docs_dataset_id() -> DatasetId {
@@ -110,6 +121,178 @@ fn remote_member() -> MemberIdentity {
 
 fn third_member() -> MemberIdentity {
     MemberIdentity::from_array(["app", "carol"])
+}
+
+#[test]
+fn sqlite_store_close_is_idempotent_and_rejects_new_operations() {
+    let store = in_memory_store(local_member());
+
+    wait_for_store_future(store.close()).expect("store should close");
+    wait_for_store_future(store.close()).expect("completed close should be idempotent");
+
+    let identity_error = wait_for_store_future(store.local_member_identity())
+        .expect_err("cached identity access should be rejected after close");
+    assert_eq!(
+        identity_error.classification().class,
+        StoreErrorClass::Unavailable
+    );
+    let Err(transaction_error) = wait_for_store_future(store.begin_read_transaction()) else {
+        panic!("new transactions should be rejected after close");
+    };
+    assert_eq!(
+        transaction_error.classification().class,
+        StoreErrorClass::Unavailable
+    );
+}
+
+#[test]
+fn concurrent_sqlite_store_close_callers_wait_for_completed_closure() {
+    let store = in_memory_store(local_member());
+    wait_for_store_future(async {
+        let transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("test transaction should start");
+        let mut first_close = std::pin::pin!(store.close());
+        future::poll_fn(
+            |context| match std::future::Future::poll(first_close.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("first close should wait for the open transaction: {result:?}")
+                }
+            },
+        )
+        .await;
+
+        let mut second_close = std::pin::pin!(store.close());
+        future::poll_fn(|context| {
+            match std::future::Future::poll(second_close.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("second close should wait for the open transaction: {result:?}")
+                }
+            }
+        })
+        .await;
+
+        transaction
+            .release()
+            .await
+            .expect("test transaction should release");
+        first_close.await.expect("first close should complete");
+        second_close.await.expect("second close should complete");
+    });
+}
+
+#[test]
+fn cancelled_sqlite_store_close_can_be_completed_by_a_later_caller() {
+    let store = in_memory_store(local_member());
+    wait_for_store_future(async {
+        let transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("test transaction should start");
+        let mut first_close = Box::pin(store.close());
+        future::poll_fn(
+            |context| match std::future::Future::poll(first_close.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("first close should wait for the open transaction: {result:?}")
+                }
+            },
+        )
+        .await;
+        assert_eq!(store.pool.state(), SqliteStoreState::Closing);
+        drop(first_close);
+
+        transaction
+            .release()
+            .await
+            .expect("test transaction should release");
+        store
+            .close()
+            .await
+            .expect("later close caller should complete closure");
+        assert_eq!(store.pool.state(), SqliteStoreState::Closed);
+    });
+}
+
+#[test]
+fn sqlite_operation_futures_check_lifecycle_when_polled() {
+    let store = in_memory_store(local_member());
+    wait_for_store_future(async {
+        let cached_identity = store.local_member_identity();
+        let new_transaction = store.begin_read_transaction();
+        let blocking_transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("blocking transaction should start");
+        let mut close = std::pin::pin!(store.close());
+        future::poll_fn(
+            |context| match std::future::Future::poll(close.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("close should wait for the blocking transaction: {result:?}")
+                }
+            },
+        )
+        .await;
+
+        let identity_error = cached_identity
+            .await
+            .expect_err("cached access should observe closure when polled");
+        assert_eq!(
+            identity_error.classification().class,
+            StoreErrorClass::Unavailable
+        );
+        let Err(transaction_error) = new_transaction.await else {
+            panic!("transaction future should observe closure when polled");
+        };
+        assert_eq!(
+            transaction_error.classification().class,
+            StoreErrorClass::Unavailable
+        );
+
+        blocking_transaction
+            .release()
+            .await
+            .expect("blocking transaction should release");
+        close.await.expect("store should close");
+    });
+}
+
+#[test]
+fn sqlite_store_provisioner_close_is_idempotent_and_rejects_new_operations() {
+    let provisioner = in_memory_provisioner();
+
+    wait_for_store_future(provisioner.close()).expect("provisioner should close");
+    wait_for_store_future(provisioner.close())
+        .expect("completed provisioner close should be idempotent");
+
+    let error = wait_for_store_future(provisioner.local_member_identity())
+        .expect_err("provisioning operations should be rejected after close");
+    assert_eq!(error.classification().class, StoreErrorClass::Unavailable);
+}
+
+#[test]
+fn dropping_an_open_activated_sqlite_store_panics_in_debug_builds() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let provisioner = in_memory_provisioner();
+        wait_for_store_future(provision_local_identity(
+            &provisioner,
+            local_member(),
+            &test_replication_security_secrets(),
+        ))
+        .expect("identity should provision");
+        let store = wait_for_store_future(provisioner.into_replication_store())
+            .expect("provisioned store should activate");
+        drop(store);
+    });
+
+    assert!(result.is_err(), "dropping an open store should panic");
 }
 
 #[test]
@@ -172,7 +355,12 @@ fn insert_raw_local_member(
     secret_byte: u8,
 ) {
     wait_for_store_future(async {
-        let mut connection = provisioner.pool.acquire().await.context(SqlxSnafu)?;
+        let mut connection = provisioner
+            .pool
+            .connections
+            .acquire()
+            .await
+            .context(SqlxSnafu)?;
         sqlx::query(
             "
 INSERT INTO local_members (
@@ -295,6 +483,7 @@ fn sqlite_file_store_reopens_with_its_provisioned_identity() {
     .expect("identity should provision");
     let store = wait_for_store_future(provisioner.into_replication_store())
         .expect("new store should activate");
+    wait_for_store_future(store.close()).expect("new store should close");
     drop(store);
 
     let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::open_file(&path))
@@ -304,6 +493,7 @@ fn sqlite_file_store_reopens_with_its_provisioned_identity() {
     let loaded_member =
         wait_for_store_future(store.local_member_identity()).expect("identity should load");
     assert_eq!(loaded_member, member);
+    wait_for_store_future(store.close()).expect("reopened store should close");
     drop(store);
     std::fs::remove_file(path).expect("test database should be removed");
 }
@@ -1473,6 +1663,7 @@ fn sqlite_store_roundtrips_local_member_private_keys() {
             .expect("private keys should exist");
     assert_eq!(loaded, record);
     wait_for_store_future(read_transaction.release()).expect("release should succeed");
+    wait_for_store_future(store.close()).expect("store should close");
 }
 
 #[test]

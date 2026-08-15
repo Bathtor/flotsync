@@ -261,6 +261,7 @@ mod tests {
             }
         );
         wait_for_test_future(transaction.release()).expect("transaction should release");
+        wait_for_test_future(store.close()).expect("store should close");
     }
 
     #[test]
@@ -343,5 +344,6 @@ mod tests {
             &MemberPublicKeysRecord::from_public_keys(delivery_security.local_keys().public_keys())
         );
         wait_for_test_future(after.release()).expect("read transaction should release");
+        wait_for_test_future(store.close()).expect("store should close");
     }
 }

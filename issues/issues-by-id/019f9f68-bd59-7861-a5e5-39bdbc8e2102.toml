@@ -4,15 +4,15 @@ title = "Remove temporary Windows failure caching"
 body = """
 Objective
 
-Stabilise explicitly-bound outbound TCP connection completion on Windows, validate the Windows test path, and then remove the temporary Windows-only rust-cache failure-saving exception.
+Stabilise explicitly-bound outbound TCP connection completion on Windows, validate the complete Windows workspace path, address platform-only shutdown failures exposed by that validation, and then remove the temporary Windows-only rust-cache failure-saving exception.
 
-Diagnosis
+TCP diagnosis
 
 Flotsync must bind caller-selected local TCP addresses because the test socket broker reserves every required socket up front. Mio supports portable pending connection completion through TcpStream::connect, but that constructor cannot bind a caller-selected local address. Mio documents TcpStream::from_std for streams already connected by another mechanism. On Windows, an explicitly-bound non-blocking connect initiated outside Mio does not reliably produce Mio AFD readiness, so the driver needs a separate completion source until the stream is established.
 
 Local experiments ruled out two tempting shortcuts. Zero-timeout Winsock select did observe successful connects but did not expose the pending failure case. Calling take_error and peer_addr without a readiness signal is also invalid: peer_addr can return the configured target while the Windows socket is still connecting. WSAPoll is the appropriate isolated status check; Microsoft documents failed connects on supported Windows versions as writable together with error and hang-up status. A released broker TCP listener is not a deterministic refusal on this host: even a blocking standard-library connect silently times out, so tests must not require it to fail within two seconds.
 
-Agreed design
+Agreed TCP design
 
 - Preserve exact explicit local-address binding on every supported platform.
 - Introduce a TCP connect module that returns the stream together with its completion source: already complete, Mio readiness, or platform monitoring.
@@ -27,35 +27,56 @@ Agreed design
 - Keep all unsafe Winsock code and platform conditionals inside the TCP connect module. The normal TCP lifecycle sees only the common completion-source and monitor interfaces.
 - Remove the diagnostic first-post-poll probe and its connect_probe_pending lifecycle flag.
 
-Scheduling constraints
+TCP scheduling constraints
 
 - Use a private fixed probe interval, initially 10 ms, only while explicitly-bound Windows connects are pending.
 - Do not busy-spin or reset the deadline after unrelated early wake-ups.
 - Do not add a public connection timeout or broaden periodic polling to ordinary Mio-managed connections.
+
+Windows workspace follow-up diagnosis
+
+The correctly dispatched Windows platform run at commit 3c6604f passed the TCP and netcat coverage. Its only failure was sqlite_file_store_reopens_with_its_provisioned_identity after all reopen and identity assertions succeeded. Windows rejected immediate database deletion because SQLx still held a file handle. Dropping a SQLx pool does not synchronously guarantee its internally-owned connections have finished closing; Unix permits unlinking an open file and therefore hid the missing orderly-shutdown step.
+
+Agreed SQLite lifecycle design
+
+- Keep shutdown out of the backend-neutral ReplicationStore trait and out of replication-runtime shutdown. The application selected the concrete backend, owns its lifetime, and may reuse the same store across runtime instances.
+- Add inherent asynchronous close operations to SqliteReplicationStore and SqliteReplicationStoreProvisioner. The replicated checklist retains its concrete store handle, shuts down its replication runtime, and then explicitly closes the SQLite store on both success and error cleanup paths.
+- Represent the transferable pool resource as one private SqliteStorePool containing the connection pool and the sole AtomicU8, backed by a matching repr(u8) SqliteStoreState enum with Open, Closing, and Closed variants. Move the complete resource from the provisioner into the activated store; both public close methods delegate to it.
+- Use Open to accept new work, Closing to reject newly polled work while connection draining remains incomplete, and Closed only after draining completes. The lifecycle remains monotonic Open-to-Closing-to-Closed.
+- Do not assign irrevocable close-future ownership to the Open-to-Closing winner. SQLx documents concurrent close calls as safe, so callers observing either Open or Closing await the same underlying closure and any completing caller publishes Closed. This lets a later caller finish after an earlier close future is cancelled without a timeout or state reversal.
+- Treat a close call after Closed as an idempotent success. Remove the obsolete concurrent-close error because concurrent callers now wait for completed closure.
+- Check that the lifecycle is Open inside every returned SQLite operation future immediately before cached access, connection acquisition, or transaction creation. Return a classified concrete store error when shutdown has started. Work already past the check may finish; connection closure waits for checked-out connections.
+- In debug builds, SqliteReplicationStore Drop asserts that lifecycle reached Closed. A cancelled close remains Closing until another caller completes it and therefore still exposes missing orderly shutdown.
+- Apply the strict debug-drop assertion to the activated store, not the provisioner, so ownership transfer and construction failures remain straightforward.
+- Add one public generic SQLite test owner in flotsync_replication::test_support. It drops the retained test value first and then closes its concrete store with the bounded test wait, replacing duplicated delivery-security, security-store, runtime-fixture, SQLite-test, and checklist-test wrappers.
+- Build same-sized runtime fixture arrays by zipping the two [...; N] inputs and collecting back to [...; N] with the prototyped collect_array shape instead of manually advancing an index.
+- Preserve application failures during cleanup: runtime-load errors remain primary while close failures are logged; normal shutdown always attempts run, runtime shutdown, and store closure, returns the earliest failure in that order, and logs every secondary failure.
 
 Validation
 
 - Cover successful explicitly-bound connection establishment and data exchange through the Windows monitor.
 - Cover deterministic connection-initiation failures reporting ConnectFailed without relying on a released local listener producing an immediate refusal.
 - Cover ordinary local_addr None connections continuing to use Mio without scheduled checks.
-- Cover monitored connection cancellation and restoration of the normal poll timeout.
-- Cover timeout clamping and unrelated early wake-ups without deadline starvation.
-- Run focused TCP tests repeatedly on Windows, then the complete serial flotsync_io suite, netcat smoke tests, formatting, and pedantic Clippy.
-- Run the Windows workspace test path. Once it is clean, remove cache-on-failure and its TODO from .github/workflows/platforms.yml and validate the workflow configuration.
+- Cover monitored connection cancellation, timeout clamping, unrelated early wake-ups, and restoration of the normal poll timeout.
+- Cover the SQLite lifecycle state transitions, completed-close idempotence, concurrent callers waiting for the same closure, cancellation recovery by a later caller, poll-time operation rejection after shutdown starts, missing close detection in debug builds, and provisioner closure.
+- Update SQLite store users and shared fixtures to perform explicit orderly closure, with the replicated checklist covering runtime-before-store shutdown ordering even when its REPL returns an error.
+- Re-run the focused Windows SQLite reopen test, SQLite and checklist suites, complete Windows workspace tests, Unix CI, formatting, and pedantic Clippy.
+- Once the full platform path is clean, remove cache-on-failure and its TODO from .github/workflows/platforms.yml and validate the workflow configuration.
 
 Constraints
 
-- Keep the shared connection-completion state transition platform-neutral.
+- Keep the shared TCP connection-completion state transition platform-neutral.
 - Preserve the socket broker requirement that tests declare and reserve their complete socket set before execution.
 - Avoid a Mio fork or unsupported Mio poll configuration.
-- Expected implementation size remains below 1000 LOC."""
+- Keep SQLite lifecycle ownership concrete and application-controlled rather than coupling generic replication runtimes to a selected backend.
+"""
 status = "in-progress"
 status_reason = "in review"
 type = "task"
 priority = 1
 assignee = "Codex"
 created_at = "2026-07-26T17:11:09.401951Z"
-updated_at = "2026-08-14T15:18:14.6426374Z"
+updated_at = "2026-08-15T13:36:58.7505964Z"
 
 [[links]]
 target = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
@@ -96,3 +117,21 @@ id = "01a000da-3172-7143-abdf-1352e7970943"
 author = "Codex"
 body = "PR #35's Linux Clippy job found that the common connect-completion abstraction left Windows-only variants dead on portable targets and modelled the portable monitor as a unit struct whose Default construction triggers a lint. Kept the shared state-machine shape, added narrowly target-specific dead-code allowances with reasons, and made the portable zero-sized monitor a braced struct. The exact flotsync_io all-targets no-deps pedantic Clippy target and serial tests pass locally."
 created_at = "2026-08-14T15:18:14.6426374Z"
+
+[[comments]]
+id = "01a0053f-3569-7812-a33d-864e6f320560"
+author = "Codex"
+body = "Windows CI at the correct PR head passed the TCP/netcat paths and exposed a separate SQLite file-cleanup failure. Review aligned on application-owned orderly closure: concrete SQLite store/provisioner close APIs, checklist runtime-before-store shutdown, and one AtomicU8-backed Open/Closing/Closed lifecycle. Only the Open-to-Closing winner drains the SQLx pool; Closed is stored after completion, post-shutdown operations return classified errors, and debug Drop requires completed closure on activated stores."
+created_at = "2026-08-15T11:47:03.6576664Z"
+
+[[comments]]
+id = "01a00595-7cf2-7913-8d4a-d421da7e4929"
+author = "Codex"
+body = "Review plan agreed: couple the pool and sole AtomicU8 in a transferable private SqliteStorePool; retain Open/Closing/Closed for work gating and completed-drain enforcement; let any close caller await the documented concurrent-safe pool closure so cancellation is recoverable; move checks to future poll time; centralise self-closing test ownership; use prototyped const-array zip/collect; and preserve primary checklist errors while logging cleanup failures."
+created_at = "2026-08-15T13:21:18.0663573Z"
+
+[[comments]]
+id = "01a005a3-d77e-74e2-a877-7077308a4b27"
+author = "Codex"
+body = "Second review implementation complete: centralised SQLite pool/state in SqliteStorePool; close callers can recover from cancellation while lifecycle remains Open -> Closing -> Closed; operation checks happen at poll time; public docs avoid SQLx; duplicated test owners use SqliteStoreTestOwner; const-generic runtime arrays use the prototyped zip/collect_array shape; checklist shutdown preserves the earliest error and logs later failures. Validation: 39 focused SQLite tests, 304 replication tests, 69 pre-existing checklist tests plus 3 new shutdown-precedence tests, diff check, and all-target pedantic Clippy completed (pre-existing warnings only)."
+created_at = "2026-08-15T13:36:58.7505964Z"

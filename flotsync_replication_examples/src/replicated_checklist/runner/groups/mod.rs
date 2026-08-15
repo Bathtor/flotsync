@@ -807,6 +807,7 @@ pub mod test_support {
         current_slice_placeholder_group_security_material_with_key_id,
         providers::VecRowProvider,
         test_support::{
+            SqliteStoreTestOwner,
             provision_test_security,
             provisioned_sqlite_store_with_schemas,
             test_public_member_keys,
@@ -840,6 +841,8 @@ pub mod test_support {
         pub read_token: ReadToken,
         pub changes: Vec<RowChange>,
     }
+
+    pub type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
 
     impl GroupInvitationResponder for RecordingInvitationResponder {
         fn accept(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send>> {
@@ -926,7 +929,7 @@ pub mod test_support {
         member: &MemberIdentity,
         group_ids: impl IntoIterator<Item = GroupId>,
     ) -> (
-        Arc<SqliteReplicationStore>,
+        TestSqliteStore,
         Arc<dyn ReplicationApi>,
         Arc<ChecklistListener>,
         ChecklistListenerReceivers,
@@ -942,7 +945,7 @@ pub mod test_support {
         member: &MemberIdentity,
         groups: impl IntoIterator<Item = ReplicationGroupRecord>,
     ) -> (
-        Arc<SqliteReplicationStore>,
+        TestSqliteStore,
         Arc<dyn ReplicationApi>,
         Arc<ChecklistListener>,
         ChecklistListenerReceivers,
@@ -978,7 +981,12 @@ pub mod test_support {
             "",
         ))
         .expect("test runtime should load");
-        (store, runtime, listener, listener_receivers)
+        (
+            SqliteStoreTestOwner::from_store(store),
+            runtime,
+            listener,
+            listener_receivers,
+        )
     }
 
     /// Build one test group with the supplied display name.

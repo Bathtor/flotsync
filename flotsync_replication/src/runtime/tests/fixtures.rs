@@ -1,6 +1,10 @@
 //! Shared runtime-test fixtures and assertions.
 
 use super::*;
+use itertools::Itertools;
+
+pub(super) type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
+pub(super) type TestDeliveryRuntimeHost = SqliteStoreTestOwner<DeliveryRuntimeHost>;
 
 pub(super) fn docs_dataset_id() -> DatasetId {
     DatasetId::try_new("docs").expect("dataset id should be valid")
@@ -140,7 +144,7 @@ where
     let store: Arc<dyn ReplicationStore> = store;
     wait_for_test_reply(load_test_delivery_security(
         app_probe_id(),
-        store,
+        store.clone(),
         local_member,
     ))
     .expect("runtime security state should load")
@@ -207,7 +211,7 @@ pub(super) fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -
 pub(super) fn sqlite_store_with_schemas<I, S>(
     local_member: MemberIdentity,
     schemas: I,
-) -> Arc<SqliteReplicationStore>
+) -> TestSqliteStore
 where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
@@ -225,10 +229,10 @@ where
     .expect("local test identity should provision");
     let store = wait_for_test_future(provisioner.into_replication_store())
         .expect("provisioned store should activate");
-    Arc::new(store)
+    SqliteStoreTestOwner::from_store(Arc::new(store))
 }
 
-pub(super) fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
+pub(super) fn sqlite_store(local_member: MemberIdentity) -> TestSqliteStore {
     sqlite_store_with_schemas(
         local_member,
         std::iter::empty::<(DatasetId, SchemaSource)>(),
@@ -439,7 +443,8 @@ where
         local_member,
         runtime,
         listener,
-        store,
+        store: store.clone(),
+        sqlite_owner: store,
     }
 }
 
@@ -622,21 +627,23 @@ pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
         provision_test_security(store.as_ref(), local_member, trusted_members);
     }
 
-    let fixtures = std::array::from_fn(|local_index| {
-        let (application_id, local_member) = &entries[local_index];
-        let listener = Arc::new(ListenerStub::default());
-        let runtime = load_runtime_with_parts(
-            application_id.clone(),
-            stores[local_index].clone(),
-            listener.clone(),
-        );
-        RuntimeFixture {
-            local_member: local_member.clone(),
-            runtime,
-            listener,
-            store: stores[local_index].clone(),
-        }
-    });
+    let fixtures = entries
+        .iter()
+        .zip(stores)
+        .map(|((application_id, local_member), store)| {
+            let listener = Arc::new(ListenerStub::default());
+            let runtime =
+                load_runtime_with_parts(application_id.clone(), store.clone(), listener.clone());
+            RuntimeFixture {
+                local_member: local_member.clone(),
+                runtime,
+                listener,
+                store: store.clone(),
+                sqlite_owner: store,
+            }
+        })
+        .collect_array()
+        .expect("entry and store arrays should retain their shared const-generic length");
     for (local_index, fixture) in fixtures.iter().enumerate() {
         let mut watches = Vec::with_capacity(N.saturating_sub(1));
         for (peer_index, peer_fixture) in fixtures.iter().enumerate() {
@@ -656,14 +663,14 @@ pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
     (endpoint_lease, fixtures)
 }
 
-pub(super) fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
-    let store = sqlite_store(local_member.clone());
+pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHost {
+    let store = provisioned_sqlite_store(local_member);
     provision_test_security(store.as_ref(), local_member, []);
     let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
     let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
         local_member,
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         security,
@@ -671,7 +678,7 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
     ))
     .expect("host should start");
     host.wait_for_runtime_startup();
-    host
+    SqliteStoreTestOwner::new(host, store)
 }
 
 pub(super) fn load_runtime_with_parts<S>(

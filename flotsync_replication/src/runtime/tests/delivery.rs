@@ -112,7 +112,7 @@ fn partial_update_batch_retry_narrows_remaining_need() {
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
-        alice_store,
+        alice_store.clone(),
         alice_listener,
         r"
         [flotsync.replication.runtime.catch-up]
@@ -884,16 +884,14 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let RuntimeFixture {
-        runtime: bob_runtime,
-        listener: bob_listener,
-        store: bob_store,
-        ..
-    } = load_runtime_fixture(
+    let bob_fixture = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
         [(dataset_id.clone(), schema)],
     );
+    let bob_runtime = bob_fixture.runtime.clone();
+    let bob_listener = bob_fixture.listener.clone();
+    let bob_store = bob_fixture.store.clone();
     let group_id = GroupId(Uuid::from_u128(24));
     bob_runtime
         .install_group_for_test(
@@ -1452,7 +1450,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         bob_member.clone(),
         [(dataset_id.clone(), title_schema_static())],
     );
-    let bob_runtime = bob_runtime.runtime;
+    let bob_runtime = bob_runtime.runtime.clone();
     let group_id = GroupId(Uuid::from_u128(24));
     bob_runtime
         .install_group_for_test(

@@ -26,7 +26,7 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
         application_id,
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         security,
@@ -44,7 +44,7 @@ fn runtime_shutdown_is_graceful_idempotent_and_marks_runtime_unavailable() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down gracefully");
     wait_for_test_reply(runtime.shutdown()).expect("second shutdown should be a no-op");
@@ -59,7 +59,7 @@ fn diagnostics_share_the_runtime_allocation_and_lifecycle() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
     let runtime_api: Arc<dyn ReplicationApi> = runtime.clone();
 
     let diagnostics = runtime_api.diagnostics();
@@ -85,7 +85,7 @@ fn diagnostics_arc_keeps_the_concrete_runtime_alive() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
     let runtime_weak = Arc::downgrade(&runtime);
     let diagnostics = runtime.diagnostics();
 
@@ -103,7 +103,7 @@ fn dropping_runtime_inside_test_executor_does_not_reenter_local_pool() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
     wait_for_test_future(async move {
         drop(runtime);
@@ -130,12 +130,12 @@ fn load_replication_runtime_reports_unsupported_identity_without_private_keys() 
     let application_id = app_probe_id();
     let inner_store = sqlite_store(alice_member());
     provision_test_security(inner_store.as_ref(), &alice_member(), []);
-    let store = Arc::new(FailingStore::new(inner_store).with_hidden_local_private_keys());
+    let store = Arc::new(FailingStore::new(inner_store.clone()).with_hidden_local_private_keys());
     let listener = Arc::new(ListenerStub::default());
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         test_replication_security_secrets(),
@@ -169,7 +169,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         wrong_security,
@@ -201,7 +201,7 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         test_replication_security_secrets(),
@@ -237,7 +237,7 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         test_replication_security_secrets(),
@@ -274,7 +274,7 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        store,
+        store.clone(),
         listener,
         ReplicationConfig::default(),
         test_replication_security_secrets(),
@@ -403,7 +403,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
-        store,
+        store.clone(),
         listener,
         runtime_config_toml.as_str(),
     );
@@ -424,7 +424,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     persist_group_membership_for_member(bob_store.as_ref(), group_id, members.clone(), 1);
     let bob_listener = Arc::new(ListenerStub::default());
-    let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store, bob_listener);
+    let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store.clone(), bob_listener);
     wait_for_group_install(&bob_runtime, group_id);
 
     let alice_store = sqlite_store(alice_member.clone());
@@ -437,7 +437,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     );
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
-        alice_store,
+        alice_store.clone(),
         alice_listener,
         runtime_config_toml.as_str(),
     );
@@ -460,7 +460,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
-            store,
+            store.clone(),
             listener,
             ReplicationConfig::default(),
             security,
@@ -485,7 +485,7 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
-            store,
+            store.clone(),
             listener,
             ReplicationConfig::default(),
             security,

@@ -538,6 +538,7 @@ mod tests {
             wire::{group_id_from_wire, message_id_from_wire},
         },
         test_support::{
+            SqliteStoreTestOwner,
             TestGroupMemberships,
             load_test_delivery_security,
             provision_test_security,
@@ -576,6 +577,8 @@ mod tests {
         sync::Arc,
         time::Duration,
     };
+
+    type TestDeliverySecurity = SqliteStoreTestOwner<DeliverySecurity>;
 
     struct FullStackHarness {
         core: TransportHarnessCore,
@@ -926,6 +929,7 @@ mod tests {
                 .system()
                 .kill_notify(self.ingress.clone())
                 .wait_timeout(WAIT_TIMEOUT);
+            block_on(self.security_store.close()).expect("group-broadcast test store should close");
         }
     }
 
@@ -1405,7 +1409,7 @@ mod tests {
     fn test_group_security(
         local_member: &MemberIdentity,
         group_memberships: &dyn GroupMemberships,
-    ) -> DeliverySecurity {
+    ) -> TestDeliverySecurity {
         let trusted_members = trusted_members_for(local_member, group_memberships);
         test_group_security_with_trusted_members(local_member, group_memberships, trusted_members)
     }
@@ -1414,14 +1418,14 @@ mod tests {
         local_member: &MemberIdentity,
         group_memberships: &dyn GroupMemberships,
         trusted_members: HashSet<MemberIdentity>,
-    ) -> DeliverySecurity {
-        let (security, _) = test_group_security_with_trusted_members_and_store(
+    ) -> TestDeliverySecurity {
+        let (security, store) = test_group_security_with_trusted_members_and_store(
             local_member,
             group_memberships,
             trusted_members,
             &HashMap::new(),
         );
-        security
+        SqliteStoreTestOwner::new(security, store)
     }
 
     /// Build delivery security plus its backing store so tests can mutate evidence later.

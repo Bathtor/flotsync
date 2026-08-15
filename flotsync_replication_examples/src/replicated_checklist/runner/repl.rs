@@ -17,7 +17,7 @@ use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
     let config = load_checklist_config(config_path)?;
-    let (config, local_member, listener_receivers, replication) = {
+    let (config, local_member, listener_receivers, replication, store) = {
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut output = io::stdout();
@@ -29,17 +29,48 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
         };
 
         let (listener, listener_receivers) = ChecklistListener::pair();
-        let replication = load_checklist_runtime(&setup, listener)
-            .await
-            .context(repl_error::LoadRuntimeSnafu)?;
+        let replication = match load_checklist_runtime(&setup, listener).await {
+            Ok(replication) => replication,
+            Err(source) => {
+                if let Err(error) = setup.store.close().await.context(repl_error::StoreSnafu) {
+                    log::error!(
+                        "SQLite store closure also failed after replication runtime loading failed: {error}"
+                    );
+                }
+                return Err(source).context(repl_error::LoadRuntimeSnafu);
+            }
+        };
         (
             setup.config,
             setup.local_member,
             listener_receivers,
             replication,
+            setup.store,
         )
     };
 
+    let run_result = run_loaded_checklist_repl(
+        config,
+        local_member,
+        listener_receivers,
+        replication.clone(),
+    )
+    .await;
+    let shutdown_result = replication
+        .shutdown()
+        .await
+        .context(repl_error::ReplicationSnafu);
+    let close_result = store.close().await.context(repl_error::StoreSnafu);
+    preserve_primary_shutdown_error(run_result, shutdown_result, close_result)
+}
+
+/// Run the interactive checklist after every application-owned resource has loaded.
+async fn run_loaded_checklist_repl(
+    config: ChecklistAppConfig,
+    local_member: MemberIdentity,
+    listener_receivers: ChecklistListenerReceivers,
+    replication: Arc<dyn ReplicationApi>,
+) -> Result<(), ReplicatedChecklistError> {
     let mut working_set = ChecklistWorkingSet::new();
     let group_state = replication
         .group_state()
@@ -59,10 +90,31 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
         listener_receivers,
         session,
     );
-    let run_result = repl.run().await;
-    let shutdown_result = repl.shutdown().await;
-    run_result?;
-    shutdown_result
+    repl.run().await
+}
+
+/// Return the earliest application failure and log every later cleanup failure.
+fn preserve_primary_shutdown_error(
+    run_result: Result<(), ReplicatedChecklistError>,
+    shutdown_result: Result<(), ReplicatedChecklistError>,
+    close_result: Result<(), ReplicatedChecklistError>,
+) -> Result<(), ReplicatedChecklistError> {
+    let results = [
+        ("checklist run", run_result),
+        ("replication runtime shutdown", shutdown_result),
+        ("SQLite store closure", close_result),
+    ];
+    let mut primary_error = None;
+    for (phase, result) in results {
+        if let Err(error) = result {
+            if primary_error.is_none() {
+                primary_error = Some(error);
+            } else {
+                log::error!("Secondary failure during {phase}: {error}");
+            }
+        }
+    }
+    primary_error.map_or(Ok(()), Err)
 }
 
 /// Runtime listener that forwards replication events into the interactive REPL queues.
@@ -781,13 +833,6 @@ impl ChecklistRepl {
         }
     }
 
-    async fn shutdown(&self) -> Result<(), ReplicatedChecklistError> {
-        self.replication
-            .shutdown()
-            .await
-            .context(repl_error::ReplicationSnafu)
-    }
-
     fn print_me(&self) -> Result<(), ReplicatedChecklistError> {
         let groups = self.group_state()?;
         println!("member: {}", self.local_member);
@@ -1019,6 +1064,55 @@ mod tests {
     use flotsync_security::{LocalStoreSecretError, install_local_store_secret_test_store};
     use std::io::Cursor;
 
+    #[test]
+    fn shutdown_error_preservation_returns_the_earliest_failure() {
+        let result = preserve_primary_shutdown_error(
+            Err(ReplicatedChecklistError::ListenerQueueClosed),
+            Err(ReplicatedChecklistError::NoDefaultGroup),
+            Err(ReplicatedChecklistError::UnknownGroup {
+                selector: "closed store".to_owned(),
+            }),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ReplicatedChecklistError::ListenerQueueClosed)
+        ));
+    }
+
+    #[test]
+    fn shutdown_error_preservation_falls_through_to_cleanup_failures() {
+        let shutdown_result = preserve_primary_shutdown_error(
+            Ok(()),
+            Err(ReplicatedChecklistError::NoDefaultGroup),
+            Err(ReplicatedChecklistError::UnknownGroup {
+                selector: "closed store".to_owned(),
+            }),
+        );
+        assert!(matches!(
+            shutdown_result,
+            Err(ReplicatedChecklistError::NoDefaultGroup)
+        ));
+
+        let close_result = preserve_primary_shutdown_error(
+            Ok(()),
+            Ok(()),
+            Err(ReplicatedChecklistError::UnknownGroup {
+                selector: "closed store".to_owned(),
+            }),
+        );
+        assert!(matches!(
+            close_result,
+            Err(ReplicatedChecklistError::UnknownGroup { selector })
+                if selector == "closed store"
+        ));
+    }
+
+    #[test]
+    fn shutdown_error_preservation_succeeds_when_every_phase_succeeds() {
+        assert!(preserve_primary_shutdown_error(Ok(()), Ok(()), Ok(())).is_ok());
+    }
+
     /// Build one isolated checklist config for startup recovery tests.
     fn startup_test_config(test_name: &str) -> (PathBuf, ChecklistAppConfig) {
         let test_id = Uuid::new_v4();
@@ -1118,6 +1212,7 @@ mod tests {
         };
         assert_eq!(public_keys.key_id.member_id, member_id);
 
+        block_on(setup.store.close()).expect("test SQLite store should close");
         drop(setup);
         std::fs::remove_dir_all(test_root).expect("test directory should be removed");
     }
@@ -1169,6 +1264,7 @@ mod tests {
             format!("{expected_prompt} [y/N] local member identity> ")
         );
 
+        block_on(setup.store.close()).expect("test SQLite store should close");
         drop(setup);
         std::fs::remove_dir_all(test_root).expect("test directory should be removed");
     }
@@ -1186,6 +1282,7 @@ mod tests {
             first_setup.local_member,
             MemberIdentity::from_array(["alice"])
         );
+        block_on(first_setup.store.close()).expect("first test SQLite store should close");
         drop(first_setup);
 
         let mut input = Cursor::new([]);
@@ -1200,6 +1297,7 @@ mod tests {
         );
         assert_eq!(output, Vec::<u8>::new());
 
+        block_on(second_setup.store.close()).expect("second test SQLite store should close");
         drop(second_setup);
         std::fs::remove_dir_all(test_root).expect("test directory should be removed");
     }

@@ -443,7 +443,11 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
 fn membership_change_default_rejects_nil_group_id() {
     let alice_member = alice_member();
     let store = sqlite_store_with_schemas(alice_member, Vec::<(DatasetId, SchemaSource)>::new());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, Arc::new(ListenerStub::default()));
+    let runtime = load_runtime_with_parts(
+        app_alice_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
 
     let error = wait_for_test_reply(
         runtime.change_group_membership(ChangeGroupMembershipRequest::default()),
@@ -486,7 +490,7 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
     let snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
         group_id,

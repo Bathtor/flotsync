@@ -77,7 +77,7 @@ use flotsync_messages::{
 };
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
-use futures_util::{FutureExt, future};
+use futures_util::FutureExt;
 use log::warn;
 use snafu::prelude::*;
 use sqlx::{
@@ -95,7 +95,10 @@ use std::{
     num::NonZeroUsize,
     path::Path,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -115,7 +118,7 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// local identity material has been provisioned.
 pub struct SqliteReplicationStoreProvisioner {
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
-    pool: Arc<SqlitePool>,
+    pool: SqliteStorePool,
 }
 
 impl SqliteReplicationStoreProvisioner {
@@ -146,6 +149,18 @@ impl SqliteReplicationStoreProvisioner {
     pub async fn open_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_file_with_schema_sources(path, std::iter::empty::<(DatasetId, SchemaSource)>())
             .await
+    }
+
+    /// Close every SQLite connection before releasing this provisioner.
+    ///
+    /// Await this operation before dropping a provisioner to ensure its connections have closed.
+    /// Concurrent calls wait for the same closure, and calls after completed closure succeed.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub async fn close(&self) -> Result<(), StoreError> {
+        self.pool.close().await
     }
 
     /// Create one empty in-memory provisioner with the supplied application schemas.
@@ -276,16 +291,18 @@ impl SqliteReplicationStoreProvisioner {
 
         Ok(Self {
             schema_sources: Arc::new(schema_sources),
-            pool: Arc::new(pool),
+            pool: SqliteStorePool::new(pool),
         })
     }
 }
 
 impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
     fn local_member_identity(&self) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         async move {
+            pool.ensure_open()?;
             let mut connection = pool
+                .connections
                 .acquire()
                 .await
                 .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
@@ -297,10 +314,12 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
     fn begin_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         let schema_sources = self.schema_sources.clone();
         async move {
+            pool.ensure_open()?;
             let connection = pool
+                .connections
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
@@ -315,31 +334,63 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
 }
 
 /// SQLite-backed [`ReplicationStore`] with exactly one authoritative local identity.
+///
+/// # Shutdown
+///
+/// Applications must stop every runtime and other store user, then await [`Self::close`] before
+/// dropping the final handle. In debug builds, dropping an activated store without completing
+/// this sequence is a programming error.
 pub struct SqliteReplicationStore {
     local_member: MemberIdentity,
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
-    pool: Arc<SqlitePool>,
+    pool: SqliteStorePool,
+}
+
+impl SqliteReplicationStore {
+    /// Close every SQLite connection during orderly application shutdown.
+    ///
+    /// The application must first stop every runtime and other user of this store. Concurrent calls
+    /// wait for the same closure, and calls after completed closure succeed. In debug builds,
+    /// dropping an activated store before closure completes is a programming error.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub async fn close(&self) -> Result<(), StoreError> {
+        self.pool.close().await
+    }
 }
 
 impl ReplicationStore for SqliteReplicationStore {
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>> {
-        future::ok(self.local_member.clone()).boxed()
+        async move {
+            self.pool.ensure_open()?;
+            Ok(self.local_member.clone())
+        }
+        .boxed()
     }
 
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
     ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
-        future::ok(self.schema_sources.get(dataset_id).cloned()).boxed()
+        let schema_source = self.schema_sources.get(dataset_id).cloned();
+        async move {
+            self.pool.ensure_open()?;
+            Ok(schema_source)
+        }
+        .boxed()
     }
 
     fn begin_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         let schema_sources = self.schema_sources.clone();
         async move {
+            pool.ensure_open()?;
             let connection = pool
+                .connections
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
@@ -355,10 +406,12 @@ impl ReplicationStore for SqliteReplicationStore {
     fn begin_read_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         let schema_sources = self.schema_sources.clone();
         async move {
+            pool.ensure_open()?;
             let connection = pool
+                .connections
                 .begin_with("BEGIN")
                 .await
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
@@ -376,9 +429,11 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     fn load_reliable_delivery_work_metadata(
         &self,
     ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         async move {
+            pool.ensure_open()?;
             let mut connection = pool
+                .connections
                 .acquire()
                 .await
                 .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
@@ -391,9 +446,11 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
         &self,
         message_id: crate::delivery::shared::MessageId,
     ) -> BoxFuture<'_, Result<Option<StoredReliableDeliveryWork>, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         async move {
+            pool.ensure_open()?;
             let mut connection = pool
+                .connections
                 .acquire()
                 .await
                 .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
@@ -406,9 +463,11 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
         &self,
         work: StoredReliableDeliveryWork,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         async move {
+            pool.ensure_open()?;
             let mut connection = pool
+                .connections
                 .acquire()
                 .await
                 .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
@@ -421,15 +480,104 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
         &self,
         message_id: crate::delivery::shared::MessageId,
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
-        let pool = self.pool.clone();
+        let pool = &self.pool;
         async move {
+            pool.ensure_open()?;
             let mut connection = pool
+                .connections
                 .acquire()
                 .await
                 .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
             remove_reliable_delivery_work(&mut connection, message_id).await
         }
         .boxed()
+    }
+}
+
+impl Drop for SqliteReplicationStore {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.pool.state(),
+            SqliteStoreState::Closed,
+            "SqliteReplicationStore must complete explicit close before drop"
+        );
+    }
+}
+
+/// Transferable owner of one SQLite connection pool and its orderly-shutdown state.
+struct SqliteStorePool {
+    connections: Arc<SqlitePool>,
+    /// Monotonic application-owned state shared by every activated-store `Arc` handle.
+    state: AtomicU8,
+}
+
+impl SqliteStorePool {
+    /// Build one open pool resource.
+    fn new(connections: SqlitePool) -> Self {
+        Self {
+            connections: Arc::new(connections),
+            state: AtomicU8::new(SqliteStoreState::Open as u8),
+        }
+    }
+
+    /// Close every connection and publish completed closure.
+    async fn close(&self) -> Result<(), StoreError> {
+        let state = match self.state.compare_exchange(
+            SqliteStoreState::Open as u8,
+            SqliteStoreState::Closing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => SqliteStoreState::Closing,
+            Err(value) => SqliteStoreState::from_atomic(value),
+        };
+        match state {
+            SqliteStoreState::Open => {
+                panic!("SQLite store state compare-exchange reported an unchanged open state")
+            }
+            SqliteStoreState::Closing => {
+                self.connections.close().await;
+                self.state
+                    .store(SqliteStoreState::Closed as u8, Ordering::Release);
+                Ok(())
+            }
+            SqliteStoreState::Closed => Ok(()),
+        }
+    }
+
+    /// Reject a new operation once orderly shutdown has started.
+    fn ensure_open(&self) -> Result<(), StoreError> {
+        ensure!(self.state() == SqliteStoreState::Open, ClosedSnafu);
+        Ok(())
+    }
+
+    /// Load and decode the state value written only by this type.
+    fn state(&self) -> SqliteStoreState {
+        SqliteStoreState::from_atomic(self.state.load(Ordering::Acquire))
+    }
+}
+
+/// Monotonic lifecycle for one concrete SQLite pool owner.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SqliteStoreState {
+    /// The store accepts new operations.
+    Open = 0,
+    /// New work is rejected while existing connections finish closing.
+    Closing = 1,
+    /// Every connection completed orderly closure.
+    Closed = 2,
+}
+
+impl SqliteStoreState {
+    /// Decode one value previously stored in the state atomic.
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            0 => Self::Open,
+            1 => Self::Closing,
+            2 => Self::Closed,
+            _ => panic!("invalid SQLite store state value {value}"),
+        }
     }
 }
 
