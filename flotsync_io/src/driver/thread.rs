@@ -13,7 +13,7 @@ use crate::{
 use mio::{Events, Poll};
 use slog::{debug, info, warn};
 use snafu::ResultExt;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 #[allow(
     clippy::needless_pass_by_value,
@@ -55,8 +55,10 @@ pub(super) fn run_driver_thread(
             state.test_state.poll_iterations += 1;
         }
 
-        poll.poll(&mut events, config.poll_timeout)
+        let poll_timeout = state.constrain_poll_timeout(config.poll_timeout, Instant::now());
+        poll.poll(&mut events, poll_timeout)
             .context(DriverPollSnafu)?;
+        state.run_due_work(Instant::now(), poll.registry(), event_sink.as_ref())?;
 
         'event_loop: for event in &events {
             if event.token() == WAKE_TOKEN {

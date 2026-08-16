@@ -72,6 +72,7 @@ use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
+    ops::{Deref, DerefMut},
     sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
@@ -257,6 +258,62 @@ where
         future,
         "timed out waiting for test reply",
     )
+}
+
+/// Own a test value together with the concrete SQLite store that backs it.
+///
+/// The retained value is dropped before the store is closed, so passive store users such as
+/// security facades cannot outlive their backing connections. Fixtures requiring an asynchronous
+/// shutdown step before store closure should keep an explicit `Drop` implementation instead.
+pub struct SqliteStoreTestOwner<T> {
+    /// Retained value, present until this owner starts dropping.
+    value: Option<T>,
+    /// Concrete store closed after the retained value has been released.
+    store: Arc<SqliteReplicationStore>,
+}
+
+impl<T> SqliteStoreTestOwner<T> {
+    /// Retain one test value and close its backing store at teardown.
+    #[must_use]
+    pub fn new(value: T, store: Arc<SqliteReplicationStore>) -> Self {
+        Self {
+            value: Some(value),
+            store,
+        }
+    }
+}
+
+impl SqliteStoreTestOwner<Arc<SqliteReplicationStore>> {
+    /// Own one concrete store directly and close it at teardown.
+    #[must_use]
+    pub fn from_store(store: Arc<SqliteReplicationStore>) -> Self {
+        Self::new(store.clone(), store)
+    }
+}
+
+impl<T> Deref for SqliteStoreTestOwner<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .as_ref()
+            .expect("SQLite test owner value should exist before drop")
+    }
+}
+
+impl<T> DerefMut for SqliteStoreTestOwner<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+            .as_mut()
+            .expect("SQLite test owner value should exist before drop")
+    }
+}
+
+impl<T> Drop for SqliteStoreTestOwner<T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        wait_for_test_future(self.store.close()).expect("test SQLite store should close");
+    }
 }
 
 /// Publish one set of row mutations and wait for the API reply.
@@ -760,6 +817,14 @@ impl RuntimeTestFixture {
         self.runtime
             .install_group_for_test(group_id, members)
             .expect("test group should install");
+    }
+}
+
+impl Drop for RuntimeTestFixture {
+    fn drop(&mut self) {
+        wait_for_test_reply(self.runtime.shutdown())
+            .expect("test replication runtime should shut down");
+        wait_for_test_future(self.store.close()).expect("test SQLite store should close");
     }
 }
 

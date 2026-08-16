@@ -927,6 +927,7 @@ impl Actor for CatchUpManagerComponent {
 mod tests {
     use super::*;
     use crate::{
+        SqliteReplicationStore,
         api::{
             DatasetId,
             DatasetUpdateRecord,
@@ -1044,7 +1045,7 @@ mod tests {
         let memberships = TestGroupMemberships::from_groups([(group_id, members)]).shared();
         let inner = provisioned_sqlite_store(&local_member);
         let store: Arc<dyn ReplicationStore> = Arc::new(
-            ControlledStore::failing_first_read_transaction(inner, classification),
+            ControlledStore::failing_first_read_transaction(inner.clone(), classification),
         );
         let manager =
             system.create(move || CatchUpManagerComponent::new(local_member, memberships, store));
@@ -1055,6 +1056,7 @@ mod tests {
             )
         });
         system.shutdown().wait().expect("Kompact shutdown");
+        wait_for_store_future(inner.close()).expect("catch-up test store should close");
         result
     }
 
@@ -1079,13 +1081,20 @@ mod tests {
     fn catch_up_manager_for_group(
         system: &KompactSystem,
         group_id: GroupId,
-    ) -> Arc<Component<CatchUpManagerComponent>> {
+    ) -> (
+        Arc<Component<CatchUpManagerComponent>>,
+        Arc<SqliteReplicationStore>,
+    ) {
         let local_member = local_member();
         let members = GroupMembers::from_ordered_members([local_member.clone(), remote_member()])
             .expect("test group members should build");
         let memberships = TestGroupMemberships::from_groups([(group_id, members)]).shared();
-        let store: Arc<dyn ReplicationStore> = provisioned_sqlite_store(&local_member);
-        system.create(move || CatchUpManagerComponent::new(local_member, memberships, store))
+        let store = provisioned_sqlite_store(&local_member);
+        let component_store: Arc<dyn ReplicationStore> = store.clone();
+        let manager = system.create(move || {
+            CatchUpManagerComponent::new(local_member, memberships, component_store)
+        });
+        (manager, store)
     }
 
     #[test]
@@ -1232,7 +1241,7 @@ mod tests {
     fn finalise_group_trims_existing_pending_need() {
         let group_id = GroupId(Uuid::from_u128(80_101));
         let system = build_test_kompact_system();
-        let manager = catch_up_manager_for_group(&system, group_id);
+        let (manager, store) = catch_up_manager_for_group(&system, group_id);
         let final_versions =
             VersionVector::Full(flotsync_core::versions::PureVersionVector::from([3, 0]));
 
@@ -1262,13 +1271,14 @@ mod tests {
             );
         });
         system.shutdown().wait().expect("Kompact shutdown");
+        wait_for_store_future(store.close()).expect("catch-up test store should close");
     }
 
     #[test]
     fn inbound_need_range_is_truncated_to_final_versions() {
         let group_id = GroupId(Uuid::from_u128(80_102));
         let system = build_test_kompact_system();
-        let manager = catch_up_manager_for_group(&system, group_id);
+        let (manager, store) = catch_up_manager_for_group(&system, group_id);
         let final_versions =
             VersionVector::Full(flotsync_core::versions::PureVersionVector::from([3, 0]));
 
@@ -1294,12 +1304,14 @@ mod tests {
             );
         });
         system.shutdown().wait().expect("Kompact shutdown");
+        wait_for_store_future(store.close()).expect("catch-up test store should close");
     }
 
     #[test]
     fn load_update_batch_honours_unlimited_batch_mode() {
         let group_id = GroupId(Uuid::from_u128(80_001));
-        let store: Arc<dyn ReplicationStore> = provisioned_sqlite_store(&local_member());
+        let sqlite_store = provisioned_sqlite_store(&local_member());
+        let store: Arc<dyn ReplicationStore> = sqlite_store.clone();
         persist_group_with_updates(&store, group_id, 20);
         let system = build_test_kompact_system();
         let logger = system.logger().clone();
@@ -1327,5 +1339,6 @@ mod tests {
             .map(|update| update.update_id.version)
             .collect::<Vec<_>>();
         assert_eq!(loaded_versions, (1..=20).collect::<Vec<_>>());
+        wait_for_store_future(sqlite_store.close()).expect("catch-up test store should close");
     }
 }

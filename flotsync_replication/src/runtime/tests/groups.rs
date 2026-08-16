@@ -51,7 +51,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
     let row_id = test_row_id(group_id, dataset_id, 32);
 
     wait_for_group_install(&runtime, group_id);
@@ -92,7 +92,11 @@ fn group_state_retains_one_coherent_view_across_publications() {
         alice_member.clone(),
         [(docs_dataset_id(), title_schema_static())],
     );
-    let runtime = load_runtime_with_parts(app_alice_id(), store, Arc::new(ListenerStub::default()));
+    let runtime = load_runtime_with_parts(
+        app_alice_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
     let before_creation = runtime
         .group_state()
         .expect("initial group state should be available");
@@ -412,7 +416,7 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
     let alice_listener = Arc::new(ListenerStub::default());
     let bob_listener = Arc::new(ListenerStub::default());
     let alice_runtime =
-        load_runtime_with_parts(app_alice_id(), alice_store, alice_listener.clone());
+        load_runtime_with_parts(app_alice_id(), alice_store.clone(), alice_listener.clone());
     let auto_accept_config = ReplicationConfig {
         group_invitation_policy: GroupInvitationPolicy {
             creation: PolicyDecision::AutoAccept,
@@ -836,7 +840,7 @@ fn prepare_group_setup_for_members(
         .filter(|member| *member != *proposer)
         .collect::<Vec<_>>();
     provision_test_security(proposer_store.as_ref(), proposer, peers);
-    let proposer_security = load_test_runtime_security(proposer_store, proposer);
+    let proposer_security = load_test_runtime_security(proposer_store.clone(), proposer);
     let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_setup(
         &proposer_security,
         members.len(),

@@ -14,6 +14,7 @@ use crate::{
 };
 use mio::Registry;
 use slog::{debug, error, info, warn};
+use std::time::{Duration, Instant};
 
 /// Commands passed across the control plane into the dedicated driver thread.
 #[derive(Debug)]
@@ -268,6 +269,25 @@ impl DriverRuntimeState {
             self.release_readiness(record.token);
         }
         Ok(())
+    }
+
+    /// Restricts the next driver poll to scheduled runtime work when necessary.
+    pub(super) fn constrain_poll_timeout(
+        &self,
+        configured: Option<Duration>,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.tcp.constrain_poll_timeout(configured, now)
+    }
+
+    /// Runs scheduled work that became due after the driver returned from polling.
+    pub(super) fn run_due_work(
+        &mut self,
+        now: Instant,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        self.tcp.probe_due_connects(now, registry, event_sink)
     }
 
     pub(super) fn resume_suspended_tcp_reads(

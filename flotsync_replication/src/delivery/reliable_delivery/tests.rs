@@ -5,6 +5,7 @@ use crate::{
     delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
     store::test_support::{ControlledStore, ReliableDeliveryLoadFault, classified_store_error},
     test_support::{
+        SqliteStoreTestOwner,
         TestGroupMemberships,
         load_test_delivery_security,
         provision_test_security,
@@ -56,6 +57,8 @@ const TEST_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Observation window used by negative ack tests to catch accidental async
 /// state transitions without sleeping a fixed one-shot delay.
 const REJECTED_ACK_OBSERVATION_WINDOW: Duration = Duration::from_millis(100);
+
+type TestDeliverySecurity = SqliteStoreTestOwner<DeliverySecurity>;
 
 // TODO(flotsync-h1z0): Replace this custom probe once generic testing
 // helpers can hand owned indication payloads such as processed handles to
@@ -151,6 +154,8 @@ impl Actor for ControlledRouteTransportComponent {
 struct FullStackHarness {
     core: TransportHarnessCore,
     store: Arc<crate::SqliteReplicationStore>,
+    /// Whether this harness represents the final owner of the shared application store.
+    close_store_on_drop: bool,
     ingress: Arc<Component<DeliveryIngressComponent>>,
     reliable: Arc<Component<ReliableDeliveryComponent>>,
     ingress_probe: Arc<Component<PortTesterComponent<TransportReliableDeliveryInboundPort>>>,
@@ -279,6 +284,7 @@ impl FullStackHarness {
         Self {
             core,
             store,
+            close_store_on_drop: true,
             ingress,
             reliable,
             ingress_probe,
@@ -288,6 +294,11 @@ impl FullStackHarness {
             client_rx,
             local_addr,
         }
+    }
+
+    /// Shut down this runtime while leaving its store open for a replacement runtime.
+    fn shutdown_for_restart(mut self) {
+        self.close_store_on_drop = false;
     }
 
     fn publish_direct_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
@@ -575,6 +586,9 @@ impl Drop for FullStackHarness {
             .system()
             .kill_notify(self.ingress.clone())
             .wait_timeout(WAIT_TIMEOUT);
+        if self.close_store_on_drop {
+            block_on(self.store.close()).expect("reliable-delivery test store should close");
+        }
     }
 }
 
@@ -585,8 +599,8 @@ struct RecipientAckScenario {
     bob: MemberIdentity,
     charlie: MemberIdentity,
     sender: FullStackHarness,
-    bob_security: DeliverySecurity,
-    charlie_security: DeliverySecurity,
+    bob_security: TestDeliverySecurity,
+    charlie_security: TestDeliverySecurity,
 }
 
 impl RecipientAckScenario {
@@ -768,8 +782,9 @@ fn test_delivery_security_and_store(
     (security, store)
 }
 
-fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
-    test_delivery_security_and_store(local_member).0
+fn test_delivery_security(local_member: &MemberIdentity) -> TestDeliverySecurity {
+    let (security, store) = test_delivery_security_and_store(local_member);
+    SqliteStoreTestOwner::new(security, store)
 }
 
 fn recipient_ack(
@@ -2062,7 +2077,7 @@ fn restart_restores_metadata_and_reuses_the_stored_envelope_after_route_discover
         b"restart envelope",
     ));
     let original_envelope = first_sender.wait_for_stored_envelope(message_id);
-    drop(first_sender);
+    first_sender.shutdown_for_restart();
 
     let observed_store = Arc::new(ControlledStore::new(sqlite_store.clone()));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = observed_store.clone();

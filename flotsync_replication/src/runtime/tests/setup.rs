@@ -115,7 +115,7 @@ fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multi
     ))
     .expect("alternate alice trust evidence should store");
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
-    let security = load_test_runtime_security(store, &bob_member);
+    let security = load_test_runtime_security(store.clone(), &bob_member);
     let bob_keys = test_public_keys(&bob_member);
     let payload = GroupSetupMessage::new(
         vec![alice_member.clone(), bob_member.clone()],
@@ -139,7 +139,7 @@ fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_perm
     let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, []);
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
-    let store_for_security: Arc<dyn ReplicationStore> = store;
+    let store_for_security: Arc<dyn ReplicationStore> = store.clone();
     let security_secrets = test_replication_security_secrets();
     let policy = TrustPolicy {
         replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
@@ -244,7 +244,7 @@ fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
         &alice_member,
         [bob_member.clone(), charlie_member.clone()],
     );
-    let security = load_test_runtime_security(store, &alice_member);
+    let security = load_test_runtime_security(store.clone(), &alice_member);
     let members = GroupMembers::from_ordered_members(vec![
         alice_member.clone(),
         bob_member.clone(),
@@ -275,7 +275,7 @@ fn bootstrap_preparation_inlines_bundles_at_configured_limit() {
     let bob_member = bob_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
-    let security = load_test_runtime_security(store, &alice_member);
+    let security = load_test_runtime_security(store.clone(), &alice_member);
     let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
         .expect("group members should build");
 

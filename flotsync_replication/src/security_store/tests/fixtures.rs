@@ -1,6 +1,7 @@
 //! Shared fixtures and assertion helpers for security-store tests.
 
 use super::*;
+use crate::test_support::SqliteStoreTestOwner;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -31,16 +32,18 @@ pub(super) fn sqlite_store() -> Arc<SqliteReplicationStore> {
     provisioned_sqlite_store(&local_member())
 }
 
-pub(super) fn security_store(store: Arc<SqliteReplicationStore>) -> SecurityStore {
+pub(super) type TestSecurityStore = SqliteStoreTestOwner<SecurityStore>;
+
+pub(super) fn security_store(store: Arc<SqliteReplicationStore>) -> TestSecurityStore {
     security_store_with_policy(store, TrustPolicy::default())
 }
 
 pub(super) fn security_store_with_policy(
     store: Arc<SqliteReplicationStore>,
     trust_policy: TrustPolicy,
-) -> SecurityStore {
-    let store: Arc<dyn ReplicationStore> = store;
-    SecurityStore::new(store, trust_policy)
+) -> TestSecurityStore {
+    let replication_store: Arc<dyn ReplicationStore> = store.clone();
+    SqliteStoreTestOwner::new(SecurityStore::new(replication_store, trust_policy), store)
 }
 
 pub(super) fn provision_member_public_keys(

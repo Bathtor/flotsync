@@ -476,6 +476,7 @@ mod tests {
         api::{MemberKeyTrustRequirement, ReplicationStore, TrustPolicy},
         codecs::messages::GroupSetupKey,
         test_support::{
+            SqliteStoreTestOwner,
             provision_test_security,
             provision_test_trusted_public_keys,
             provisioned_sqlite_store,
@@ -488,6 +489,8 @@ mod tests {
     use std::{future::Future, sync::Arc, time::Duration};
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    type TestDeliverySecurity = SqliteStoreTestOwner<DeliverySecurity>;
 
     fn wait_for_delivery_security_future<F>(future: F) -> F::Output
     where
@@ -538,26 +541,27 @@ mod tests {
         store: Arc<SqliteReplicationStore>,
         local_member: &MemberIdentity,
         trust_policy: TrustPolicy,
-    ) -> DeliverySecurity {
-        let store: Arc<dyn ReplicationStore> = store;
+    ) -> TestDeliverySecurity {
+        let replication_store: Arc<dyn ReplicationStore> = store.clone();
         let security_secrets = test_replication_security_secrets();
-        wait_for_delivery_security_future(DeliverySecurity::load(
-            SecurityStore::new(store, trust_policy),
+        let security = wait_for_delivery_security_future(DeliverySecurity::load(
+            SecurityStore::new(replication_store, trust_policy),
             local_member,
             Arc::clone(security_secrets.store_secret_key()),
             *security_secrets.store_secret_key_id(),
         ))
-        .expect("delivery security should load")
+        .expect("delivery security should load");
+        SqliteStoreTestOwner::new(security, store)
     }
 
     fn load_delivery_security(
         store: Arc<SqliteReplicationStore>,
         local_member: &MemberIdentity,
-    ) -> DeliverySecurity {
+    ) -> TestDeliverySecurity {
         load_delivery_security_with_policy(store, local_member, TrustPolicy::default())
     }
 
-    fn signing_security() -> DeliverySecurity {
+    fn signing_security() -> TestDeliverySecurity {
         let alice = alice_member();
         let store = sqlite_store(&alice);
         provision_security(store.as_ref(), &alice, Vec::new());

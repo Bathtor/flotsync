@@ -98,6 +98,9 @@ pub(super) enum SqliteStoreError {
         /// Original filesystem failure.
         source: std::io::Error,
     },
+    /// A SQLite store operation was requested after orderly closure started.
+    #[snafu(display("The SQLite replication store is closed."))]
+    Closed,
     /// An activated replication store has no provisioned local identity.
     #[snafu(display("The replication store has no provisioned local member identity."))]
     MissingLocalMemberIdentity,
@@ -345,6 +348,10 @@ impl SqliteStoreError {
             | Self::MissingLocalMemberIdentity
             | Self::MissingSchema { .. } => configuration(StoreErrorScope::Store),
             Self::CreateDatabaseFile { source, .. } => classify_create_file_error(source),
+            Self::Closed => StoreErrorClassification::UNKNOWN
+                .with_scope(StoreErrorScope::Connection)
+                .with_class(StoreErrorClass::Unavailable)
+                .with_resolution(StoreErrorResolution::Recreate),
             Self::AmbiguousLocalMemberIdentities { .. } => invalid_data(StoreErrorScope::Store),
             Self::ConflictingLocalMemberIdentity { .. } => {
                 conflicting_state(StoreErrorScope::Store)

@@ -29,6 +29,12 @@ slog-term = "2"
 snafu = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [[test]]
 name = "kompact_tcp"
 path = "tests/kompact_tcp.rs"
