@@ -70,13 +70,14 @@ Constraints
 - Avoid a Mio fork or unsupported Mio poll configuration.
 - Keep SQLite lifecycle ownership concrete and application-controlled rather than coupling generic replication runtimes to a selected backend.
 """
-status = "in-progress"
-status_reason = "in review"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 assignee = "Codex"
 created_at = "2026-07-26T17:11:09.401951Z"
-updated_at = "2026-08-15T13:36:58.7505964Z"
+updated_at = "2026-08-16T14:23:48.402759Z"
+closed_at = "2026-08-16T14:23:48.402759Z"
 
 [[links]]
 target = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
@@ -135,3 +136,27 @@ id = "01a005a3-d77e-74e2-a877-7077308a4b27"
 author = "Codex"
 body = "Second review implementation complete: centralised SQLite pool/state in SqliteStorePool; close callers can recover from cancellation while lifecycle remains Open -> Closing -> Closed; operation checks happen at poll time; public docs avoid SQLx; duplicated test owners use SqliteStoreTestOwner; const-generic runtime arrays use the prototyped zip/collect_array shape; checklist shutdown preserves the earliest error and logs later failures. Validation: 39 focused SQLite tests, 304 replication tests, 69 pre-existing checklist tests plus 3 new shutdown-precedence tests, diff check, and all-target pedantic Clippy completed (pre-existing warnings only)."
 created_at = "2026-08-15T13:36:58.7505964Z"
+
+[[comments]]
+id = "01a005c7-8ba3-7e20-9f58-808e10f49cee"
+author = "Codex"
+body = "Windows platform run 31888940793 used head dd7e46d and exposed one missed direct runtime-loading test teardown. load_replication_runtime_accepts_store_provisioned_security dropped the runtime without awaiting shutdown and never closed its concrete SQLite store; asynchronous worker timing made serial local runs appear green. Agreed targeted fix: await runtime shutdown, then store closure, and validate isolated nocapture plus serial and parallel replication suites."
+created_at = "2026-08-15T14:15:58.627615Z"
+
+[[comments]]
+id = "01a005ca-7414-7171-8e72-f049003c834d"
+author = "Codex"
+body = "Targeted teardown fix implemented. The isolated test now awaits ReplicationApi::shutdown followed by SqliteReplicationStore::close and no longer emits the background Drop panic. Validation passed with the isolated exact nocapture test, all 304 replication tests serially, and all 304 with normal parallel scheduling. Full cargo test --workspace --locked remains locally blocked at bonjour-sys bindgen because LLVM/libclang and the Bonjour runtime are not installed on this Windows host."
+created_at = "2026-08-15T14:19:09.2047152Z"
+
+[[comments]]
+id = "01a00af4-fe82-7dc0-a817-08817a25b854"
+author = "Codex"
+body = "Validated the final Windows state with the full locked workspace suite after installing LLVM/libclang and Bonjour. All unit, integration, and documentation tests passed. Removed the temporary Windows-only rust-cache cache-on-failure override and its TODO; normal cache handling is restored."
+created_at = "2026-08-16T14:23:43.2340814Z"
+
+[[comments]]
+id = "01a00af5-12b2-72f1-95bf-63cf1580f4e2"
+author = "unknown"
+body = "completed"
+created_at = "2026-08-16T14:23:48.402759Z"

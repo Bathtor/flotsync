@@ -37,6 +37,8 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
         .expect("runtime should expose setup-provisioned public keys");
 
     assert_eq!(loaded_public_bundle, expected_public_bundle);
+    wait_for_test_reply(loaded_runtime.shutdown()).expect("runtime should shut down gracefully");
+    wait_for_test_future(store.close()).expect("test SQLite store should close");
 }
 
 #[test]
