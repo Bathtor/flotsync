@@ -8,6 +8,7 @@ use crate::{
     __seal_replication_group_snapshot,
     __seal_replication_group_view,
     api::{
+        ApplicationSchemas,
         GroupSchema,
         ReplicationGroupLifecycle,
         ReplicationGroupRecord,
@@ -21,6 +22,7 @@ use flotsync_core::{
     MemberIdentity,
     membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
 };
+use flotsync_data_types::schema::datamodel::SchemaSource;
 use sealed::sealed;
 use std::{collections::HashMap, sync::Arc};
 
@@ -28,9 +30,11 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn application_snapshot_from_records(
     local_member: &MemberIdentity,
+    application_schemas: &ApplicationSchemas,
     records: impl IntoIterator<Item = ReplicationGroupRecord>,
 ) -> Result<Arc<dyn ReplicationGroupSnapshot>, GroupInstallError> {
-    let snapshot = RuntimeGroupStateSnapshot::from_records(local_member, records)?;
+    let snapshot =
+        RuntimeGroupStateSnapshot::from_records(local_member, application_schemas, records)?;
     Ok(Arc::new(snapshot))
 }
 
@@ -47,14 +51,18 @@ impl RuntimeGroupStateSnapshot {
         Self::default()
     }
 
-    /// Project active storage records into one validated runtime snapshot.
+    /// Build one validated runtime snapshot from active storage records.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn from_records(
         local_member: &MemberIdentity,
+        application_schemas: &ApplicationSchemas,
         records: impl IntoIterator<Item = ReplicationGroupRecord>,
     ) -> Result<Self, GroupInstallError> {
         let mut snapshot = Self::new();
         for record in records {
-            snapshot.insert_record(local_member, record)?;
+            let resolved_group_schema =
+                resolve_group_schema(application_schemas, record.group_schema.clone());
+            snapshot.insert_record(local_member, resolved_group_schema, record)?;
         }
         Ok(snapshot)
     }
@@ -63,13 +71,14 @@ impl RuntimeGroupStateSnapshot {
     pub(super) fn insert_record(
         &mut self,
         local_member: &MemberIdentity,
+        resolved_group_schema: Arc<GroupSchema>,
         record: ReplicationGroupRecord,
     ) -> Result<(), GroupInstallError> {
         let group_id = record.group_id;
         if self.groups.contains_key(&group_id) {
             return DuplicateStoredGroupSnafu { group_id }.fail();
         }
-        let group = RuntimeGroupState::from_record(local_member, record)?;
+        let group = RuntimeGroupState::from_record(local_member, resolved_group_schema, record)?;
         self.groups.insert(group_id, group);
         Ok(())
     }
@@ -117,14 +126,17 @@ impl ReplicationGroupSnapshot for RuntimeGroupStateSnapshot {
 
 /// Single atomically replaceable owner of the current runtime group snapshot.
 pub(super) struct SharedGroupState {
+    /// Process-static schemas used to deduplicate cold or newly hosted group definitions.
+    application_schemas: &'static ApplicationSchemas,
     /// Current immutable state published to every restricted reader.
     current: ArcSwap<RuntimeGroupStateSnapshot>,
 }
 
 impl SharedGroupState {
     /// Create one empty group-state owner for runtime startup.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(application_schemas: &'static ApplicationSchemas) -> Self {
         Self {
+            application_schemas,
             current: ArcSwap::from_pointee(RuntimeGroupStateSnapshot::default()),
         }
     }
@@ -132,6 +144,43 @@ impl SharedGroupState {
     /// Replace the complete runtime group state atomically.
     pub(super) fn replace(&self, snapshot: RuntimeGroupStateSnapshot) {
         self.current.store(Arc::new(snapshot));
+    }
+
+    /// Build replacement runtime state from the complete active-group record set.
+    ///
+    /// Already hosted group ids reuse their resolved schema allocation. Records first seen during
+    /// startup or after joining a group resolve their stored schema against the application
+    /// registry before entering the returned state. This method does not publish the replacement.
+    pub(super) fn build_runtime_state_from_active_records(
+        &self,
+        local_member: &MemberIdentity,
+        records: impl IntoIterator<Item = ReplicationGroupRecord>,
+    ) -> Result<RuntimeGroupStateSnapshot, GroupInstallError> {
+        let current = self.current.load();
+        let mut snapshot = RuntimeGroupStateSnapshot::new();
+        for record in records {
+            let group_id = record.group_id;
+            let resolved_group_schema = current.groups.get(&group_id).map_or_else(
+                || resolve_group_schema(self.application_schemas, record.group_schema.clone()),
+                |group| Arc::clone(&group.group_schema),
+            );
+            snapshot.insert_record(local_member, resolved_group_schema, record)?;
+        }
+        Ok(snapshot)
+    }
+
+    /// Return the resolved schema retained for one hosted group.
+    pub(super) fn group_schema(&self, group_id: &GroupId) -> Option<Arc<GroupSchema>> {
+        self.current
+            .load()
+            .groups
+            .get(group_id)
+            .map(|group| Arc::clone(&group.group_schema))
+    }
+
+    /// Return the application schema registry shared by this runtime.
+    pub(super) const fn application_schemas(&self) -> &'static ApplicationSchemas {
+        self.application_schemas
     }
 
     /// Load the application-facing view current at this instant.
@@ -155,15 +204,16 @@ struct RuntimeGroupState {
     /// Canonically indexed member identities.
     members: GroupMembers,
     /// Dataset schema fixed for this group.
-    group_schema: GroupSchema,
+    group_schema: Arc<GroupSchema>,
     /// Current application-access and replication lifecycle.
     lifecycle: ReplicationGroupLifecycle,
 }
 
 impl RuntimeGroupState {
-    /// Project one validated active storage record into the restricted runtime representation.
+    /// Convert one validated active storage record and its resolved schema into runtime state.
     fn from_record(
         local_member: &MemberIdentity,
+        resolved_group_schema: Arc<GroupSchema>,
         record: ReplicationGroupRecord,
     ) -> Result<Self, GroupInstallError> {
         let members = LoadedGroupMeta::validated_members_from_replication_group_record(
@@ -174,7 +224,7 @@ impl RuntimeGroupState {
             group_id: record.group_id,
             group_name: record.group_name,
             members,
-            group_schema: record.group_schema,
+            group_schema: resolved_group_schema,
             lifecycle: record.lifecycle,
         })
     }
@@ -195,10 +245,35 @@ impl ReplicationGroupView for RuntimeGroupState {
     }
 
     fn group_schema(&self) -> &GroupSchema {
-        &self.group_schema
+        self.group_schema.as_ref()
     }
 
     fn lifecycle(&self) -> &ReplicationGroupLifecycle {
         &self.lifecycle
     }
+}
+
+/// Deduplicate one group schema loaded from cold storage or a remote payload.
+///
+/// Definitions structurally equal to the current application schema reuse its process-static
+/// reference. Unmatched definitions retain their loaded ownership so stored and remote group
+/// schemas remain authoritative across application changes.
+pub(super) fn resolve_group_schema(
+    application_schemas: &ApplicationSchemas,
+    group_schema: GroupSchema,
+) -> Arc<GroupSchema> {
+    let datasets = group_schema
+        .into_datasets()
+        .into_iter()
+        .map(|(dataset_id, loaded_source)| {
+            let resolved_source = match application_schemas.get(&dataset_id) {
+                Some(static_schema) if static_schema == loaded_source.as_schema() => {
+                    SchemaSource::Static(static_schema)
+                }
+                _ => loaded_source,
+            };
+            (dataset_id, resolved_source)
+        })
+        .collect();
+    Arc::new(GroupSchema::new(datasets))
 }

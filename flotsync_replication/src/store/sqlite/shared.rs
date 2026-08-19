@@ -455,7 +455,8 @@ pub(super) fn decode_group_id(raw: &str) -> Result<GroupId, StoreError> {
 }
 
 pub(super) fn decode_dataset_id(raw: &str) -> Result<DatasetId, StoreError> {
-    DatasetId::try_new(raw.to_owned()).map_err(|source| invalid_stored_object("dataset id", source))
+    raw.parse()
+        .map_err(|source| invalid_stored_object("dataset id", source))
 }
 
 pub(super) fn decode_row_key(raw: &str) -> Result<RowKey, StoreError> {

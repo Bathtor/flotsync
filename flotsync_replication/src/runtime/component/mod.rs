@@ -41,7 +41,7 @@ use super::{
         snapshot,
         summary,
     },
-    group_state::{RuntimeGroupStateSnapshot, SharedGroupState},
+    group_state::{RuntimeGroupStateSnapshot, SharedGroupState, resolve_group_schema},
     in_memory::{
         LoadedGroupMeta,
         PendingUpdateSet,
@@ -73,6 +73,7 @@ use crate::{
         DatasetRowStateWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupDatasetSchemaRef,
         GroupInvitation,
         GroupInvitationResponder,
         GroupMemberKeys,
@@ -110,7 +111,6 @@ use crate::{
         RowKey,
         RowMutation,
         RowProviderError,
-        SchemaSource,
         SnapshotRowsRequest,
         SnapshotValueRowBatch,
         SnapshotValueRows,
@@ -168,6 +168,8 @@ use flotsync_core::{
     membership::{GroupMembers, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
+#[cfg(any(test, feature = "test-support"))]
+use flotsync_data_types::schema::datamodel::SchemaSource;
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
@@ -235,16 +237,6 @@ struct PreparedLocalPublish {
     read_token: ReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
-}
-
-enum DatasetSchemaLoadError {
-    Load {
-        dataset_id: DatasetId,
-        source: StoreError,
-    },
-    Missing {
-        dataset_id: DatasetId,
-    },
 }
 
 /// Application response to one pending group decision replayed through the listener.
@@ -515,30 +507,6 @@ impl ReplicationRuntimeComponent {
         action
     }
 
-    async fn load_dataset_schemas<I>(
-        store: Arc<dyn ReplicationStore>,
-        dataset_ids: I,
-    ) -> Result<HashMap<DatasetId, SchemaSource>, DatasetSchemaLoadError>
-    where
-        I: IntoIterator<Item = DatasetId>,
-    {
-        let mut loaded_schemas = HashMap::new();
-        for dataset_id in dataset_ids {
-            let schema = store
-                .load_dataset_schema(&dataset_id)
-                .await
-                .map_err(|source| DatasetSchemaLoadError::Load {
-                    dataset_id: dataset_id.clone(),
-                    source,
-                })?;
-            let schema = schema.ok_or_else(|| DatasetSchemaLoadError::Missing {
-                dataset_id: dataset_id.clone(),
-            })?;
-            loaded_schemas.insert(dataset_id, schema);
-        }
-        Ok(loaded_schemas)
-    }
-
     /// Validate stored material against the members and schema from accepted work.
     fn validate_activation_group_material(
         &self,
@@ -564,7 +532,9 @@ impl ReplicationRuntimeComponent {
         .context(activation::InvalidPersistedGroupSnafu { group_id })?;
         ensure!(
             local_group.members.ordered_members() == expected_members.ordered_members()
-                && group_record.group_schema == *group_schema,
+                && group_record
+                    .group_schema
+                    .has_same_schema_definitions(group_schema),
             activation::ConflictingGroupMaterialSnafu { group_id }
         );
         Ok(group_record)
@@ -600,24 +570,27 @@ impl ReplicationRuntimeComponent {
             .context(snapshot::StoreAccessSnafu)?;
         let read_token = Self::read_token_from_group_versions(group_versions);
 
-        let mut schemas = HashMap::with_capacity(request.datasets.len());
+        let group_schema = self
+            .group_memberships
+            .group_schema(&request.group_id)
+            .expect("application snapshot groups retain resolved schemas");
         for dataset_id in &request.datasets {
-            let schema = self
-                .store
-                .load_dataset_schema(dataset_id)
-                .await
-                .context(snapshot::StoreAccessSnafu)?;
-            let schema = schema.context(snapshot::MissingDatasetSchemaSnafu {
-                dataset_id: dataset_id.clone(),
-            })?;
-            schemas.insert(dataset_id.clone(), schema);
+            // The provider performs its own schema lookup when loading each dataset. This eager
+            // membership check exists only to return a complete request error before streaming.
+            ensure!(
+                group_schema.contains_dataset(dataset_id),
+                snapshot::MissingDatasetSchemaSnafu {
+                    group_id: request.group_id,
+                    dataset_id: dataset_id.clone(),
+                }
+            );
         }
 
         let provider = StoreSnapshotRowProvider::new(
             transaction,
             request.group_id,
             request.datasets,
-            schemas,
+            group_schema,
             request.max_rows_per_batch,
             request.include_tombstones,
         );
@@ -631,10 +604,19 @@ impl ReplicationRuntimeComponent {
     /// Persist one set of explicit row patches back into the replication store.
     async fn apply_dataset_row_patches(
         transaction: &mut dyn ReplicationStoreTransaction,
+        group_schema: &GroupSchema,
         patches: Vec<DatasetRowStatePatch>,
     ) -> Result<(), StoreError> {
         for patch in patches {
-            transaction.apply_dataset_row_patch(patch).await?;
+            let schema = group_schema
+                .schema(&patch.dataset_id)
+                .expect("prepared row patches must belong to the hosted group");
+            let dataset = GroupDatasetSchemaRef {
+                group_id: &patch.group_id,
+                dataset_id: &patch.dataset_id,
+                schema: schema.as_schema(),
+            };
+            transaction.apply_dataset_row_patch(dataset, &patch).await?;
         }
         Ok(())
     }
@@ -1226,8 +1208,9 @@ impl ReplicationRuntimeComponent {
             .load_replication_groups()
             .await
             .context(StoreGroupSnafu { group_id })?;
-        let next_group_state =
-            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)?;
+        let next_group_state = self
+            .group_memberships
+            .build_runtime_state_from_active_records(&self.local_member, active_groups)?;
         transaction
             .commit()
             .await
@@ -1253,8 +1236,12 @@ impl ReplicationRuntimeComponent {
         let mut group_state = RuntimeGroupStateSnapshot::new();
         for persisted_group in persisted_groups {
             let group_id = persisted_group.group_id;
+            let resolved_group_schema = resolve_group_schema(
+                self.group_memberships.application_schemas(),
+                persisted_group.group_schema.clone(),
+            );
             group_state
-                .insert_record(&self.local_member, persisted_group)
+                .insert_record(&self.local_member, resolved_group_schema, persisted_group)
                 .context(InvalidGroupSnafu { group_id })?;
         }
 
@@ -1507,10 +1494,11 @@ impl ReplicationRuntimeComponent {
             .load_replication_groups()
             .await
             .map_err(ApiError::from_store_classification_source)?;
-        let next_group_state =
-            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
-                .boxed()
-                .context(ApiExternalSnafu)?;
+        let next_group_state = self
+            .group_memberships
+            .build_runtime_state_from_active_records(&self.local_member, active_groups)
+            .boxed()
+            .context(ApiExternalSnafu)?;
         transaction
             .commit()
             .await
@@ -1959,12 +1947,13 @@ impl ReplicationRuntimeComponent {
             .load_replication_groups()
             .await
             .context(accept_migration::StoreAccessSnafu)?;
-        let next_group_state =
-            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
-                .context(activation::InstallGroupSnafu {
-                    group_id: prepared.migration_id.new_group_id,
-                })
-                .context(accept_migration::PrepareTargetSnafu)?;
+        let next_group_state = self
+            .group_memberships
+            .build_runtime_state_from_active_records(&self.local_member, active_groups)
+            .context(activation::InstallGroupSnafu {
+                group_id: prepared.migration_id.new_group_id,
+            })
+            .context(accept_migration::PrepareTargetSnafu)?;
         transaction
             .commit()
             .await
@@ -2053,11 +2042,13 @@ impl ReplicationRuntimeComponent {
             .load_replication_groups()
             .await
             .context(activation::StoreAccessSnafu)?;
-        let next_group_state = RuntimeGroupStateSnapshot::from_records(
-            &self.local_member,
-            active_groups.iter().cloned(),
-        )
-        .context(activation::InstallGroupSnafu { group_id })?;
+        let next_group_state = self
+            .group_memberships
+            .build_runtime_state_from_active_records(
+                &self.local_member,
+                active_groups.iter().cloned(),
+            )
+            .context(activation::InstallGroupSnafu { group_id })?;
         let read_token = Self::read_token_from_groups(active_groups);
         transaction
             .commit()
@@ -2202,17 +2193,19 @@ impl ReplicationRuntimeComponent {
             group_id,
             dataset_rows,
         } = collect_group_row_scope(&changes)?;
-        let loaded_schemas =
-            Self::load_dataset_schemas(self.store.clone(), dataset_rows.keys().cloned())
-                .await
-                .map_err(|error| match error {
-                    DatasetSchemaLoadError::Load { dataset_id, source } => {
-                        PublishChangesError::LoadDatasetSchema { dataset_id, source }
-                    }
-                    DatasetSchemaLoadError::Missing { dataset_id } => {
-                        PublishChangesError::MissingDatasetSchema { dataset_id }
-                    }
-                })?;
+        let group_schema = self
+            .group_memberships
+            .group_schema(&group_id)
+            .context(publish::UnknownGroupSnafu { group_id })?;
+        for dataset_id in dataset_rows.keys() {
+            ensure!(
+                group_schema.schema(dataset_id).is_some(),
+                publish::MissingDatasetSchemaSnafu {
+                    group_id,
+                    dataset_id: dataset_id.clone(),
+                }
+            );
+        }
         let mut transaction = self
             .store
             .begin_transaction()
@@ -2248,7 +2241,7 @@ impl ReplicationRuntimeComponent {
         );
         let mut dataset_state = replay::load_publish_dataset_state(
             transaction.as_mut(),
-            &loaded_schemas,
+            group_schema.as_ref(),
             group_id,
             local_group.member_count(),
             dataset_rows,
@@ -2274,9 +2267,13 @@ impl ReplicationRuntimeComponent {
             dataset_updates: prepared_local_changes.dataset_updates.clone(),
             applied_locally: true,
         };
-        Self::apply_dataset_row_patches(transaction.as_mut(), prepared_local_changes.row_patches)
-            .await
-            .context(publish::StoreAccessSnafu)?;
+        Self::apply_dataset_row_patches(
+            transaction.as_mut(),
+            group_schema.as_ref(),
+            prepared_local_changes.row_patches,
+        )
+        .await
+        .context(publish::StoreAccessSnafu)?;
         transaction
             .append_replication_update(persisted_update)
             .await
@@ -2622,9 +2619,10 @@ impl ReplicationRuntimeComponent {
                     .load_replication_groups()
                     .await
                     .context(inbound::StoreAccessSnafu)?;
-                let snapshot =
-                    RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
-                        .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+                let snapshot = self
+                    .group_memberships
+                    .build_runtime_state_from_active_records(&self.local_member, active_groups)
+                    .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
                 Some(snapshot)
             } else {
                 None
@@ -2674,9 +2672,10 @@ impl ReplicationRuntimeComponent {
                 .load_replication_groups()
                 .await
                 .context(inbound::StoreAccessSnafu)?;
-            let next_group_state =
-                RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
-                    .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+            let next_group_state = self
+                .group_memberships
+                .build_runtime_state_from_active_records(&self.local_member, active_groups)
+                .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
             transaction
                 .commit()
                 .await
@@ -2745,9 +2744,10 @@ impl ReplicationRuntimeComponent {
                 .load_replication_groups()
                 .await
                 .context(inbound::StoreAccessSnafu)?;
-            let snapshot =
-                RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
-                    .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+            let snapshot = self
+                .group_memberships
+                .build_runtime_state_from_active_records(&self.local_member, active_groups)
+                .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
             Some(snapshot)
         } else {
             None
@@ -2931,6 +2931,10 @@ impl ReplicationRuntimeComponent {
         message: UpdateMessage,
     ) -> Result<InboundUpdateOutcome, InboundDeliveryError> {
         let group_id = message.group_id;
+        let group_schema = self
+            .group_memberships
+            .group_schema(&group_id)
+            .context(inbound::UnknownHostedGroupSnafu { group_id })?;
         let mut transaction = self
             .store
             .begin_transaction()
@@ -3007,18 +3011,16 @@ impl ReplicationRuntimeComponent {
                 .iter()
                 .map(|dataset_update| dataset_update.dataset_id.clone())
                 .collect::<HashSet<_>>();
-            let loaded_schemas =
-                Self::load_dataset_schemas(self.store.clone(), touched_dataset_ids)
-                    .await
-                    .map_err(|error| match error {
-                        DatasetSchemaLoadError::Load { dataset_id, source } => {
-                            InboundDeliveryError::LoadDatasetSchema { dataset_id, source }
-                        }
-                        DatasetSchemaLoadError::Missing { dataset_id } => {
-                            InboundDeliveryError::MissingDatasetSchema { dataset_id }
-                        }
-                    })?;
-            validate_update_mapping(&inbound_update, &loaded_schemas)?;
+            for dataset_id in touched_dataset_ids {
+                ensure!(
+                    group_schema.schema(&dataset_id).is_some(),
+                    inbound::MissingDatasetSchemaSnafu {
+                        group_id,
+                        dataset_id,
+                    }
+                );
+            }
+            validate_update_mapping(&inbound_update, group_schema.as_ref())?;
             transaction
                 .append_replication_update(inbound_update.clone())
                 .await
@@ -3071,27 +3073,27 @@ impl ReplicationRuntimeComponent {
             .flat_map(|update| update.dataset_updates.iter())
             .map(|dataset_update| dataset_update.dataset_id.clone())
             .collect::<HashSet<_>>();
-        let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), touched_dataset_ids)
-            .await
-            .map_err(|error| match error {
-                DatasetSchemaLoadError::Load { dataset_id, source } => {
-                    InboundDeliveryError::LoadDatasetSchema { dataset_id, source }
+        for dataset_id in touched_dataset_ids {
+            ensure!(
+                group_schema.schema(&dataset_id).is_some(),
+                inbound::MissingDatasetSchemaSnafu {
+                    group_id,
+                    dataset_id,
                 }
-                DatasetSchemaLoadError::Missing { dataset_id } => {
-                    InboundDeliveryError::MissingDatasetSchema { dataset_id }
-                }
-            })?;
+            );
+        }
         let touched_dataset_rows =
-            collect_record_row_scope(&apply_plan.ready_chain, &loaded_schemas)?;
+            collect_record_row_scope(&apply_plan.ready_chain, group_schema.as_ref())?;
         let touched_dataset_slices = replay::load_touched_dataset_slices(
             transaction.as_mut(),
+            group_schema.as_ref(),
             group_id,
             &touched_dataset_rows,
         )
         .await
         .context(inbound::StoreAccessSnafu)?;
         let mut working_datasets =
-            replay::materialise_dataset_slices(&loaded_schemas, touched_dataset_slices);
+            replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
         let writable_group_versions = transaction
             .load_writable_replication_group_versions()
             .await
@@ -3115,9 +3117,13 @@ impl ReplicationRuntimeComponent {
                     row_changes: applied_batch.row_changes,
                 });
             }
-            Self::apply_dataset_row_patches(transaction.as_mut(), applied_batch.row_patches)
-                .await
-                .context(inbound::StoreAccessSnafu)?;
+            Self::apply_dataset_row_patches(
+                transaction.as_mut(),
+                group_schema.as_ref(),
+                applied_batch.row_patches,
+            )
+            .await
+            .context(inbound::StoreAccessSnafu)?;
             transaction
                 .mark_replication_update_applied(&group_id, ready_update.update_id)
                 .await
@@ -3709,11 +3715,18 @@ impl ReplicationRuntimeComponent {
             .collect::<Vec<_>>();
         let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
             .expect("test install group members were already validated");
+        let group_schema = GroupSchema::new(
+            self.group_memberships
+                .application_schemas()
+                .iter()
+                .map(|(dataset_id, schema)| (dataset_id, SchemaSource::Static(schema)))
+                .collect(),
+        );
         let record = self.build_replication_group_record(
             group_id,
             None,
             member_keys,
-            GroupSchema::default(),
+            group_schema,
             security_material,
         );
         Handled::block_on(self, async move |mut async_self| {

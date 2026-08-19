@@ -14,6 +14,7 @@ use crate::{
     api::{
         ApiError,
         ApiResult,
+        ApplicationSchemas,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         FlotsyncDiagnostics,
@@ -77,8 +78,10 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `application_id` scopes the loaded runtime instance for diagnostics and future
 /// multi-application hosting.
-/// `store` provides the local member identity and dataset schemas needed by the
-/// current replication runtime.
+/// `application_schemas` provides the process-static application schema for each
+/// locally understood dataset. Stored group schemas remain authoritative; the
+/// runtime reuses one of these references only when its definition matches.
+/// `store` provides the local member identity and replication state.
 /// `listener` receives replication events produced by inbound delivery.
 /// `config` carries public runtime policy knobs; the current runtime only honours
 /// the migration-policy shape while the deeper protocol remains unimplemented.
@@ -88,6 +91,7 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -95,6 +99,7 @@ pub async fn load_replication_runtime(
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -116,6 +121,7 @@ pub async fn load_replication_runtime(
 /// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime_with_runtime_config_toml(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -124,6 +130,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -136,6 +143,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
 
 pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -171,6 +179,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         .map_err(|source| security_load_error(application_id.clone(), source))?;
     load_replication_runtime_typed_with_security(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -183,6 +192,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -191,6 +201,7 @@ pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     load_replication_runtime_typed_with_security(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -202,6 +213,7 @@ pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
 
 async fn load_replication_runtime_typed_with_security(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -217,6 +229,7 @@ async fn load_replication_runtime_typed_with_security(
             })?;
     let host = DeliveryRuntimeHost::start_with_runtime_config_toml(
         &local_member,
+        application_schemas,
         store,
         listener,
         config.clone(),

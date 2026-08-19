@@ -278,6 +278,33 @@ impl GroupSchema {
         self.datasets.get(dataset_id)
     }
 
+    /// Return whether this group declares a schema for `dataset_id`.
+    #[must_use]
+    pub fn contains_dataset(&self, dataset_id: &DatasetId) -> bool {
+        self.datasets.contains_key(dataset_id)
+    }
+
+    /// Return whether this value and `other` contain the same dataset schema definitions.
+    ///
+    /// Unlike [`PartialEq`], this comparison deliberately ignores each
+    /// [`SchemaSource`]'s ownership representation and compares the underlying
+    /// [`Schema`] values structurally.
+    #[must_use]
+    pub fn has_same_schema_definitions(&self, other: &Self) -> bool {
+        self.datasets.len() == other.datasets.len()
+            && self.datasets.iter().all(|(dataset_id, schema)| {
+                other
+                    .datasets
+                    .get(dataset_id)
+                    .is_some_and(|other_schema| schema.as_schema() == other_schema.as_schema())
+            })
+    }
+
+    /// Consume this group schema and return its dataset schema map.
+    pub(crate) fn into_datasets(self) -> HashMap<DatasetId, SchemaSource> {
+        self.datasets
+    }
+
     /// Return the number of dataset schemas in this group schema.
     #[must_use]
     pub fn len(&self) -> usize {

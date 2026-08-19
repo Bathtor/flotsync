@@ -9,7 +9,7 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
@@ -61,7 +61,7 @@ fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_i
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
@@ -114,7 +114,7 @@ fn request_summary_reports_local_versions() {
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
@@ -155,7 +155,7 @@ fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
@@ -244,7 +244,7 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
@@ -289,13 +289,7 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(
-            dataset_id.clone(),
-            SchemaSource::from(title_schema_shared()),
-        )],
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
@@ -390,10 +384,7 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
 #[test]
 fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
     let alice_member = alice_member();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let store = sqlite_store(alice_member.clone());
     let runtime = load_runtime_with_parts(
         app_alice_id(),
         store.clone(),
@@ -442,7 +433,7 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
 #[test]
 fn membership_change_default_rejects_nil_group_id() {
     let alice_member = alice_member();
-    let store = sqlite_store_with_schemas(alice_member, Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member);
     let runtime = load_runtime_with_parts(
         app_alice_id(),
         store.clone(),
@@ -468,10 +459,7 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
     let dataset_id = docs_dataset_id();
     let group_id = GroupId(Uuid::from_u128(50_601));
     let successor_group_id = GroupId(Uuid::from_u128(50_602));
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let versions = VersionVector::initial(NonZeroUsize::new(1).unwrap());
     persist_group_in_store(
         store.as_ref(),
@@ -608,11 +596,11 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_note_schema_shared())],
+        &TITLE_NOTE_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        group_schema: docs_group_schema_from_schema(title_note_schema_shared()),
+        group_schema: docs_group_schema_from_schema(title_note_schema_static()),
         ..Default::default()
     }))
     .expect("create_group should succeed");
@@ -682,14 +670,11 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
 fn publish_changes_error_display_includes_local_operation_source() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let schema = Arc::new(Schema::from_fields([
-        Field::linear_string("title"),
-        Field::monotonic_counter("edit_count"),
-    ]));
+    let schema = title_edit_count_schema_static();
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), schema.clone())],
+        &TITLE_EDIT_COUNT_APPLICATION_SCHEMAS,
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
@@ -741,10 +726,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
         node_index: 0,
         version: MAX_VERSION_VALUE,
     });
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     persist_group_in_store(
         store.as_ref(),
         ReplicationGroupRecord {

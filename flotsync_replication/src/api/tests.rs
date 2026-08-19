@@ -2,6 +2,11 @@
 
 use super::*;
 use crate::test_support::docs_group_schema;
+use flotsync_data_types::Field;
+use std::sync::{Arc, LazyLock};
+
+static REPRESENTATION_TEST_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
 
 fn member_key_id<const N: usize>(segments: [&str; N], fingerprint_seed: u8) -> MemberKeyId {
     MemberKeyId {
@@ -19,6 +24,21 @@ fn member_public_keys_record() -> MemberPublicKeysRecord {
         signing_public_key: Box::from([1_u8, 2, 3]),
         encryption_public_key: Box::from([4_u8, 5, 6]),
     }
+}
+
+#[test]
+fn schema_source_equality_distinguishes_ownership_while_group_definitions_compare_structurally() {
+    let dataset_id = DatasetId::try_from_static("representation_test")
+        .expect("representation test dataset id should build");
+    let static_source = SchemaSource::Static(&REPRESENTATION_TEST_SCHEMA);
+    let shared_source = SchemaSource::Shared(Arc::new(REPRESENTATION_TEST_SCHEMA.clone()));
+    assert_ne!(static_source, shared_source);
+    assert_eq!(static_source.as_schema(), shared_source.as_schema());
+
+    let static_group = GroupSchema::new(HashMap::from([(dataset_id.clone(), static_source)]));
+    let shared_group = GroupSchema::new(HashMap::from([(dataset_id, shared_source)]));
+    assert_ne!(static_group, shared_group);
+    assert!(static_group.has_same_schema_definitions(&shared_group));
 }
 
 #[test]

@@ -500,10 +500,11 @@ impl proto::ProtoCodec for DatasetUpdateMessage {
             .fail();
         }
 
-        let dataset_id =
-            DatasetId::try_new(message.dataset_id.clone()).context(InvalidDatasetIdSnafu {
+        let dataset_id = DatasetId::try_from_owned(message.dataset_id.clone()).context(
+            InvalidDatasetIdSnafu {
                 value: message.dataset_id,
-            })?;
+            },
+        )?;
         Ok(Self {
             dataset_id,
             operations: message.operations,
@@ -525,7 +526,7 @@ impl DecodeProtoView for DatasetUpdateMessage {
 
         let dataset_id_value = message.dataset_id.to_owned();
         let dataset_id =
-            DatasetId::try_new(dataset_id_value.clone()).context(InvalidDatasetIdSnafu {
+            DatasetId::try_from_owned(dataset_id_value.clone()).context(InvalidDatasetIdSnafu {
                 value: dataset_id_value,
             })?;
         let operations = message

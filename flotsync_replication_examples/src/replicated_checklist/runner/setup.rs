@@ -14,12 +14,9 @@ pub(super) async fn create_checklist_store_provisioner(
     config: ChecklistAppConfig,
 ) -> Result<ChecklistStoreProvisioning, ReplicatedChecklistError> {
     ensure_store_parent_exists(&config.store_path)?;
-    let store = SqliteReplicationStoreProvisioner::create_file_with_schema_sources(
-        &config.store_path,
-        [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
-    )
-    .await
-    .context(repl_error::StoreSnafu)?;
+    let store = SqliteReplicationStoreProvisioner::create_file(&config.store_path)
+        .await
+        .context(repl_error::StoreSnafu)?;
     Ok(ChecklistStoreProvisioning { config, store })
 }
 
@@ -27,12 +24,9 @@ pub(super) async fn create_checklist_store_provisioner(
 pub(super) async fn open_checklist_store_provisioner(
     config: ChecklistAppConfig,
 ) -> Result<ChecklistStoreProvisioning, ReplicatedChecklistError> {
-    let store = SqliteReplicationStoreProvisioner::open_file_with_schema_sources(
-        &config.store_path,
-        [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
-    )
-    .await
-    .context(repl_error::StoreSnafu)?;
+    let store = SqliteReplicationStoreProvisioner::open_file(&config.store_path)
+        .await
+        .context(repl_error::StoreSnafu)?;
     Ok(ChecklistStoreProvisioning { config, store })
 }
 

@@ -7,7 +7,7 @@ use super::{
         InboundDeliveryError,
         PublishChangesError,
     },
-    group_state::RuntimeGroupStateSnapshot,
+    group_state::{RuntimeGroupStateSnapshot, SharedGroupState},
     handle::{
         ReplicationRuntime,
         load_replication_runtime_typed_with_security_for_test,
@@ -36,6 +36,7 @@ use crate::{
     SqliteReplicationStoreProvisioner,
     api::{
         ApiError,
+        ApplicationSchemas,
         AuthorityScope,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
@@ -45,6 +46,7 @@ use crate::{
         DatasetRowStateSlice,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupDatasetSchemaRef,
         GroupInvitation,
         GroupInvitationPolicy,
         GroupInvitationResponder,
@@ -89,6 +91,7 @@ use crate::{
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
+        ReplicationGroupSnapshot,
         ReplicationGroupView,
         ReplicationSecuritySecrets,
         ReplicationStore,
@@ -197,6 +200,27 @@ const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
 const APP_PROBE_SEGMENTS: [&str; 2] = ["app", "probe"];
 static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
+static STATIC_TITLE_NOTE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::from_fields([Field::linear_string("title"), Field::linear_string("note")])
+});
+static STATIC_TITLE_EDIT_COUNT_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::from_fields([
+        Field::linear_string("title"),
+        Field::monotonic_counter("edit_count"),
+    ])
+});
+static TITLE_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_SCHEMA)
+        .expect("title application schemas should build")
+});
+static TITLE_NOTE_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_NOTE_SCHEMA)
+        .expect("title/note application schemas should build")
+});
+static TITLE_EDIT_COUNT_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_EDIT_COUNT_SCHEMA)
+        .expect("title/edit-count application schemas should build")
+});
 
 struct RuntimeFixture<S> {
     local_member: MemberIdentity,
@@ -270,13 +294,6 @@ where
 {
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>> {
         self.inner.local_member_identity()
-    }
-
-    fn load_dataset_schema(
-        &self,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
-        self.inner.load_dataset_schema(dataset_id)
     }
 
     fn begin_transaction(
@@ -506,14 +523,13 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_dataset_rows<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         row_keys: &'a mut RowKeyIterator<'a>,
     ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .load_dataset_rows(group_id, dataset_id, row_keys)
+            .load_dataset_rows(dataset, row_keys)
     }
 
     fn load_replication_update<'a>(
@@ -553,15 +569,14 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .scan_dataset_row_batch(group_id, dataset_id, after, limit)
+            .scan_dataset_row_batch(dataset, after, limit)
     }
 
     fn load_pending_group_decisions(
@@ -731,10 +746,11 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .update_replication_group_lifecycle(group_id, lifecycle)
     }
 
-    fn apply_dataset_row_patch(
-        &mut self,
-        patch: DatasetRowStatePatch,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
+    fn apply_dataset_row_patch<'a>(
+        &'a mut self,
+        dataset: GroupDatasetSchemaRef<'a>,
+        patch: &'a DatasetRowStatePatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         let failure = self.fail_next_apply_dataset_row_patch.clone();
         async move {
             let should_fail = {
@@ -765,7 +781,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             self.inner
                 .as_mut()
                 .expect("failing store transaction must remain open during delegated writes")
-                .apply_dataset_row_patch(patch)
+                .apply_dataset_row_patch(dataset, patch)
                 .await
         }
         .boxed()

@@ -217,14 +217,6 @@ pub(super) enum SqliteStoreError {
         expected_member_count: usize,
         actual_member_count: usize,
     },
-    /// Application schema configuration omitted a referenced dataset.
-    #[snafu(display(
-        "Stored schema source for dataset '{dataset_id}' in group '{group_id}' was missing."
-    ))]
-    MissingSchema {
-        group_id: GroupId,
-        dataset_id: DatasetId,
-    },
     /// A stored protobuf blob could not be decoded.
     #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
     DecodeStoredProto {
@@ -304,6 +296,16 @@ pub(super) enum SqliteStoreError {
         from: &'static str,
         to: &'static str,
     },
+    /// A caller paired a row patch with schema context for another group or dataset.
+    #[snafu(display(
+        "Dataset row patch context identified group '{context_group}' and dataset '{context_dataset}', but the patch identified group '{patch_group}' and dataset '{patch_dataset}'."
+    ))]
+    InvalidDatasetRowPatchContext {
+        context_group: GroupId,
+        context_dataset: DatasetId,
+        patch_group: GroupId,
+        patch_dataset: DatasetId,
+    },
     /// An operation expected an authoritative update row that was absent.
     #[snafu(display("Stored update '{group_id}/{update_id:?}' was missing."))]
     MissingStoredUpdate {
@@ -344,9 +346,9 @@ impl SqliteStoreError {
         match self {
             Self::Sqlx { source } => classify_sqlx(SqliteOperation::ExecuteQuery, source),
             Self::SqlxPhase { operation, source } => classify_sqlx(*operation, source),
-            Self::ParseSqliteUrl { .. }
-            | Self::MissingLocalMemberIdentity
-            | Self::MissingSchema { .. } => configuration(StoreErrorScope::Store),
+            Self::ParseSqliteUrl { .. } | Self::MissingLocalMemberIdentity => {
+                configuration(StoreErrorScope::Store)
+            }
             Self::CreateDatabaseFile { source, .. } => classify_create_file_error(source),
             Self::Closed => StoreErrorClassification::UNKNOWN
                 .with_scope(StoreErrorScope::Connection)
@@ -378,9 +380,8 @@ impl SqliteStoreError {
             | Self::InvalidLocalMemberIndex { .. }
             | Self::InvalidDefaultGroupSecurityMaterial { .. }
             | Self::ActiveVersionMemberCountMismatch { .. }
-            | Self::LifecycleVersionMemberCountMismatch { .. } => {
-                contract(StoreErrorScope::Operation)
-            }
+            | Self::LifecycleVersionMemberCountMismatch { .. }
+            | Self::InvalidDatasetRowPatchContext { .. } => contract(StoreErrorScope::Operation),
             Self::ConflictingMemberSecurityMaterial { .. }
             | Self::ConflictingGroupMaterial { .. }
             | Self::ConflictingPendingGroupWork { .. }

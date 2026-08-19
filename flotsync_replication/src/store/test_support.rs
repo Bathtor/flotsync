@@ -2,11 +2,9 @@
 
 use crate::{
     api::{
-        DatasetId,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
-        SchemaSource,
         StoreError,
         StoreErrorClassification,
     },
@@ -252,13 +250,6 @@ where
 {
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>> {
         self.inner.local_member_identity()
-    }
-
-    fn load_dataset_schema(
-        &self,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
-        self.inner.load_dataset_schema(dataset_id)
     }
 
     fn begin_transaction(

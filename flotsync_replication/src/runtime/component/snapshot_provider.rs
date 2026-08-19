@@ -14,9 +14,8 @@ pub(super) struct StoreSnapshotRowProvider {
     group_id: GroupId,
     /// Dataset ids still waiting to be scanned.
     datasets: HashSet<DatasetId>,
-    /// Schemas for all requested datasets, loaded up front so snapshot batches
-    /// can project stored state into value rows without exposing CRDT state.
-    schemas: HashMap<DatasetId, SchemaSource>,
+    /// Resolved immutable schema for the hosted group.
+    group_schema: Arc<GroupSchema>,
     /// Dataset currently being scanned across batches.
     current_dataset: Option<DatasetId>,
     /// Exclusive lower bound for the current dataset scan.
@@ -32,7 +31,7 @@ impl StoreSnapshotRowProvider {
         transaction: Box<dyn ReplicationStoreReadTransaction>,
         group_id: GroupId,
         datasets: HashSet<DatasetId>,
-        schemas: HashMap<DatasetId, SchemaSource>,
+        group_schema: Arc<GroupSchema>,
         max_rows_per_batch: NonZeroUsize,
         include_tombstones: bool,
     ) -> Self {
@@ -40,7 +39,7 @@ impl StoreSnapshotRowProvider {
             transaction: Some(transaction),
             group_id,
             datasets,
-            schemas,
+            group_schema,
             current_dataset: None,
             after_row_key: None,
             max_rows_per_batch,
@@ -95,21 +94,25 @@ impl BatchProvider for StoreSnapshotRowProvider {
                 let group_id = self.group_id;
                 let after = self.after_row_key;
                 let max_rows_per_batch = self.max_rows_per_batch;
+                let schema = self
+                    .group_schema
+                    .schema(&dataset_id)
+                    .expect("snapshot provider datasets must belong to the hosted group");
+                let dataset = GroupDatasetSchemaRef {
+                    group_id: &group_id,
+                    dataset_id: &dataset_id,
+                    schema: schema.as_schema(),
+                };
                 let Some(transaction) = self.transaction.as_mut() else {
                     return Ok(None);
                 };
                 let batch = transaction
-                    .scan_dataset_row_batch(&group_id, &dataset_id, after, max_rows_per_batch)
+                    .scan_dataset_row_batch(dataset, after, max_rows_per_batch)
                     .await
                     .boxed()
                     .context(ProviderExternalSnafu)?;
 
-                let schema = self
-                    .schemas
-                    .get(&dataset_id)
-                    .expect("snapshot provider datasets must have loaded schemas")
-                    .clone();
-                let rows = reuse.prepare(schema, self.max_rows_per_batch.get());
+                let rows = reuse.prepare(schema.clone(), self.max_rows_per_batch.get());
                 for record in batch.rows {
                     if record.tombstoned && !self.include_tombstones {
                         continue;

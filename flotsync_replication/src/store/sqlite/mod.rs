@@ -10,6 +10,7 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupDatasetSchemaRef,
         GroupMemberKeys,
         GroupSchema,
         LocalIdentityProvisioningStore,
@@ -117,7 +118,6 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// an empty store; consume it with [`Self::into_replication_store`] only after
 /// local identity material has been provisioned.
 pub struct SqliteReplicationStoreProvisioner {
-    schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     pool: SqliteStorePool,
 }
 
@@ -128,7 +128,17 @@ impl SqliteReplicationStoreProvisioner {
     ///
     /// See `StoreError` for failure conditions.
     pub async fn in_memory() -> Result<Self, StoreError> {
-        Self::in_memory_with_schema_sources(std::iter::empty::<(DatasetId, SchemaSource)>()).await
+        let database_url = format!(
+            "sqlite:file:flotsync-replication-{}?mode=memory&cache=shared",
+            Uuid::new_v4()
+        );
+        let connect_options = SqliteConnectOptions::from_str(&database_url)
+            .context(ParseSqliteUrlSnafu {
+                database_url: database_url.clone(),
+            })?
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(connect_options).await
     }
 
     /// Create one new disk-backed `SQLite` store provisioner.
@@ -137,8 +147,19 @@ impl SqliteReplicationStoreProvisioner {
     ///
     /// See `StoreError` for failure conditions.
     pub async fn create_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::create_file_with_schema_sources(path, std::iter::empty::<(DatasetId, SchemaSource)>())
-            .await
+        let path = path.as_ref().to_path_buf();
+        let reserved_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|_| CreateDatabaseFileSnafu { path: path.clone() })?;
+        drop(reserved_file);
+        let connect_options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(connect_options).await
     }
 
     /// Open one existing disk-backed `SQLite` store provisioner.
@@ -147,8 +168,12 @@ impl SqliteReplicationStoreProvisioner {
     ///
     /// See `StoreError` for failure conditions.
     pub async fn open_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_file_with_schema_sources(path, std::iter::empty::<(DatasetId, SchemaSource)>())
-            .await
+        let connect_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(connect_options).await
     }
 
     /// Close every SQLite connection before releasing this provisioner.
@@ -161,81 +186,6 @@ impl SqliteReplicationStoreProvisioner {
     /// See `StoreError` for failure conditions.
     pub async fn close(&self) -> Result<(), StoreError> {
         self.pool.close().await
-    }
-
-    /// Create one empty in-memory provisioner with the supplied application schemas.
-    ///
-    /// # Errors
-    ///
-    /// See `StoreError` for failure conditions.
-    pub async fn in_memory_with_schema_sources<I, S>(schema_sources: I) -> Result<Self, StoreError>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let schema_sources = Self::collect_schema_sources(schema_sources);
-        let database_url = format!(
-            "sqlite:file:flotsync-replication-{}?mode=memory&cache=shared",
-            Uuid::new_v4()
-        );
-        let connect_options = SqliteConnectOptions::from_str(&database_url)
-            .context(ParseSqliteUrlSnafu {
-                database_url: database_url.clone(),
-            })?
-            .foreign_keys(true)
-            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(schema_sources, connect_options).await
-    }
-
-    /// Create one new disk-backed provisioner with the supplied application schemas.
-    ///
-    /// # Errors
-    ///
-    /// See `StoreError` for failure conditions.
-    pub async fn create_file_with_schema_sources<I, S>(
-        path: impl AsRef<Path>,
-        schema_sources: I,
-    ) -> Result<Self, StoreError>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let path = path.as_ref().to_path_buf();
-        let reserved_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|_| CreateDatabaseFileSnafu { path: path.clone() })?;
-        drop(reserved_file);
-        let schema_sources = Self::collect_schema_sources(schema_sources);
-        let connect_options = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(false)
-            .foreign_keys(true)
-            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(schema_sources, connect_options).await
-    }
-
-    /// Open one existing disk-backed provisioner with the supplied application schemas.
-    ///
-    /// # Errors
-    ///
-    /// See `StoreError` for failure conditions.
-    pub async fn open_file_with_schema_sources<I, S>(
-        path: impl AsRef<Path>,
-        schema_sources: I,
-    ) -> Result<Self, StoreError>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let schema_sources = Self::collect_schema_sources(schema_sources);
-        let connect_options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(false)
-            .foreign_keys(true)
-            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(schema_sources, connect_options).await
     }
 
     /// Consume this provisioner and construct a replication-ready store.
@@ -251,26 +201,12 @@ impl SqliteReplicationStoreProvisioner {
             .ok_or_else(|| StoreError::from(MissingLocalMemberIdentitySnafu.build()))?;
         Ok(SqliteReplicationStore {
             local_member,
-            schema_sources: self.schema_sources,
             pool: self.pool,
         })
     }
 
-    /// Collect caller-provided schemas into the representation shared by store handles.
-    fn collect_schema_sources<I, S>(schema_sources: I) -> HashMap<DatasetId, SchemaSource>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        schema_sources
-            .into_iter()
-            .map(|(dataset_id, schema)| (dataset_id, schema.into()))
-            .collect()
-    }
-
     /// Build a provisioner from fully configured `SQLite` connection options.
     async fn from_connect_options(
-        schema_sources: HashMap<DatasetId, SchemaSource>,
         connect_options: SqliteConnectOptions,
     ) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
@@ -290,7 +226,6 @@ impl SqliteReplicationStoreProvisioner {
         drop(connection);
 
         Ok(Self {
-            schema_sources: Arc::new(schema_sources),
             pool: SqliteStorePool::new(pool),
         })
     }
@@ -315,7 +250,6 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let pool = &self.pool;
-        let schema_sources = self.schema_sources.clone();
         async move {
             pool.ensure_open()?;
             let connection = pool
@@ -325,7 +259,6 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
-                schema_sources,
                 SqliteReplicationTransactionKind::Write,
             )) as Box<dyn ReplicationStoreTransaction>)
         }
@@ -342,7 +275,6 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
 /// this sequence is a programming error.
 pub struct SqliteReplicationStore {
     local_member: MemberIdentity,
-    schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     pool: SqliteStorePool,
 }
 
@@ -370,23 +302,10 @@ impl ReplicationStore for SqliteReplicationStore {
         .boxed()
     }
 
-    fn load_dataset_schema(
-        &self,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
-        let schema_source = self.schema_sources.get(dataset_id).cloned();
-        async move {
-            self.pool.ensure_open()?;
-            Ok(schema_source)
-        }
-        .boxed()
-    }
-
     fn begin_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let pool = &self.pool;
-        let schema_sources = self.schema_sources.clone();
         async move {
             pool.ensure_open()?;
             let connection = pool
@@ -396,7 +315,6 @@ impl ReplicationStore for SqliteReplicationStore {
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
-                schema_sources,
                 SqliteReplicationTransactionKind::Write,
             )) as Box<dyn ReplicationStoreTransaction>)
         }
@@ -407,7 +325,6 @@ impl ReplicationStore for SqliteReplicationStore {
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
         let pool = &self.pool;
-        let schema_sources = self.schema_sources.clone();
         async move {
             pool.ensure_open()?;
             let connection = pool
@@ -417,7 +334,6 @@ impl ReplicationStore for SqliteReplicationStore {
                 .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
-                schema_sources,
                 SqliteReplicationTransactionKind::Read,
             )) as Box<dyn ReplicationStoreReadTransaction>)
         }
@@ -588,19 +504,13 @@ impl SqliteStoreState {
 /// to the pool.
 struct SqliteReplicationStoreTransaction {
     connection: Option<SqliteStoreTransaction>,
-    schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     kind: SqliteReplicationTransactionKind,
 }
 
 impl SqliteReplicationStoreTransaction {
-    fn new(
-        connection: SqliteStoreTransaction,
-        schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
-        kind: SqliteReplicationTransactionKind,
-    ) -> Self {
+    fn new(connection: SqliteStoreTransaction, kind: SqliteReplicationTransactionKind) -> Self {
         Self {
             connection: Some(connection),
-            schema_sources,
             kind,
         }
     }
@@ -770,38 +680,23 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
 
     fn load_dataset_rows<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         row_keys: &'a mut RowKeyIterator<'a>,
     ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
-        let schema_sources = self.schema_sources.clone();
-        async move {
-            load_dataset_rows(
-                self.assert_open_connection(),
-                schema_sources.as_ref(),
-                group_id,
-                dataset_id,
-                row_keys,
-            )
-            .await
-        }
-        .boxed()
+        async move { load_dataset_rows(self.assert_open_connection(), dataset, row_keys).await }
+            .boxed()
     }
 
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
-        let schema_sources = self.schema_sources.clone();
         async move {
             scan_dataset_row_batch(
                 self.assert_open_connection(),
-                schema_sources.as_ref(),
-                group_id,
-                dataset_id,
+                dataset,
                 after,
                 limit,
             )
@@ -954,20 +849,13 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn apply_dataset_row_patch(
-        &mut self,
-        patch: DatasetRowStatePatch,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        let schema_sources = self.schema_sources.clone();
-        async move {
-            apply_dataset_row_patch(
-                self.assert_open_connection(),
-                schema_sources.as_ref(),
-                &patch,
-            )
-            .await
-        }
-        .boxed()
+    fn apply_dataset_row_patch<'a>(
+        &'a mut self,
+        dataset: GroupDatasetSchemaRef<'a>,
+        patch: &'a DatasetRowStatePatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        async move { apply_dataset_row_patch(self.assert_open_connection(), dataset, patch).await }
+            .boxed()
     }
 
     fn append_replication_update(

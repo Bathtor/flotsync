@@ -1,14 +1,152 @@
 id = "019f5789-2d54-70e2-a97c-f1f3a1521121"
 ref = "flotsync-k5b"
 title = "Rethink group schema access before schema migration"
-body = "Review how replication runtime and store access fixed group schemas before any further schema-migration work. Current slice makes lookup group-scoped, but still duplicates schema payloads across bootstrap, invitations, migration proposals, store rows, and runtime validation. Decide whether to introduce a shared group-schema view/accessor, schema interning, or another storage/query shape before implementing schema migration."
-status = "open"
+body = """
+Rethink schema ownership and access so applications register process-static dataset schemas once, while every replication group continues to carry and store its complete immutable schema definition.
+
+Agreed holistic plan:
+
+P01. Keep ApplicationSchemas as the public representation-abstract registry. Applications construct it once, normally in LazyLock, and runtime-loading APIs accept only a &'static ApplicationSchemas. Keep the backing representation private so it can change without altering public APIs.
+
+P02. Replace the private HashMap with an immutable sorted Box slice of static dataset identifier strings and static Schema references. Validate every key, sort first by byte length and then lexical contents, reject adjacent duplicates, and use binary search with the identical comparator. This avoids hashing untrusted lookup needles and is tuned for modest application registries with relatively short keys.
+
+P03. Provide a zero-allocation ApplicationSchemas::EMPTY representation. Add checked constructors for arbitrary entries, a single entry, LazyLock Schema entries, and one LazyLock Schema entry. Lazy constructors remove explicit dereference coercions at application and fixture call sites.
+
+P04. Expose one public ApplicationSchemas iterator yielding DatasetId values and static Schema references. Its ordering is explicitly unspecified despite the current sorted representation.
+
+P05. Change the private DatasetId storage to Cow<'static, str>. Parsed, decoded, or otherwise dynamic identifiers remain owned Strings; identifiers produced from already validated application registry keys borrow the static string without allocation or repeated validation. Keep the existing string-facing public API and content-based equality, ordering, and hashing.
+
+P06. Keep SchemaSource equality representation-sensitive. Document that Static and Shared sources are distinct and that callers requiring structural equality must compare the underlying values returned by as_schema.
+
+P07. Add and document an explicit GroupSchema structural-definition comparison for group-definition validation. It compares dataset ids and underlying Schema values without changing ordinary GroupSchema or SchemaSource equality. Keep contains_dataset for membership-only validation.
+
+P08. Keep public GroupSchema directly map-backed and mutable so protobuf decoding can continue checked incremental insertion without copy-on-write behaviour.
+
+P09. Resolve a loaded GroupSchema inside the replication runtime. For each dataset, structurally compare the loaded definition with the application registry schema. Use SchemaSource::Static for a match and retain the loaded SchemaSource::Shared for a mismatch.
+
+P10. Store resolved immutable group schemas as Arc<GroupSchema> in the existing module-private RuntimeGroupState. SharedGroupState retains the static ApplicationSchemas pointer and remains the per-runtime owner; do not add a global or store-owned schema cache.
+
+P11. Build replacement runtime state from each complete active-record set. Reuse the existing Arc<GroupSchema> for already hosted GroupIds and resolve only cold-start or newly hosted groups. RuntimeGroupState construction receives an already resolved schema rather than deciding between static and cached sources itself.
+
+P12. Document that cold-store and remote schema resolution deduplicates equal in-memory definitions against application-static references. Preserve complete per-group schema payloads in SQLite, bootstrap messages, invitations, migration proposals, pending decisions, and pending activations. Static mismatches retain shared loaded schemas.
+
+P13. Remove application-wide schema sources and load_dataset_schema from the replication-store abstraction. The store is not responsible for schema resolution or caching.
+
+P14. Keep GroupDatasetSchemaRef as a simple copyable argument container with public borrowed group, dataset, and schema fields. Put prescriptive ephemeral-use and non-retention requirements on the transaction methods that consume it.
+
+P15. Require row-patch writes to reject schema contexts whose group or dataset identifier differs from the borrowed DatasetRowStatePatch. Use the Snafu ensure idiom and classify the mismatch as an invalid caller argument before empty-patch handling.
+
+P16. Rework publish, inbound apply, replay, snapshot streaming, initial snapshot creation, and activation to select schemas from resolved group state and pass borrowed schema contexts into schema-aware store operations. Snapshot request validation uses allocation-free membership checks solely to raise a complete missing-schema error before returning its provider.
+
+P17. Include group and dataset identifiers in missing-schema errors raised while taking snapshots, publishing changes, or applying inbound deliveries. Remove synthetic display-only substring tests unless a business path naturally covers the error.
+
+P18. Update SQLite constructors, test support, secure-runtime tests, and replicated-checklist wiring so one LazyLock-initialised ApplicationSchemas registry is supplied to runtime loading rather than store construction. Keep fixture accessors that centralise LazyLock-to-static Schema coercion where still useful.
+
+P19. Remove fixture logic that infers an application registry by comparing schemas. Make each fixture call site pass its exact static registry, use ApplicationSchemas::EMPTY for empty cases, and use the single-entry and LazyLock constructors for fixed registries.
+
+P20. Keep all test-only process-static schemas and registries in module-level static values. Do not leak heap allocations to manufacture static references.
+
+P21. Cover sorted registry lookup across input order, length partitions and equal-length lexical ordering; duplicate and invalid-key rejection; empty, single-entry, and LazyLock construction; allocation-free registry iteration; content equality and hashing between borrowed and owned DatasetId values; static-match canonicalisation; loaded-schema fallback; representation-sensitive source equality; structural group-definition equality; startup hydration; newly activated groups; resolved Arc reuse; schema-aware row reads, scans, and writes; protobuf mutable construction; and application-facing schema references.
+
+P22. Replace the broad DatasetId::try_new input with explicit try_from_owned(String) and try_from_static(&'static str) constructors so callers choose ownership and allocation behaviour deliberately. The static constructor validates before retaining the borrowed reference.
+
+P23. Implement FromStr as the canonical parser for arbitrary borrowed text, producing an owned identifier after validation. Retain TryFrom<String> as an allocation-preserving owned conversion, remove redundant TryFrom<&str>, and name the crate-private registry-only no-validation path from_static_unchecked.
+
+P24. Document exact validation failures and allocation behaviour for DatasetId validation, owned and static construction, borrowed access, parsing, and conversion back into String.
+
+P25. Make populated ApplicationSchemas iteration tests assert the complete identifier-to-schema mapping without depending on order. Add direct DatasetId tests for valid forms, every validation error category including byte indices and non-ASCII input, storage selection, parsing, and cross-representation equality, order, and hash behaviour.
+
+Scope and constraints:
+
+C01. Implement this as one coherent review slice. The third-review delta is estimated at approximately 240 to 430 LOC. The complete branch already exceeds 1,000 changed LOC, but splitting now would require transitional public and store contracts without a useful independent boundary, and the user prefers completing it in one slice.
+
+C02. Group schemas are immutable after group definition. Resolved runtime entries do not expire or change for an existing GroupId, and later refreshes reuse the cached Arc without repeated structural comparison.
+
+C03. The database and wire definitions remain authoritative for each group across application code changes. Static application schemas are only canonical in-memory ownership candidates when structurally equal.
+
+C04. Pending group work retains its decoded schema and enters resolved hosted state only on activation.
+
+C05. ApplicationSchemas intentionally hides its concrete collection representation and ordering. The agreed initial representation is the length-first sorted boxed slice, but callers may not depend on it.
+
+C06. Dataset identifiers remain strings because their validated ASCII language is a strict UTF-8 subset and string APIs integrate directly with SQL, protobuf, formatting, and existing public interfaces. Only their private owned-or-static representation changes.
+
+C07. Future schema-change protocol work remains outside this issue; this issue establishes the ownership and lookup boundary it will rely on.
+
+C08. The third-review implementation is complete and all recorded feedback is reconciled.
+
+C09. The fourth-review delta refines DatasetId construction, documentation, call-site ownership selection, and tests without changing the agreed schema ownership or persistence boundaries. It is estimated at 120 to 220 changed LOC and remains part of this coherent issue slice.
+
+C10. The fourth-review implementation is complete: explicit owned and static DatasetId construction, FromStr parsing, unchecked-path naming, public API documentation, call-site ownership selection, registry iterator mapping coverage, and direct identifier validation coverage are all in place and validated."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 labels = ["area:replication"]
+assignee = "Codex"
 created_at = "2026-07-12T18:13:55.668921Z"
-updated_at = "2026-07-26T12:04:18.005117Z"
+updated_at = "2026-08-19T06:02:13.078621Z"
+closed_at = "2026-08-19T06:02:13.078621Z"
 
 [[links]]
 target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
 label = "discovered from"
+
+[[comments]]
+id = "01a00ec4-55e5-7cf1-b93b-1bc60c5e4f3a"
+author = "Codex"
+body = "Plan alignment completed after schema-ownership review. The agreed design keeps application registration static-only, resolves full stored or wire schemas inside the runtime, shares resolved GroupSchema values through existing per-runtime group state, removes store-owned schema sources, and passes borrowed GroupDatasetSchemaRef contexts into schema-aware row operations. The complete contract change will be implemented as one review slice."
+created_at = "2026-08-17T08:09:03.205561Z"
+
+[[comments]]
+id = "01a00ef0-4875-7b53-bec0-ef3b03ae22ff"
+author = "Codex"
+body = "Implementation complete and ready for review. Runtime loaders now accept process-static schema references; hosted group state resolves matching stored definitions to those references and retains unmatched loaded schemas; SQLite no longer owns an application schema registry and row operations receive borrowed GroupDatasetSchemaRef contexts. Full per-group schemas remain persisted and carried on wire/pending paths. Added focused ownership/structural equality, canonicalisation, fallback, startup, activation, and Arc-reuse coverage. Validation passed for 308 replication unit tests, 6 secure-runtime integration tests, 72 replicated-checklist tests, workspace all-target checking, formatting, and pedantic Clippy for both changed crates."
+created_at = "2026-08-17T08:57:03.349208Z"
+
+[[comments]]
+id = "01a00f14-1e34-7c81-bd2e-08078a23b92c"
+author = "Codex"
+body = "Review delta agreed: withdraw the cache-revalidation concern because group schemas are immutable; classify mismatched borrowed row schema context as an invalid caller argument before empty-patch handling; add group identifiers to runtime missing-schema errors; and replace the leaked test schema with a module-level LazyLock."
+created_at = "2026-08-17T09:36:11.828481Z"
+
+[[comments]]
+id = "01a00f1a-ff31-78c1-b281-0b2a15f6943f"
+author = "Codex"
+body = "Review corrections implemented. SQLite now rejects mismatched GroupDatasetSchemaRef and DatasetRowStatePatch identifiers before empty-patch handling with a typed operation-contract error; snapshot, publish, and inbound missing-schema errors include group and dataset ids; and the fixed test schema uses a module-level LazyLock without leaking memory. B01 remains withdrawn under the immutable-group-schema invariant. Validation passed for 310 replication unit tests, 6 secure-runtime integration tests, 72 example tests, workspace all-target checking, formatting, and warning-free pedantic Clippy for both changed crates."
+created_at = "2026-08-17T09:43:42.641221Z"
+
+[[comments]]
+id = "01a0109e-47eb-7f73-b84c-f805d2995ff9"
+author = "lkroll"
+body = "Second review delta implemented. Public runtime APIs now accept a static ApplicationSchemas registry whose checked, compacted HashMap backing remains private; SharedGroupState retains the registry pointer and reuses resolved group-schema Arcs across complete active-state rebuilds. Store schema contexts are simple public-field argument structs with prescriptive ephemeral-use contracts and required mismatch errors. Snapshot validation uses contains_dataset solely for eager error reporting, the state-building and cold-schema helpers have precise names and documentation, and replicated-checklist passes one LazyLock registry in real and test loading. All R19-R38 feedback is reconciled with nothing deferred. Validation passed for 311 replication unit tests, 6 secure-runtime integration tests, 72 checklist tests, workspace all-target checking, formatting, and warning-free pedantic Clippy for both changed crates."
+created_at = "2026-08-17T16:46:43.691379Z"
+
+[[comments]]
+id = "01a0142b-7a07-7ce3-978d-943c712ac74b"
+author = "Codex"
+body = "Third-review plan aligned and deliberately paused before implementation. ApplicationSchemas will use a length-first sorted boxed slice with binary search, zero-allocation empty and single-entry conveniences, LazyLock-aware constructors, and one public allocation-free DatasetId iterator with unspecified ordering. DatasetId will privately use Cow with static registry keys borrowed and dynamic values owned. Fixture schema inference will be removed in favour of explicit registries. Estimated review delta is 240 to 430 LOC; the complete contract remains one coherent slice."
+created_at = "2026-08-18T09:19:48.743668Z"
+
+[[comments]]
+id = "01a0186d-8519-7f51-91f6-2b497172bf50"
+author = "Codex"
+body = "Third-review implementation complete. ApplicationSchemas now uses a length-first sorted boxed slice with matching binary-search lookup, allocation-free EMPTY, direct and LazyLock-aware constructors, and a public ordering-unspecified iterator. DatasetId uses Cow so registry-derived ids borrow validated static keys while dynamic ids remain owned. Removed fixture registry inference and made all test/application call sites explicit. R39-R49 are fully reconciled. Validation passed for 314 replication library tests, 6 secure-runtime integration tests, 72 checklist tests, workspace all-target checking, formatting, and warning-free pedantic Clippy for the changed crates."
+created_at = "2026-08-19T05:10:25.817212Z"
+
+[[comments]]
+id = "01a0188c-1a33-7671-9518-41833fb06da8"
+author = "Codex"
+body = "Fourth-review plan agreed: split DatasetId construction into checked owned and static paths, add FromStr, retain TryFrom<String>, remove TryFrom<&str>, rename the crate-private bypass to from_static_unchecked, improve ownership/error documentation, strengthen validation coverage, and make the registry iterator test assert complete key-to-schema mappings."
+created_at = "2026-08-19T05:43:50.067754Z"
+
+[[comments]]
+id = "01a01892-bc38-7672-aefa-4f060b92dadc"
+author = "lkroll"
+body = "Fourth-review implementation complete. DatasetId now has explicit checked owned and static construction, FromStr parsing, allocation-preserving TryFrom<String>, and a precisely documented crate-private unchecked static path. All call sites select ownership deliberately; registry iteration verifies complete identifier-to-schema mappings; and identifier tests cover valid syntax, validation failures with byte indices, non-ASCII input, representation selection, parsing, equality, ordering, and hashing. R50-R53 are reconciled with nothing deferred. Validation passed for 317 replication library tests, 6 secure-runtime integration tests, 72 replication example tests, pedantic Clippy for affected packages, workspace all-target checking, formatting, and Git whitespace checks."
+created_at = "2026-08-19T05:51:04.760984Z"
+
+[[comments]]
+id = "01a0189c-eed6-7923-b153-612cd62eb13e"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-19T06:02:13.078621Z"

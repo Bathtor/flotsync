@@ -7,7 +7,7 @@ pub(super) type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStor
 pub(super) type TestDeliveryRuntimeHost = SqliteStoreTestOwner<DeliveryRuntimeHost>;
 
 pub(super) fn docs_dataset_id() -> DatasetId {
-    DatasetId::try_new("docs").expect("dataset id should be valid")
+    DatasetId::try_from_static("docs").expect("dataset id should be valid")
 }
 
 pub(super) fn alice_member() -> MemberIdentity {
@@ -177,8 +177,19 @@ pub(super) fn docs_group_schema() -> GroupSchema {
     docs_group_schema_from_schema(title_schema_shared())
 }
 
+/// Coerce the title-schema `LazyLock` into the process-static reference expected by APIs.
 pub(super) fn title_schema_static() -> &'static Schema {
     &STATIC_TITLE_SCHEMA
+}
+
+/// Coerce the title/note-schema `LazyLock` into the process-static reference expected by APIs.
+pub(super) fn title_note_schema_static() -> &'static Schema {
+    &STATIC_TITLE_NOTE_SCHEMA
+}
+
+/// Coerce the title/edit-count-schema `LazyLock` into the static reference expected by APIs.
+pub(super) fn title_edit_count_schema_static() -> &'static Schema {
+    &STATIC_TITLE_EDIT_COUNT_SCHEMA
 }
 
 pub(super) fn title_row_values(title: &str) -> RowValues {
@@ -208,18 +219,9 @@ pub(super) fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -
     clippy::needless_pass_by_value,
     reason = "Runtime fixture callers consistently transfer or clone member identities into store construction."
 )]
-pub(super) fn sqlite_store_with_schemas<I, S>(
-    local_member: MemberIdentity,
-    schemas: I,
-) -> TestSqliteStore
-where
-    I: IntoIterator<Item = (DatasetId, S)>,
-    S: Into<SchemaSource>,
-{
-    let provisioner = wait_for_test_future(
-        SqliteReplicationStoreProvisioner::in_memory_with_schema_sources(schemas),
-    )
-    .expect("store provisioner should build");
+pub(super) fn sqlite_store(local_member: MemberIdentity) -> TestSqliteStore {
+    let provisioner = wait_for_test_future(SqliteReplicationStoreProvisioner::in_memory())
+        .expect("store provisioner should build");
     wait_for_test_reply(provision_shared_test_identity(
         app_probe_id(),
         &provisioner,
@@ -230,13 +232,6 @@ where
     let store = wait_for_test_future(provisioner.into_replication_store())
         .expect("provisioned store should activate");
     SqliteStoreTestOwner::from_store(Arc::new(store))
-}
-
-pub(super) fn sqlite_store(local_member: MemberIdentity) -> TestSqliteStore {
-    sqlite_store_with_schemas(
-        local_member,
-        std::iter::empty::<(DatasetId, SchemaSource)>(),
-    )
 }
 
 pub(super) fn store_pending_group_decision(
@@ -425,20 +420,21 @@ pub(super) fn accept_one_creation_invitation(
     }
 }
 
-pub(super) fn load_runtime_fixture<I, S>(
+pub(super) fn load_runtime_fixture(
     application_id: ApplicationId,
     local_member: MemberIdentity,
-    schemas: I,
-) -> RuntimeFixture<SqliteReplicationStore>
-where
-    I: IntoIterator<Item = (DatasetId, S)>,
-    S: Into<SchemaSource>,
-{
+    application_schemas: &'static ApplicationSchemas,
+) -> RuntimeFixture<SqliteReplicationStore> {
     let listener = Arc::new(ListenerStub::default());
-    let store = sqlite_store_with_schemas(local_member, schemas);
+    let store = sqlite_store(local_member);
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
-    let runtime = load_runtime_with_parts(application_id, store.clone(), listener.clone());
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        application_id,
+        application_schemas,
+        store.clone(),
+        listener.clone(),
+    );
     RuntimeFixture {
         local_member,
         runtime,
@@ -450,11 +446,7 @@ where
 
 #[test]
 pub(super) fn runtime_api_returns_local_public_key_bundle() {
-    let fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), &ApplicationSchemas::EMPTY);
 
     let bundle = wait_for_test_reply(fixture.runtime.local_public_key_bundle())
         .expect("local public key bundle should load");
@@ -468,11 +460,7 @@ pub(super) fn runtime_api_returns_local_public_key_bundle() {
 #[test]
 pub(super) fn runtime_api_reports_known_member_key_trust() {
     let alice = alice_member();
-    let fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let fixture = load_runtime_fixture(app_alice_id(), alice.clone(), &ApplicationSchemas::EMPTY);
     let record = MemberPublicKeysRecord::from_public_keys(&test_public_keys(&alice));
     let mut transaction =
         wait_for_test_reply(fixture.store.begin_transaction()).expect("transaction should start");
@@ -503,11 +491,7 @@ pub(super) fn runtime_api_reports_known_member_key_trust() {
 #[test]
 pub(super) fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
     let bob = bob_member();
-    let fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), &ApplicationSchemas::EMPTY);
     let bundle = test_public_keys(&bob).public_key_bundle();
     let fingerprint = bundle.fingerprint();
     let key_id = MemberKeyId {
@@ -574,9 +558,7 @@ pub(super) fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
     assert!(updated_binding.trust.has_local_explicit_trust);
 }
 
-pub(super) fn load_title_runtime_pair_with_trust(
-    dataset_id: &DatasetId,
-) -> (
+pub(super) fn load_title_runtime_pair_with_trust() -> (
     RuntimeFixture<SqliteReplicationStore>,
     RuntimeFixture<SqliteReplicationStore>,
 ) {
@@ -585,13 +567,10 @@ pub(super) fn load_title_runtime_pair_with_trust(
     let alice_fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     provision_test_security(
         alice_fixture.store.as_ref(),
         &alice_member,
@@ -670,6 +649,7 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHo
     let listener = Arc::new(ListenerStub::default());
     let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
         local_member,
+        &ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -689,8 +669,27 @@ pub(super) fn load_runtime_with_parts<S>(
 where
     S: ReplicationStore + 'static,
 {
-    load_runtime_with_parts_and_config(
+    load_runtime_with_parts_and_application_schemas_and_config(
         application_id,
+        &ApplicationSchemas::EMPTY,
+        store,
+        listener,
+        ReplicationConfig::default(),
+    )
+}
+
+pub(super) fn load_runtime_with_parts_and_application_schemas<S>(
+    application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
+    store: Arc<S>,
+    listener: Arc<ListenerStub>,
+) -> Arc<ReplicationRuntime>
+where
+    S: ReplicationStore + 'static,
+{
+    load_runtime_with_parts_and_application_schemas_and_config(
+        application_id,
+        application_schemas,
         store,
         listener,
         ReplicationConfig::default(),
@@ -706,11 +705,31 @@ pub(super) fn load_runtime_with_parts_and_config<S>(
 where
     S: ReplicationStore + 'static,
 {
+    load_runtime_with_parts_and_application_schemas_and_config(
+        application_id,
+        &ApplicationSchemas::EMPTY,
+        store,
+        listener,
+        config,
+    )
+}
+
+fn load_runtime_with_parts_and_application_schemas_and_config<S>(
+    application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
+    store: Arc<S>,
+    listener: Arc<ListenerStub>,
+    config: ReplicationConfig,
+) -> Arc<ReplicationRuntime>
+where
+    S: ReplicationStore + 'static,
+{
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
     let security = load_test_runtime_security(store.clone(), &local_member);
     wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -722,6 +741,7 @@ where
 
 pub(super) fn load_runtime_with_parts_and_runtime_config_toml<S>(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<S>,
     listener: Arc<ListenerStub>,
     runtime_config_toml: &str,
@@ -734,6 +754,7 @@ where
     let security = load_test_runtime_security(store.clone(), &local_member);
     wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
         application_id,
+        application_schemas,
         store,
         listener,
         ReplicationConfig::default(),
@@ -941,9 +962,19 @@ where
     let mut requested_row_keys = requested_row_keys.iter();
     let mut transaction =
         wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let group = wait_for_test_reply(transaction.load_replication_group(&group_id))
+        .expect("group should load")
+        .expect("group should exist");
+    let schema = group
+        .group_schema
+        .schema(dataset_id)
+        .expect("dataset should belong to the group");
     let row_slice = wait_for_test_reply(transaction.load_dataset_rows(
-        &group_id,
-        dataset_id,
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id,
+            schema: schema.as_schema(),
+        },
         &mut requested_row_keys,
     ))
     .expect("row slice should load");

@@ -12,13 +12,14 @@ use super::{
 use crate::api::{
     DatasetId,
     DatasetRowStateSlice,
+    GroupDatasetSchemaRef,
+    GroupSchema,
     ReplicationStoreTransaction,
     ReplicationUpdateFilter,
     ReplicationUpdateRecord,
     RowId,
     RowKey,
     RowValuesPatch,
-    SchemaSource,
 };
 use flotsync_core::{
     GroupId,
@@ -85,14 +86,23 @@ impl PublishDatasetState {
 /// Load current row slices for the rows touched by one publish operation.
 pub(super) async fn load_touched_dataset_slices(
     transaction: &mut dyn ReplicationStoreTransaction,
+    group_schema: &GroupSchema,
     group_id: GroupId,
     dataset_rows: &HashMap<DatasetId, HashSet<RowKey>>,
 ) -> Result<HashMap<DatasetId, DatasetRowStateSlice>, crate::api::StoreError> {
     let mut slices = HashMap::with_capacity(dataset_rows.len());
     for (dataset_id, row_keys) in dataset_rows {
+        let schema = group_schema
+            .schema(dataset_id)
+            .expect("touched dataset schemas must be present in the hosted group");
+        let dataset = GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id,
+            schema: schema.as_schema(),
+        };
         let mut row_keys = row_keys.iter();
         let row_slice = transaction
-            .load_dataset_rows(&group_id, dataset_id, &mut row_keys)
+            .load_dataset_rows(dataset, &mut row_keys)
             .await?;
         slices.insert(dataset_id.clone(), row_slice);
     }
@@ -101,13 +111,13 @@ pub(super) async fn load_touched_dataset_slices(
 
 /// Materialise loaded row slices into in-memory datasets for CRDT application.
 pub(super) fn materialise_dataset_slices(
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
     slices: HashMap<DatasetId, DatasetRowStateSlice>,
 ) -> HashMap<DatasetId, LocalDataset> {
     let mut datasets = HashMap::with_capacity(slices.len());
     for (dataset_id, row_slice) in slices {
-        let schema = schemas
-            .get(&dataset_id)
+        let schema = group_schema
+            .schema(&dataset_id)
             .expect("touched dataset schemas must be pre-loaded");
         datasets.insert(
             dataset_id,
@@ -125,15 +135,16 @@ pub(super) fn materialise_dataset_slices(
 /// by this publish request.
 pub(super) async fn load_publish_dataset_state(
     transaction: &mut dyn ReplicationStoreTransaction,
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
     group_id: GroupId,
     member_count: NonZeroUsize,
     dataset_rows: HashMap<DatasetId, HashSet<RowKey>>,
     read_versions: &VersionVector,
 ) -> Result<PublishDatasetState, PublishChangesError> {
-    let latest_slices = load_touched_dataset_slices(transaction, group_id, &dataset_rows)
-        .await
-        .context(publish::StoreAccessSnafu)?;
+    let latest_slices =
+        load_touched_dataset_slices(transaction, group_schema, group_id, &dataset_rows)
+            .await
+            .context(publish::StoreAccessSnafu)?;
     let dataset_ids_that_require_replay = latest_slices
         .iter()
         .filter_map(|(dataset_id, slice)| {
@@ -144,7 +155,7 @@ pub(super) async fn load_publish_dataset_state(
         })
         .collect::<HashSet<_>>();
 
-    let latest_datasets = materialise_dataset_slices(schemas, latest_slices);
+    let latest_datasets = materialise_dataset_slices(group_schema, latest_slices);
     let mut replayed_read_base_datasets = HashMap::new();
     if !dataset_ids_that_require_replay.is_empty() {
         let applied_updates = transaction
@@ -154,7 +165,7 @@ pub(super) async fn load_publish_dataset_state(
         let replayed_datasets = replay_datasets_at_versions(
             group_id,
             member_count,
-            schemas,
+            group_schema,
             applied_updates,
             read_versions,
             &dataset_rows,
@@ -162,8 +173,8 @@ pub(super) async fn load_publish_dataset_state(
         .context(publish::ReplaySnafu)?;
 
         for dataset_id in dataset_ids_that_require_replay {
-            let schema = schemas
-                .get(&dataset_id)
+            let schema = group_schema
+                .schema(&dataset_id)
                 .expect("replayed dataset schema must be pre-loaded");
             let replayed_dataset = replayed_datasets
                 .get(&dataset_id)
@@ -186,7 +197,7 @@ pub(super) async fn load_publish_dataset_state(
 pub(super) fn replay_datasets_at_versions(
     group_id: GroupId,
     member_count: NonZeroUsize,
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
     updates: Vec<ReplicationUpdateRecord>,
     target_versions: &VersionVector,
     row_scope: &HashMap<DatasetId, HashSet<RowKey>>,
@@ -199,7 +210,7 @@ pub(super) fn replay_datasets_at_versions(
     // not guarantee topological ordering for applied-update replay.
     while let Some(update_index) = find_ready_update_index(&pending_updates, &simulated_versions) {
         let update = pending_updates.remove(update_index);
-        replay_one_update(group_id, schemas, row_scope, &mut datasets, &update)?;
+        replay_one_update(group_id, group_schema, row_scope, &mut datasets, &update)?;
         simulated_versions.increment_at(update.update_id.node_index as usize);
     }
 
@@ -267,13 +278,13 @@ fn replay_ready(simulated_versions: &VersionVector, update: &ReplicationUpdateRe
 
 fn replay_one_update(
     group_id: GroupId,
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
     row_scope: &HashMap<DatasetId, HashSet<RowKey>>,
     datasets: &mut HashMap<DatasetId, LocalDataset>,
     update: &ReplicationUpdateRecord,
 ) -> Result<(), ReplayError> {
     'dataset_updates: for dataset_update in &update.dataset_updates {
-        let Some(schema) = schemas.get(&dataset_update.dataset_id) else {
+        let Some(schema) = group_schema.schema(&dataset_update.dataset_id) else {
             continue 'dataset_updates;
         };
         let Some(scoped_rows) = row_scope.get(&dataset_update.dataset_id) else {
@@ -312,7 +323,7 @@ fn replay_one_update(
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowStateWrite, DatasetUpdateRecord, ReplicationRowStateRecord},
+        api::{DatasetRowStateWrite, DatasetUpdateRecord, ReplicationRowStateRecord, SchemaSource},
         row_values,
     };
     use flotsync_core::{MemberIdentity, versions::PureVersionVector};
@@ -321,7 +332,7 @@ mod tests {
     use uuid::Uuid;
 
     fn docs_dataset_id() -> DatasetId {
-        DatasetId::try_new("docs").expect("dataset id should build")
+        DatasetId::try_from_static("docs").expect("dataset id should build")
     }
 
     fn title_schema() -> SchemaSource {
@@ -423,7 +434,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(40_001));
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let schemas = HashMap::from([(dataset_id.clone(), schema.clone())]);
+        let schemas = GroupSchema::new(HashMap::from([(dataset_id.clone(), schema.clone())]));
         let member_count = NonZeroUsize::new(1).expect("member count should be non-zero");
         let read_versions = VersionVector::initial(member_count);
         let update_id = update_id(1);
@@ -473,7 +484,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(40_002));
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let schemas = HashMap::from([(dataset_id.clone(), schema.clone())]);
+        let schemas = GroupSchema::new(HashMap::from([(dataset_id.clone(), schema.clone())]));
         let member_count = NonZeroUsize::new(1).expect("member count should be non-zero");
         let initial_versions = VersionVector::initial(member_count);
         let first_update_id = update_id(1);

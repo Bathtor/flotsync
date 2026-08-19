@@ -68,6 +68,7 @@ macro_rules! row_values {
     }};
 }
 
+mod application_schemas;
 mod changes;
 mod diagnostics;
 mod group_state;
@@ -78,6 +79,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+pub use application_schemas::*;
 pub use changes::*;
 pub use diagnostics::*;
 pub use group_state::*;

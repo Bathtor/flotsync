@@ -4,11 +4,11 @@ use super::*;
 
 pub(super) async fn load_dataset_rows(
     connection: &mut SqliteStoreConnection,
-    schema_sources: &HashMap<DatasetId, SchemaSource>,
-    group_id: &GroupId,
-    dataset_id: &DatasetId,
+    dataset: GroupDatasetSchemaRef<'_>,
     row_keys: &mut RowKeyIterator<'_>,
 ) -> Result<DatasetRowStateSlice, StoreError> {
+    let group_id = dataset.group_id;
+    let dataset_id = dataset.dataset_id;
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     let mut row_keys = row_keys.peekable();
     if row_keys.peek().is_none() {
@@ -31,13 +31,6 @@ pub(super) async fn load_dataset_rows(
         });
     }
 
-    let schema = schema_sources
-        .get(dataset_id)
-        .cloned()
-        .context(MissingSchemaSnafu {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-        })?;
     let member_count = load_group_member_count(connection, group_id).await?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
@@ -63,20 +56,16 @@ WHERE group_id = ",
         .context(SqlxSnafu)?;
     for row in stored_rows {
         let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let row_snapshot = decode_dataset_row_snapshot(
-            schema.as_schema(),
-            &row.get::<Vec<u8>, _>("row_snapshot"),
-        )?;
+        let row_snapshot =
+            decode_dataset_row_snapshot(dataset.schema, &row.get::<Vec<u8>, _>("row_snapshot"))?;
+        let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
         rows.insert(
             row_key,
             Some(ReplicationRowStateRecord {
                 row_id: row_key,
                 snapshot: row_snapshot,
                 tombstoned: row.get::<bool, _>("row_tombstoned"),
-                last_changed_versions: decode_dataset_row_last_changed_versions(
-                    &row,
-                    member_count,
-                )?,
+                last_changed_versions,
             }),
         );
     }
@@ -95,12 +84,12 @@ WHERE group_id = ",
 /// continue with `row_key > next_after`.
 pub(super) async fn scan_dataset_row_batch(
     connection: &mut SqliteStoreConnection,
-    schema_sources: &HashMap<DatasetId, SchemaSource>,
-    group_id: &GroupId,
-    dataset_id: &DatasetId,
+    dataset: GroupDatasetSchemaRef<'_>,
     after: Option<RowKey>,
     limit: NonZeroUsize,
 ) -> Result<DatasetRowStateBatch, StoreError> {
+    let group_id = dataset.group_id;
+    let dataset_id = dataset.dataset_id;
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     if !dataset_exists {
         return Ok(DatasetRowStateBatch {
@@ -112,13 +101,6 @@ pub(super) async fn scan_dataset_row_batch(
         });
     }
 
-    let schema = schema_sources
-        .get(dataset_id)
-        .cloned()
-        .context(MissingSchemaSnafu {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-        })?;
     let member_count = load_group_member_count(connection, group_id).await?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
@@ -144,15 +126,14 @@ WHERE group_id = ",
     let mut rows = Vec::with_capacity(stored_rows.len());
     for row in stored_rows {
         let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let row_snapshot = decode_dataset_row_snapshot(
-            schema.as_schema(),
-            &row.get::<Vec<u8>, _>("row_snapshot"),
-        )?;
+        let row_snapshot =
+            decode_dataset_row_snapshot(dataset.schema, &row.get::<Vec<u8>, _>("row_snapshot"))?;
+        let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
         rows.push(ReplicationRowStateRecord {
             row_id: row_key,
             snapshot: row_snapshot,
             tombstoned: row.get::<bool, _>("row_tombstoned"),
-            last_changed_versions: decode_dataset_row_last_changed_versions(&row, member_count)?,
+            last_changed_versions,
         });
     }
     let next_after = if rows.len() == limit.get() {
@@ -171,20 +152,24 @@ WHERE group_id = ",
 
 pub(super) async fn apply_dataset_row_patch(
     connection: &mut SqliteStoreConnection,
-    schema_sources: &HashMap<DatasetId, SchemaSource>,
+    dataset: GroupDatasetSchemaRef<'_>,
     patch: &DatasetRowStatePatch,
 ) -> Result<(), StoreError> {
+    let context_matches_patch =
+        dataset.group_id == &patch.group_id && dataset.dataset_id == &patch.dataset_id;
+    ensure!(
+        context_matches_patch,
+        InvalidDatasetRowPatchContextSnafu {
+            context_group: *dataset.group_id,
+            context_dataset: dataset.dataset_id.clone(),
+            patch_group: patch.group_id,
+            patch_dataset: patch.dataset_id.clone(),
+        }
+    );
     if patch.actions.is_empty() {
         return Ok(());
     }
 
-    let schema = schema_sources
-        .get(&patch.dataset_id)
-        .cloned()
-        .context(MissingSchemaSnafu {
-            group_id: patch.group_id,
-            dataset_id: patch.dataset_id.clone(),
-        })?;
     ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
 
     for action in &patch.actions {
@@ -203,7 +188,7 @@ pub(super) async fn apply_dataset_row_patch(
                 (row_key, snapshot, true)
             }
         };
-        let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
+        let row_snapshot = encode_dataset_row_snapshot(dataset.schema, snapshot)?;
         sqlx::query(
             "
 INSERT INTO dataset_rows (

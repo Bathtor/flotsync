@@ -12,7 +12,11 @@ fn runtime_group_state_projection_rejects_duplicate_group_ids() {
         GroupSchema::default(),
     );
 
-    let result = RuntimeGroupStateSnapshot::from_records(&local_member, [record.clone(), record]);
+    let result = RuntimeGroupStateSnapshot::from_records(
+        &local_member,
+        &ApplicationSchemas::EMPTY,
+        [record.clone(), record],
+    );
     let Err(error) = result else {
         panic!("duplicate group identifiers should be rejected");
     };
@@ -25,13 +29,102 @@ fn runtime_group_state_projection_rejects_duplicate_group_ids() {
 }
 
 #[test]
+fn runtime_group_state_reuses_matching_process_static_schema() {
+    let local_member = alice_member();
+    let group_id = GroupId(Uuid::from_u128(31));
+    let dataset_id = docs_dataset_id();
+    let loaded_schema = title_schema_shared();
+    let record = inactive_group_record(
+        group_id,
+        vec![local_member.clone(), bob_member()],
+        docs_group_schema_from_schema(loaded_schema),
+    );
+    let snapshot = RuntimeGroupStateSnapshot::from_records(
+        &local_member,
+        &TITLE_APPLICATION_SCHEMAS,
+        [record],
+    )
+    .expect("matching stored schema should resolve");
+    let schema = snapshot
+        .group(&group_id)
+        .expect("group should be projected")
+        .group_schema()
+        .schema(&dataset_id)
+        .expect("dataset should be projected");
+
+    assert!(matches!(schema, SchemaSource::Static(_)));
+    assert!(std::ptr::eq(schema.as_schema(), title_schema_static()));
+}
+
+#[test]
+fn runtime_group_state_keeps_non_matching_loaded_schema() {
+    let local_member = alice_member();
+    let group_id = GroupId(Uuid::from_u128(32));
+    let dataset_id = docs_dataset_id();
+    let loaded_schema = title_note_schema_shared();
+    let record = inactive_group_record(
+        group_id,
+        vec![local_member.clone(), bob_member()],
+        docs_group_schema_from_schema(loaded_schema.clone()),
+    );
+    let snapshot = RuntimeGroupStateSnapshot::from_records(
+        &local_member,
+        &TITLE_APPLICATION_SCHEMAS,
+        [record],
+    )
+    .expect("non-matching stored schema should remain usable");
+    let schema = snapshot
+        .group(&group_id)
+        .expect("group should be projected")
+        .group_schema()
+        .schema(&dataset_id)
+        .expect("dataset should be projected");
+
+    let SchemaSource::Shared(resolved) = schema else {
+        panic!("non-matching schema should retain shared ownership");
+    };
+    assert!(Arc::ptr_eq(resolved, &loaded_schema));
+}
+
+#[test]
+fn runtime_group_state_reuses_resolved_schema_arc_for_hosted_group() {
+    let local_member = alice_member();
+    let group_id = GroupId(Uuid::from_u128(33));
+    let state = SharedGroupState::new(&ApplicationSchemas::EMPTY);
+    let first_record = inactive_group_record(
+        group_id,
+        vec![local_member.clone(), bob_member()],
+        docs_group_schema(),
+    );
+    let first_snapshot = state
+        .build_runtime_state_from_active_records(&local_member, [first_record])
+        .expect("first group projection should succeed");
+    state.replace(first_snapshot);
+    let first_schema = state
+        .group_schema(&group_id)
+        .expect("first projection should retain a schema");
+
+    let second_record = inactive_group_record(
+        group_id,
+        vec![local_member.clone(), bob_member()],
+        docs_group_schema(),
+    );
+    let second_snapshot = state
+        .build_runtime_state_from_active_records(&local_member, [second_record])
+        .expect("second group projection should succeed");
+    state.replace(second_snapshot);
+    let second_schema = state
+        .group_schema(&group_id)
+        .expect("second projection should retain a schema");
+
+    assert!(Arc::ptr_eq(&first_schema, &second_schema));
+}
+
+#[test]
 fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let group_id = GroupId(Uuid::from_u128(31));
     let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member()])
         .expect("group should build");
@@ -51,8 +144,13 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
-    let row_id = test_row_id(group_id, dataset_id, 32);
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        listener,
+    );
+    let row_id = test_row_id(group_id, dataset_id.clone(), 32);
 
     wait_for_group_install(&runtime, group_id);
     let group_state = runtime
@@ -62,7 +160,20 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         .group(&group_id)
         .expect("persisted group should be published at startup");
     assert_eq!(hydrated_group.group_id(), group_id);
-    assert_eq!(hydrated_group.group_schema(), &docs_group_schema());
+    assert!(
+        hydrated_group
+            .group_schema()
+            .has_same_schema_definitions(&docs_group_schema())
+    );
+    let hydrated_schema = hydrated_group
+        .group_schema()
+        .schema(&dataset_id)
+        .expect("hydrated docs dataset should have a schema");
+    assert!(matches!(hydrated_schema, SchemaSource::Static(_)));
+    assert!(std::ptr::eq(
+        hydrated_schema.as_schema(),
+        title_schema_static()
+    ));
     assert_eq!(hydrated_group.lifecycle(), &ReplicationGroupLifecycle::Open);
     assert!(hydrated_group.is_readable());
     assert!(hydrated_group.is_writable());
@@ -88,10 +199,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
 fn group_state_retains_one_coherent_view_across_publications() {
     let alice_member = alice_member();
     let group_schema = docs_group_schema();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(docs_dataset_id(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let runtime = load_runtime_with_parts(
         app_alice_id(),
         store.clone(),
@@ -138,12 +246,14 @@ fn group_state_retains_one_coherent_view_across_publications() {
 fn create_group_persists_membership_across_runtime_restart() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let first_listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener.clone());
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        first_listener.clone(),
+    );
     let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("  shared docs  ".to_owned()),
         message: Some(String::new()),
@@ -159,11 +269,25 @@ fn create_group_persists_membership_across_runtime_restart() {
     assert!(creation_tokens[0].group_version(&group_id).is_some());
     let created = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(created.group_name.as_deref(), Some("shared docs"));
+    let created_state = runtime
+        .group_state()
+        .expect("created group state should be available");
+    let created_schema = created_state
+        .group(&group_id)
+        .expect("created group should be published")
+        .group_schema()
+        .schema(&dataset_id)
+        .expect("created group should retain the docs schema");
+    assert!(matches!(created_schema, SchemaSource::Static(_)));
     drop(runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime =
-        load_runtime_with_parts(app_alice_id(), store.clone(), restarted_listener);
+    let restarted_runtime = load_runtime_with_parts_and_application_schemas(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        restarted_listener,
+    );
     let row_id = test_row_id(group_id, dataset_id, 33);
 
     wait_for_group_install(&restarted_runtime, group_id);
@@ -185,10 +309,7 @@ fn create_group_persists_membership_across_runtime_restart() {
 #[test]
 fn create_group_rejects_empty_name_after_trimming() {
     let alice_member = alice_member();
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let store = sqlite_store(alice_member.clone());
     let runtime = load_runtime_with_parts(
         app_alice_id(),
         store.clone(),
@@ -218,7 +339,7 @@ fn create_group_rejects_empty_name_after_trimming() {
 #[test]
 fn create_group_default_is_rejected_as_incomplete() {
     let alice_member = alice_member();
-    let store = sqlite_store_with_schemas(alice_member, Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member);
     let runtime = load_runtime_with_parts(
         app_alice_id(),
         store.clone(),
@@ -239,7 +360,7 @@ fn create_group_default_is_rejected_as_incomplete() {
 
 #[test]
 fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
-    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member());
     let invited_group_id = GroupId(Uuid::from_u128(60_101));
     store_pending_group_decision(
         store.as_ref(),
@@ -304,7 +425,7 @@ fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
 
 #[test]
 fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_target() {
-    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member());
     let old_group_id = GroupId(Uuid::from_u128(60_120));
     let selected_group_id = GroupId(Uuid::from_u128(60_121));
     let competing_group_id = GroupId(Uuid::from_u128(60_122));
@@ -400,12 +521,8 @@ fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_
 fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decision() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let alice_store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
-    let bob_sqlite_store =
-        sqlite_store_with_schemas(bob_member.clone(), Vec::<(DatasetId, SchemaSource)>::new());
+    let alice_store = sqlite_store(alice_member.clone());
+    let bob_sqlite_store = sqlite_store(bob_member.clone());
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     provision_test_security(
         bob_sqlite_store.as_ref(),
@@ -549,10 +666,7 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
     let group_id = GroupId(Uuid::from_u128(60_105));
     let unrelated_group_id = GroupId(Uuid::from_u128(60_104));
     let row_key = RowKey(Uuid::from_u128(60_106));
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let members = vec![alice_member.clone(), bob_member.clone()];
     let member_count = NonZeroUsize::new(members.len()).expect("group should have members");
     let mut unrelated_versions = VersionVector::initial(member_count);
@@ -652,10 +766,7 @@ fn runtime_resumes_pending_migration_proposal_activation() {
         new_group_id: GroupId(Uuid::from_u128(60_112)),
     };
     let row_key = RowKey(Uuid::from_u128(60_113));
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let members = vec![alice_member, bob_member];
     let final_versions = VersionVector::Full(PureVersionVector::from([4, 0]));
     persist_group_in_store(
@@ -734,10 +845,7 @@ fn runtime_keeps_inactive_group_material_hidden_without_accepted_work() {
     let alice_member_id = alice_member();
     let bob_member_id = bob_member();
     let group_id = GroupId(Uuid::from_u128(60_107));
-    let store = sqlite_store_with_schemas(
-        alice_member_id.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let store = sqlite_store(alice_member_id.clone());
     store_inactive_group_material(
         store.as_ref(),
         inactive_group_record(
@@ -762,10 +870,7 @@ fn runtime_accepts_replayed_invitation_with_stored_group_material() {
     let dataset_id = docs_dataset_id();
     let group_id = GroupId(Uuid::from_u128(60_108));
     let row_key = RowKey(Uuid::from_u128(60_109));
-    let store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let store = sqlite_store(alice_member.clone());
     let members = vec![alice_member.clone(), bob_member.clone()];
     let mut inactive_group = inactive_group_record(group_id, members.clone(), docs_group_schema());
     inactive_group.group_name = Some("stored name".to_owned());
@@ -1011,7 +1116,7 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
 /// Assert manually restored Metadata work cannot transition into activation.
 fn assert_metadata_work_accept_rejects_without_activation(record: PendingGroupDecisionRecord) {
     let group_id = record.group_id();
-    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member());
     store_pending_group_decision(store.as_ref(), record);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
@@ -1070,7 +1175,7 @@ fn metadata_pending_group_work_accept_rejects_without_persisting_activation() {
 
 #[test]
 fn stopped_runtime_stale_invitation_accept_reports_unavailable_after_reject() {
-    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member());
     let group_id = GroupId(Uuid::from_u128(60_103));
     store_pending_group_decision(store.as_ref(), runtime_test_invitation_decision(group_id));
     let (first_runtime, stale_accept) = replay_one_pending_invitation(store.clone(), group_id);
@@ -1092,7 +1197,7 @@ fn stopped_runtime_stale_invitation_accept_reports_unavailable_after_reject() {
 
 #[test]
 fn stopped_runtime_stale_invitation_reject_reports_unavailable_after_accept() {
-    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let store = sqlite_store(alice_member());
     let group_id = GroupId(Uuid::from_u128(60_104));
     store_pending_group_decision(store.as_ref(), runtime_test_invitation_decision(group_id));
     let (first_runtime, stale_reject) = replay_one_pending_invitation(store.clone(), group_id);
@@ -1130,6 +1235,7 @@ fn runtime_replay_listener_failure_keeps_pending_group_decision() {
     let start_result =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
             &alice_member,
+            &ApplicationSchemas::EMPTY,
             store.clone(),
             listener.clone(),
             ReplicationConfig::default(),

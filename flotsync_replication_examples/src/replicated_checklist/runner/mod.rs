@@ -1,4 +1,5 @@
 use super::{
+    CHECKLIST_DATASET_ID,
     CHECKLIST_SCHEMA,
     ChecklistCommand,
     ChecklistGroupCommand,
@@ -22,6 +23,7 @@ use clap::{Parser, Subcommand};
 use flotsync_core::{GroupId, MemberIdentity, member::IdentifierParseError};
 use flotsync_replication::{
     ApiError,
+    ApplicationSchemas,
     CreateGroupRequest,
     GroupInvitation,
     GroupInvitationResponder,
@@ -100,8 +102,13 @@ const CHECKLIST_SNAPSHOT_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwra
 static CHECKLIST_GROUP_SCHEMA: LazyLock<GroupSchema> = LazyLock::new(|| {
     GroupSchema::new(HashMap::from([(
         checklist_dataset_id(),
-        CHECKLIST_SCHEMA.clone().into(),
+        (&*CHECKLIST_SCHEMA).into(),
     )]))
+});
+/// Process-static schemas the checklist runtime may reuse for matching group definitions.
+static CHECKLIST_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entry(CHECKLIST_DATASET_ID, &CHECKLIST_SCHEMA)
+        .expect("checklist application schemas should build")
 });
 // TODO(flotsync-lsi8): Remove this unsafe profile escape hatch once headless
 // local store-secret backends are implemented.
