@@ -16,6 +16,7 @@ use super::{
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
     api::{
+        ApplicationSchemas,
         BoxError,
         ReplicationConfig,
         ReplicationEventListener,
@@ -259,6 +260,7 @@ impl DeliveryRuntimeHost {
     /// config fragment merged into the Kompact runtime config.
     pub(crate) async fn start_with_runtime_config_toml(
         local_member: &MemberIdentity,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
@@ -267,6 +269,7 @@ impl DeliveryRuntimeHost {
     ) -> Result<Self, RuntimeHostError> {
         Self::start_with_options(
             local_member,
+            application_schemas,
             store,
             listener,
             config,
@@ -278,8 +281,13 @@ impl DeliveryRuntimeHost {
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "This internal startup boundary keeps independently owned runtime services explicit; the eighth argument exists only in tests."
+    )]
     async fn start_with_options(
         local_member: &MemberIdentity,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
@@ -291,7 +299,7 @@ impl DeliveryRuntimeHost {
         let system = built_system.system.clone();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
-        let group_memberships = Arc::new(SharedGroupState::new());
+        let group_memberships = Arc::new(SharedGroupState::new(application_schemas));
         let topology = RuntimeTopology::build(
             &system,
             RuntimeTopologyBuildInput {
@@ -348,8 +356,13 @@ impl DeliveryRuntimeHost {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "This test-only startup boundary adds explicit route publication control to the production runtime inputs."
+    )]
     pub(super) async fn start_with_route_publish_mode_for_test(
         local_member: &MemberIdentity,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
@@ -359,6 +372,7 @@ impl DeliveryRuntimeHost {
     ) -> Result<Self, RuntimeHostError> {
         Self::start_with_options(
             local_member,
+            application_schemas,
             store,
             listener,
             config,

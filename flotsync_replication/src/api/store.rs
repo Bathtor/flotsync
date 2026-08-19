@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Borrowed group, dataset, and schema arguments for one schema-aware store operation.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupDatasetSchemaRef<'a> {
+    /// Replication group that owns the dataset.
+    pub group_id: &'a GroupId,
+    /// Dataset governed by `schema` within `group_id`.
+    pub dataset_id: &'a DatasetId,
+    /// Schema used to encode or decode the dataset rows.
+    pub schema: &'a Schema,
+}
+
 /// One row-granular dataset view loaded for a single transaction.
 ///
 /// If `dataset_exists` is `true`, the dataset entry already exists for
@@ -221,16 +232,23 @@ pub trait ReplicationStoreReadTransaction: Send {
 
     /// Load the stored state for the requested dataset row keys.
     ///
+    /// `dataset` must describe this group's authoritative schema for the requested dataset.
+    /// Implementations must use its borrowed values only while executing the returned future and
+    /// must not clone them into retained store state.
+    ///
     /// Implementations must include every iterated `row_key` exactly once in
     /// `DatasetRowStateSlice.rows`.
     fn load_dataset_rows<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         row_keys: &'a mut RowKeyIterator<'a>,
     ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>>;
 
     /// Scan one ordered batch of stored dataset rows.
+    ///
+    /// `dataset` must describe this group's authoritative schema for the requested dataset.
+    /// Implementations must use its borrowed values only while executing the returned future and
+    /// must not clone them into retained store state.
     ///
     /// `after` is an exclusive lower bound over row keys. `None` starts before
     /// the first row. Implementations must return at most `limit` rows ordered
@@ -239,8 +257,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// exhausted.
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
+        dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>>;
@@ -407,10 +424,16 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Apply one explicit set of row-level dataset storage actions.
-    fn apply_dataset_row_patch(
-        &mut self,
-        patch: DatasetRowStatePatch,
-    ) -> BoxFuture<'_, Result<(), StoreError>>;
+    ///
+    /// `dataset` must carry the same group and dataset identifiers as `patch` and the authoritative
+    /// schema for that group dataset. Implementations must return an error when either identifier
+    /// differs. They must use the borrowed context only while executing the returned future and
+    /// must not clone it into retained store state.
+    fn apply_dataset_row_patch<'a>(
+        &'a mut self,
+        dataset: GroupDatasetSchemaRef<'a>,
+        patch: &'a DatasetRowStatePatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Append one new persisted replication update record.
     ///
@@ -504,12 +527,6 @@ pub trait ReplicationStore:
 {
     /// Return the member identity hosted by this replication runtime instance.
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>>;
-
-    /// Load one locally available dataset schema.
-    fn load_dataset_schema(
-        &self,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>>;
 
     /// Begin one mutable transaction over the replication state store.
     fn begin_transaction(

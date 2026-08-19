@@ -1016,7 +1016,7 @@ mod tests {
             sender: local_member(),
             read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             dataset_updates: vec![DatasetUpdateRecord {
-                dataset_id: DatasetId::try_new("docs").expect("dataset id should build"),
+                dataset_id: DatasetId::try_from_static("docs").expect("dataset id should build"),
                 operations: vec![datamodel_proto::SchemaOperation::default()],
             }],
             applied_locally: true,

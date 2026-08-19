@@ -1009,6 +1009,7 @@ async fn load_checklist_runtime(
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     load_replication_runtime_with_runtime_config_toml(
         checklist_application_id(),
+        &CHECKLIST_APPLICATION_SCHEMAS,
         setup.store.clone(),
         listener,
         ReplicationConfig::default(),

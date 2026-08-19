@@ -9,6 +9,7 @@ use flotsync_core::{
 };
 use flotsync_data_types::{Field, Schema};
 use flotsync_replication::{
+    ApplicationSchemas,
     ChangeGroupMembershipRequest,
     CreateGroupRequest,
     DatasetId,
@@ -30,7 +31,7 @@ use flotsync_replication::{
         docs_group_schema,
         provision_test_security,
         provision_test_trusted_public_keys,
-        provisioned_sqlite_store_with_schemas,
+        provisioned_sqlite_store,
         publish_changes,
         snapshot_read_token,
         test_application_id,
@@ -39,11 +40,7 @@ use flotsync_replication::{
         wait_for_test_reply,
     },
 };
-use std::{
-    collections::HashSet,
-    num::NonZeroUsize,
-    sync::{Arc, LazyLock},
-};
+use std::{collections::HashSet, num::NonZeroUsize, sync::LazyLock};
 use uuid::Uuid;
 
 const ALICE_MEMBER_SEGMENTS: [&str; 2] = ["alice", "laptop"];
@@ -52,13 +49,16 @@ const CHARLIE_MEMBER_SEGMENTS: [&str; 2] = ["charlie", "laptop"];
 const PROBE_MEMBER_SEGMENTS: [&str; 2] = ["probe", "laptop"];
 static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
+static APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_SCHEMA)
+        .expect("test application schemas should build")
+});
 
 #[test]
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
 
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
@@ -80,7 +80,11 @@ fn create_group_bootstrap_installs_remote_membership() {
             .group(&group_id)
             .expect("created group should be published");
         assert_eq!(group.group_name(), Some("shared docs"));
-        assert_eq!(group.group_schema(), &docs_group_schema());
+        assert!(
+            group
+                .group_schema()
+                .has_same_schema_definitions(&docs_group_schema())
+        );
         assert_eq!(group.lifecycle(), &ReplicationGroupLifecycle::Open);
     }
 
@@ -114,17 +118,16 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     let alice_member = alice_member();
     let bob_member = bob_member();
     let charlie_member = charlie_member();
-    let dataset_id = docs_dataset_id();
     let alice_fixture = RuntimeTestFixture::load(
         test_application_id(),
         &alice_member,
-        [(dataset_id.clone(), title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [bob_member.clone(), charlie_member.clone()],
     );
     let bob_fixture = RuntimeTestFixture::load_with_config(
         test_application_id(),
         &bob_member,
-        [(dataset_id.clone(), title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [alice_member.clone()],
         ReplicationConfig {
             group_invitation_policy: GroupInvitationPolicy {
@@ -141,7 +144,7 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     let charlie_fixture = RuntimeTestFixture::load_with_config(
         test_application_id(),
         &charlie_member,
-        [(dataset_id, title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [alice_member.clone()],
         ReplicationConfig {
             group_invitation_policy: GroupInvitationPolicy {
@@ -213,7 +216,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
 
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
@@ -268,7 +271,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
 #[test]
 fn update_gap_triggers_need_range_and_update_batch_catch_up() {
     let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
     let alice_member = alice_fixture.local_member.clone();
     let bob_member = bob_fixture.local_member.clone();
     let group_id = GroupId(Uuid::from_u128(50_001));
@@ -334,7 +337,7 @@ fn update_gap_triggers_need_range_and_update_batch_catch_up() {
 #[test]
 fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
     let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
     let alice_member = alice_fixture.local_member.clone();
     let bob_member = bob_fixture.local_member.clone();
     let group_id = GroupId(Uuid::from_u128(50_101));
@@ -389,17 +392,13 @@ fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
 fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let dataset_id = docs_dataset_id();
     let alice_fixture = RuntimeTestFixture::load(
         test_application_id(),
         &alice_member,
-        [(dataset_id.clone(), title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [bob_member.clone()],
     );
-    let bob_store = provisioned_sqlite_store_with_schemas(
-        &bob_member,
-        [(dataset_id.clone(), title_schema_shared())],
-    );
+    let bob_store = provisioned_sqlite_store(&bob_member);
     wait_for_test_reply(provision_test_security(
         test_application_id(),
         bob_store.as_ref(),
@@ -414,7 +413,8 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
         &test_public_member_keys(&probe_member()),
     ))
     .expect("bob mismatched trusted public keys should provision");
-    let bob_fixture = RuntimeTestFixture::load_from_store(test_application_id(), bob_store);
+    let bob_fixture =
+        RuntimeTestFixture::load_from_store(test_application_id(), &APPLICATION_SCHEMAS, bob_store);
 
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
@@ -427,7 +427,7 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
 }
 
 fn docs_dataset_id() -> DatasetId {
-    DatasetId::try_new("docs").expect("dataset id should be valid")
+    DatasetId::try_from_static("docs").expect("dataset id should be valid")
 }
 
 fn alice_member() -> MemberIdentity {
@@ -444,10 +444,6 @@ fn charlie_member() -> MemberIdentity {
 
 fn probe_member() -> MemberIdentity {
     MemberIdentity::from_array(PROBE_MEMBER_SEGMENTS)
-}
-
-fn title_schema_shared() -> Arc<Schema> {
-    Arc::new(STATIC_TITLE_SCHEMA.clone())
 }
 
 fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
@@ -478,21 +474,19 @@ fn load_group(fixture: &RuntimeTestFixture, group_id: GroupId) -> ReplicationGro
     })
 }
 
-fn load_title_runtime_pair_with_trust(
-    dataset_id: &DatasetId,
-) -> (RuntimeTestFixture, RuntimeTestFixture) {
+fn load_title_runtime_pair_with_trust() -> (RuntimeTestFixture, RuntimeTestFixture) {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let alice_fixture = RuntimeTestFixture::load(
         test_application_id(),
         &alice_member,
-        [(dataset_id.clone(), title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [bob_member.clone()],
     );
     let bob_fixture = RuntimeTestFixture::load_with_config(
         test_application_id(),
         &bob_member,
-        [(dataset_id.clone(), title_schema_shared())],
+        &APPLICATION_SCHEMAS,
         [alice_member],
         ReplicationConfig {
             group_invitation_policy: GroupInvitationPolicy {

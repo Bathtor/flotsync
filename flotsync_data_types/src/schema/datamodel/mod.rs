@@ -45,6 +45,11 @@ pub use snapshots::*;
 /// Applications that hardcode most of their schemas can pass a static schema
 /// reference without paying for additional reference counting, while dynamic
 /// schema providers can still use shared `Arc` ownership.
+///
+/// Equality includes the ownership representation: a [`SchemaSource::Static`]
+/// value and a [`SchemaSource::Shared`] value are distinct even when their
+/// underlying schemas are structurally equal. Callers that need structural
+/// schema equality should compare the values returned by [`Self::as_schema`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaSource {
     /// One dynamically owned schema shared through reference counting.

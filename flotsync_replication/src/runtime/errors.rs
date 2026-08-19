@@ -125,8 +125,13 @@ pub(super) enum SnapshotRowsError {
     UnknownGroup { group_id: GroupId },
     #[snafu(display("Group {group_id} is closed to application reads."))]
     GroupClosed { group_id: GroupId },
-    #[snafu(display("Dataset {dataset_id} has no schema available for row snapshots."))]
-    MissingDatasetSchema { dataset_id: DatasetId },
+    #[snafu(display(
+        "Dataset {dataset_id} in group {group_id} has no schema available for row snapshots."
+    ))]
+    MissingDatasetSchema {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
     #[snafu(display("Replication-store access failed at {location}: {source}"))]
     StoreAccess {
         source: StoreError,
@@ -500,15 +505,11 @@ pub(crate) enum PublishChangesError {
     },
     #[snafu(display("Failed to reconstruct row state at read token: {source}"))]
     Replay { source: ReplayError },
-    #[snafu(display(
-        "Failed to load schema for dataset '{dataset_id}' from the replication store: {source}"
-    ))]
-    LoadDatasetSchema {
+    #[snafu(display("No schema was available for dataset '{dataset_id}' in group {group_id}."))]
+    MissingDatasetSchema {
+        group_id: GroupId,
         dataset_id: DatasetId,
-        source: StoreError,
     },
-    #[snafu(display("No schema was available for dataset '{dataset_id}'."))]
-    MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
         "Row {row_id} referenced unknown schema field '{field_name}' in dataset '{dataset_id}'.",
     ))]
@@ -547,9 +548,7 @@ impl StoreErrorClassificationSource for PublishChangesError {
     fn store_error_classification(&self) -> Option<StoreErrorClassification> {
         match self {
             Self::InvalidPersistedGroup { source, .. } => source.store_error_classification(),
-            Self::StoreAccess { source, .. } | Self::LoadDatasetSchema { source, .. } => {
-                source.store_error_classification()
-            }
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
             Self::EmptyChanges
             | Self::MixedGroups { .. }
             | Self::UnknownGroup { .. }
@@ -679,14 +678,12 @@ pub(crate) enum InboundDeliveryError {
         location: Location,
     },
     #[snafu(display(
-        "Failed to load schema for inbound dataset '{dataset_id}' from the replication store: {source}"
+        "No schema was available for inbound dataset '{dataset_id}' in group {group_id}."
     ))]
-    LoadDatasetSchema {
+    MissingDatasetSchema {
+        group_id: GroupId,
         dataset_id: DatasetId,
-        source: StoreError,
     },
-    #[snafu(display("No schema was available for inbound dataset '{dataset_id}'."))]
-    MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
         "Inbound update for group {group_id} came from sender {sender}, which is not a group member.",
     ))]
@@ -762,9 +759,7 @@ impl StoreErrorClassificationSource for InboundDeliveryError {
             Self::InstallGroupSetup { source, .. } | Self::InvalidPersistedGroup { source, .. } => {
                 source.store_error_classification()
             }
-            Self::StoreAccess { source, .. } | Self::LoadDatasetSchema { source, .. } => {
-                source.store_error_classification()
-            }
+            Self::StoreAccess { source, .. } => source.store_error_classification(),
             Self::PendingGroupActivation { source } => source.store_error_classification(),
             Self::DecodeMessage { .. }
             | Self::UnexpectedReliableMessage
@@ -798,7 +793,6 @@ impl InboundDeliveryError {
     pub(crate) fn failure_action(&self) -> InboundFailureAction {
         match self {
             Self::StoreAccess { .. }
-            | Self::LoadDatasetSchema { .. }
             | Self::InvalidPersistedGroup { .. }
             | Self::InstallGroupSetup { .. }
             | Self::AcceptMigration { .. }

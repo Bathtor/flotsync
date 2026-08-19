@@ -76,7 +76,7 @@ fn test_update_message(
         update_id,
         read_versions,
         dataset_updates: vec![DatasetUpdateMessage {
-            dataset_id: DatasetId::try_new("docs").expect("dataset id should build"),
+            dataset_id: DatasetId::try_from_static("docs").expect("dataset id should build"),
             operations: vec![datamodel_proto::SchemaOperation::default()],
         }],
     }
@@ -486,7 +486,7 @@ fn stored_update_proto_source_matches_owned_update_message_encoding() {
             version: 3,
         },
         dataset_updates: vec![DatasetUpdateRecord {
-            dataset_id: DatasetId::try_new("docs").expect("dataset id should build"),
+            dataset_id: DatasetId::try_from_static("docs").expect("dataset id should build"),
             operations: vec![datamodel_proto::SchemaOperation::default()],
         }],
         applied_locally: true,

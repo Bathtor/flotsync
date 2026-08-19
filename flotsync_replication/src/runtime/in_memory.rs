@@ -16,6 +16,7 @@ use crate::api::{
     DatasetRowStateSlice,
     DatasetRowStateWrite,
     DatasetUpdateRecord,
+    GroupSchema,
     ReplicationGroupRecord,
     ReplicationRowStateSnapshot,
     ReplicationUpdateRecord,
@@ -420,13 +421,13 @@ pub(super) fn collect_group_row_scope(
 /// operations rather than decoded row operations.
 pub(super) fn collect_record_row_scope(
     updates: &[ReplicationUpdateRecord],
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
 ) -> Result<HashMap<DatasetId, HashSet<RowKey>>, InboundDeliveryError> {
     let mut dataset_rows: HashMap<DatasetId, HashSet<RowKey>> = HashMap::new();
     for update in updates {
         for dataset_update in &update.dataset_updates {
-            let schema = schemas
-                .get(&dataset_update.dataset_id)
+            let schema = group_schema
+                .schema(&dataset_update.dataset_id)
                 .expect("touched inbound dataset schemas must be pre-loaded");
             for operation in &dataset_update.operations {
                 let operation = decode_update_schema_operation(
@@ -454,11 +455,11 @@ pub(super) fn collect_record_row_scope(
 /// decodable for the local schema and bound to the update's `UpdateId`.
 pub(super) fn validate_update_mapping(
     update: &ReplicationUpdateRecord,
-    schemas: &HashMap<DatasetId, SchemaSource>,
+    group_schema: &GroupSchema,
 ) -> Result<(), InboundDeliveryError> {
     for dataset_update in &update.dataset_updates {
-        let schema = schemas
-            .get(&dataset_update.dataset_id)
+        let schema = group_schema
+            .schema(&dataset_update.dataset_id)
             .expect("inbound update schemas must be pre-loaded before validation");
         for operation in &dataset_update.operations {
             decode_update_schema_operation(

@@ -587,7 +587,7 @@ impl DecodeProto for DatasetSchema {
     type Proto = replication_proto::DatasetSchema;
 
     fn decode_proto(mut dataset_schema: Self::Proto) -> Result<Self, Self::Error> {
-        let dataset_id = DatasetId::try_new(dataset_schema.dataset_id.clone()).context(
+        let dataset_id = DatasetId::try_from_owned(dataset_schema.dataset_id.clone()).context(
             InvalidDatasetIdSnafu {
                 value: dataset_schema.dataset_id,
             },
@@ -617,11 +617,12 @@ impl DecodeProtoView for DatasetSchema {
     type ProtoView<'a> = replication_proto::DatasetSchemaView<'a>;
 
     fn decode_proto_view(dataset_schema: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
-        let dataset_id = DatasetId::try_new(dataset_schema.dataset_id).with_context(|_| {
-            InvalidDatasetIdSnafu {
+        let dataset_id = dataset_schema
+            .dataset_id
+            .parse::<DatasetId>()
+            .with_context(|_| InvalidDatasetIdSnafu {
                 value: dataset_schema.dataset_id.to_owned(),
-            }
-        })?;
+            })?;
         let Some(schema) = dataset_schema.schema.as_option() else {
             return Err(PendingGroupPayloadError::missing_required_field(
                 "dataset_schema.schema",
@@ -774,10 +775,11 @@ impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialDatasetValueRows 
         dataset: Self::Proto,
         group_schema: &'schema GroupSchema,
     ) -> Result<Self, Self::Error> {
-        let dataset_id =
-            DatasetId::try_new(dataset.dataset_id.clone()).context(InvalidDatasetIdSnafu {
+        let dataset_id = DatasetId::try_from_owned(dataset.dataset_id.clone()).context(
+            InvalidDatasetIdSnafu {
                 value: dataset.dataset_id,
-            })?;
+            },
+        )?;
         let schema =
             group_schema
                 .schema(&dataset_id)
@@ -802,9 +804,12 @@ impl<'schema> DecodeProtoViewWith<&'schema GroupSchema> for InitialDatasetValueR
         group_schema: &'schema GroupSchema,
     ) -> Result<Self, Self::Error> {
         let dataset_id =
-            DatasetId::try_new(dataset.dataset_id).with_context(|_| InvalidDatasetIdSnafu {
-                value: dataset.dataset_id.to_owned(),
-            })?;
+            dataset
+                .dataset_id
+                .parse::<DatasetId>()
+                .with_context(|_| InvalidDatasetIdSnafu {
+                    value: dataset.dataset_id.to_owned(),
+                })?;
         let schema =
             group_schema
                 .schema(&dataset_id)

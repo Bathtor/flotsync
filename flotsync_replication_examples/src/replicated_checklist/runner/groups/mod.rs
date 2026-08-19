@@ -797,7 +797,6 @@ pub mod test_support {
     use flotsync_core::{MemberIndex, versions::VersionVector};
     use flotsync_replication::{
         GroupMemberKeys,
-        GroupSchema,
         LocalStoreSecretProfile,
         MemberKeyId,
         ReplicationGroupLifecycle,
@@ -809,7 +808,7 @@ pub mod test_support {
         test_support::{
             SqliteStoreTestOwner,
             provision_test_security,
-            provisioned_sqlite_store_with_schemas,
+            provisioned_sqlite_store,
             test_public_member_keys,
             test_replication_security_secrets,
         },
@@ -889,7 +888,7 @@ pub mod test_support {
             }])
             .expect("test group member keys should build"),
             local_member_index: MemberIndex::new(0),
-            group_schema: GroupSchema::default(),
+            group_schema: CHECKLIST_GROUP_SCHEMA.clone(),
             version_vector: VersionVector::initial(NonZeroUsize::MIN),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
@@ -950,10 +949,7 @@ pub mod test_support {
         Arc<ChecklistListener>,
         ChecklistListenerReceivers,
     ) {
-        let store = provisioned_sqlite_store_with_schemas(
-            member,
-            [(checklist_dataset_id(), CHECKLIST_SCHEMA.clone())],
-        );
+        let store = provisioned_sqlite_store(member);
         block_on(provision_test_security(
             checklist_application_id(),
             store.as_ref(),
@@ -974,6 +970,7 @@ pub mod test_support {
         let (listener, listener_receivers) = ChecklistListener::pair();
         let runtime = block_on(load_replication_runtime_with_runtime_config_toml(
             checklist_application_id(),
+            &CHECKLIST_APPLICATION_SCHEMAS,
             store.clone(),
             listener.clone(),
             ReplicationConfig::default(),

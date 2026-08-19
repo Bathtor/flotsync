@@ -8,6 +8,7 @@ use crate::api::{
     DatasetId,
     DatasetRowStatePatch,
     DatasetRowStateWrite,
+    GroupDatasetSchemaRef,
     GroupSchema,
     InitialDatasetValueRows,
     InitialGroupValueRows,
@@ -59,8 +60,13 @@ pub(super) async fn build_inline_initial_snapshot(
     let row_limit = NonZeroUsize::new(usize::MAX).expect("row scan limit must be non-zero");
 
     for dataset_schema in group_schema.datasets() {
+        let dataset = GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_schema.dataset_id,
+            schema: dataset_schema.schema.as_schema(),
+        };
         let batch = transaction
-            .scan_dataset_row_batch(&group_id, &dataset_schema.dataset_id, None, row_limit)
+            .scan_dataset_row_batch(dataset, None, row_limit)
             .await
             .context(change_membership::StoreAccessSnafu)?;
         ensure!(
@@ -186,8 +192,16 @@ pub(super) async fn embed_inline_initial_snapshot(
         let (row_patch, dataset_row_changes) =
             embed_initial_dataset(group_id, member_count, group_schema, dataset_state)?;
         if !row_patch.actions.is_empty() {
+            let schema = group_schema
+                .schema(&row_patch.dataset_id)
+                .expect("embedded initial dataset must belong to the target group");
+            let dataset = GroupDatasetSchemaRef {
+                group_id: &row_patch.group_id,
+                dataset_id: &row_patch.dataset_id,
+                schema: schema.as_schema(),
+            };
             transaction
-                .apply_dataset_row_patch(row_patch)
+                .apply_dataset_row_patch(dataset, &row_patch)
                 .await
                 .context(activation::StoreAccessSnafu)?;
         }

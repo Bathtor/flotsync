@@ -64,7 +64,7 @@ pub static CHECKLIST_SCHEMA: LazyLock<Schema> = LazyLock::new(build_checklist_sc
 /// Panics if the static checklist dataset identifier is not a valid [`DatasetId`].
 #[must_use]
 pub fn checklist_dataset_id() -> DatasetId {
-    DatasetId::try_new(CHECKLIST_DATASET_ID)
+    DatasetId::try_from_static(CHECKLIST_DATASET_ID)
         .expect("checklist dataset id must be a valid dataset identifier")
 }
 

@@ -7,7 +7,7 @@ fn pending_apply_need_retries_after_route_appears() {
     let _runtime_endpoint_leases =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
     let alice_member = alice_fixture.local_member.clone();
     let bob_member = bob_fixture.local_member.clone();
     let alice_runtime = &alice_fixture.runtime;
@@ -105,13 +105,11 @@ fn partial_update_batch_retry_narrows_remaining_need() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let alice_listener = Arc::new(ListenerStub::default());
-    let alice_store = sqlite_store_with_schemas(
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
-    );
+    let alice_store = sqlite_store(alice_member.clone());
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
         alice_store.clone(),
         alice_listener,
         r"
@@ -119,11 +117,8 @@ fn partial_update_batch_retry_narrows_remaining_need() {
         max-updates-per-batch = 1
         ",
     );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     provision_test_security(
         bob_fixture.store.as_ref(),
         &bob_member,
@@ -201,7 +196,7 @@ fn update_batch_forwarded_by_non_producer_member_applies() {
     let probe_fixture = load_runtime_fixture(
         app_probe_id(),
         probe_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
     let probe_runtime = &probe_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(50_401));
@@ -254,17 +249,13 @@ fn request_summary_returns_remote_current_version_vector() {
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let dataset_id = docs_dataset_id();
     let alice_fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        &TITLE_APPLICATION_SCHEMAS,
     );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     provision_test_security(
         alice_fixture.store.as_ref(),
         &alice_member,
@@ -323,13 +314,10 @@ fn group_invitation_persists_group_schema() {
     let alice_fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
+        &ApplicationSchemas::EMPTY,
     );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &ApplicationSchemas::EMPTY);
     provision_test_security(
         alice_fixture.store.as_ref(),
         &alice_member,
@@ -397,11 +385,8 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22));
     bob_runtime
@@ -504,11 +489,8 @@ fn migrated_group_updates_follow_read_only_and_closed_application_visibility() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let group_id = GroupId(Uuid::from_u128(50_701));
     fixture
         .runtime
@@ -607,11 +589,8 @@ fn duplicate_update_batch_delivery_is_ignored() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22_001));
     bob_runtime
@@ -679,11 +658,8 @@ fn inbound_update_with_out_of_range_producer_index_is_rejected() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22_101));
     bob_runtime
@@ -723,11 +699,8 @@ fn update_batch_failure_after_first_update_keeps_first_notifications() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22_201));
     bob_runtime
@@ -791,11 +764,8 @@ fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), schema)],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = &bob_fixture.runtime;
     let inbound_group_id = GroupId(Uuid::from_u128(23_001));
     let unrelated_group_id = GroupId(Uuid::from_u128(23_002));
@@ -884,11 +854,8 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), schema)],
-    );
+    let bob_fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = bob_fixture.runtime.clone();
     let bob_listener = bob_fixture.listener.clone();
     let bob_store = bob_fixture.store.clone();
@@ -1105,10 +1072,10 @@ fn inbound_update_rejects_operation_change_id_mismatch_before_persisting() {
         }],
         applied_locally: false,
     };
-    let schemas = std::collections::HashMap::from([(
+    let schemas = GroupSchema::new(std::collections::HashMap::from([(
         dataset_id.clone(),
         SchemaSource::from(title_schema_static()),
-    )]);
+    )]));
 
     let error =
         validate_update_mapping(&update, &schemas).expect_err("change-id mismatch should reject");
@@ -1179,9 +1146,14 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let store = sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema)]);
+    let store = sqlite_store(bob_member.clone());
     let first_listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), first_listener);
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_bob_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        first_listener,
+    );
     let group_id = GroupId(Uuid::from_u128(35));
     runtime
         .install_group_for_test(
@@ -1311,11 +1283,15 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let sqlite_store =
-        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema)]);
+    let sqlite_store = sqlite_store(bob_member.clone());
     let store = Arc::new(FailingStore::new(sqlite_store.clone()));
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), listener.clone());
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_bob_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        listener.clone(),
+    );
     let group_id = GroupId(Uuid::from_u128(37));
     runtime
         .install_group_for_test(
@@ -1445,11 +1421,8 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema_static();
-    let bob_runtime = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let bob_runtime =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let bob_runtime = bob_runtime.runtime.clone();
     let group_id = GroupId(Uuid::from_u128(24));
     bob_runtime

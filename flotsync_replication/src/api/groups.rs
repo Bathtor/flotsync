@@ -360,7 +360,9 @@ impl GroupInvitation {
         self.group_id == other.group_id
             && self.source == other.source
             && self.proposed_members == other.proposed_members
-            && self.group_schema == other.group_schema
+            && self
+                .group_schema
+                .has_same_schema_definitions(&other.group_schema)
             && self.initial_snapshot == other.initial_snapshot
     }
 
@@ -500,7 +502,9 @@ impl MigrationProposal {
         self.migration_id == other.migration_id
             && self.final_versions == other.final_versions
             && self.proposed_members == other.proposed_members
-            && self.group_schema == other.group_schema
+            && self
+                .group_schema
+                .has_same_schema_definitions(&other.group_schema)
             && self.initial_snapshot == other.initial_snapshot
     }
 }
@@ -1332,7 +1336,9 @@ impl ReplicationGroupRecord {
         self.group_id == other.group_id
             && self.member_keys == other.member_keys
             && self.local_member_index == other.local_member_index
-            && self.group_schema == other.group_schema
+            && self
+                .group_schema
+                .has_same_schema_definitions(&other.group_schema)
     }
 
     /// Return whether this active group is compatible with stored material
@@ -1416,7 +1422,7 @@ impl ReplicationGroupMaterialRecord {
         self.group_id == group_id
             && self.member_keys == *member_keys
             && self.local_member_index == local_member_index
-            && self.group_schema == *group_schema
+            && self.group_schema.has_same_schema_definitions(group_schema)
     }
 
     /// Return the number of members encoded in this material.

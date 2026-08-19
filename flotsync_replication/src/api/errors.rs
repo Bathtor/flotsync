@@ -11,20 +11,30 @@ use snafu::{Location, prelude::*};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Invalid replication dataset identifier.
 #[derive(Debug, Snafu)]
 pub enum DatasetIdError {
+    /// The supplied identifier contains no characters.
     #[snafu(display("Dataset identifier must not be empty."))]
     Empty,
+    /// The supplied identifier does not begin with an ASCII letter or underscore.
     #[snafu(display(
         "Dataset identifier '{value}' has an invalid first character. Use [A-Za-z_]."
     ))]
-    InvalidStartCharacter { value: String },
+    InvalidStartCharacter {
+        /// Complete invalid identifier supplied by the caller.
+        value: String,
+    },
+    /// The supplied identifier contains an invalid character after its first character.
     #[snafu(display(
         "Dataset identifier '{value}' contains invalid character '{character}' at byte index {index}. Only [A-Za-z0-9_] are allowed."
     ))]
     InvalidCharacter {
+        /// Complete invalid identifier supplied by the caller.
         value: String,
+        /// Byte index of `character` within `value`.
         index: usize,
+        /// Character rejected by dataset identifier validation.
         character: char,
     },
 }

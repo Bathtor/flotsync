@@ -2,6 +2,7 @@ use crate::{
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
     api::{
+        ApplicationSchemas,
         DatasetId,
         DatasetSchema,
         EncryptedLocalMemberPrivateKeys,
@@ -97,7 +98,7 @@ pub fn replication_group_snapshot(
     local_member: &MemberIdentity,
     records: impl IntoIterator<Item = ReplicationGroupRecord>,
 ) -> Arc<dyn ReplicationGroupSnapshot> {
-    application_snapshot_from_records(local_member, records)
+    application_snapshot_from_records(local_member, &ApplicationSchemas::EMPTY, records)
         .expect("test group records should pass production runtime projection")
 }
 
@@ -163,7 +164,7 @@ impl SharedGroupMemberships for TestSharedGroupMemberships {
 /// [`DatasetId`] validation.
 #[must_use]
 pub fn docs_dataset_id() -> DatasetId {
-    DatasetId::try_new("docs").expect("test dataset id should build")
+    DatasetId::try_from_static("docs").expect("test dataset id should build")
 }
 
 /// Dataset schema entry with one replicated linear `title` field.
@@ -205,6 +206,7 @@ pub fn docs_group_schema() -> GroupSchema {
 /// local-private-key sealing, or runtime startup fails.
 pub async fn load_replication_runtime_with_test_security_toml(
     application_id: ApplicationId,
+    application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -226,6 +228,7 @@ pub async fn load_replication_runtime_with_test_security_toml(
     .await?;
     let runtime = load_replication_runtime_with_runtime_config_toml(
         application_id,
+        application_schemas,
         store,
         listener,
         config,
@@ -604,20 +607,16 @@ impl RuntimeTestFixture {
     /// Panics if the store cannot be created, deterministic security cannot be
     /// provisioned, or the runtime cannot be loaded.
     #[must_use]
-    pub fn load<I, S>(
+    pub fn load(
         application_id: ApplicationId,
         local_member: &MemberIdentity,
-        schemas: I,
+        application_schemas: &'static ApplicationSchemas,
         trusted_members: impl IntoIterator<Item = MemberIdentity>,
-    ) -> Self
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
+    ) -> Self {
         Self::load_with_config(
             application_id,
             local_member,
-            schemas,
+            application_schemas,
             trusted_members,
             ReplicationConfig::default(),
         )
@@ -630,18 +629,14 @@ impl RuntimeTestFixture {
     /// Panics if the store cannot be created, deterministic security cannot be
     /// provisioned, or the runtime cannot be loaded.
     #[must_use]
-    pub fn load_with_config<I, S>(
+    pub fn load_with_config(
         application_id: ApplicationId,
         local_member: &MemberIdentity,
-        schemas: I,
+        application_schemas: &'static ApplicationSchemas,
         trusted_members: impl IntoIterator<Item = MemberIdentity>,
         config: ReplicationConfig,
-    ) -> Self
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let store = provisioned_sqlite_store_with_schemas(local_member, schemas);
+    ) -> Self {
+        let store = provisioned_sqlite_store(local_member);
         wait_for_test_reply(provision_test_security(
             application_id.clone(),
             store.as_ref(),
@@ -649,10 +644,12 @@ impl RuntimeTestFixture {
             trusted_members,
         ))
         .expect("test security should provision");
-        Self::load_from_store_with_config(application_id, store, config)
+        Self::load_from_store_with_config(application_id, application_schemas, store, config)
     }
 
     /// Build one runtime fixture from an already provisioned `SQLite` store.
+    ///
+    /// `application_schemas` has the same matching and reuse semantics as the production API.
     ///
     /// # Panics
     ///
@@ -661,6 +658,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn load_from_store(
         application_id: ApplicationId,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<SqliteReplicationStore>,
     ) -> Self {
         let local_member = wait_for_test_reply(store.local_member_identity())
@@ -673,6 +671,7 @@ impl RuntimeTestFixture {
         .expect("runtime security state should load");
         Self::load_from_store_with_loaded_security(
             application_id,
+            application_schemas,
             store,
             local_member,
             ReplicationConfig::default(),
@@ -683,6 +682,8 @@ impl RuntimeTestFixture {
     /// Build one runtime fixture from an already provisioned `SQLite` store
     /// with custom runtime policy.
     ///
+    /// `application_schemas` has the same matching and reuse semantics as the production API.
+    ///
     /// # Panics
     ///
     /// Panics if the local member cannot be loaded, deterministic runtime
@@ -690,6 +691,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn load_from_store_with_config(
         application_id: ApplicationId,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<SqliteReplicationStore>,
         config: ReplicationConfig,
     ) -> Self {
@@ -704,6 +706,7 @@ impl RuntimeTestFixture {
         .expect("runtime security state should load");
         Self::load_from_store_with_loaded_security(
             application_id,
+            application_schemas,
             store,
             local_member,
             config,
@@ -714,6 +717,7 @@ impl RuntimeTestFixture {
     /// Finish loading a fixture once local member identity and security are available.
     fn load_from_store_with_loaded_security(
         application_id: ApplicationId,
+        application_schemas: &'static ApplicationSchemas,
         store: Arc<SqliteReplicationStore>,
         local_member: MemberIdentity,
         config: ReplicationConfig,
@@ -724,6 +728,7 @@ impl RuntimeTestFixture {
         let listener_for_runtime: Arc<dyn ReplicationEventListener> = listener.clone();
         let runtime = wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
             application_id,
+            application_schemas,
             store_for_runtime,
             listener_for_runtime,
             config,
@@ -834,18 +839,10 @@ impl Drop for RuntimeTestFixture {
 ///
 /// Panics if the provisioner cannot be created, identity material cannot be stored, or activation
 /// does not discover the provisioned local identity.
-pub fn provisioned_sqlite_store_with_schemas<I, S>(
-    local_member: &MemberIdentity,
-    schemas: I,
-) -> Arc<SqliteReplicationStore>
-where
-    I: IntoIterator<Item = (DatasetId, S)>,
-    S: Into<SchemaSource>,
-{
-    let provisioner = wait_for_test_future(
-        SqliteReplicationStoreProvisioner::in_memory_with_schema_sources(schemas),
-    )
-    .expect("store provisioner should build");
+#[must_use]
+pub fn provisioned_sqlite_store(local_member: &MemberIdentity) -> Arc<SqliteReplicationStore> {
+    let provisioner = wait_for_test_future(SqliteReplicationStoreProvisioner::in_memory())
+        .expect("store provisioner should build");
     wait_for_test_future(provision_test_identity(
         test_application_id(),
         &provisioner,
@@ -856,19 +853,6 @@ where
     let store = wait_for_test_future(provisioner.into_replication_store())
         .expect("provisioned store should activate");
     Arc::new(store)
-}
-
-/// Build one replication-ready in-memory SQLite store with no application schemas.
-///
-/// # Panics
-///
-/// Panics if local identity provisioning or store activation fails.
-#[must_use]
-pub fn provisioned_sqlite_store(local_member: &MemberIdentity) -> Arc<SqliteReplicationStore> {
-    provisioned_sqlite_store_with_schemas(
-        local_member,
-        std::iter::empty::<(DatasetId, SchemaSource)>(),
-    )
 }
 
 /// Provision deterministic local-private keys and trusted peer keys into one store.
