@@ -554,6 +554,7 @@ pub(super) fn apply_one_update(
                 group_id: update.group_id,
                 dataset_id: dataset_update.dataset_id.clone(),
                 actions: row_writes,
+                change_id: update.update_id,
                 last_changed_versions: last_changed_versions.clone(),
             });
         }

@@ -425,6 +425,7 @@ mod tests {
             row_id: row_key,
             snapshot,
             tombstoned: false,
+            created_by: Some(update_id(1)),
             last_changed_versions,
         }
     }

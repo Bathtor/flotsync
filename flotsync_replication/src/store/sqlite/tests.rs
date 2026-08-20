@@ -77,6 +77,48 @@ async fn apply_row_patch(
     transaction.apply_dataset_row_patch(dataset, &patch).await
 }
 
+/// Replace persisted creator columns, bypassing their consistency check for corruption tests.
+fn replace_raw_row_creator(
+    store: &SqliteReplicationStore,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    row_key: RowKey,
+    node_index: Option<i64>,
+    version: Option<i64>,
+) {
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await.context(SqlxSnafu)?;
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .context(SqlxSnafu)?;
+        let update_result = sqlx::query(
+            "
+UPDATE dataset_rows
+SET row_created_by_node_index = ?1,
+    row_created_by_version = ?2
+WHERE group_id = ?3 AND dataset_id = ?4 AND row_key = ?5
+",
+        )
+        .bind(node_index)
+        .bind(version)
+        .bind(group_id.to_string())
+        .bind(dataset_id.as_str())
+        .bind(row_key.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu);
+        let reset_result = sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await
+            .context(SqlxSnafu);
+        update_result?;
+        reset_result?;
+        Ok::<_, StoreError>(())
+    })
+    .expect("raw row creator should update");
+}
+
 type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
 
 fn in_memory_store(local_member: MemberIdentity) -> TestSqliteStore {
@@ -920,6 +962,7 @@ fn inactive_group_material_is_not_active_and_cannot_own_data_state() {
                     row_key,
                     snapshot: title_snapshot(&schema, row_key, "inactive"),
                 }],
+                change_id: sample_change_id(),
                 last_changed_versions: sample_last_changed_versions(),
             },
         )
@@ -975,6 +1018,10 @@ fn stored_member_identity_rejects_overlong_identifier() {
 
 fn title_schema() -> Arc<Schema> {
     Arc::new(Schema::from_fields([Field::linear_string("title")]))
+}
+
+fn heading_schema() -> Arc<Schema> {
+    Arc::new(Schema::from_fields([Field::linear_string("heading")]))
 }
 
 fn docs_group_schema() -> GroupSchema {
@@ -1100,6 +1147,13 @@ fn sample_last_changed_versions() -> VersionVector {
     version_vector
 }
 
+fn sample_change_id() -> UpdateId {
+    UpdateId {
+        node_index: 0,
+        version: 1,
+    }
+}
+
 fn insert_row_patch(
     group_id: GroupId,
     dataset_id: &DatasetId,
@@ -1116,6 +1170,7 @@ fn insert_row_patch(
             row_key,
             snapshot: snapshot.clone().into_owned(),
         }],
+        change_id: sample_change_id(),
         last_changed_versions: sample_last_changed_versions(),
     }
 }
@@ -1124,6 +1179,23 @@ fn title_snapshot(
     schema: &Arc<Schema>,
     row_key: RowKey,
     title: &str,
+) -> ReplicationRowStateSnapshot {
+    string_snapshot(schema, "title", row_key, title)
+}
+
+fn heading_snapshot(
+    schema: &Arc<Schema>,
+    row_key: RowKey,
+    heading: &str,
+) -> ReplicationRowStateSnapshot {
+    string_snapshot(schema, "heading", row_key, heading)
+}
+
+fn string_snapshot(
+    schema: &Arc<Schema>,
+    field_name: &str,
+    row_key: RowKey,
+    value: &str,
 ) -> ReplicationRowStateSnapshot {
     let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
     let operation = source_data
@@ -1136,9 +1208,9 @@ fn title_snapshot(
             vec![
                 schema
                     .columns
-                    .get("title")
-                    .expect("title field should exist")
-                    .initial(title)
+                    .get(field_name)
+                    .expect("string field should exist")
+                    .initial(value)
                     .expect("field value should build"),
             ],
         )
@@ -1417,6 +1489,7 @@ fn sqlite_store_rejects_mismatched_row_patch_schema_context() {
         group_id,
         dataset_id: dataset_id.clone(),
         actions: Vec::new(),
+        change_id: sample_change_id(),
         last_changed_versions: sample_last_changed_versions(),
     };
     let mut transaction =
@@ -1520,6 +1593,7 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
             row_id: *row_key,
             snapshot: snapshot.clone(),
             tombstoned: false,
+            created_by: Some(row_patch.change_id),
             last_changed_versions: row_patch.last_changed_versions.clone(),
         },
         DatasetRowStateWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
@@ -2055,6 +2129,7 @@ fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
         row_id: row_key,
         snapshot: snapshot.clone().into_owned(),
         tombstoned: true,
+        created_by: None,
         last_changed_versions: sample_last_changed_versions(),
     };
 
@@ -2072,6 +2147,7 @@ fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
                 row_key,
                 snapshot: stored_row.snapshot.clone(),
             }],
+            change_id: sample_change_id(),
             last_changed_versions: stored_row.last_changed_versions.clone(),
         },
     ))
@@ -2128,6 +2204,7 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
                     snapshot: title_snapshot(&schema, first_row_key, "first"),
                 },
             ],
+            change_id: sample_change_id(),
             last_changed_versions: sample_last_changed_versions(),
         },
     ))
@@ -2165,6 +2242,427 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This transition-scan contract scenario keeps both stored sides and their pagination assertions together."
+)]
+fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
+    let dataset_id = docs_dataset_id();
+    let previous_schema = title_schema();
+    let current_schema = heading_schema();
+    let store = in_memory_store(local_member());
+    let previous_group_id = GroupId(Uuid::from_u128(107));
+    let current_group_id = GroupId(Uuid::from_u128(108));
+    let previous_only = RowKey(Uuid::from_u128(301));
+    let current_only = RowKey(Uuid::from_u128(302));
+    let corresponding = RowKey(Uuid::from_u128(303));
+    let previous_change_id = UpdateId {
+        node_index: 0,
+        version: 1,
+    };
+    let current_change_id = UpdateId {
+        node_index: 1,
+        version: 1,
+    };
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(previous_group_id)))
+        .expect("previous group should store");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(current_group_id)))
+        .expect("current group should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &previous_schema,
+        DatasetRowStatePatch {
+            group_id: previous_group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![
+                DatasetRowStateWrite::UpsertActive {
+                    row_key: corresponding,
+                    snapshot: title_snapshot(
+                        &previous_schema,
+                        corresponding,
+                        "previous corresponding",
+                    ),
+                },
+                DatasetRowStateWrite::UpsertActive {
+                    row_key: previous_only,
+                    snapshot: title_snapshot(&previous_schema, previous_only, "previous only"),
+                },
+            ],
+            change_id: previous_change_id,
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("previous rows should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &current_schema,
+        DatasetRowStatePatch {
+            group_id: current_group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![
+                DatasetRowStateWrite::UpsertActive {
+                    row_key: current_only,
+                    snapshot: heading_snapshot(&current_schema, current_only, "current only"),
+                },
+                DatasetRowStateWrite::UpsertTombstone {
+                    row_key: corresponding,
+                    snapshot: heading_snapshot(&current_schema, corresponding, "current tombstone"),
+                },
+            ],
+            change_id: current_change_id,
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("current rows should store");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let previous_group = GroupDatasetSchemaRef {
+        group_id: &previous_group_id,
+        dataset_id: &dataset_id,
+        schema: &previous_schema,
+    };
+    let current_group = GroupDatasetSchemaRef {
+        group_id: &current_group_id,
+        dataset_id: &dataset_id,
+        schema: &current_schema,
+    };
+    let first_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        previous_group,
+        current_group,
+        None,
+        NonZeroUsize::new(2).expect("limit should be non-zero"),
+    ))
+    .expect("first transition batch should scan");
+    let second_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        previous_group,
+        current_group,
+        first_batch.next_after,
+        NonZeroUsize::new(2).expect("limit should be non-zero"),
+    ))
+    .expect("second transition batch should scan");
+    wait_for_store_future(transaction.release()).expect("read should release");
+
+    assert_eq!(first_batch.dataset_id, dataset_id);
+    assert_eq!(first_batch.previous_group_id, previous_group_id);
+    assert_eq!(first_batch.current_group_id, current_group_id);
+    assert!(first_batch.previous_dataset_exists);
+    assert!(first_batch.current_dataset_exists);
+    let first_row_presence = first_batch
+        .rows
+        .iter()
+        .map(|transition| {
+            (
+                transition.row_key,
+                transition.previous.is_some(),
+                transition.current.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_row_presence,
+        vec![(previous_only, true, false), (current_only, false, true)]
+    );
+    assert_eq!(first_batch.next_after, Some(current_only));
+    assert_eq!(second_batch.rows.len(), 1);
+    let transition = &second_batch.rows[0];
+    assert_eq!(transition.row_key, corresponding);
+    assert_eq!(
+        transition.previous.as_ref().map(|row| row.created_by),
+        Some(Some(previous_change_id))
+    );
+    assert_eq!(
+        transition
+            .current
+            .as_ref()
+            .map(|row| (row.created_by, row.tombstoned)),
+        Some((None, true))
+    );
+    assert_eq!(second_batch.next_after, None);
+}
+
+#[test]
+fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhaustion() {
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = in_memory_store(local_member());
+    let previous_group_id = GroupId(Uuid::from_u128(110));
+    let current_group_id = GroupId(Uuid::from_u128(111));
+    let row_key = RowKey(Uuid::from_u128(305));
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(previous_group_id)))
+        .expect("previous group should store");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(current_group_id)))
+        .expect("current group should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &schema,
+        DatasetRowStatePatch {
+            group_id: previous_group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowStateWrite::UpsertActive {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, "previous"),
+            }],
+            change_id: sample_change_id(),
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("previous row should store");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    let previous_group = GroupDatasetSchemaRef {
+        group_id: &previous_group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    };
+    let current_group = GroupDatasetSchemaRef {
+        group_id: &current_group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    };
+    let limit = NonZeroUsize::new(1).expect("limit should be non-zero");
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        previous_group,
+        current_group,
+        None,
+        limit,
+    ))
+    .expect("transition batch should scan");
+    let exhausted = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        previous_group,
+        current_group,
+        batch.next_after,
+        limit,
+    ))
+    .expect("exhaustion batch should scan");
+    let empty_dataset_id =
+        DatasetId::try_from_static("empty").expect("empty dataset id should build");
+    let empty_previous_group = GroupDatasetSchemaRef {
+        group_id: &previous_group_id,
+        dataset_id: &empty_dataset_id,
+        schema: &schema,
+    };
+    let empty_current_group = GroupDatasetSchemaRef {
+        group_id: &current_group_id,
+        dataset_id: &empty_dataset_id,
+        schema: &schema,
+    };
+    let empty = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        empty_previous_group,
+        empty_current_group,
+        None,
+        limit,
+    ))
+    .expect("empty transition batch should scan");
+    let mismatch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+        previous_group,
+        empty_current_group,
+        None,
+        limit,
+    ))
+    .expect_err("different dataset references should be rejected");
+    wait_for_store_future(transaction.release()).expect("read should release");
+
+    assert!(batch.previous_dataset_exists);
+    assert!(!batch.current_dataset_exists);
+    assert_eq!(batch.rows.len(), 1);
+    assert!(batch.rows[0].previous.is_some());
+    assert!(batch.rows[0].current.is_none());
+    assert_eq!(batch.next_after, Some(row_key));
+    assert!(exhausted.rows.is_empty());
+    assert_eq!(exhausted.next_after, None);
+    assert!(!empty.previous_dataset_exists);
+    assert!(!empty.current_dataset_exists);
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.next_after, None);
+    assert_eq!(mismatch.classification().class, StoreErrorClass::Contract);
+}
+
+#[test]
+fn sqlite_store_preserves_row_creator_through_updates_and_tombstoning() {
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = in_memory_store(local_member());
+    let group_id = GroupId(Uuid::from_u128(109));
+    let row_key = RowKey(Uuid::from_u128(304));
+    let first_upper_half_version = 1_u64 << 63;
+    let created_by = UpdateId {
+        node_index: 0,
+        version: first_upper_half_version,
+    };
+    let updated_by = UpdateId {
+        node_index: 0,
+        version: first_upper_half_version + 1,
+    };
+    let deleted_by = UpdateId {
+        node_index: 0,
+        version: first_upper_half_version + 2,
+    };
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+        .expect("group should store");
+    for (change_id, tombstoned, title) in [
+        (created_by, false, "created"),
+        (updated_by, false, "updated"),
+        (deleted_by, true, "deleted"),
+    ] {
+        let action = if tombstoned {
+            DatasetRowStateWrite::UpsertTombstone {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, title),
+            }
+        } else {
+            DatasetRowStateWrite::UpsertActive {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, title),
+            }
+        };
+        wait_for_store_future(apply_row_patch(
+            transaction.as_mut(),
+            &schema,
+            DatasetRowStatePatch {
+                group_id,
+                dataset_id: dataset_id.clone(),
+                actions: vec![action],
+                change_id,
+                last_changed_versions: sample_last_changed_versions(),
+            },
+        ))
+        .expect("row change should store");
+    }
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let requested_row_keys = [row_key];
+    let mut requested_row_keys = requested_row_keys.iter();
+    let loaded = wait_for_store_future(transaction.load_dataset_rows(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        &mut requested_row_keys,
+    ))
+    .expect("row should load");
+    wait_for_store_future(transaction.release()).expect("read should release");
+
+    let row = loaded
+        .rows
+        .get(&row_key)
+        .and_then(Option::as_ref)
+        .expect("stored row should be present");
+    assert_eq!(row.created_by, Some(created_by));
+    assert!(row.tombstoned);
+}
+
+#[test]
+fn sqlite_store_rejects_incomplete_and_out_of_range_row_creators() {
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = in_memory_store(local_member());
+    let group_id = GroupId(Uuid::from_u128(112));
+    let row_key = RowKey(Uuid::from_u128(306));
+    let change_id = sample_change_id();
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+        .expect("group should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &schema,
+        DatasetRowStatePatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowStateWrite::UpsertActive {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, "created"),
+            }],
+            change_id,
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("row should store");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    replace_raw_row_creator(
+        store.as_ref(),
+        group_id,
+        &dataset_id,
+        row_key,
+        Some(0),
+        None,
+    );
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let requested_row_keys = [row_key];
+    let mut requested_row_keys = requested_row_keys.iter();
+    let incomplete_error = wait_for_store_future(transaction.load_dataset_rows(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        &mut requested_row_keys,
+    ))
+    .expect_err("incomplete creator provenance should fail");
+    wait_for_store_future(transaction.release()).expect("read should release");
+    assert_sqlite_store_error(&incomplete_error, |source| {
+        matches!(
+            source,
+            SqliteStoreError::IncompleteStoredRowCreationProvenance {
+                row_key: stored_row_key,
+            } if *stored_row_key == row_key
+        )
+    });
+
+    replace_raw_row_creator(
+        store.as_ref(),
+        group_id,
+        &dataset_id,
+        row_key,
+        Some(2),
+        Some(i64::from(U64BitsInI64::from(change_id.version))),
+    );
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let requested_row_keys = [row_key];
+    let mut requested_row_keys = requested_row_keys.iter();
+    let out_of_range_error = wait_for_store_future(transaction.load_dataset_rows(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        &mut requested_row_keys,
+    ))
+    .expect_err("out-of-range creator should fail");
+    wait_for_store_future(transaction.release()).expect("read should release");
+    assert_sqlite_store_error(&out_of_range_error, |source| {
+        matches!(
+            source,
+            SqliteStoreError::InvalidStoredRowCreatorIndex {
+                row_key: stored_row_key,
+                creator_index: 2,
+                member_count: 2,
+            } if *stored_row_key == row_key
+        )
+    });
+}
+
+#[test]
 fn sqlite_store_rejects_tombstone_to_active_row_transition() {
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
@@ -2188,6 +2686,7 @@ fn sqlite_store_rejects_tombstone_to_active_row_transition() {
                 row_key,
                 snapshot: tombstone_snapshot,
             }],
+            change_id: sample_change_id(),
             last_changed_versions: sample_last_changed_versions(),
         },
     ))
@@ -2203,6 +2702,10 @@ fn sqlite_store_rejects_tombstone_to_active_row_transition() {
                 row_key,
                 snapshot: active_snapshot,
             }],
+            change_id: UpdateId {
+                node_index: 0,
+                version: 2,
+            },
             last_changed_versions: sample_last_changed_versions(),
         },
     ))

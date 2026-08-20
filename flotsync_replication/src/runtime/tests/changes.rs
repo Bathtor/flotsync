@@ -44,14 +44,13 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
         [row_id.row_key],
     );
     assert!(row_slice.dataset_exists);
-    assert!(
-        row_slice
-            .rows
-            .get(&row_id.row_key)
-            .cloned()
-            .flatten()
-            .is_some()
-    );
+    let stored_row = row_slice
+        .rows
+        .get(&row_id.row_key)
+        .cloned()
+        .flatten()
+        .expect("published row should persist");
+    assert_eq!(stored_row.created_by, Some(receipt.update_id));
 }
 
 #[test]

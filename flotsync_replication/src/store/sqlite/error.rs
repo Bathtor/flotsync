@@ -190,6 +190,18 @@ pub(super) enum SqliteStoreError {
         /// Number of members in the associated group.
         member_count: usize,
     },
+    /// A stored row creator index could not identify a member of its owning group.
+    #[snafu(display(
+        "Stored row {row_key} creator index {creator_index} is invalid for {member_count} group members."
+    ))]
+    InvalidStoredRowCreatorIndex {
+        /// Row whose stored creation provenance is invalid.
+        row_key: RowKey,
+        /// Raw signed value read from SQLite.
+        creator_index: i64,
+        /// Number of members in the row's owning group.
+        member_count: usize,
+    },
     /// Caller-provided active progress used the wrong member width.
     #[snafu(display(
         "Replication group {group_id} has {version_member_count} active version-vector members, but its material has {member_count} members."
@@ -230,6 +242,14 @@ pub(super) enum SqliteStoreError {
         /// Logical stored object kind.
         object: &'static str,
         source: Box<dyn StdError + Send + Sync>,
+    },
+    /// Stored row-creation provenance populated only one of its two columns.
+    #[snafu(display(
+        "Stored row {row_key} creation provenance must contain both the member index and version, or neither."
+    ))]
+    IncompleteStoredRowCreationProvenance {
+        /// Row whose stored creation provenance is incomplete.
+        row_key: RowKey,
     },
     /// A stored sort key had the wrong fixed width.
     #[snafu(display("Stored {object} sort key had invalid length {len}."))]
@@ -367,9 +387,11 @@ impl SqliteStoreError {
             | Self::MemberIndexOverflow { .. }
             | Self::SecretCryptoVersionOverflow { .. }
             | Self::InvalidStoredLocalMemberIndex { .. }
+            | Self::InvalidStoredRowCreatorIndex { .. }
             | Self::StoredGroupMemberCountMismatch { .. }
             | Self::DecodeStoredProto { .. }
             | Self::InvalidStoredObject { .. }
+            | Self::IncompleteStoredRowCreationProvenance { .. }
             | Self::InvalidStoredSortKey { .. }
             | Self::StoredUpdateGroupMismatch { .. }
             | Self::StoredUpdateIdMismatch { .. }

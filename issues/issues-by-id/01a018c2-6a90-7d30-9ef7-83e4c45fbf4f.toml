@@ -1,0 +1,32 @@
+id = "01a018c2-6a90-7d30-9ef7-83e4c45fbf4f"
+ref = "flotsync-2js"
+title = "Explore stable group lineage identity"
+body = """
+Optional follow-up discovered while defining application-facing row correspondence in flotsync-9fs.
+
+Context:
+L01. The current model intentionally keeps RowId group-scoped and represents successor rows as distinct occurrences related by an explicit group transition.
+L02. A stable group-lineage identity is orthogonal to row correspondence and may later provide a long-lived application handle across membership or schema epochs.
+L03. No current use-case requires that extra identity layer, so it should not complicate flotsync-9fs.
+
+Scope:
+L04. Identify concrete application use-cases for a stable group-lineage id distinct from GroupId.
+L05. Define creation, propagation, invitation, successor, branching, and local selected-head semantics if those use-cases justify the concept.
+L06. Decide how a lineage id would coexist with group-scoped RowId, explicit successor relations, group-state views, snapshots, and writes.
+L07. Preserve the option to add the concept without changing the current slice's meaning of group-scoped row identity.
+
+Out of scope:
+L08. Application row reconciliation metadata for immediate group changes; that remains in flotsync-9fs."""
+status = "open"
+type = "task"
+priority = 4
+labels = [
+    "area:api",
+    "area:replication",
+]
+created_at = "2026-08-19T06:43:09.584861Z"
+updated_at = "2026-08-19T06:43:28.25948Z"
+
+[[links]]
+target = "019f5b3a-ee57-7413-b39b-55e107995695"
+label = "discovered from"

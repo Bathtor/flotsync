@@ -2,27 +2,106 @@ id = "019f5b3a-ee57-7413-b39b-55e107995695"
 ref = "flotsync-9fs"
 title = "Design application-facing record identity across group changes"
 body = """
-Design and implement application-facing record identity/projection semantics so membership or schema changes do not appear as duplicated rows to applications.
+Define application-facing row correspondence across group changes so applications can replace an old group view with a successor view without treating every successor row as an unrelated insertion or silently collapsing potentially divergent state.
 
 Context:
-D01. flotsync-git-pow.4 intentionally materialises inline snapshots into a new group namespace and emits add/upsert events for those new-group rows.
-D02. That is acceptable for the current protocol slice, but it means repeated membership or schema changes can make the same logical records appear multiple times when an application observes rows by group-scoped RowId alone.
-D03. This work is blocked by flotsync-git-pow.4 because it should build on the first working inline activation path and its listener semantics.
+C01. flotsync-git-pow.4 materialises Empty or Inline snapshots into a new group namespace and emits new-group rows to the listener after activation.
+C02. RowId is group-scoped, so the same dataset row key in old and successor groups denotes two distinct row occurrences.
+C03. Repeated membership or schema changes currently leave applications to infer that relationship from ordinary new-group upserts, which can produce duplicate application rows and hides the reconciliation boundary.
+C04. The old group already records its selected successor and migration cut, so the runtime has an explicit old-to-new transition context.
 
-Scope:
-D04. Decide the long-term application-facing identity model for logical records across group changes, including whether identity is a stable record id, a dataset projection, a supersession relation, or another explicit API concept.
-D05. Define listener semantics so applications can distinguish true new records from records re-exposed in a new group after membership or schema change.
-D06. Define query/snapshot semantics that prevent duplicate logical rows by default while preserving access to group-scoped diagnostic/runtime views where needed.
-D07. Update the design documentation and API contracts with the chosen semantics.
-D08. Implement the runtime/storage/listener changes needed for the chosen model.
-D09. Add tests covering repeated membership/schema changes, overlapping rows between old and new groups, and application-level views without duplicate logical rows.
+Agreed model:
+M01. Keep RowId as the authoritative application-visible, group-scoped row identity.
+M02. A successor-group row has a distinct RowId from its old-group counterpart. Flotsync must not silently collapse the two occurrences into one stable record identity.
+M03. Within one explicit group change, matching DatasetId and RowKey values define row correspondence between the old and successor group. This correspondence is transition-local and does not create application-global record identity.
+M04. Corresponding rows are related but need not be equivalent. Membership or schema changes may expose state that differs from the application's last observed old-group state.
+M05. Applications own reconciliation of dirty or otherwise retained local state. They may remap it, warn that it may be lost, or expose a conflict for user resolution.
+M06. Flotsync should make reconciliation easier by reporting conservative facts about correspondence and divergence, but it must not choose an application-specific merge or conflict resolution.
+M07. A stable group-lineage id remains an orthogonal optional extension tracked in priority-4 follow-up flotsync-2js; it is not part of this slice.
 
-Out of scope:
-D10. GroupClose protocol shape and old-group access-state enforcement; that is tracked separately in flotsync-git-lg9."""
-status = "open"
+Agreed listener API:
+A01. Keep ReplicationEvent::DataChanged as the streamed listener boundary and add batch lineage distinguishing ordinary data changes from GroupReplacement { migration_id }.
+A02. Do not expose a group-wide previous-position comparison. Apart from MigrationId, reconciliation evidence is row-local.
+A03. Refactor the emitted row item so PreviousRow is parent metadata for a current Upsert or Delete change rather than metadata nested only inside an upsert.
+A04. PreviousRow distinguishes ordinary/not-compared changes, a present corresponding old occurrence, an absent old occurrence with evidence, and unavailable old-group state.
+A05. Present previous rows carry their old RowId plus the strongest conservative row-local causal evidence available for relevant create, update, and delete operations relative to the accepted cut.
+A06. Corresponding old/new rows emit one successor Upsert whose PreviousRow names the old occurrence. Old-visible rows without successor occurrences emit Delete for the old RowId with the same previous-row lineage. Successor-only rows emit Upsert with absent or unavailable previous-row evidence.
+A07. When Flotsync compares projected row values, it emits the canonical identities of differing fields so applications do not repeat the comparison with potentially inconsistent equality semantics.
+A08. Detailed schema-change semantics are deferred from the first implementation slice, but the row-level field-change model must remain extensible to schema-added/defaulted, schema-removed, and definition-changed fields. A separate schema-comparison helper will support columnar applications.
+A09. One GroupReplacement DataChanged batch is an atomic application-view transition, including when its row provider is empty. Applications merge its ReadToken only after recording the complete replacement and any unresolved conflicts.
+A10. Flotsync reports evidence and application-facing changes but does not choose how dirty state is rebased, discarded, or presented as a conflict.
+
+Current implementation slice:
+S01. Implement the agreed DataChanged lineage and parent PreviousRow/current-change API for membership-change activation with unchanged schemas.
+S02. Compare visible old and successor occurrences by DatasetId and RowKey and emit corresponding upserts, successor-only upserts, and old-only deletes.
+S03. Emit canonical changed-field identities for corresponding projected rows.
+S04. Emit the strongest row-local creation/change/deletion cut evidence supported by retained state, with an explicit unknown/unavailable fallback rather than inference.
+S05. Cover Empty activation, migration-sourced invitations without a hosted old group, and repeated membership changes.
+S06. Preserve opaque multi-group ReadToken behaviour and the existing post-commit listener boundary.
+S07. Keep group-scoped snapshot APIs; document that restart rebuilds from application-readable groups and therefore excludes closed predecessors.
+
+Agreed implementation architecture:
+I01. Storage aligns raw previous/current row records by DatasetId and RowKey; replication alone owns application visibility, correspondence, field equality, causal interpretation, and public listener semantics.
+I02. Add an ordered paired-row store scan whose result contains independently optional raw previous/current records, including tombstones. Provide a correct default implemented by merging two existing ordered scans.
+I03. Override the paired scan in SQLite with an indexed union-of-keys query and joins to the two row records, avoiding a dependency on FULL OUTER JOIN support.
+I04. Persist the UpdateId which first introduced each row and preserve it across later updates and tombstoning. Combine this with existing last-changed versions in replication to derive only conservative included/not-included/unknown evidence relative to the accepted cut.
+I05. Do not replay the complete old-group update log by default. Missing historical proof remains explicitly unknown or unavailable.
+I06. After atomic successor activation and predecessor closure, use a store-backed provider over one pinned read transaction to compare and emit rows in bounded batches.
+I07. Compare materialised application values in replication and emit deterministic canonical differing-field identities. The first slice supports unchanged schemas.
+I08. Retain the existing post-commit listener failure model; a general retryable listener outbox remains outside this task.
+
+Agreed task split:
+T01. flotsync-j6x, "Add paired row scans and provenance", owns the raw paired-row storage contract, its generic fallback, the SQLite optimisation, creator provenance, patch call sites, and focused store tests.
+T02. flotsync-v76, "Emit group replacement row lineage", owns the public listener API, streaming replacement provider, replication-layer comparison/evidence, runtime integration, OKF/example updates, and end-to-end tests.
+T03. flotsync-v76 is blocked by flotsync-j6x so the public/runtime work consumes a settled storage foundation.
+
+Deliverables:
+D01. Update OKF design documentation and public API contracts with the agreed identity, correspondence, replacement, and reconciliation semantics.
+D02. Add the public listener and snapshot/query API shapes selected during design alignment.
+D03. Add runtime/store comparison and transition plumbing required by those contracts.
+D04. Update the replicated checklist example to demonstrate safe handling of clean, dirty, identical, divergent, introduced, and removed rows.
+D05. Add focused and integration tests for repeated group changes with unchanged schemas, overlapping rows, Empty activation, dirty application state, and restart/replay behaviour.
+
+Explicit deferrals:
+X01. Application-specific dirty-state merge, automatic conflict resolution, and field-level diff presentation are out of scope.
+X02. Stable group-lineage identity is deferred to flotsync-2js.
+X03. GroupClose protocol shape and standalone old-group access policy remain in flotsync-yty.
+X04. Chunked or fetched snapshot transfer and broader snapshot batching redesign remain outside this task.
+X05. Detailed schema-added/defaulted/removed field semantics and the columnar schema helper remain deferred.
+X06. Exact-cut history replay and a general retryable listener outbox are not introduced in this slice.
+
+Implementation estimate:
+E01. flotsync-j6x: roughly 500-890 LOC.
+E02. flotsync-v76: roughly 730-1,350 LOC.
+E03. Total likely 1,230-2,240 LOC, intentionally split into the two ordered children above because the complete plan exceeds 1,000 LOC."""
+status = "in-progress"
+status_reason = "plan agreed; implementation split into flotsync-j6x then flotsync-v76"
 type = "task"
 priority = 1
 labels = ["area:replication"]
+assignee = "codex"
 blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+children = [
+    "01a01af2-7b1b-71c3-bf8b-6a8747152a65",
+    "01a01af2-8bbe-70f3-bea5-684f2e1c723e",
+]
 created_at = "2026-07-13T11:26:56.59962Z"
-updated_at = "2026-07-26T12:04:17.994087Z"
+updated_at = "2026-08-19T16:55:48.241835Z"
+
+[[comments]]
+id = "01a018c3-eb67-7742-bd76-65f9aec6b303"
+author = "codex"
+body = "Model decision aligned: retain group-scoped RowId and treat successor rows as distinct but transition-related occurrences. Applications remain responsible for dirty-state reconciliation; Flotsync will expose previous-row existence, projected-state equality, and conservative divergence context without choosing a merge. Stable group-lineage identity is deferred as optional priority-4 follow-up flotsync-2js."
+created_at = "2026-08-19T06:44:48.103336Z"
+
+[[comments]]
+id = "01a01ae3-eea9-7e30-a88d-8d4ea8073797"
+author = "codex"
+body = "Listener API agreed: DataChanged gains Ordinary versus GroupReplacement { migration_id } batch lineage; row items carry parent PreviousRow metadata plus current Upsert/Delete; old-only rows emit Deletes with lineage; corresponding rows report canonical differing fields and the strongest provable row-local cut evidence. Group-wide PreviousGroupPosition and a dedicated transition event are rejected. Detailed schema-default/removal semantics remain extensible but deferred from the first implementation slice."
+created_at = "2026-08-19T16:39:00.521908Z"
+
+[[comments]]
+id = "01a01af3-4f11-7841-9ed9-8bc2527d7b1d"
+author = "codex"
+body = "Implementation plan agreed and split: flotsync-j6x owns raw paired-row scans, SQLite optimisation, creator provenance, patch call sites, and store tests; flotsync-v76 owns the public lineage API, streaming replacement provider, replication-layer comparison/evidence, runtime integration, documentation, and end-to-end coverage. flotsync-v76 is blocked by flotsync-j6x."
+created_at = "2026-08-19T16:55:48.241835Z"

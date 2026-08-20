@@ -2146,6 +2146,7 @@ impl ReplicationRuntimeComponent {
                 group_id,
                 dataset_id,
                 actions,
+                change_id: update_id,
                 last_changed_versions: last_changed_versions.clone(),
             })
             .collect();

@@ -1,0 +1,38 @@
+id = "01a01fb2-a6a2-7092-b3e0-c6b7c4c6331e"
+ref = "flotsync-duu"
+title = "Reuse row scan output buffers"
+body = """
+Reduce repeated row-scan allocation by adding an explicit reusable-output contract to replication storage scans.
+
+Context:
+C01. Discovered while reviewing flotsync-j6x paired row scans.
+C02. ReplicationStore row scans currently return newly allocated DatasetRowStateBatch and DatasetRowStatePairBatch values. Allocation reuse only begins at the higher BatchProvider layer, after storage has already allocated and decoded each page.
+
+Scope:
+S01. Design one consistent reuse model for ordinary and paired dataset row scans rather than optimising only the paired path.
+S02. Preserve object safety and asynchronous borrowing for ReplicationStoreReadTransaction implementations.
+S03. Let SQLite decode directly into reusable record buffers where practical.
+S04. Keep pagination, dataset-presence metadata, row ordering, and error semantics unchanged.
+S05. Update custom stores, test doubles, providers, and callers to use the agreed reuse contract.
+
+Validation:
+V01. Functional tests show previously populated buffers are cleared and refilled correctly across successive pages and dataset changes.
+V02. Do not encode allocation counts or performance thresholds as unit-test contracts.
+V03. Run formatting, relevant tests, and pedantic Clippy.
+
+Estimate:
+E01. API and call-site design: 100-180 LOC.
+E02. SQLite and default implementation changes: 120-220 LOC.
+E03. Tests and provider integration: 100-180 LOC.
+E04. Expected total: 320-580 LOC."""
+status = "open"
+type = "task"
+priority = 3
+labels = ["area:replication"]
+blocked_by = ["01a01af2-7b1b-71c3-bf8b-6a8747152a65"]
+created_at = "2026-08-20T15:03:16.898508Z"
+updated_at = "2026-08-20T15:26:02.929588Z"
+
+[[links]]
+target = "01a01af2-7b1b-71c3-bf8b-6a8747152a65"
+label = "discovered from"

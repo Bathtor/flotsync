@@ -1,0 +1,144 @@
+id = "01a01af2-7b1b-71c3-bf8b-6a8747152a65"
+ref = "flotsync-j6x"
+title = "Add paired row scans and provenance"
+body = """
+Provide the storage foundation for comparing rows from a previous and successor replication group without moving application-facing reconciliation semantics into ReplicationStore implementations.
+
+Parent context:
+C01. Parent task flotsync-9fs keeps RowId group-scoped and defines row correspondence within one explicit group replacement.
+C02. Storage owns efficient retrieval and alignment of stored row records; replication owns visibility, correspondence, field equality, cut evidence, and listener API semantics.
+C03. This child lands before runtime/listener child flotsync-v76 consumes row transitions and creator provenance.
+
+Agreed storage model:
+A01. A transition scan compares the same DatasetId reference in the previous and current groups. Dataset renames do not preserve row correspondence.
+A02. The request accepts previous/current GroupDatasetSchemaRef values and rejects unequal dataset references before performing store work.
+A03. Each emitted DatasetRowStateTransition has one RowKey and independently optional stored previous/current ReplicationRowStateRecord values, including tombstones.
+A04. Every transition has at least one stored side, and every present record has row_id equal to the enclosing row_key.
+A05. Transitions are ordered by ascending RowKey across keys present in either group occurrence.
+A06. DatasetRowStateTransitionBatch carries one DatasetId, both group IDs, both dataset-existence flags, rows, and exclusive-after continuation.
+A07. The previous/current fields derive their meaning from the enclosing batch's previous/current group references.
+A08. Storage returns stored records only; application-facing row changes, field differences, and migration-cut classifications remain replication concerns.
+
+Public API implementation:
+B01. Expose DatasetRowStateBatch::transition_with_limit as the reusable public default alignment operation.
+B02. Rename the row value, result batch, scan method, helper methods, tests, and documentation consistently around directional transition terminology while retaining previous/current fields.
+B03. The default trait implementation performs two ordinary scans and an in-memory alignment. Document this cost and encourage efficient stores to override it.
+B04. The alignment assigns iterator next values directly into optional transition fields, asserts the row invariant, uses option_when for continuation, and keeps complex test projections in named locals.
+B05. Document that records consumed beyond the last emitted key are omitted from the returned result and may be fetched again when the source scans resume after next_after.
+B06. Reusable output buffers remain deferred to P3 task flotsync-duu so ordinary and transition scans can adopt one consistent contract.
+
+Agreed provenance:
+P01. ReplicationRowStateRecord carries created_by: Option<UpdateId>.
+P02. DatasetRowStatePatch carries the exact applying change_id.
+P03. Store Some(change_id) when an active row key is first introduced, None when a tombstone is first observed without a stored row, and preserve known provenance across later changes.
+P04. Initial active snapshot rows use Some(INITIAL_STATE_ORIGIN).
+P05. Validate stored creator member indices against group membership and report creator-specific structured corruption errors with row context.
+P06. SQLite stores the creator member index and scalar creator version as INTEGER values. A generic SQLite-local newtype losslessly reinterprets u64 bits as i64 and back; upper-half values therefore appear negative in SQLite.
+P07. Sortable version BLOBs remain only where unsigned range ordering is required.
+
+SQLite transition scan:
+S01. Override the default with a CTE that selects the limited combined RowKey page before joining previous/current row records.
+S02. Apply the exclusive after bound in both key-select arms so non-initial pages remain indexed range scans.
+S03. SQLx QueryBuilder remains a textual builder because it has no typed query AST or composable bound-query union.
+S04. Keep complete static SQL statements visibly formatted as multi-line literals. Generate individually assembled QueryBuilder fragments without unnecessary formatting whitespace, and use format_args! for qualified projections without allocating temporary strings.
+S05. Keep the authoritative projection-column array, previous/current ordinal layouts, and ordinal accessors together on one layout type.
+S06. Keep bounded fetch_all materialisation in this slice with a TODO(flotsync-duu) source comment; reconsider streaming together with reusable decoded output.
+S07. Load dataset-presence flags in one focused query and both group member counts in a second focused query.
+S08. Document that a nullable joined snapshot means the corresponding left-join side had no stored row.
+S09. Add an adjacent SQLite DDL comment documenting the unsigned creator bits stored in signed INTEGER form.
+
+Validation:
+V01. Contract tests cover both-present, previous-only, current-only, tombstones, empty/missing datasets, ordering, pagination, and exact-limit continuation.
+V02. Tests cover one shared DatasetId with differing previous/current schemas and reject mismatched dataset references.
+V03. SQLite tests cover known and unknown creator provenance, preservation across changes, incomplete provenance, invalid creator indices, and creator integer round trips across the i64 sign boundary.
+V04. Tests use typed error variants and fields rather than rendered messages.
+V05. Do not add allocation thresholds or SQLite query-plan assertions to unit tests.
+V06. Run formatting, focused tests, the broader single-threaded replication suite, diff checks, and pedantic Clippy.
+
+Explicit exclusions:
+X01. Do not add listener lineage types or RowChange production in this child.
+X02. Do not compare materialised field values in storage.
+X03. Do not replay old-group update logs to infer missing history.
+X04. Do not implement schema-added/defaulted/removed field handling.
+X05. Do not implement reusable storage output buffers here; follow-up flotsync-duu owns that work.
+X06. Do not add query-plan performance tests.
+
+Estimate:
+E01. Public API renaming, validation, and documentation: 100-170 touched LOC.
+E02. SQLite query/layout and integer representation cleanup: 100-180 touched LOC.
+E03. Call-site and test updates: 80-140 touched LOC.
+E04. Expected third-review revision is 280-490 touched LOC; the complete child remains below 1,000 touched LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+labels = ["area:replication"]
+assignee = "codex"
+blocks = [
+    "01a01af2-8bbe-70f3-bea5-684f2e1c723e",
+    "01a01fb2-a6a2-7092-b3e0-c6b7c4c6331e",
+]
+parent = "019f5b3a-ee57-7413-b39b-55e107995695"
+created_at = "2026-08-19T16:54:53.979117Z"
+updated_at = "2026-08-20T17:02:25.036377Z"
+closed_at = "2026-08-20T17:02:25.036377Z"
+
+[[comments]]
+id = "01a01b02-26a6-75a0-8e7c-47147b64cacf"
+author = "codex"
+body = "Implemented the agreed storage foundation: raw paired-row batches with a default ordered merge; an SQLite union-of-keys/left-join override; persisted created_by provenance preserved across updates and tombstoning; and exact change_id propagation from local, inbound, and initial-snapshot writes. Coverage includes union alignment, tombstones, missing/empty datasets, pagination, exact-limit exhaustion, creator round trips, and all three production provenance origins. Full flotsync_replication suite passes (323 tests); pedantic clippy is clean."
+created_at = "2026-08-19T17:12:00.934242Z"
+
+[[comments]]
+id = "01a01b0d-7898-77c3-be13-3f40fba65abd"
+author = "codex"
+body = "Review delta agreed: keep SQLite pagination range-indexed by filtering inside both UNION arms; make row creator provenance optional for first-seen tombstones; validate present creator indices against group membership; document pair-key equality; and assess repeated paired-scan metadata queries without broadening the storage API. These decisions are integrated into the full child plan."
+created_at = "2026-08-19T17:24:22.808677Z"
+
+[[comments]]
+id = "01a01b17-9eef-7692-af29-190d20ed4534"
+author = "codex"
+body = "Addressed every agreed review item: paired pagination now filters within both UNION arms and SQLite plans two covering-index row-key range scans; row creator provenance is optional for first-seen tombstones and preserved when known; nullable creator columns are consistency-constrained and decoding rejects incomplete or out-of-range provenance; pair-key equality is documented; and paired metadata loading is reduced from four queries per page to one. Formatting, the focused corruption test, all 324 replication tests, and pedantic clippy pass."
+created_at = "2026-08-19T17:35:27.983794Z"
+
+[[comments]]
+id = "01a01b2f-ea2e-7d90-a01d-5af3d169bc27"
+author = "codex"
+body = "Second-pass review delta: S01 is intentionally rejected because SQLite planner performance is not a unit-test contract. Accepted fixes are creator-specific row-contextual corruption errors, typed variant/field assertions in corruption tests, and accurate per-page metadata documentation."
+created_at = "2026-08-19T18:02:00.110483Z"
+
+[[comments]]
+id = "01a01b32-e22b-7f93-b921-e93ad15cb8a1"
+author = "codex"
+body = "Addressed the accepted second-pass findings. Row creator corruption now uses dedicated typed errors with row identity and the raw stored index, incomplete provenance also carries row identity, corruption tests match concrete variants and fields, and paired metadata documentation now describes its per-page lifecycle. S01 remains intentionally unimplemented. Focused corruption coverage, all 324 replication tests, formatting, diff checks, and pedantic clippy pass."
+created_at = "2026-08-19T18:05:14.667044Z"
+
+[[comments]]
+id = "01a01fc8-6160-70a0-ab7d-10ec543fb7e4"
+author = "codex"
+body = "Implemented the aligned review revision: paired scans now take one shared dataset id plus explicit previous/current group schemas; paired batches expose one dataset id; the public default merge is DatasetRowStateBatch::join_with_limit with positive contract documentation; SQLite generates repeated joined projections from one column list and decodes calculated ordinal layouts; metadata is split into datasets and group/material queries; creator scalar versions use lossless INTEGER bit reinterpretation; and bounded fetch_all references deferred P3 task flotsync-duu. Coverage includes differing schemas for one dataset and upper-half u64 creator persistence. All 324 replication tests, formatting, diff checks, and pedantic Clippy pass."
+created_at = "2026-08-20T15:27:00.960467Z"
+
+[[comments]]
+id = "01a0200d-2878-7541-aa1e-1dda4e6465a0"
+author = "codex"
+body = "Third review plan agreed: remove GroupRowSchemaRef in favour of validated previous/current GroupDatasetSchemaRef arguments; adopt DatasetRowStateTransition terminology; clarify batch-relative side semantics and consumed-but-omitted rows; compact generated SQL with non-allocating formatted fragments; co-locate the projection array and ordinal layouts; use standard TODO(flotsync-duu) syntax; and generalise unsigned-bit SQLite INTEGER conversion behind a newtype."
+created_at = "2026-08-20T16:42:08.376379Z"
+
+[[comments]]
+id = "01a02014-c733-7f83-8115-752ffe0f1c81"
+author = "codex"
+body = "Implemented the agreed third review revision. The public and SQLite APIs now use DatasetRowStateTransition terminology and direct previous/current GroupDatasetSchemaRef arguments with typed mismatch validation. Documentation ties side semantics to the enclosing batch and explains consumed-but-omitted input rows. SQLite SQL fragments are compact, projection generation uses format_args!, the projection array and ordinal layouts are co-located, the fetch_all deferral uses TODO(flotsync-duu), and creator versions use generic U64BitsInI64 conversions with an adjacent DDL explanation. Focused transition tests and all 324 replication tests pass; formatting, diff checks, and pedantic Clippy are clean."
+created_at = "2026-08-20T16:50:27.763493Z"
+
+[[comments]]
+id = "01a0201e-11a6-71f2-815e-9280905e9ad5"
+author = "codex"
+body = "Final SQL-formatting correction: restored the two complete static metadata queries as visibly formatted multi-line literals. Compact spacing remains limited to individually assembled QueryBuilder fragments. Focused transition tests, formatting, and diff checks pass."
+created_at = "2026-08-20T17:00:36.646934Z"
+
+[[comments]]
+id = "01a0201f-b90c-7590-ac75-53dc2ffdf782"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-20T17:02:25.036377Z"

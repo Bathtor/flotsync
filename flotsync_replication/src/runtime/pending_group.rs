@@ -169,6 +169,7 @@ fn embed_initial_dataset(
             group_id,
             dataset_id,
             actions,
+            change_id: UpdateId::INITIAL_STATE_ORIGIN,
             last_changed_versions: VersionVector::initial(member_count),
         },
         row_changes,

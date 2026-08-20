@@ -728,13 +728,20 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
             rows: vec![CapturedRowChange::Upsert {
                 row_id: RowId {
                     group_id,
-                    dataset_id,
+                    dataset_id: dataset_id.clone(),
                     row_key,
                 },
                 title: "activated on startup".to_owned(),
             }],
         }]
     );
+    let stored_row = load_persisted_row_slice(store.as_ref(), group_id, &dataset_id, [row_key])
+        .rows
+        .get(&row_key)
+        .cloned()
+        .flatten()
+        .expect("activated row should persist");
+    assert_eq!(stored_row.created_by, Some(UpdateId::INITIAL_STATE_ORIGIN));
     let read_tokens = listener.captured_data_change_read_tokens();
     let activation_read_token = read_tokens
         .last()

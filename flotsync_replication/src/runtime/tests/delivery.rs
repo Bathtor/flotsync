@@ -959,6 +959,13 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             .flatten()
             .expect("deleted row should persist as a tombstone");
     assert!(deleted_row.tombstoned);
+    assert_eq!(
+        deleted_row.created_by,
+        Some(UpdateId {
+            version: 1,
+            node_index: 0,
+        })
+    );
     drop(bob_runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
@@ -994,6 +1001,13 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             .flatten()
             .expect("edited tombstone should persist");
     assert!(edited_tombstone.tombstoned);
+    assert_eq!(
+        edited_tombstone.created_by,
+        Some(UpdateId {
+            version: 1,
+            node_index: 0,
+        })
+    );
     let materialised_tombstone =
         flotsync_messages::InMemoryStateData::from_row_snapshots_with_tombstones(
             schema,

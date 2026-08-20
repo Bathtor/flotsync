@@ -1,0 +1,56 @@
+id = "01a01af2-8bbe-70f3-bea5-684f2e1c723e"
+ref = "flotsync-v76"
+title = "Emit group replacement row lineage"
+body = """
+Expose the agreed group-replacement lineage API and implement the streaming replication-layer comparison using the paired-row and provenance foundation from the first child.
+
+Parent context:
+C01. Parent task flotsync-9fs keeps RowId group-scoped while relating matching DatasetId and RowKey occurrences within one explicit group replacement.
+C02. Applications own reconciliation of dirty state; Flotsync reports conservative correspondence, divergence, and cut evidence without choosing a merge.
+C03. This child consumes the raw paired-row scan and created_by provenance supplied by the storage child.
+
+Agreed listener API:
+A01. Keep ReplicationEvent::DataChanged and add lineage distinguishing Ordinary changes from GroupReplacement { migration_id }.
+A02. Each emitted item carries PreviousRow parent metadata plus a current Upsert or Delete change.
+A03. PreviousRow distinguishes not compared, present, absent, and unavailable previous state.
+A04. Corresponding visible rows emit one successor Upsert naming the previous RowId. Previous-visible/current-missing rows emit Delete for the previous RowId. Current-only rows emit successor Upsert with absent or unavailable evidence.
+A05. Corresponding upserts carry canonical differing-field identities computed by Flotsync over application-facing values.
+A06. Present previous rows carry conservative creator and observed-state evidence relative to the accepted final cut, with explicit unknown/unavailable outcomes.
+A07. One GroupReplacement DataChanged event is the atomic application transition, including an empty provider. Applications merge its ReadToken only after consuming and recording the complete replacement.
+
+Implementation work:
+I01. Add and document the public lineage, PreviousRow, cut-evidence, and parent row-change types.
+I02. Add a store-backed group-replacement RowProvider that owns one consistent read transaction and streams paired rows in bounded batches.
+I03. Keep visibility, correspondence, field comparison, and causal interpretation in replication. Storage records remain raw inputs.
+I04. Compare materialised application values for unchanged schemas and emit deterministically ordered canonical differing-field identities.
+I05. Use created_by, last_changed_versions, the old group's local member index, and the accepted final cut to derive only provable included/not-included/unknown evidence. Do not replay the full update log by default.
+I06. Integrate the provider after atomic activation/old-group closure commit and before listener notification; clarify that the read transaction pins the comparison view.
+I07. Handle Empty activation, a migration-sourced invitation without a hosted predecessor, repeated membership changes, and corresponding rows whose values are identical.
+I08. Preserve opaque multi-group ReadToken behaviour and require complete provider consumption before merging the event token.
+
+Validation and documentation:
+V01. Unit tests cover every previous/current visibility combination, identical and divergent values, stable changed-field ordering, and cut-evidence classifications.
+V02. Provider tests cover multi-page streaming, transaction release, unavailable predecessor state, and scan errors.
+V03. Runtime tests cover one replacement event, an empty replacement event, old-only deletes, repeated group changes, and listener/read-token ordering.
+V04. Update public rustdoc, relevant OKF design documentation, and the replicated checklist example with clean, dirty, identical, divergent, introduced, and removed rows.
+V05. Run formatting, focused tests, broader single-threaded replication tests as appropriate, and pedantic clippy for touched Rust targets.
+
+Explicit exclusions:
+X01. Detailed schema-added/defaulted/removed field semantics and the columnar schema helper remain deferred.
+X02. Application-specific dirty-state merging and automatic conflict resolution remain out of scope.
+X03. Stable group-lineage identity remains in P4 follow-up flotsync-2js.
+X04. A general retryable listener outbox is not introduced; post-commit listener failure retains the existing recovery model.
+
+Estimate:
+E01. Public API and documentation: 120-220 LOC.
+E02. Comparison provider and runtime integration: 260-480 LOC.
+E03. Tests, OKF updates, and example changes: 350-650 LOC.
+E04. Expected total: 730-1,350 LOC. If the upper bound materialises, keep documentation/example work as a separately reviewable commit within this child rather than creating a third child without renewed alignment."""
+status = "open"
+type = "task"
+priority = 1
+labels = ["area:replication"]
+blocked_by = ["01a01af2-7b1b-71c3-bf8b-6a8747152a65"]
+parent = "019f5b3a-ee57-7413-b39b-55e107995695"
+created_at = "2026-08-19T16:54:58.238942Z"
+updated_at = "2026-08-19T16:55:09.474433Z"
