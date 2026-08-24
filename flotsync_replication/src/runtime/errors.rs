@@ -407,6 +407,13 @@ pub(crate) enum GroupActivationError {
     ))]
     ConflictingGroupMaterial { group_id: GroupId },
     #[snafu(display(
+        "Migration from group {old_group_id} to group {new_group_id} changes dataset schema definitions."
+    ))]
+    MigrationSchemaMismatch {
+        old_group_id: GroupId,
+        new_group_id: GroupId,
+    },
+    #[snafu(display(
         "Accepted activation snapshot for group {group_id} referenced unknown dataset '{dataset_id}'."
     ))]
     MissingInitialDatasetSchema {
@@ -453,6 +460,7 @@ impl StoreErrorClassificationSource for GroupActivationError {
             | Self::InvalidMembers { .. }
             | Self::LocalMemberMissing { .. }
             | Self::ConflictingGroupMaterial { .. }
+            | Self::MigrationSchemaMismatch { .. }
             | Self::MissingInitialDatasetSchema { .. }
             | Self::EmbedInitialRows { .. }
             | Self::CloseOldGroup { .. }
@@ -654,6 +662,13 @@ pub(crate) enum InboundDeliveryError {
     },
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
+    #[snafu(display(
+        "Inbound migration from group {old_group_id} to group {new_group_id} changes dataset schema definitions."
+    ))]
+    MigrationSchemaMismatch {
+        old_group_id: GroupId,
+        new_group_id: GroupId,
+    },
     #[snafu(display("Inbound pending group work carried an invalid group member set: {source}"))]
     InvalidPendingGroupMembers { source: GroupMembersError },
     #[snafu(display(
@@ -771,6 +786,7 @@ impl StoreErrorClassificationSource for InboundDeliveryError {
             | Self::GroupSetupSenderNotInGroup { .. }
             | Self::GroupSetupSenderNotFirstMember { .. }
             | Self::UnknownHostedGroup { .. }
+            | Self::MigrationSchemaMismatch { .. }
             | Self::InvalidPendingGroupMembers { .. }
             | Self::PendingGroupMissingLocalMember { .. }
             | Self::MissingDatasetSchema { .. }
@@ -811,6 +827,7 @@ impl InboundDeliveryError {
             | Self::GroupSetupSenderNotInGroup { .. }
             | Self::GroupSetupSenderNotFirstMember { .. }
             | Self::UnknownHostedGroup { .. }
+            | Self::MigrationSchemaMismatch { .. }
             | Self::InvalidPendingGroupMembers { .. }
             | Self::PendingGroupMissingLocalMember { .. }
             | Self::MissingDatasetSchema { .. }

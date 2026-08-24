@@ -705,15 +705,7 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
             group_id,
             members,
             docs_group_schema(),
-            InitialSnapshot::Inline(InitialGroupValueRows {
-                datasets: vec![InitialDatasetValueRows {
-                    dataset_id: dataset_id.clone(),
-                    rows: vec![InitialValueRow {
-                        row_key,
-                        row: title_row_values("activated on startup"),
-                    }],
-                }],
-            }),
+            one_title_row_snapshot(dataset_id.clone(), row_key, "activated on startup"),
             None,
             None,
         )),
@@ -742,6 +734,10 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
         .flatten()
         .expect("activated row should persist");
     assert_eq!(stored_row.created_by, Some(UpdateId::INITIAL_STATE_ORIGIN));
+    assert_eq!(
+        listener.captured_data_change_lineages(),
+        vec![DataChangeLineage::Update]
+    );
     let read_tokens = listener.captured_data_change_read_tokens();
     let activation_read_token = read_tokens
         .last()
@@ -801,15 +797,11 @@ fn runtime_resumes_pending_migration_proposal_activation() {
             final_versions,
             proposed_members: members,
             group_schema: docs_group_schema(),
-            initial_snapshot: InitialSnapshot::Inline(InitialGroupValueRows {
-                datasets: vec![InitialDatasetValueRows {
-                    dataset_id: dataset_id.clone(),
-                    rows: vec![InitialValueRow {
-                        row_key,
-                        row: title_row_values("migration resumed on startup"),
-                    }],
-                }],
-            }),
+            initial_snapshot: one_title_row_snapshot(
+                dataset_id.clone(),
+                row_key,
+                "migration resumed on startup",
+            ),
             group_name: None,
             message: None,
         }),
@@ -830,6 +822,10 @@ fn runtime_resumes_pending_migration_proposal_activation() {
                 title: "migration resumed on startup".to_owned(),
             }],
         }]
+    );
+    assert_eq!(
+        listener.captured_data_change_lineages(),
+        vec![DataChangeLineage::GroupReplacement { migration_id }]
     );
     assert!(listener.take_pending_group_events().is_empty());
     assert!(load_pending_group_activations(store.as_ref()).is_empty());
@@ -961,6 +957,19 @@ fn prepare_group_setup_for_members(
     ))
     .expect("group setup should prepare");
     Arc::new(prepared.group_setup().clone())
+}
+
+/// Build one inline title-row snapshot for activation scenarios.
+fn one_title_row_snapshot(dataset_id: DatasetId, row_key: RowKey, title: &str) -> InitialSnapshot {
+    InitialSnapshot::Inline(InitialGroupValueRows {
+        datasets: vec![InitialDatasetValueRows {
+            dataset_id,
+            rows: vec![InitialValueRow {
+                row_key,
+                row: title_row_values(title),
+            }],
+        }],
+    })
 }
 
 #[test]
@@ -1116,6 +1125,80 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
             .expect("active target should remain published")
             .group_name(),
         Some("replayed migration")
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn migration_proposal_with_changed_schema_is_rejected_before_pending_work_is_stored() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let old_group_id = GroupId(Uuid::from_u128(60_119));
+    let new_group_id = GroupId(Uuid::from_u128(60_120));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    let group_setup = prepare_group_setup_for_members(new_group_id, &alice_member, &members);
+    let store = sqlite_store(bob_member.clone());
+    provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_bob_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        listener,
+    );
+    runtime
+        .install_group_for_test(old_group_id, members.clone())
+        .expect("source group should install");
+    let final_versions = load_persisted_group(store.as_ref(), old_group_id).version_vector;
+    let proposal = MigrationProposal {
+        migration_id: MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        final_versions,
+        proposed_members: members.ordered_members(),
+        group_schema: docs_group_schema_from_schema(title_note_schema_shared()),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: None,
+        message: None,
+    };
+
+    let error = runtime
+        .apply_pending_group_for_test(
+            alice_member,
+            PendingGroupDecisionRecord::MigrationProposal(proposal),
+            group_setup,
+        )
+        .expect_err("schema-changing migration proposal must be rejected");
+
+    assert!(matches!(
+        error,
+        InboundDeliveryError::MigrationSchemaMismatch {
+            old_group_id: actual_old_group_id,
+            new_group_id: actual_new_group_id,
+        } if actual_old_group_id == old_group_id && actual_new_group_id == new_group_id
+    ));
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(
+        wait_for_test_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let target = transaction
+                .load_replication_group_material(&new_group_id)
+                .await
+                .expect("target material lookup should succeed");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            target
+        })
+        .is_none()
     );
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }

@@ -12,7 +12,9 @@ use flotsync_replication::{
     InitialSnapshot,
     InitialSnapshotMetadata,
     MigrationId,
+    PreviousRow,
     ReplicationGroupLifecycle,
+    RowChangeKind,
     RowId,
     RowKey,
     SnapshotRef,
@@ -399,13 +401,13 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
             accepted_event: Some(AcceptedListenerEvent {
                 listener: listener.clone(),
                 read_token,
-                changes: vec![RowChange::Upsert {
-                    row_id: RowId {
-                        group_id: invited_group_id,
-                        dataset_id: checklist_dataset_id(),
-                        row_key,
+                changes: vec![RowChange {
+                    previous: PreviousRow::NotCompared,
+                    change: RowChangeKind::Upsert {
+                        row_id: RowId::new(invited_group_id, checklist_dataset_id(), row_key),
+                        row: Arc::new(row_values),
+                        previous_value_differences: None,
                     },
-                    row: Arc::new(row_values),
                 }],
             }),
         }),
@@ -744,18 +746,24 @@ fn listener_group_validation_rejects_rows_outside_the_registry() {
     let known_group = GroupId(Uuid::from_u128(71_007));
     let unknown_group = GroupId(Uuid::from_u128(71_008));
     let groups = test_group_state([test_group(known_group, &member)]);
-    let known = RowChange::Delete {
-        row_id: RowId {
-            group_id: known_group,
-            dataset_id: checklist_dataset_id(),
-            row_key: RowKey(Uuid::from_u128(1)),
+    let known = RowChange {
+        previous: PreviousRow::NotCompared,
+        change: RowChangeKind::Delete {
+            row_id: RowId {
+                group_id: known_group,
+                dataset_id: checklist_dataset_id(),
+                row_key: RowKey(Uuid::from_u128(1)),
+            },
         },
     };
-    let unknown = RowChange::Delete {
-        row_id: RowId {
-            group_id: unknown_group,
-            dataset_id: checklist_dataset_id(),
-            row_key: RowKey(Uuid::from_u128(2)),
+    let unknown = RowChange {
+        previous: PreviousRow::NotCompared,
+        change: RowChangeKind::Delete {
+            row_id: RowId {
+                group_id: unknown_group,
+                dataset_id: checklist_dataset_id(),
+                row_key: RowKey(Uuid::from_u128(2)),
+            },
         },
     };
 

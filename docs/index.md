@@ -6,6 +6,7 @@ Do not edit it directly.
 ## API Contract
 
 - [FlotSync Freeform I/O API](flotsync_io_api.md) - Defines the raw and Kompact-facing freeform network I/O API model.
+- [Group Replacement Row Lineage](group_replacement_row_lineage.md) - Defines listener-visible row correspondence, divergence, and accepted-cut evidence across group replacements.
 
 ## Benchmark
 

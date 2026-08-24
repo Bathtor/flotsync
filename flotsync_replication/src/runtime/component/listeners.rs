@@ -42,6 +42,7 @@ pub(super) async fn notify_listener_data_change(
 ) -> Result<(), ListenerError> {
     listener
         .on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::Update,
             read_token: event_batch.read_token,
             rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
         })
@@ -53,12 +54,11 @@ pub(super) async fn notify_pending_activation_data_changes(
     listener: Arc<dyn ReplicationEventListener>,
     outcome: PendingGroupActivationOutcome,
 ) -> Result<(), ListenerError> {
-    notify_listener_data_change(
-        listener,
-        ListenerDataChanges {
+    listener
+        .on_event(ReplicationEvent::DataChanged {
+            lineage: outcome.lineage,
             read_token: outcome.read_token,
-            row_changes: outcome.row_changes,
-        },
-    )
-    .await
+            rows: outcome.rows,
+        })
+        .await
 }

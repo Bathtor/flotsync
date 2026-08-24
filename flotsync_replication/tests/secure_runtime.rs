@@ -12,6 +12,7 @@ use flotsync_replication::{
     ApplicationSchemas,
     ChangeGroupMembershipRequest,
     CreateGroupRequest,
+    DataChangeLineage,
     DatasetId,
     GroupInvitationPolicy,
     GroupMigrationPolicy,
@@ -208,6 +209,15 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
         assert!(members.contains(&charlie_member));
         let stored = load_group(fixture, migration_id.new_group_id);
         assert_eq!(stored.group_name.as_deref(), Some("original docs"));
+    }
+    alice_fixture.listener().wait_for_data_change_count(2);
+    bob_fixture.listener().wait_for_data_change_count(2);
+    charlie_fixture.listener().wait_for_data_change_count(1);
+    for fixture in [&alice_fixture, &bob_fixture, &charlie_fixture] {
+        assert_eq!(
+            fixture.listener().captured_data_change_lineages().last(),
+            Some(&DataChangeLineage::GroupReplacement { migration_id })
+        );
     }
 }
 

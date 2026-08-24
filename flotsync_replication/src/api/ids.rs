@@ -151,6 +151,18 @@ pub struct RowId {
     pub row_key: RowKey,
 }
 
+impl RowId {
+    /// Build a row identifier from its group, dataset, and dataset-local key.
+    #[must_use]
+    pub fn new(group_id: GroupId, dataset_id: DatasetId, row_key: RowKey) -> Self {
+        Self {
+            group_id,
+            dataset_id,
+            row_key,
+        }
+    }
+}
+
 impl std::fmt::Display for RowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}/{}", self.group_id, self.dataset_id, self.row_key)

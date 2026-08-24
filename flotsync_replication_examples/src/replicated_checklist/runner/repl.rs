@@ -13,6 +13,8 @@ use super::{
     },
     *,
 };
+#[cfg(test)]
+use flotsync_replication::DataChangeLineage;
 use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
@@ -214,6 +216,7 @@ impl ReplicationEventListener for ChecklistListener {
                 ReplicationEvent::DataChanged {
                     read_token,
                     mut rows,
+                    ..
                 } => {
                     let mut emitted_batch = false;
                     while let Some(batch) = rows.next_batch().await.boxed()? {
@@ -1312,6 +1315,7 @@ mod tests {
         let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
 
         block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::Update,
             read_token: read_token.clone(),
             rows: Box::new(VecRowProvider::new(Vec::new())),
         }))

@@ -761,7 +761,15 @@ pub struct AcceptedMigrationCutover {
     reason = "Listener events are infrequent, and keeping invitation values direct avoids public API indirection."
 )]
 pub enum ReplicationEvent {
+    /// One streamed application-view update.
+    ///
+    /// [`DataChangeLineage::GroupReplacement`] represents one atomic old-to-new
+    /// application-view transition across the complete row provider. Applications
+    /// should consume and record every row before merging `read_token`; dropping
+    /// the provider abandons the remainder of that transition.
     DataChanged {
+        /// Context required to interpret row-level predecessor metadata.
+        lineage: DataChangeLineage,
         /// Read position reached by the row changes in this event.
         ///
         /// Applications that keep local mutable state should merge this into
@@ -770,6 +778,7 @@ pub enum ReplicationEvent {
         /// listener token when local and inbound events are consumed out of
         /// order.
         read_token: ReadToken,
+        /// Batched row operations which comprise this event.
         rows: Box<RowProvider>,
     },
     GroupInvitation {
@@ -780,6 +789,18 @@ pub enum ReplicationEvent {
     MigrationProposals {
         /// Complete candidate set known when this event was emitted.
         proposals: SmallVec<[MigrationCandidateProposal; 1]>,
+    },
+}
+
+/// Batch-level relationship between emitted data changes and a preceding group view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataChangeLineage {
+    /// An update to data within an existing group occurrence.
+    Update,
+    /// One atomic replacement of an old group view by its migration successor.
+    GroupReplacement {
+        /// Explicit old-to-new group transition represented by this event.
+        migration_id: MigrationId,
     },
 }
 
@@ -802,7 +823,9 @@ pub trait GroupInvitationResponder: Send {
     /// been delivered through [`ReplicationEventListener`] as a
     /// [`ReplicationEvent::DataChanged`] event. Applications should ingest the
     /// activation through that listener event rather than independently loading
-    /// the same snapshot.
+    /// the same snapshot. A migration-sourced invitation emits
+    /// [`DataChangeLineage::GroupReplacement`] with unavailable predecessor
+    /// metadata because a newly added member does not host the old group.
     /// Metadata-only snapshots are not fetchable by the current runtime and
     /// therefore cannot be accepted yet.
     fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
@@ -824,8 +847,9 @@ pub trait MigrationProposalResponder: Send {
     /// runtime and therefore cannot be accepted yet. On success, the activated
     /// snapshot's rows and read position have also been delivered through
     /// [`ReplicationEventListener`] as a [`ReplicationEvent::DataChanged`]
-    /// event; applications should ingest activation through that event rather
-    /// than independently loading the same snapshot.
+    /// event with [`DataChangeLineage::GroupReplacement`]; applications should
+    /// ingest the complete replacement through that event rather than
+    /// independently loading the same snapshot.
     fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
 
     /// Refuse the proposed migration with the supplied reason and remove the
@@ -998,7 +1022,10 @@ pub trait ReplicationApi: Send + Sync {
     ///
     /// Continuing remote members receive old-group-scoped migration proposals;
     /// newly added members receive new-group-scoped invitations with migration
-    /// source context.
+    /// source context. Every accepting member receives one
+    /// [`DataChangeLineage::GroupReplacement`] event, including when both group
+    /// views are empty. Continuing members receive row correspondence and cut
+    /// evidence; newly added members receive unavailable predecessor metadata.
     /// [`GroupNameUpdate`] is resolved locally before those messages are built;
     /// replacement names are trimmed and rejected if empty. The optional
     /// message is never inherited, is carried verbatim while setup is pending, and is discarded

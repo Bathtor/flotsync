@@ -134,29 +134,195 @@ pub struct PublishChangesRequest {
 }
 
 /// Row-level change emitted by the framework to an application listener.
-pub enum RowChange {
+///
+/// `previous` describes how the row relates to the application view before
+/// this event. `change` is the operation to apply to obtain the event view.
+pub struct RowChange {
+    /// Previous-row correspondence and migration evidence for this operation.
+    pub previous: PreviousRow,
+    /// Operation which updates the application view.
+    pub change: RowChangeKind,
+}
+
+impl RowChange {
+    /// Build an upsert which is unrelated to a group replacement.
+    pub(crate) fn ordinary_upsert(row_id: RowId, row: Arc<dyn RowValueRead + Send + Sync>) -> Self {
+        Self {
+            previous: PreviousRow::NotCompared,
+            change: RowChangeKind::Upsert {
+                row_id,
+                row,
+                previous_value_differences: None,
+            },
+        }
+    }
+
+    /// Build a delete which is unrelated to a group replacement.
+    pub(crate) fn ordinary_delete(row_id: RowId) -> Self {
+        Self {
+            previous: PreviousRow::NotCompared,
+            change: RowChangeKind::Delete { row_id },
+        }
+    }
+
+    /// Return the group-scoped identity affected by this operation.
+    #[must_use]
+    pub fn row_id(&self) -> &RowId {
+        self.change.row_id()
+    }
+
+    /// Return the complete visible row value for an upsert, or `None` for a delete.
+    #[must_use]
+    pub fn row(&self) -> Option<&(dyn RowValueRead + Send + Sync)> {
+        self.change.row()
+    }
+}
+
+/// Operation applied to the application view for one [`RowChange`].
+pub enum RowChangeKind {
+    /// Insert a successor row or replace the visible values of an existing row.
     Upsert {
+        /// Row occurrence which becomes visible.
         row_id: RowId,
+        /// Complete application-facing value of the visible row.
         row: Arc<dyn RowValueRead + Send + Sync>,
+        /// Fields which differ from the visible old-group row.
+        ///
+        /// `Some` means Flotsync compared both visible row values. An empty
+        /// collection means they were identical. `None` means no value
+        /// comparison was performed; [`RowChange::previous`] explains why.
+        previous_value_differences: Option<Box<[RowFieldDifference]>>,
     },
+    /// Remove a row occurrence from the application view.
     Delete {
+        /// Row occurrence which is no longer visible.
         row_id: RowId,
     },
 }
 
-impl RowChange {
-    #[must_use]
-    pub fn row_id(&self) -> &RowId {
+impl RowChangeKind {
+    /// Return the group-scoped identity affected by this operation.
+    fn row_id(&self) -> &RowId {
         match self {
-            RowChange::Upsert { row_id, .. } | RowChange::Delete { row_id } => row_id,
+            Self::Upsert { row_id, .. } | Self::Delete { row_id } => row_id,
         }
     }
 
-    #[must_use]
-    pub fn row(&self) -> Option<&(dyn RowValueRead + Send + Sync)> {
+    /// Return the complete visible row value for an upsert, or `None` for a delete.
+    fn row(&self) -> Option<&(dyn RowValueRead + Send + Sync)> {
         match self {
-            RowChange::Upsert { row, .. } => Some(row.as_ref()),
-            RowChange::Delete { .. } => None,
+            Self::Upsert { row, .. } => Some(row.as_ref()),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+/// What Flotsync knows about the corresponding row in the old application view.
+///
+/// During a group replacement, this tells an application whether the same
+/// dataset and row key was visible, deleted, or not stored in the old group.
+/// When the old group is not available locally, it says that the answer is
+/// unknown. Applications can combine this with [`PreviousRowEvidence`] to
+/// decide whether old-group work needs to be reconciled with the successor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviousRow {
+    /// This is an update within one group, so there is no old-group comparison.
+    NotCompared,
+    /// The same dataset and row key was visible in the old group.
+    Present {
+        /// Group-scoped identity to remove or reconcile from the old view.
+        row_id: RowId,
+        /// What is known about the row's origin and inclusion in the successor.
+        evidence: PreviousRowEvidence,
+    },
+    /// The old group was inspected and contained no visible corresponding row.
+    Absent(PreviousRowAbsence),
+    /// The old group is not hosted locally, so past existence and values are unknown.
+    Unavailable,
+}
+
+impl PreviousRow {
+    /// Build evidence for a corresponding old-group row whose latest state is deletion.
+    pub(crate) fn tombstoned(row_id: RowId, evidence: PreviousRowEvidence) -> Self {
+        Self::Absent(PreviousRowAbsence::Tombstoned { row_id, evidence })
+    }
+
+    /// No occurrence for the corresponding key is stored in the inspected old group.
+    pub(crate) const NOT_STORED: Self = Self::Absent(PreviousRowAbsence::NotStored);
+}
+
+/// Why an inspected old group had no visible row for the corresponding key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviousRowAbsence {
+    /// No occurrence is stored for this key in the locally inspected old group.
+    ///
+    /// Unlike [`PreviousRow::Unavailable`], Flotsync did inspect the old group.
+    /// It found neither a visible row nor a retained deletion for this key.
+    NotStored,
+    /// The corresponding old-group occurrence exists, but its latest state is deletion.
+    Tombstoned {
+        /// Group-scoped identity of the deleted old-group occurrence.
+        row_id: RowId,
+        /// What is known about its creation and latest, deleted state.
+        evidence: PreviousRowEvidence,
+    },
+}
+
+/// Information applications can use to recognise old-group work omitted by a successor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviousRowEvidence {
+    /// Who created the old-group occurrence relative to this application member.
+    ///
+    /// `None` means the creator is not recorded or cannot be interpreted.
+    pub creator: Option<PreviousRowCreator>,
+    /// Whether the accepted old-group state used for the successor included creation.
+    ///
+    /// `None` means retained provenance cannot establish the answer.
+    pub creation: Option<AcceptedCutRelation>,
+    /// Whether that accepted state included the occurrence's latest stored state.
+    ///
+    /// For a visible row this is its latest value; for a tombstone it is the
+    /// deletion. `None` means retained provenance cannot establish the answer.
+    pub last_state: Option<AcceptedCutRelation>,
+}
+
+/// Who created an old-group row occurrence relative to the local application member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviousRowCreator {
+    /// The local member created the predecessor occurrence.
+    Local,
+    /// Another member created the predecessor occurrence.
+    Other,
+}
+
+/// Whether old-group work was included in the accepted state used for the successor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptedCutRelation {
+    /// The successor's accepted old-group state includes this operation or state.
+    Included,
+    /// The operation or state is newer than the accepted old-group state.
+    ///
+    /// This work is known locally but is not known to have reached the member
+    /// which created the successor, so the application may need to reconcile it.
+    NotIncluded,
+}
+
+/// One conceptual difference between corresponding application-facing row values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowFieldDifference {
+    /// The field exists on both sides with different projected values.
+    ValueChanged {
+        /// Canonical schema field name.
+        field_name: Cow<'static, str>,
+    },
+}
+
+impl RowFieldDifference {
+    /// Return the canonical schema field name represented by this difference.
+    #[must_use]
+    pub fn field_name(&self) -> &str {
+        match self {
+            Self::ValueChanged { field_name } => field_name,
         }
     }
 }

@@ -341,6 +341,10 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
             }],
         }
     );
+    assert_eq!(
+        listener.captured_data_change_lineages()[previous_event_count],
+        DataChangeLineage::GroupReplacement { migration_id }
+    );
     let old_group = load_persisted_group(store.as_ref(), old_group_id);
     assert_eq!(
         old_group.lifecycle,
@@ -384,11 +388,8 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
 fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
-    let runtime = load_runtime_with_parts(
-        app_alice_id(),
-        store.clone(),
-        Arc::new(ListenerStub::default()),
-    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("old docs".to_owned()),
         message: Some("old message".to_owned()),
@@ -396,6 +397,7 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
         group_schema: GroupSchema::default(),
     }))
     .expect("group creation should succeed");
+    listener.wait_for_data_change_count(1);
 
     let error = wait_for_test_reply(runtime.change_group_membership(
         ChangeGroupMembershipRequest {
@@ -425,8 +427,23 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
         },
     ))
     .expect("clearing successor metadata should succeed");
+    listener.wait_for_data_change_count(2);
     let successor = load_persisted_group(store.as_ref(), migration_id.new_group_id);
     assert_eq!(successor.group_name, None);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![
+            CapturedDataChange { rows: Vec::new() },
+            CapturedDataChange { rows: Vec::new() },
+        ]
+    );
+    assert_eq!(
+        listener.captured_data_change_lineages(),
+        vec![
+            DataChangeLineage::Update,
+            DataChangeLineage::GroupReplacement { migration_id },
+        ]
+    );
 }
 
 #[test]

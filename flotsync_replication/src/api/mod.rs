@@ -25,6 +25,7 @@ use flotsync_utils::{BoxFuture, option_when};
 use smallvec::{Array, SmallVec, smallvec};
 use snafu::prelude::*;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, hash_map::Entry},
     fmt,
     num::NonZeroUsize,

@@ -14,7 +14,7 @@ Agreed model:
 M01. Keep RowId as the authoritative application-visible, group-scoped row identity.
 M02. A successor-group row has a distinct RowId from its old-group counterpart. Flotsync must not silently collapse the two occurrences into one stable record identity.
 M03. Within one explicit group change, matching DatasetId and RowKey values define row correspondence between the old and successor group. This correspondence is transition-local and does not create application-global record identity.
-M04. Corresponding rows are related but need not be equivalent. Membership or schema changes may expose state that differs from the application's last observed old-group state.
+M04. Corresponding rows are related but need not be equivalent. Membership or schema changes may expose state that differs from the application last observed old-group state.
 M05. Applications own reconciliation of dirty or otherwise retained local state. They may remap it, warn that it may be lost, or expose a conflict for user resolution.
 M06. Flotsync should make reconciliation easier by reporting conservative facts about correspondence and divergence, but it must not choose an application-specific merge or conflict resolution.
 M07. A stable group-lineage id remains an orthogonal optional extension tracked in priority-4 follow-up flotsync-2js; it is not part of this slice.
@@ -39,11 +39,12 @@ S04. Emit the strongest row-local creation/change/deletion cut evidence supporte
 S05. Cover Empty activation, migration-sourced invitations without a hosted old group, and repeated membership changes.
 S06. Preserve opaque multi-group ReadToken behaviour and the existing post-commit listener boundary.
 S07. Keep group-scoped snapshot APIs; document that restart rebuilds from application-readable groups and therefore excludes closed predecessors.
+S08. Make only minimal replicated-checklist changes required to conform to the new API. Substantive example dirty-state reconciliation is a separate child.
 
 Agreed implementation architecture:
 I01. Storage aligns raw previous/current row records by DatasetId and RowKey; replication alone owns application visibility, correspondence, field equality, causal interpretation, and public listener semantics.
-I02. Add an ordered paired-row store scan whose result contains independently optional raw previous/current records, including tombstones. Provide a correct default implemented by merging two existing ordered scans.
-I03. Override the paired scan in SQLite with an indexed union-of-keys query and joins to the two row records, avoiding a dependency on FULL OUTER JOIN support.
+I02. Add an ordered row-transition store scan whose result contains independently optional raw previous/current records, including tombstones. Provide a correct default implemented by merging two existing ordered scans.
+I03. Override the transition scan in SQLite with an indexed union-of-keys query and joins to the two row records, avoiding a dependency on FULL OUTER JOIN support.
 I04. Persist the UpdateId which first introduced each row and preserve it across later updates and tombstoning. Combine this with existing last-changed versions in replication to derive only conservative included/not-included/unknown evidence relative to the accepted cut.
 I05. Do not replay the complete old-group update log by default. Missing historical proof remains explicitly unknown or unavailable.
 I06. After atomic successor activation and predecessor closure, use a store-backed provider over one pinned read transaction to compare and emit rows in bounded batches.
@@ -51,19 +52,22 @@ I07. Compare materialised application values in replication and emit determinist
 I08. Retain the existing post-commit listener failure model; a general retryable listener outbox remains outside this task.
 
 Agreed task split:
-T01. flotsync-j6x, "Add paired row scans and provenance", owns the raw paired-row storage contract, its generic fallback, the SQLite optimisation, creator provenance, patch call sites, and focused store tests.
-T02. flotsync-v76, "Emit group replacement row lineage", owns the public listener API, streaming replacement provider, replication-layer comparison/evidence, runtime integration, OKF/example updates, and end-to-end tests.
-T03. flotsync-v76 is blocked by flotsync-j6x so the public/runtime work consumes a settled storage foundation.
+T01. flotsync-j6x, Add paired row scans and provenance, owns the raw row-transition storage contract, its generic fallback, the SQLite optimisation, creator provenance, patch call sites, and focused store tests. This child is complete.
+T02. flotsync-v76, Emit group replacement row lineage, owns the public listener API, streaming replacement provider, replication-layer comparison/evidence, runtime integration, OKF updates, focused/end-to-end runtime coverage, and only minimal replicated-checklist API conformance.
+T03. flotsync-v76 consumes the settled flotsync-j6x storage foundation.
+T04. flotsync-fk0, Add checklist group replacement reconciliation, owns the checklist-specific dirty-state reconciliation policy, conflict representation, user-visible resolution workflow, tests, and scenario documentation.
+T05. flotsync-fk0 is blocked by flotsync-v76 so it consumes the final public listener API.
 
 Deliverables:
 D01. Update OKF design documentation and public API contracts with the agreed identity, correspondence, replacement, and reconciliation semantics.
 D02. Add the public listener and snapshot/query API shapes selected during design alignment.
 D03. Add runtime/store comparison and transition plumbing required by those contracts.
-D04. Update the replicated checklist example to demonstrate safe handling of clean, dirty, identical, divergent, introduced, and removed rows.
-D05. Add focused and integration tests for repeated group changes with unchanged schemas, overlapping rows, Empty activation, dirty application state, and restart/replay behaviour.
+D04. Keep the replicated checklist compiling against the new API in flotsync-v76 without introducing an accidental reconciliation policy.
+D05. In flotsync-fk0, teach the replicated checklist to demonstrate safe handling of clean, dirty, identical, divergent, introduced, removed, and unresolved rows.
+D06. Add focused and integration tests for repeated group changes with unchanged schemas, overlapping rows, Empty activation, and restart/replay behaviour in flotsync-v76; add application dirty-state reconciliation coverage in flotsync-fk0.
 
 Explicit deferrals:
-X01. Application-specific dirty-state merge, automatic conflict resolution, and field-level diff presentation are out of scope.
+X01. Framework-level application-specific dirty-state merge and automatic conflict resolution are out of scope; flotsync-fk0 implements only an example application policy.
 X02. Stable group-lineage identity is deferred to flotsync-2js.
 X03. GroupClose protocol shape and standalone old-group access policy remain in flotsync-yty.
 X04. Chunked or fetched snapshot transfer and broader snapshot batching redesign remain outside this task.
@@ -71,9 +75,10 @@ X05. Detailed schema-added/defaulted/removed field semantics and the columnar sc
 X06. Exact-cut history replay and a general retryable listener outbox are not introduced in this slice.
 
 Implementation estimate:
-E01. flotsync-j6x: roughly 500-890 LOC.
-E02. flotsync-v76: roughly 730-1,350 LOC.
-E03. Total likely 1,230-2,240 LOC, intentionally split into the two ordered children above because the complete plan exceeds 1,000 LOC."""
+E01. Completed flotsync-j6x storage foundation: approximately 1,700 added lines including tests and tracking updates.
+E02. flotsync-v76 core API/runtime/documentation and minimal checklist conformance: roughly 870-1,500 LOC.
+E03. flotsync-fk0 substantive checklist reconciliation: roughly 540-960 LOC.
+E04. The remaining work is intentionally split because the combined runtime and application-policy work is likely to exceed 1,000 LOC and has distinct review boundaries."""
 status = "in-progress"
 status_reason = "plan agreed; implementation split into flotsync-j6x then flotsync-v76"
 type = "task"
@@ -84,9 +89,10 @@ blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
 children = [
     "01a01af2-7b1b-71c3-bf8b-6a8747152a65",
     "01a01af2-8bbe-70f3-bea5-684f2e1c723e",
+    "01a0202d-5496-7740-9ec8-b264c2971798",
 ]
 created_at = "2026-07-13T11:26:56.59962Z"
-updated_at = "2026-08-19T16:55:48.241835Z"
+updated_at = "2026-08-20T17:18:47.692846Z"
 
 [[comments]]
 id = "01a018c3-eb67-7742-bd76-65f9aec6b303"
@@ -105,3 +111,9 @@ id = "01a01af3-4f11-7841-9ed9-8bc2527d7b1d"
 author = "codex"
 body = "Implementation plan agreed and split: flotsync-j6x owns raw paired-row scans, SQLite optimisation, creator provenance, patch call sites, and store tests; flotsync-v76 owns the public lineage API, streaming replacement provider, replication-layer comparison/evidence, runtime integration, documentation, and end-to-end coverage. flotsync-v76 is blocked by flotsync-j6x."
 created_at = "2026-08-19T16:55:48.241835Z"
+
+[[comments]]
+id = "01a0202e-b78c-7a63-bada-81da8ace67c4"
+author = "codex"
+body = "Task split refined after alignment: flotsync-v76 retains the framework API/runtime implementation and only minimal checklist conformance; priority-2 sibling child flotsync-fk0 owns substantive replicated-checklist dirty-state reconciliation and is blocked by flotsync-v76."
+created_at = "2026-08-20T17:18:47.692846Z"

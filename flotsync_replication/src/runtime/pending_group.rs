@@ -112,6 +112,7 @@ fn embed_initial_dataset(
     member_count: NonZeroUsize,
     group_schema: &GroupSchema,
     dataset_state: InitialDatasetValueRows,
+    listener_rows: InitialSnapshotListenerRows,
 ) -> Result<(DatasetRowStatePatch, Vec<RowChange>), GroupActivationError> {
     // TODO(flotsync-git-vy1): redesign snapshot activation so a dataset does
     // not simultaneously retain initial value rows, embedded CRDT state,
@@ -143,25 +144,27 @@ fn embed_initial_dataset(
     })?;
     let dataset = LocalDataset { data };
     let mut actions = Vec::with_capacity(row_keys.len());
-    let mut row_changes = Vec::with_capacity(row_keys.len());
+    let mut row_changes = match listener_rows {
+        InitialSnapshotListenerRows::Collect => Vec::with_capacity(row_keys.len()),
+        InitialSnapshotListenerRows::Omit => Vec::new(),
+    };
 
     for row_key in row_keys {
-        let row_id = RowId {
-            group_id,
-            dataset_id: dataset_id.clone(),
-            row_key,
-        };
         let snapshot = dataset
             .snapshot_row(row_key)
             .expect("embedded activation row must be snapshotable");
-        let row = dataset
-            .clone_value_row(row_key)
-            .expect("embedded activation row must be readable");
         actions.push(DatasetRowStateWrite::UpsertActive { row_key, snapshot });
-        row_changes.push(RowChange::Upsert {
-            row_id,
-            row: Arc::new(row),
-        });
+        if listener_rows == InitialSnapshotListenerRows::Collect {
+            let row_id = RowId {
+                group_id,
+                dataset_id: dataset_id.clone(),
+                row_key,
+            };
+            let row = dataset
+                .clone_value_row(row_key)
+                .expect("embedded activation row must be readable");
+            row_changes.push(RowChange::ordinary_upsert(row_id, Arc::new(row)));
+        }
     }
 
     Ok((
@@ -187,11 +190,17 @@ pub(super) async fn embed_inline_initial_snapshot(
     member_count: NonZeroUsize,
     group_schema: &GroupSchema,
     initial_state: InitialGroupValueRows,
+    listener_rows: InitialSnapshotListenerRows,
 ) -> Result<Vec<RowChange>, GroupActivationError> {
     let mut row_changes = Vec::new();
     for dataset_state in initial_state.datasets {
-        let (row_patch, dataset_row_changes) =
-            embed_initial_dataset(group_id, member_count, group_schema, dataset_state)?;
+        let (row_patch, dataset_row_changes) = embed_initial_dataset(
+            group_id,
+            member_count,
+            group_schema,
+            dataset_state,
+            listener_rows,
+        )?;
         if !row_patch.actions.is_empty() {
             let schema = group_schema
                 .schema(&row_patch.dataset_id)
@@ -209,4 +218,41 @@ pub(super) async fn embed_inline_initial_snapshot(
         row_changes.extend(dataset_row_changes);
     }
     Ok(row_changes)
+}
+
+/// Embed one supported activation snapshot and return any update listener rows.
+pub(super) async fn embed_initial_snapshot(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    group_id: GroupId,
+    member_count: NonZeroUsize,
+    group_schema: &GroupSchema,
+    initial_snapshot: InitialSnapshot,
+    listener_rows: InitialSnapshotListenerRows,
+) -> Result<Vec<RowChange>, GroupActivationError> {
+    match initial_snapshot {
+        InitialSnapshot::Empty => Ok(Vec::new()),
+        InitialSnapshot::Inline(initial_state) => {
+            embed_inline_initial_snapshot(
+                transaction,
+                group_id,
+                member_count,
+                group_schema,
+                initial_state,
+                listener_rows,
+            )
+            .await
+        }
+        InitialSnapshot::Metadata(_) => {
+            activation::UnsupportedInitialSnapshotSnafu { group_id }.fail()
+        }
+    }
+}
+
+/// Whether inline activation should also materialise update listener rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitialSnapshotListenerRows {
+    /// Return upserts for a non-replacement update event.
+    Collect,
+    /// Write successor state without duplicating rows already streamed by a replacement provider.
+    Omit,
 }

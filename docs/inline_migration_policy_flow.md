@@ -7,9 +7,10 @@ applies_to:
   - flotsync_replication
 source_of_truth:
   - ../flotsync_replication/src/api/mod.rs
-  - ../flotsync_replication/src/runtime/component.rs
+  - ../flotsync_replication/src/runtime/component/mod.rs
+  - ../flotsync_replication/src/runtime/component/group_replacement_provider.rs
   - ../flotsync_replication/src/runtime/pending_group.rs
-  - ../flotsync_replication/src/store/sqlite.rs
+  - ../flotsync_replication/src/store/sqlite/mod.rs
 depends_on:
   - communication_protocol_spec.md
   - single_recipient_durable_delivery.md
@@ -17,6 +18,7 @@ tracked_by:
   - flotsync-git-pow.5
   - flotsync-git-03f
   - flotsync-git-lg9
+  - flotsync-v76
 ---
 
 # Inline Migration Policy Flow
@@ -43,11 +45,8 @@ The current flow does not:
 - emit or apply the standalone `GroupClose` operation
 
 Standalone closure without a replacement group is tracked by
-`flotsync-git-lg9`. Migration requires the old group to become read-only and
-then inactive as the target group activates. The current implementation does
-not yet perform that transition; `flotsync-git-03f` tracks the gap.
-Application-facing deactivation exposure remains with `flotsync-git-pvp` and
-`flotsync-git-os1`.
+`flotsync-git-lg9`. Application-facing deactivation exposure outside a group
+replacement remains with `flotsync-git-pvp` and `flotsync-git-os1`.
 
 ## Inputs and Ownership
 
@@ -114,7 +113,7 @@ either `AwaitingDecision` or `AcceptedActivation`.
 | `AwaitingDecision` | Listener rejects | Remove pending work and inactive material | Complete response |
 | `AwaitingDecision` | Listener accepts Empty/Inline | Transition the same row to `AcceptedActivation` | Activate |
 | `AwaitingDecision` | Listener accepts Metadata | Remove pending work and inactive material | Return unsupported-snapshot error |
-| `AcceptedActivation` | Activation commits | Insert active marker, embed rows, remove pending work | Install live membership and notify rows |
+| `AcceptedActivation` | Activation commits | Insert active marker, embed rows, close the accepted predecessor, and remove pending work | Install live membership and notify one view transition |
 
 Conflicting work for an occupied target group is rejected. Exact replay is
 idempotent, including the transition from the same decision payload to accepted
@@ -127,12 +126,18 @@ activation.
 `InitialSnapshot::Inline` contains projected row values. The runtime embeds
 deterministic CRDT state using `UpdateId(0, 0)`, writes one dataset patch at a
 time in the activation transaction, and inserts the active-group marker in that
-same transaction. Listener row changes are emitted only after commit.
+same transaction. For a migration proposal, the accepted predecessor also
+becomes closed in that transaction. Listener row changes are emitted only after
+commit.
 
 The activation listener `ReadToken` contains progress for every active group,
-not only the newly activated target group. Until `flotsync-git-03f` is
-implemented, target-group activation does not yet apply the required old-group
-read-only and inactive transitions.
+not only the newly activated target group. Migration activation emits one
+`DataChangeLineage::GroupReplacement` event even when both group views are
+empty. The event's row provider represents the complete old-to-new application
+view transition described by the
+[group replacement row lineage contract](group_replacement_row_lineage.md).
+Continuing members compare the locally hosted predecessor with its successor;
+newly added members receive successor rows with unavailable predecessor state.
 
 ## Restart Behaviour
 
@@ -144,6 +149,11 @@ At startup:
 - listener failure leaves `AwaitingDecision` stored so later startup can retry
 - activation failure after accepted-state commit leaves `AcceptedActivation`
   available for startup retry
+
+The activation transaction is committed before the replacement provider is
+opened and delivered. A later provider-open or listener failure follows the
+runtime's existing post-commit failure model: the group activation remains
+committed and this slice does not add an application-event outbox.
 
 ## Reliable-Delivery Completion
 
@@ -171,3 +181,5 @@ Checked-in tests cover:
 - inactive-material isolation and target-group pending-work uniqueness
 - inline row embedding, listener changes, and global read tokens
 - proposal delivery to continuing members and migration invitations to added members
+- update versus group-replacement lineage
+- hosted predecessor comparison, removed-row deletes, tombstones, and unavailable predecessors

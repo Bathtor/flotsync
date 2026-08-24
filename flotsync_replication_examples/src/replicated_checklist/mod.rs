@@ -26,6 +26,7 @@ use flotsync_replication::{
     DatasetId,
     ReadToken,
     RowChange,
+    RowChangeKind,
     RowId,
     RowKey,
     RowMutation,
@@ -1231,11 +1232,11 @@ impl ChecklistWorkingSet {
         &self,
         change: RowChange,
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
-        match change {
-            RowChange::Upsert { row_id, row } => {
+        match change.change {
+            RowChangeKind::Upsert { row_id, row, .. } => {
                 self.checklist_upsert_change_from_row(&row_id, row.as_ref())
             }
-            RowChange::Delete { row_id } => {
+            RowChangeKind::Delete { row_id } => {
                 self.validate_row_dataset(&row_id)?;
                 Ok(ChecklistRowChange::Delete {
                     item_id: ChecklistItemId::group(row_id.group_id, row_id.row_key),

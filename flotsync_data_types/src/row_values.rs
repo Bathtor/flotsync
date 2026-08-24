@@ -20,6 +20,7 @@ use crate::{
         values::{PrimitiveValue, PrimitiveValueArray, PrimitiveValueRef},
     },
 };
+use flotsync_utils::option_when;
 use snafu::prelude::*;
 use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
@@ -277,6 +278,32 @@ impl RowValues {
     #[must_use]
     pub fn get(&self, field_name: &str) -> Option<&NullableBasicValue> {
         self.fields.get(field_name)
+    }
+
+    /// Iterate over fields whose projected values differ from `other`.
+    ///
+    /// The field names come from `self`. The iteration order is unspecified;
+    /// callers that expose the result should establish their own deterministic
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the rows do not contain exactly the same fields.
+    pub fn differing_field_names<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        assert_eq!(
+            self.field_count(),
+            other.field_count(),
+            "compared rows must contain the same number of fields"
+        );
+        self.fields.iter().filter_map(move |(field_name, value)| {
+            let other_value = other
+                .get(field_name)
+                .expect("compared rows must contain the same fields");
+            option_when!(other_value != value, field_name.as_str())
+        })
     }
 
     /// Build a complete projected row from any value-readable row.
@@ -636,4 +663,54 @@ fn validate_complete_value_row(
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differing_field_names_reports_fields_with_different_values() {
+        let other = RowValues::from_fields_unchecked(HashMap::from([
+            ("changed".to_owned(), "before".into()),
+            ("same".to_owned(), "value".into()),
+        ]));
+        let row = RowValues::from_fields_unchecked(HashMap::from([
+            ("changed".to_owned(), "after".into()),
+            ("same".to_owned(), "value".into()),
+        ]));
+
+        assert_eq!(
+            row.differing_field_names(&other).collect::<Vec<_>>(),
+            ["changed"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "compared rows must contain the same number of fields")]
+    fn differing_field_names_rejects_different_field_counts() {
+        let row = RowValues::from_fields_unchecked(HashMap::from([
+            ("first".to_owned(), "value".into()),
+            ("second".to_owned(), "value".into()),
+        ]));
+        let other =
+            RowValues::from_fields_unchecked(HashMap::from([("first".to_owned(), "value".into())]));
+
+        let _differences = row.differing_field_names(&other);
+    }
+
+    #[test]
+    #[should_panic(expected = "compared rows must contain the same fields")]
+    fn differing_field_names_rejects_different_fields() {
+        let row = RowValues::from_fields_unchecked(HashMap::from([
+            ("first".to_owned(), "value".into()),
+            ("second".to_owned(), "value".into()),
+        ]));
+        let other = RowValues::from_fields_unchecked(HashMap::from([
+            ("first".to_owned(), "value".into()),
+            ("different".to_owned(), "value".into()),
+        ]));
+
+        let _differences = row.differing_field_names(&other).collect::<Vec<_>>();
+    }
 }

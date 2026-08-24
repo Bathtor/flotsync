@@ -4,6 +4,8 @@ use super::{
     repl::{ChecklistRepl, ChecklistSession, PendingGroupInvitation, join_words},
     *,
 };
+#[cfg(test)]
+use flotsync_replication::DataChangeLineage;
 use flotsync_replication::{
     GroupInvitationSource,
     InitialSnapshot,
@@ -850,6 +852,7 @@ pub mod test_support {
                     event
                         .listener
                         .on_event(ReplicationEvent::DataChanged {
+                            lineage: DataChangeLineage::Update,
                             read_token: event.read_token,
                             rows: Box::new(VecRowProvider::new(event.changes)),
                         })
