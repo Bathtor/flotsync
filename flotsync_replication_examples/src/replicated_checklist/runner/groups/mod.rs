@@ -4,8 +4,6 @@ use super::{
     repl::{ChecklistRepl, ChecklistSession, PendingGroupInvitation, join_words},
     *,
 };
-#[cfg(test)]
-use flotsync_replication::DataChangeLineage;
 use flotsync_replication::{
     GroupInvitationSource,
     InitialSnapshot,
@@ -247,18 +245,42 @@ impl ChecklistSession {
         Ok(ChecklistItemAssociation::Group(group.group_id()))
     }
 
-    /// Ensure a listener batch refers only to groups present in this registry.
+    /// Ensure a listener event is consistent with its declared lineage.
     pub fn validate_listener_changes(
         groups: &dyn ReplicationGroupSnapshot,
+        lineage: DataChangeLineage,
         changes: &[RowChange],
     ) -> Result<(), ReplicatedChecklistError> {
-        for change in changes {
-            let group_id = change.row_id().group_id;
-            let is_readable = groups
-                .group(&group_id)
-                .is_some_and(ReplicationGroupView::is_readable);
-            if !is_readable {
-                return repl_error::UnknownListenerGroupSnafu { group_id }.fail();
+        match lineage {
+            DataChangeLineage::Update => {
+                for change in changes {
+                    let group_id = change.row_id().group_id;
+                    let is_readable = groups
+                        .group(&group_id)
+                        .is_some_and(ReplicationGroupView::is_readable);
+                    if !is_readable {
+                        return repl_error::UnknownListenerGroupSnafu { group_id }.fail();
+                    }
+                }
+            }
+            DataChangeLineage::GroupReplacement { migration_id } => {
+                let new_group_is_readable = groups
+                    .group(&migration_id.new_group_id)
+                    .is_some_and(ReplicationGroupView::is_readable);
+                if !new_group_is_readable {
+                    return repl_error::UnknownListenerGroupSnafu {
+                        group_id: migration_id.new_group_id,
+                    }
+                    .fail();
+                }
+                for change in changes {
+                    let group_id = change.row_id().group_id;
+                    if group_id != migration_id.old_group_id
+                        && group_id != migration_id.new_group_id
+                    {
+                        return repl_error::UnknownListenerGroupSnafu { group_id }.fail();
+                    }
+                }
             }
         }
         Ok(())
@@ -405,8 +427,8 @@ impl ChecklistRepl {
             .await
             .context(repl_error::ReplicationSnafu)?;
         self.repair_default_group()?;
-        self.drain_listener_queue()?;
-        self.session.working_set.drain_queued_events();
+        let drain_report = self.drain_listener_queue(dialog)?;
+        self.write_reconciliation_follow_up(dialog, &drain_report)?;
         let groups = self
             .replication
             .group_state()
@@ -456,6 +478,20 @@ impl ChecklistRepl {
         &mut self,
         position: NonZeroUsize,
     ) -> Result<(), ReplicatedChecklistError> {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        self.accept_invitation_with_dialog(position, &mut dialog)
+            .await
+    }
+
+    /// Accept an invitation and reconcile its activation through an injected dialog.
+    pub async fn accept_invitation_with_dialog(
+        &mut self,
+        position: NonZeroUsize,
+        dialog: &mut ChecklistDialog<'_>,
+    ) -> Result<(), ReplicatedChecklistError> {
         let pending = self.take_invitation(position)?;
         let group_id = pending.invitation.group_id;
         pending
@@ -464,8 +500,8 @@ impl ChecklistRepl {
             .await
             .context(repl_error::ReplicationSnafu)?;
         self.repair_default_group()?;
-        self.drain_listener_queue()?;
-        self.session.working_set.drain_queued_events();
+        let drain_report = self.drain_listener_queue(dialog)?;
+        self.write_reconciliation_follow_up(dialog, &drain_report)?;
         let groups = self
             .replication
             .group_state()
@@ -838,8 +874,13 @@ pub mod test_support {
 
     /// Listener event delivered before a successful test acceptance returns.
     pub struct AcceptedListenerEvent {
+        /// Lineage carried by the accepted activation event.
+        pub lineage: DataChangeLineage,
+        /// Listener receiving the activation event before acceptance completes.
         pub listener: Arc<ChecklistListener>,
+        /// Read position carried by the activation event.
         pub read_token: ReadToken,
+        /// Complete activation changes carried by the test event.
         pub changes: Vec<RowChange>,
     }
 
@@ -852,7 +893,7 @@ pub mod test_support {
                     event
                         .listener
                         .on_event(ReplicationEvent::DataChanged {
-                            lineage: DataChangeLineage::Update,
+                            lineage: event.lineage,
                             read_token: event.read_token,
                             rows: Box::new(VecRowProvider::new(event.changes)),
                         })

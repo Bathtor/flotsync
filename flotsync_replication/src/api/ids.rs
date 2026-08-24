@@ -161,6 +161,15 @@ impl RowId {
             row_key,
         }
     }
+
+    /// Return whether both identifiers name the same dataset row across group versions.
+    ///
+    /// Group identity is deliberately ignored: a group replacement gives the same logical row a
+    /// new group-scoped identity while retaining its dataset and row key.
+    #[must_use]
+    pub fn same_dataset_row(&self, other: &Self) -> bool {
+        self.dataset_id == other.dataset_id && self.row_key == other.row_key
+    }
 }
 
 impl std::fmt::Display for RowId {
@@ -275,5 +284,33 @@ mod tests {
         let mut owned_hasher = DefaultHasher::new();
         owned_id.hash(&mut owned_hasher);
         assert_eq!(static_hasher.finish(), owned_hasher.finish());
+    }
+
+    #[test]
+    fn dataset_row_identity_ignores_group_but_not_dataset_or_key() {
+        let row = RowId::new(
+            GroupId(Uuid::from_u128(1)),
+            DatasetId::try_from_static("docs").expect("dataset id should build"),
+            RowKey(Uuid::from_u128(2)),
+        );
+        let successor = RowId::new(
+            GroupId(Uuid::from_u128(3)),
+            DatasetId::try_from_static("docs").expect("dataset id should build"),
+            RowKey(Uuid::from_u128(2)),
+        );
+        let other_dataset = RowId::new(
+            successor.group_id,
+            DatasetId::try_from_static("other").expect("dataset id should build"),
+            successor.row_key,
+        );
+        let other_key = RowId::new(
+            successor.group_id,
+            successor.dataset_id.clone(),
+            RowKey(Uuid::from_u128(4)),
+        );
+
+        assert!(row.same_dataset_row(&successor));
+        assert!(!row.same_dataset_row(&other_dataset));
+        assert!(!row.same_dataset_row(&other_key));
     }
 }

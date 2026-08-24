@@ -399,6 +399,7 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
         respond: Box::new(RecordingInvitationResponder {
             decisions: decisions.clone(),
             accepted_event: Some(AcceptedListenerEvent {
+                lineage: DataChangeLineage::Update,
                 listener: listener.clone(),
                 read_token,
                 changes: vec![RowChange {
@@ -431,6 +432,86 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
             .text,
         "listener row"
     );
+    assert_eq!(
+        *decisions.lock().expect("decision lock should be available"),
+        vec![RecordedInvitationDecision::Accepted]
+    );
+
+    block_on(runtime.shutdown()).expect("test runtime should shut down");
+}
+
+#[test]
+fn migration_invitation_acceptance_applies_the_delivered_replacement_before_returning() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let old_group_id = GroupId(Uuid::from_u128(72_101));
+    let new_group_id = GroupId(Uuid::from_u128(72_102));
+    let (_store, runtime, listener, receivers) =
+        load_test_runtime_with_groups(&member, [new_group_id]);
+    let session = ChecklistSession::new(ChecklistWorkingSet::new());
+    let mut repl = ChecklistRepl::new(
+        test_app_config(),
+        member.clone(),
+        runtime.clone(),
+        receivers,
+        session,
+    );
+    let decisions = Arc::new(Mutex::new(Vec::new()));
+    let row_key = RowKey(Uuid::from_u128(72_103));
+    let remote = ChecklistItem::new("replacement row");
+    let row_values = RowValues::from_fields_unchecked(remote.to_row_values_patch().fields);
+    let migration_id = MigrationId {
+        old_group_id,
+        new_group_id,
+    };
+    let invitation = GroupInvitation::new_migration(
+        migration_id,
+        vec![member],
+        CHECKLIST_GROUP_SCHEMA.clone(),
+        InitialSnapshot::Empty,
+        Some("replacement".to_owned()),
+        None,
+    );
+    let read_token = snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
+    block_on(listener.on_event(ReplicationEvent::GroupInvitation {
+        invitation,
+        respond: Box::new(RecordingInvitationResponder {
+            decisions: decisions.clone(),
+            accepted_event: Some(AcceptedListenerEvent {
+                lineage: DataChangeLineage::GroupReplacement { migration_id },
+                listener: listener.clone(),
+                read_token,
+                changes: vec![RowChange {
+                    previous: PreviousRow::Unavailable,
+                    change: RowChangeKind::Upsert {
+                        row_id: RowId::new(new_group_id, checklist_dataset_id(), row_key),
+                        row: Arc::new(row_values),
+                        previous_value_differences: None,
+                    },
+                }],
+            }),
+        }),
+    }))
+    .expect("migration invitation should reach the listener");
+
+    assert!(
+        block_on(repl.handle_command(ChecklistCommand::Group {
+            command: ChecklistGroupCommand::Accept {
+                invitation: NonZeroUsize::MIN,
+            },
+        }))
+        .expect("migration acceptance should apply its replacement")
+    );
+
+    let new_item_id = ChecklistItemId::group(new_group_id, row_key);
+    assert_eq!(repl.session.default_group, None);
+    assert_eq!(
+        repl.session
+            .working_set
+            .item(new_item_id)
+            .map(|item| item.text.as_str()),
+        Some("replacement row")
+    );
+    assert_eq!(repl.session.working_set.events().len(), 1);
     assert_eq!(
         *decisions.lock().expect("decision lock should be available"),
         vec![RecordedInvitationDecision::Accepted]
@@ -506,13 +587,13 @@ fn created_group_is_visible_to_the_runtime_registry_and_listener() {
     assert_eq!(group.group_id(), group_id);
     assert_eq!(group.group_name(), Some("shared"));
 
-    let listener_batch = receivers
-        .batches
+    let listener_event = receivers
+        .events
         .try_recv()
         .expect("created group should deliver its read position through the listener");
-    assert!(listener_batch.changes.is_empty());
+    assert!(listener_event.changes.is_empty());
     let mut working_set = ChecklistWorkingSet::new();
-    working_set.merge_read_token(listener_batch.read_token);
+    working_set.merge_read_token(listener_event.read_token);
     assert!(working_set.listed_items().is_empty());
     assert!(working_set.read_token().is_ok());
 
@@ -767,12 +848,67 @@ fn listener_group_validation_rejects_rows_outside_the_registry() {
         },
     };
 
-    ChecklistSession::validate_listener_changes(groups.as_ref(), &[known])
-        .expect("known group should validate");
+    ChecklistSession::validate_listener_changes(
+        groups.as_ref(),
+        DataChangeLineage::Update,
+        &[known],
+    )
+    .expect("known group should validate");
     assert!(matches!(
-        ChecklistSession::validate_listener_changes(groups.as_ref(), &[unknown]),
+        ChecklistSession::validate_listener_changes(
+            groups.as_ref(),
+            DataChangeLineage::Update,
+            &[unknown]
+        ),
         Err(ReplicatedChecklistError::UnknownListenerGroup { group_id })
             if group_id == unknown_group
+    ));
+}
+
+#[test]
+fn replacement_validation_accepts_the_declared_old_group_only() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let old_group = GroupId(Uuid::from_u128(71_017));
+    let new_group = GroupId(Uuid::from_u128(71_018));
+    let unrelated_group = GroupId(Uuid::from_u128(71_019));
+    let groups = test_group_state([test_group(new_group, &member)]);
+    let lineage = DataChangeLineage::GroupReplacement {
+        migration_id: MigrationId {
+            old_group_id: old_group,
+            new_group_id: new_group,
+        },
+    };
+    let old_delete = RowChange {
+        previous: PreviousRow::NotCompared,
+        change: RowChangeKind::Delete {
+            row_id: RowId::new(
+                old_group,
+                checklist_dataset_id(),
+                RowKey(Uuid::from_u128(1)),
+            ),
+        },
+    };
+    let unrelated_delete = RowChange {
+        previous: PreviousRow::NotCompared,
+        change: RowChangeKind::Delete {
+            row_id: RowId::new(
+                unrelated_group,
+                checklist_dataset_id(),
+                RowKey(Uuid::from_u128(2)),
+            ),
+        },
+    };
+
+    ChecklistSession::validate_listener_changes(groups.as_ref(), lineage, &[old_delete])
+        .expect("declared predecessor rows should not need a readable old group");
+    assert!(matches!(
+        ChecklistSession::validate_listener_changes(
+            groups.as_ref(),
+            lineage,
+            &[unrelated_delete]
+        ),
+        Err(ReplicatedChecklistError::UnknownListenerGroup { group_id })
+            if group_id == unrelated_group
     ));
 }
 

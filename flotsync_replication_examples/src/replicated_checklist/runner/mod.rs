@@ -3,9 +3,12 @@ use super::{
     CHECKLIST_SCHEMA,
     ChecklistCommand,
     ChecklistGroupCommand,
+    ChecklistItem,
     ChecklistItemAssociation,
+    ChecklistItemEdit,
     ChecklistItemId,
     ChecklistKeyCommand,
+    ChecklistStatus,
     ChecklistWorkingSet,
     ChecklistWorkingSetError,
     EditCommand,
@@ -17,14 +20,17 @@ use super::{
     checklist_help,
     config::{ChecklistAppConfig, ChecklistConfigError, checklist_application_id},
     parse_checklist_command,
+    reconciliation::{ChecklistReconciliation, ChecklistReplacementPlan},
 };
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use flotsync_core::{GroupId, MemberIdentity, member::IdentifierParseError};
 use flotsync_replication::{
+    AcceptedCutRelation,
     ApiError,
     ApplicationSchemas,
     CreateGroupRequest,
+    DataChangeLineage,
     GroupInvitation,
     GroupInvitationResponder,
     GroupSchema,
@@ -32,6 +38,8 @@ use flotsync_replication::{
     LoadError,
     LoadSecurityError,
     LocalIdentityProvisioningStore,
+    PreviousRowCreator,
+    PreviousRowEvidence,
     ProvisionLocalIdentityError,
     PublishChangesRequest,
     ReadToken,
@@ -44,6 +52,7 @@ use flotsync_replication::{
     ReplicationSecuritySecrets,
     ReplicationStore,
     RowChange,
+    RowFieldDifference,
     RowProviderError,
     SnapshotRowsRequest,
     SqliteReplicationStore,
@@ -185,6 +194,8 @@ pub enum ReplicatedChecklistError {
     },
     #[snafu(display("Checklist listener queue closed."))]
     ListenerQueueClosed,
+    #[snafu(display("Input ended while {action}."))]
+    EndOfInput { action: &'static str },
     #[snafu(display("No readable checklist group matches {selector:?}."))]
     UnknownGroup { selector: String },
     #[snafu(display(
@@ -282,10 +293,37 @@ impl<'io> ChecklistDialog<'io> {
             action: "flushing checklist prompt",
         })?;
         let mut answer = String::new();
-        self.input
+        let read = self
+            .input
             .read_line(&mut answer)
             .context(repl_error::IoSnafu { action })?;
+        ensure!(read != 0, repl_error::EndOfInputSnafu { action });
         Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    /// Read one labelled option, retrying until the answer matches exactly.
+    fn read_choice<T: Copy>(
+        &mut self,
+        prompt: &str,
+        action: &'static str,
+        choices: &[(&str, T)],
+    ) -> Result<T, ReplicatedChecklistError> {
+        loop {
+            let answer = self.read_line(prompt, action)?;
+            if let Some((_, selected)) = choices
+                .iter()
+                .find(|(label, _)| answer.trim().eq_ignore_ascii_case(label))
+            {
+                return Ok(*selected);
+            }
+            let labels = choices
+                .iter()
+                .map(|(label, _)| format!("`{label}`"))
+                .join(", ");
+            writeln!(self.output, "enter one of: {labels}").context(repl_error::IoSnafu {
+                action: "writing checklist choice help",
+            })?;
+        }
     }
 
     /// Read one required member identity.

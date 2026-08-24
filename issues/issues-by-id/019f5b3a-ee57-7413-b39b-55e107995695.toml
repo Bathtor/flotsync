@@ -79,8 +79,8 @@ E01. Completed flotsync-j6x storage foundation: approximately 1,700 added lines 
 E02. flotsync-v76 core API/runtime/documentation and minimal checklist conformance: roughly 870-1,500 LOC.
 E03. flotsync-fk0 substantive checklist reconciliation: roughly 540-960 LOC.
 E04. The remaining work is intentionally split because the combined runtime and application-policy work is likely to exceed 1,000 LOC and has distinct review boundaries."""
-status = "in-progress"
-status_reason = "plan agreed; implementation split into flotsync-j6x then flotsync-v76"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 labels = ["area:replication"]
@@ -92,7 +92,8 @@ children = [
     "01a0202d-5496-7740-9ec8-b264c2971798",
 ]
 created_at = "2026-07-13T11:26:56.59962Z"
-updated_at = "2026-08-20T17:18:47.692846Z"
+updated_at = "2026-08-24T16:37:40.219221Z"
+closed_at = "2026-08-24T16:37:40.219221Z"
 
 [[comments]]
 id = "01a018c3-eb67-7742-bd76-65f9aec6b303"
@@ -117,3 +118,9 @@ id = "01a0202e-b78c-7a63-bada-81da8ace67c4"
 author = "codex"
 body = "Task split refined after alignment: flotsync-v76 retains the framework API/runtime implementation and only minimal checklist conformance; priority-2 sibling child flotsync-fk0 owns substantive replicated-checklist dirty-state reconciliation and is blocked by flotsync-v76."
 created_at = "2026-08-20T17:18:47.692846Z"
+
+[[comments]]
+id = "01a034a2-80fb-7fa2-a6ad-8aa1638119ed"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-24T16:37:40.219221Z"

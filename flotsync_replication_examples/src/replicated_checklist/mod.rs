@@ -5,12 +5,14 @@
 //! wiring live in the example CLI task.
 
 mod config;
+mod reconciliation;
 mod runner;
 
 pub use config::ChecklistConfigError;
 pub use runner::{ReplicatedChecklistArgs, ReplicatedChecklistError, run};
 
 use clap::{CommandFactory, Parser, Subcommand};
+use enumset::{EnumSet, EnumSetType};
 use flotsync_core::GroupId;
 use flotsync_data_types::{
     Decode,
@@ -530,27 +532,80 @@ impl ChecklistItem {
     }
 
     fn changed_fields_since(&self, original: &Self) -> RowValuesPatch {
-        let mut fields = HashMap::new();
+        self.row_values_patch_for(self.changes_since(original))
+    }
+
+    /// Return the checklist fields changed relative to `original` without allocating.
+    fn changes_since(&self, original: &Self) -> EnumSet<ChecklistItemField> {
+        let mut changes = EnumSet::new();
         if self.text != original.text {
-            insert_field(&mut fields, FIELD_TEXT, self.text.clone());
+            changes.insert(ChecklistItemField::Text);
         }
         if self.note != original.note {
-            insert_field(&mut fields, FIELD_NOTE, self.note.clone());
+            changes.insert(ChecklistItemField::Note);
         }
         if self.tags != original.tags {
+            changes.insert(ChecklistItemField::Tags);
+        }
+        if self.status != original.status {
+            changes.insert(ChecklistItemField::Status);
+        }
+        if self.priority != original.priority {
+            changes.insert(ChecklistItemField::Priority);
+        }
+        if self.edit_count != original.edit_count {
+            changes.insert(ChecklistItemField::EditCount);
+        }
+        changes
+    }
+
+    /// Copy the selected fields from `source` onto this item.
+    fn apply_changes_from(&mut self, source: &Self, changes: EnumSet<ChecklistItemField>) {
+        if changes.contains(ChecklistItemField::Text) {
+            self.text.clone_from(&source.text);
+        }
+        if changes.contains(ChecklistItemField::Note) {
+            self.note.clone_from(&source.note);
+        }
+        if changes.contains(ChecklistItemField::Tags) {
+            self.tags.clone_from(&source.tags);
+        }
+        if changes.contains(ChecklistItemField::Status) {
+            self.status = source.status;
+        }
+        if changes.contains(ChecklistItemField::Priority) {
+            self.priority = source.priority;
+        }
+        if changes.contains(ChecklistItemField::EditCount) {
+            // The schema models edit_count as a monotonic counter. Rebasing must preserve the
+            // greater observation instead of allowing a successor value to lower the count.
+            self.edit_count = self.edit_count.max(source.edit_count);
+        }
+    }
+
+    /// Encode the selected fields with their current values.
+    fn row_values_patch_for(&self, changes: EnumSet<ChecklistItemField>) -> RowValuesPatch {
+        let mut fields = HashMap::new();
+        if changes.contains(ChecklistItemField::Text) {
+            insert_field(&mut fields, FIELD_TEXT, self.text.clone());
+        }
+        if changes.contains(ChecklistItemField::Note) {
+            insert_field(&mut fields, FIELD_NOTE, self.note.clone());
+        }
+        if changes.contains(ChecklistItemField::Tags) {
             insert_field(
                 &mut fields,
                 FIELD_TAGS,
                 self.tags.iter().cloned().collect::<Vec<_>>(),
             );
         }
-        if self.status != original.status {
+        if changes.contains(ChecklistItemField::Status) {
             insert_field(&mut fields, FIELD_STATUS, self.status.as_str().to_owned());
         }
-        if self.priority != original.priority {
+        if changes.contains(ChecklistItemField::Priority) {
             insert_field(&mut fields, FIELD_PRIORITY, self.priority);
         }
-        if self.edit_count != original.edit_count {
+        if changes.contains(ChecklistItemField::EditCount) {
             insert_field(&mut fields, FIELD_EDIT_COUNT, self.edit_count);
         }
         RowValuesPatch::new(fields)
@@ -561,6 +616,88 @@ impl ChecklistItem {
             .edit_count
             .checked_add(1)
             .expect("checklist edit_count must not overflow during an example run");
+    }
+
+    /// Apply one field edit and report whether it changed the item.
+    fn apply_edit(&mut self, edit: ChecklistItemEdit) -> bool {
+        let changed = match edit {
+            ChecklistItemEdit::Text(text) if self.text != text => {
+                self.text = text;
+                true
+            }
+            ChecklistItemEdit::Note(note) if self.note != note => {
+                self.note = note;
+                true
+            }
+            ChecklistItemEdit::Tags(tags) if self.tags != tags => {
+                self.tags = tags;
+                true
+            }
+            ChecklistItemEdit::Status(status) if self.status != status => {
+                self.status = status;
+                true
+            }
+            ChecklistItemEdit::Priority(priority) if self.priority != priority => {
+                self.priority = priority;
+                true
+            }
+            ChecklistItemEdit::Text(_)
+            | ChecklistItemEdit::Note(_)
+            | ChecklistItemEdit::Tags(_)
+            | ChecklistItemEdit::Status(_)
+            | ChecklistItemEdit::Priority(_) => false,
+        };
+        if changed {
+            self.increment_edit_count();
+        }
+        changed
+    }
+}
+
+/// One field replacement shared by ordinary commands and reconciliation editing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ChecklistItemEdit {
+    /// Replace the short checklist text.
+    Text(String),
+    /// Replace the longer free-form note.
+    Note(String),
+    /// Replace the complete tag set.
+    Tags(BTreeSet<String>),
+    /// Replace the workflow status.
+    Status(ChecklistStatus),
+    /// Replace the user-selected priority.
+    Priority(u8),
+}
+
+/// Finite checklist field domain used for change comparison and rebasing.
+#[derive(Debug, EnumSetType)]
+pub(super) enum ChecklistItemField {
+    /// Short checklist text.
+    Text,
+    /// Longer free-form note.
+    Note,
+    /// Complete tag set.
+    Tags,
+    /// Workflow status.
+    Status,
+    /// User-selected priority.
+    Priority,
+    /// Application-maintained edit counter.
+    EditCount,
+}
+
+impl ChecklistItemField {
+    /// Map one checklist schema field name into the finite field domain.
+    pub(super) fn from_schema_name(field_name: &str) -> Option<Self> {
+        match field_name {
+            FIELD_TEXT => Some(Self::Text),
+            FIELD_NOTE => Some(Self::Note),
+            FIELD_TAGS => Some(Self::Tags),
+            FIELD_STATUS => Some(Self::Status),
+            FIELD_PRIORITY => Some(Self::Priority),
+            FIELD_EDIT_COUNT => Some(Self::EditCount),
+            _ => None,
+        }
     }
 }
 
@@ -624,12 +761,15 @@ impl ChecklistItemId {
     }
 }
 
-/// One queued listener batch in checklist terms.
+/// Raw checklist projection of one framework listener event.
+///
+/// For a group replacement, `changes` records what the framework delivered.
+/// It does not incorporate the application result selected by reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChecklistEvent {
     /// Local receive timestamp for display in the example event log.
     pub timestamp: SystemTime,
-    /// Decoded checklist changes carried by one listener batch.
+    /// Decoded checklist changes carried by one listener event.
     pub changes: Vec<ChecklistRowChange>,
 }
 
@@ -695,6 +835,20 @@ pub enum ChecklistWorkingSetError {
         "Incoming replication change conflicts with dirty checklist item {item_id:?}. Restart the checklist to reload current snapshots before continuing."
     ))]
     IncomingChangeForDirtyItem { item_id: ChecklistItemId },
+    #[snafu(display(
+        "Replacement {role} row {row} belonged to an unexpected group; expected {expected_group_id}."
+    ))]
+    UnexpectedReplacementRowGroup {
+        row: RowId,
+        expected_group_id: GroupId,
+        role: &'static str,
+    },
+    #[snafu(display("Invalid group replacement row change: {reason}."))]
+    InvalidReplacementChange { reason: &'static str },
+    #[snafu(display(
+        "Group replacement successor item {item_id:?} already has unsynchronised local state."
+    ))]
+    DirtyReplacementSuccessor { item_id: ChecklistItemId },
     #[snafu(display("Checklist working set does not have a replication read token."))]
     MissingReadToken,
 }
@@ -703,7 +857,7 @@ pub enum ChecklistWorkingSetError {
 ///
 /// Local commands update this working set and remember the original row state
 /// for dirty rows. Listener changes are queued here and applied when `sync`
-/// drains the queue. Listener batches that unexpectedly conflict with an
+/// drains the queue. Listener events that unexpectedly conflict with an
 /// unsynchronised local change are rejected rather than rebased in the example.
 pub struct ChecklistWorkingSet {
     dataset_id: DatasetId,
@@ -876,12 +1030,7 @@ impl ChecklistWorkingSet {
     ) -> Result<(), ChecklistWorkingSetError> {
         let text = text.into();
         self.modify_item(item_id, |item| {
-            if item.text == text {
-                return false;
-            }
-            item.text = text;
-            item.increment_edit_count();
-            true
+            item.apply_edit(ChecklistItemEdit::Text(text))
         })
     }
 
@@ -895,12 +1044,7 @@ impl ChecklistWorkingSet {
     ) -> Result<(), ChecklistWorkingSetError> {
         let note = note.into();
         self.modify_item(item_id, |item| {
-            if item.note == note {
-                return false;
-            }
-            item.note = note;
-            item.increment_edit_count();
-            true
+            item.apply_edit(ChecklistItemEdit::Note(note))
         })
     }
 
@@ -965,12 +1109,7 @@ impl ChecklistWorkingSet {
         priority: u8,
     ) -> Result<(), ChecklistWorkingSetError> {
         self.modify_item(item_id, |item| {
-            if item.priority == priority {
-                return false;
-            }
-            item.priority = priority;
-            item.increment_edit_count();
-            true
+            item.apply_edit(ChecklistItemEdit::Priority(priority))
         })
     }
 
@@ -986,7 +1125,9 @@ impl ChecklistWorkingSet {
         };
         self.display_order.retain(|candidate| *candidate != item_id);
         match self.dirty_rows.remove(&item_id) {
-            Some(DirtyRowKind::Insert) => {}
+            Some(DirtyRowKind::Insert) => {
+                // Deleting an unpublished insertion cancels it without publishing a tombstone.
+            }
             _ => {
                 self.dirty_rows.insert(item_id, DirtyRowKind::Delete);
             }
@@ -1068,7 +1209,7 @@ impl ChecklistWorkingSet {
         self.enqueue_checklist_changes(checklist_changes)
     }
 
-    /// Queue one decoded listener batch after checking for dirty-row conflicts.
+    /// Queue one decoded listener event after checking for dirty-row conflicts.
     ///
     /// # Errors
     ///
@@ -1198,9 +1339,7 @@ impl ChecklistWorkingSet {
             if item.status.rank() >= target.rank() {
                 return false;
             }
-            item.status = target;
-            item.increment_edit_count();
-            true
+            item.apply_edit(ChecklistItemEdit::Status(target))
         })
     }
 
