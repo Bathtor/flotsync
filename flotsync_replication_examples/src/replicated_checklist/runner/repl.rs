@@ -119,20 +119,52 @@ fn preserve_primary_shutdown_error(
 
 /// Runtime listener that forwards replication events into the interactive REPL queues.
 pub struct ChecklistListener {
-    pub batch_sender: Sender<ChecklistListenerBatch>,
+    /// Complete data events awaiting application-side ingestion.
+    pub event_sender: Sender<ChecklistListenerEvent>,
+    /// Invitations awaiting an interactive application decision.
     pub invitation_sender: Sender<PendingGroupInvitation>,
 }
 
-/// One listener-delivered row batch and the read position that accompanies it.
-pub struct ChecklistListenerBatch {
+/// One complete listener-delivered data event and its resulting read position.
+pub struct ChecklistListenerEvent {
+    /// Framework lineage needed to interpret predecessor metadata.
+    pub lineage: DataChangeLineage,
+    /// Read position to merge only after the complete event is applied.
     pub read_token: ReadToken,
+    /// Every row change collected from the event's provider pages.
     pub changes: Vec<RowChange>,
 }
 
 /// Listener queues consumed independently by the interactive REPL.
 pub struct ChecklistListenerReceivers {
-    pub batches: Receiver<ChecklistListenerBatch>,
+    /// Complete data events awaiting application-side ingestion.
+    pub events: Receiver<ChecklistListenerEvent>,
+    /// Invitations awaiting an interactive application decision.
     pub invitations: Receiver<PendingGroupInvitation>,
+}
+
+/// Result of draining complete listener events during one command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChecklistListenerDrainReport {
+    /// Complete framework data events consumed from the listener queue.
+    pub event_count: usize,
+    /// Checklist events applied to the working set.
+    pub applied_event_count: usize,
+    /// Reconciliation results retained as dirty successor-group work.
+    pub dirty_resolution_count: usize,
+    /// Successor groups containing retained resolution work.
+    pub dirty_resolution_groups: HashSet<GroupId>,
+}
+
+impl ChecklistListenerDrainReport {
+    /// Accumulate a later ordered drain into this command's report.
+    fn merge(&mut self, later: Self) {
+        self.event_count += later.event_count;
+        self.applied_event_count += later.applied_event_count;
+        self.dirty_resolution_count += later.dirty_resolution_count;
+        self.dirty_resolution_groups
+            .extend(later.dirty_resolution_groups);
+    }
 }
 
 /// One listener-mediated invitation and its one-shot runtime response.
@@ -173,12 +205,14 @@ impl ChecklistGroupSyncOutcome {
 pub struct ChecklistSyncReport {
     /// Per-group outcomes in deterministic group UUID order.
     pub group_outcomes: Vec<ChecklistGroupSyncOutcome>,
-    /// Whether listener draining was deferred because at least one group failed.
+    /// Whether listener events arriving during publication were left queued after a failure.
     pub listener_drain_deferred: bool,
-    /// Listener batches ingested after every group publication succeeded.
-    pub listener_batch_count: usize,
+    /// Complete listener events ingested during the synchronisation command.
+    pub listener_event_count: usize,
     /// Queued checklist events applied after listener ingestion.
     pub applied_event_count: usize,
+    /// Reconciliation results retained for publication by a later sync.
+    pub dirty_resolution_count: usize,
     /// Process-local dirty items deliberately skipped by replication sync.
     pub dirty_local_item_count: usize,
     /// Groups that remain dirty after this pass, ordered by UUID.
@@ -188,15 +222,15 @@ pub struct ChecklistSyncReport {
 impl ChecklistListener {
     /// Return the listener plus independent data and invitation receivers.
     pub fn pair() -> (Arc<Self>, ChecklistListenerReceivers) {
-        let (batch_sender, batch_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
         let (invitation_sender, invitation_receiver) = mpsc::channel();
         (
             Arc::new(Self {
-                batch_sender,
+                event_sender,
                 invitation_sender,
             }),
             ChecklistListenerReceivers {
-                batches: batch_receiver,
+                events: event_receiver,
                 invitations: invitation_receiver,
             },
         )
@@ -208,37 +242,29 @@ impl ReplicationEventListener for ChecklistListener {
         &self,
         event: ReplicationEvent,
     ) -> Pin<Box<dyn Future<Output = Result<(), ListenerError>> + Send + '_>> {
-        let batch_sender = self.batch_sender.clone();
+        let event_sender = self.event_sender.clone();
         async move {
             match event {
                 ReplicationEvent::DataChanged {
+                    lineage,
                     read_token,
                     mut rows,
                 } => {
-                    let mut emitted_batch = false;
+                    let mut changes = Vec::new();
                     while let Some(batch) = rows.next_batch().await.boxed()? {
-                        emitted_batch = true;
-                        batch_sender
-                            .send(ChecklistListenerBatch {
-                                read_token: read_token.clone(),
-                                changes: batch.into_iter().collect(),
-                            })
-                            .map_err(|_| ListenerError::Rejected {
-                                message: "checklist listener queue is closed".to_owned(),
-                            })?;
+                        changes.extend(batch);
                     }
-                    if !emitted_batch {
-                        // Empty group activations still carry the read token
-                        // that makes the new group usable by the application.
-                        batch_sender
-                            .send(ChecklistListenerBatch {
-                                read_token,
-                                changes: Vec::new(),
-                            })
-                            .map_err(|_| ListenerError::Rejected {
-                                message: "checklist listener queue is closed".to_owned(),
-                            })?;
-                    }
+                    // Empty group activations still carry the read token that
+                    // makes the new group usable by the application.
+                    event_sender
+                        .send(ChecklistListenerEvent {
+                            lineage,
+                            read_token,
+                            changes,
+                        })
+                        .map_err(|_| ListenerError::Rejected {
+                            message: "checklist listener queue is closed".to_owned(),
+                        })?;
                     Ok(())
                 }
                 ReplicationEvent::GroupInvitation {
@@ -279,8 +305,8 @@ pub struct ChecklistRepl {
     pub local_member: MemberIdentity,
     /// Runtime control and operation-local group-state access.
     pub replication: Arc<dyn ReplicationApi>,
-    /// Listener-delivered row batches awaiting command-loop ingestion.
-    pub batch_receiver: Receiver<ChecklistListenerBatch>,
+    /// Complete listener events awaiting command-side application.
+    pub event_receiver: Receiver<ChecklistListenerEvent>,
     /// Listener-delivered invitations awaiting user decisions.
     pub invitation_receiver: Receiver<PendingGroupInvitation>,
     /// Stable user-facing invitation queue with one-shot responders.
@@ -297,6 +323,29 @@ pub struct ChecklistSession {
     pub working_set: ChecklistWorkingSet,
 }
 
+/// Valid actions offered for one ambiguous replacement row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconciliationChoice {
+    /// Keep the local value or absence unchanged.
+    AcceptLocal,
+    /// Keep the framework successor value or absence unchanged.
+    AcceptRemote,
+    /// Open the local value in the detached item editor.
+    EditLocal,
+    /// Open the framework successor value in the detached item editor.
+    EditRemote,
+}
+
+impl ReconciliationChoice {
+    /// Labels and values accepted by the reconciliation prompt.
+    const CHOICES: &'static [(&'static str, Self)] = &[
+        ("accept local", Self::AcceptLocal),
+        ("accept remote", Self::AcceptRemote),
+        ("edit local", Self::EditLocal),
+        ("edit remote", Self::EditRemote),
+    ];
+}
+
 impl ChecklistRepl {
     /// Build one REPL around a running replication API and listener queues.
     pub fn new(
@@ -310,7 +359,7 @@ impl ChecklistRepl {
             config,
             local_member,
             replication,
-            batch_receiver: listener_receivers.batches,
+            event_receiver: listener_receivers.events,
             invitation_receiver: listener_receivers.invitations,
             pending_invitations: Vec::new(),
             session,
@@ -415,7 +464,9 @@ impl ChecklistRepl {
                 return Ok(true);
             }
             ChecklistCommand::Quit => return Ok(false),
-            _ => {}
+            _ => {
+                // All remaining commands operate on the heterogeneous workspace below.
+            }
         }
         self.handle_workspace_command(command).await?;
         Ok(true)
@@ -593,20 +644,32 @@ impl ChecklistRepl {
     }
 
     async fn sync(&mut self) -> Result<(), ReplicatedChecklistError> {
-        let report = self.synchronise_groups().await?;
-        println!("{}", self.format_sync_report(&report)?);
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        let report = self.synchronise_groups(&mut dialog).await?;
+        let formatted_report = self.format_sync_report(&report)?;
+        println!("{formatted_report}");
         Ok(())
     }
 
-    /// Publish every dirty real group while preserving failures for display and retry.
+    /// Apply queued events, then publish groups which were dirty when sync began.
+    ///
+    /// Reconciliation results created by the initial event drain deliberately
+    /// remain dirty for the next explicit sync.
     pub async fn synchronise_groups(
         &mut self,
+        dialog: &mut ChecklistDialog<'_>,
     ) -> Result<ChecklistSyncReport, ReplicatedChecklistError> {
+        let publishable_groups = self.session.working_set.dirty_group_ids();
+        let mut drain_report = self.drain_listener_queue(dialog)?;
         let mut dirty_groups = self
             .session
             .working_set
             .dirty_group_ids()
             .into_iter()
+            .filter(|group_id| publishable_groups.contains(group_id))
             .collect::<Vec<_>>();
         dirty_groups.sort();
 
@@ -656,13 +719,10 @@ impl ChecklistRepl {
         }
 
         let listener_drain_deferred = group_outcomes.iter().any(|outcome| !outcome.is_success());
-        let (listener_batch_count, applied_event_count) = if listener_drain_deferred {
-            (0, 0)
-        } else {
-            let listener_batch_count = self.drain_listener_queue()?;
-            let applied_event_count = self.session.working_set.drain_queued_events();
-            (listener_batch_count, applied_event_count)
-        };
+        if !listener_drain_deferred {
+            let later_drain = self.drain_listener_queue(dialog)?;
+            drain_report.merge(later_drain);
+        }
         let dirty_local_item_count = self.session.working_set.dirty_local_item_count();
         let mut remaining_dirty_groups = self
             .session
@@ -674,8 +734,9 @@ impl ChecklistRepl {
         Ok(ChecklistSyncReport {
             group_outcomes,
             listener_drain_deferred,
-            listener_batch_count,
-            applied_event_count,
+            listener_event_count: drain_report.event_count,
+            applied_event_count: drain_report.applied_event_count,
+            dirty_resolution_count: drain_report.dirty_resolution_count,
             dirty_local_item_count,
             remaining_dirty_groups,
         })
@@ -708,10 +769,13 @@ impl ChecklistRepl {
                 })
                 .join("\n")
         };
-        let listener_batches = if report.listener_drain_deferred {
-            "deferred because a group publication failed".to_owned()
+        let listener_events = if report.listener_drain_deferred {
+            format!(
+                "{} applied before publication; later events deferred because a group publication failed",
+                report.listener_event_count
+            )
         } else {
-            report.listener_batch_count.to_string()
+            report.listener_event_count.to_string()
         };
         let dirty_group_labels = report
             .remaining_dirty_groups
@@ -730,41 +794,276 @@ impl ChecklistRepl {
         };
         let applied_events = report.applied_event_count;
         let dirty_local = report.dirty_local_item_count;
+        let resolution_guidance = if report.dirty_resolution_count == 0 {
+            String::new()
+        } else {
+            let resolution_count = report.dirty_resolution_count;
+            format!(
+                "\n  retained reconciliation changes: {resolution_count}\n  next step: run `sync` again to publish them"
+            )
+        };
         Ok(formatdoc! {"
             {heading}
               groups:
             {group_outcomes}
-              listener batches: {listener_batches}
+              listener events: {listener_events}
               applied events: {applied_events}
               unsynchronised local items: {dirty_local}
-              dirty groups: {dirty_group_summary}"
+              dirty groups: {dirty_group_summary}{resolution_guidance}"
         })
     }
 
-    /// Drain queued listener batches into the working set and return the number of batches drained.
-    pub fn drain_listener_queue(&mut self) -> Result<usize, ReplicatedChecklistError> {
+    /// Drain complete listener events in order, resolving replacements before token merge.
+    pub fn drain_listener_queue(
+        &mut self,
+        dialog: &mut ChecklistDialog<'_>,
+    ) -> Result<ChecklistListenerDrainReport, ReplicatedChecklistError> {
         let groups = self.group_state()?;
-        let mut drained_batch_count = 0;
-        while let Some(batch) = self.receive_listener_batch()? {
-            ChecklistSession::validate_listener_changes(groups.as_ref(), &batch.changes)?;
-            self.session
-                .working_set
-                .enqueue_row_changes(batch.changes)
-                .context(repl_error::WorkingSetSnafu)?;
-            // No REPL command can run while sync is draining listener batches,
-            // so it is safe to merge the event token before the queued rows are
-            // applied immediately after this method returns.
-            self.session.working_set.merge_read_token(batch.read_token);
-            drained_batch_count += 1;
+        let mut report = ChecklistListenerDrainReport::default();
+        while let Some(event) = self.receive_listener_event()? {
+            ChecklistSession::validate_listener_changes(
+                groups.as_ref(),
+                event.lineage,
+                &event.changes,
+            )?;
+            match event.lineage {
+                DataChangeLineage::Update => {
+                    self.session
+                        .working_set
+                        .enqueue_row_changes(event.changes)
+                        .context(repl_error::WorkingSetSnafu)?;
+                    report.applied_event_count += self.session.working_set.drain_queued_events();
+                }
+                DataChangeLineage::GroupReplacement { migration_id } => {
+                    let mut plan = self
+                        .session
+                        .working_set
+                        .prepare_group_replacement(migration_id, event.changes)
+                        .context(repl_error::WorkingSetSnafu)?;
+                    Self::resolve_group_replacement(dialog, &mut plan)?;
+                    let outcome = plan.commit(&mut self.session.working_set);
+                    report.applied_event_count += 1;
+                    report.dirty_resolution_count += outcome.dirty_resolution_count;
+                    if outcome.dirty_resolution_count != 0 {
+                        report
+                            .dirty_resolution_groups
+                            .insert(migration_id.new_group_id);
+                    }
+                }
+            }
+            self.session.working_set.merge_read_token(event.read_token);
+            report.event_count += 1;
         }
-        Ok(drained_batch_count)
+        Ok(report)
     }
 
-    /// Return one queued listener batch, or `None` when the listener queue is currently empty.
-    fn receive_listener_batch(
+    /// Explain retained local resolutions which require another explicit sync.
+    pub(super) fn write_reconciliation_follow_up(
         &self,
-    ) -> Result<Option<ChecklistListenerBatch>, ReplicatedChecklistError> {
-        match self.batch_receiver.try_recv() {
+        dialog: &mut ChecklistDialog<'_>,
+        report: &ChecklistListenerDrainReport,
+    ) -> Result<(), ReplicatedChecklistError> {
+        if report.dirty_resolution_count == 0 {
+            return Ok(());
+        }
+        let groups = self.group_state()?;
+        let labels = report
+            .dirty_resolution_groups
+            .iter()
+            .map(|group_id| ChecklistSession::group_label(groups.as_ref(), *group_id))
+            .sorted()
+            .join(", ");
+        write!(
+            dialog.output,
+            "{} reconciliation change(s) were retained as local changes in {labels}.
+Run `sync` again to publish them.
+",
+            report.dirty_resolution_count
+        )
+        .context(repl_error::IoSnafu {
+            action: "writing reconciliation follow-up",
+        })?;
+        Ok(())
+    }
+
+    /// Guide the user through every ambiguous row before a replacement is committed.
+    fn resolve_group_replacement(
+        dialog: &mut ChecklistDialog<'_>,
+        plan: &mut ChecklistReplacementPlan,
+    ) -> Result<(), ReplicatedChecklistError> {
+        if plan.reconciliations().is_empty() {
+            return Ok(());
+        }
+        let migration_id = plan.migration_id();
+        writeln!(
+            dialog.output,
+            "group replacement {} -> {} needs reconciliation:",
+            migration_id.old_group_id, migration_id.new_group_id
+        )
+        .context(repl_error::IoSnafu {
+            action: "writing reconciliation heading",
+        })?;
+
+        let reconciliation_count = plan.reconciliations().len();
+        for index in 0..reconciliation_count {
+            let reconciliation = plan.reconciliations()[index].clone();
+            Self::write_reconciliation(dialog, index, reconciliation_count, &reconciliation)?;
+            let selected = Self::read_reconciliation_choice(dialog, &reconciliation)?;
+            plan.resolve_next(selected);
+        }
+        Ok(())
+    }
+
+    /// Display one complete local-versus-remote decision and its evidence.
+    fn write_reconciliation(
+        dialog: &mut ChecklistDialog<'_>,
+        index: usize,
+        count: usize,
+        reconciliation: &ChecklistReconciliation,
+    ) -> Result<(), ReplicatedChecklistError> {
+        let local = format_reconciliation_candidate("local", reconciliation.local.as_ref());
+        let remote = format_reconciliation_candidate("remote", reconciliation.remote.as_ref());
+        let differences = match reconciliation.differing_fields.as_deref() {
+            None => "comparison unavailable".to_owned(),
+            Some([]) => "none".to_owned(),
+            Some(differences) => differences
+                .iter()
+                .map(RowFieldDifference::field_name)
+                .join(", "),
+        };
+        let evidence = format_reconciliation_evidence(reconciliation.evidence);
+        write!(
+            dialog.output,
+            "reconciliation {}/{}:
+  old: {:?}
+  successor: {:?}
+{local}{remote}  differing fields: {differences}
+{evidence}",
+            index + 1,
+            count,
+            reconciliation.old_item_id,
+            reconciliation.new_item_id,
+        )
+        .context(repl_error::IoSnafu {
+            action: "writing reconciliation",
+        })?;
+        Ok(())
+    }
+
+    /// Read one of the four agreed choices, retrying invalid or unavailable input.
+    #[allow(
+        clippy::needless_continue,
+        reason = "Explicit retries keep unavailable reconciliation choices in the choice loop."
+    )]
+    fn read_reconciliation_choice(
+        dialog: &mut ChecklistDialog<'_>,
+        reconciliation: &ChecklistReconciliation,
+    ) -> Result<Option<ChecklistItem>, ReplicatedChecklistError> {
+        'choice: loop {
+            let choice = dialog.read_choice(
+                "resolution [accept local/accept remote/edit local/edit remote]> ",
+                "reading reconciliation choice",
+                ReconciliationChoice::CHOICES,
+            )?;
+            match choice {
+                ReconciliationChoice::AcceptLocal => return Ok(reconciliation.local.clone()),
+                ReconciliationChoice::AcceptRemote => return Ok(reconciliation.remote.clone()),
+                ReconciliationChoice::EditLocal => {
+                    if let Some(local) = &reconciliation.local {
+                        return Self::edit_reconciliation_item(dialog, local.clone()).map(Some);
+                    }
+                    writeln!(dialog.output, "local is absent and cannot be edited").context(
+                        repl_error::IoSnafu {
+                            action: "writing unavailable reconciliation choice",
+                        },
+                    )?;
+                    continue 'choice;
+                }
+                ReconciliationChoice::EditRemote => {
+                    if let Some(remote) = &reconciliation.remote {
+                        return Self::edit_reconciliation_item(dialog, remote.clone()).map(Some);
+                    }
+                    writeln!(dialog.output, "remote is absent and cannot be edited").context(
+                        repl_error::IoSnafu {
+                            action: "writing unavailable reconciliation choice",
+                        },
+                    )?;
+                    continue 'choice;
+                }
+            }
+        }
+    }
+
+    /// Edit a selected reconciliation base until the user accepts the result.
+    fn edit_reconciliation_item(
+        dialog: &mut ChecklistDialog<'_>,
+        mut item: ChecklistItem,
+    ) -> Result<ChecklistItem, ReplicatedChecklistError> {
+        'editor: loop {
+            let command = dialog.read_line(
+                "edit [text/note/tags/status/priority/accept]> ",
+                "reading reconciliation edit",
+            )?;
+            let (field, value) = command
+                .split_once(char::is_whitespace)
+                .map_or((command.trim(), ""), |(field, value)| {
+                    (field.trim(), value.trim())
+                });
+            let edit = match field.to_ascii_lowercase().as_str() {
+                "accept" if value.is_empty() => return Ok(item),
+                "text" => ChecklistItemEdit::Text(value.to_owned()),
+                "note" => ChecklistItemEdit::Note(value.to_owned()),
+                "tags" => {
+                    ChecklistItemEdit::Tags(value.split_whitespace().map(str::to_owned).collect())
+                }
+                "status" => {
+                    let Some(status) = ChecklistStatus::from_schema_value(value) else {
+                        writeln!(dialog.output, "status must be open, in_progress, or done")
+                            .context(repl_error::IoSnafu {
+                                action: "writing reconciliation edit help",
+                            })?;
+                        continue 'editor;
+                    };
+                    ChecklistItemEdit::Status(status)
+                }
+                "priority" => {
+                    let Ok(priority) = value.parse::<u8>() else {
+                        writeln!(dialog.output, "priority must be an integer from 0 to 255")
+                            .context(repl_error::IoSnafu {
+                                action: "writing reconciliation edit help",
+                            })?;
+                        continue 'editor;
+                    };
+                    ChecklistItemEdit::Priority(priority)
+                }
+                _ => {
+                    writeln!(
+                        dialog.output,
+                        "enter a field and value, or `accept` to use the edited row"
+                    )
+                    .context(repl_error::IoSnafu {
+                        action: "writing reconciliation edit help",
+                    })?;
+                    continue 'editor;
+                }
+            };
+            item.apply_edit(edit);
+            write!(
+                dialog.output,
+                "{}",
+                format_reconciliation_candidate("edited", Some(&item))
+            )
+            .context(repl_error::IoSnafu {
+                action: "writing edited reconciliation candidate",
+            })?;
+        }
+    }
+
+    /// Return one queued listener event, or `None` when the listener queue is currently empty.
+    fn receive_listener_event(
+        &self,
+    ) -> Result<Option<ChecklistListenerEvent>, ReplicatedChecklistError> {
+        match self.event_receiver.try_recv() {
             Ok(changes) => Ok(Some(changes)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => repl_error::ListenerQueueClosedSnafu.fail(),
@@ -1035,6 +1334,60 @@ fn unprovisioned_store_prompt(store_path: &Path) -> String {
     )
 }
 
+/// Format one complete reconciliation candidate or explicit row absence.
+fn format_reconciliation_candidate(label: &str, item: Option<&ChecklistItem>) -> String {
+    if let Some(item) = item {
+        let tags = item.formatted_tags();
+        formatdoc! {"
+              {label}:
+                text: {text}
+                note: {note}
+                tags: {tags}
+                status: {status}
+                priority: {priority}
+                edit_count: {edit_count}
+            ",
+            text = item.text,
+            note = item.note,
+            status = item.status,
+            priority = item.priority,
+            edit_count = item.edit_count,
+        }
+    } else {
+        format!("  {label}: absent\n")
+    }
+}
+
+/// Format user-facing facts about whether the replacement included the old row.
+fn format_reconciliation_evidence(evidence: Option<PreviousRowEvidence>) -> String {
+    let Some(evidence) = evidence else {
+        return "  old-row evidence: unavailable\n".to_owned();
+    };
+    let creator = match evidence.creator {
+        Some(PreviousRowCreator::Local) => "this member",
+        Some(PreviousRowCreator::Other) => "another member",
+        None => "unknown",
+    };
+    let creation = cut_relation_label(evidence.creation);
+    let last_state = cut_relation_label(evidence.last_state);
+    formatdoc! {"
+          old-row creator: {creator}
+          row creation: {creation}
+          latest old-row state: {last_state}
+        "}
+}
+
+/// Describe whether one old-group fact reached the accepted replacement input.
+const fn cut_relation_label(relation: Option<AcceptedCutRelation>) -> &'static str {
+    match relation {
+        Some(AcceptedCutRelation::Included) => "included in the replacement",
+        Some(AcceptedCutRelation::NotIncluded) => {
+            "newer than the accepted cut and not included in the replacement"
+        }
+        None => "unknown",
+    }
+}
+
 fn format_timestamp(timestamp: SystemTime) -> String {
     DateTime::<Local>::from(timestamp)
         .format("%Y-%m-%d %H:%M:%S %:z")
@@ -1047,6 +1400,7 @@ mod tests {
     use crate::replicated_checklist::{
         ChecklistItem,
         ChecklistRowChange,
+        FIELD_TEXT,
         runner::groups::test_support::{
             load_test_runtime_with_group_records,
             load_test_runtime_with_groups,
@@ -1055,15 +1409,275 @@ mod tests {
         },
     };
     use flotsync_replication::{
+        BatchProvider,
+        MigrationId,
+        PreviousRow,
+        PreviousRowAbsence,
         ReplicationStore,
+        RowChangeBatch,
+        RowChangeKind,
         RowId,
         RowKey,
         RowMutation,
+        RowValues,
         providers::VecRowProvider,
         test_support::{publish_changes, snapshot_read_token},
     };
     use flotsync_security::{LocalStoreSecretError, install_local_store_secret_test_store};
-    use std::io::Cursor;
+    use futures_util::{
+        FutureExt,
+        future::{self, BoxFuture},
+    };
+    use std::{borrow::Cow, collections::VecDeque, io::Cursor};
+
+    /// Deterministic provider which emits one pre-built row-change page per call.
+    struct PagedRowProvider {
+        /// Remaining pages in delivery order.
+        pages: VecDeque<RowChangeBatch>,
+    }
+
+    impl BatchProvider for PagedRowProvider {
+        type Batch = RowChangeBatch;
+
+        fn new_batch(&self) -> Self::Batch {
+            RowChangeBatch::new()
+        }
+
+        fn fill_batch(
+            &mut self,
+            _reuse: Self::Batch,
+        ) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>> {
+            future::ready(Ok(self.pages.pop_front())).boxed()
+        }
+    }
+
+    /// Run one sync with an empty dialog which must not be read by these tests.
+    fn synchronise_test_groups(
+        repl: &mut ChecklistRepl,
+    ) -> Result<ChecklistSyncReport, ReplicatedChecklistError> {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        block_on(repl.synchronise_groups(&mut dialog))
+    }
+
+    /// Build one wizard decision with both candidate rows available.
+    fn test_reconciliation() -> ChecklistReconciliation {
+        ChecklistReconciliation {
+            old_item_id: ChecklistItemId::group(
+                GroupId(Uuid::from_u128(50)),
+                RowKey(Uuid::from_u128(51)),
+            ),
+            new_item_id: ChecklistItemId::group(
+                GroupId(Uuid::from_u128(52)),
+                RowKey(Uuid::from_u128(51)),
+            ),
+            local: Some(ChecklistItem::new("local")),
+            remote: Some(ChecklistItem::new("remote")),
+            differing_fields: Some(
+                vec![RowFieldDifference::ValueChanged {
+                    field_name: Cow::Borrowed(FIELD_TEXT),
+                }]
+                .into_boxed_slice(),
+            ),
+            evidence: None,
+        }
+    }
+
+    /// Build one replacement collision between a dirty old-group insert and a successor row.
+    fn replacement_collision_change(new_group_id: GroupId, row_key: RowKey) -> RowChange {
+        let remote = ChecklistItem::new("remote");
+        let row = RowValues::from_fields_unchecked(remote.to_row_values_patch().fields);
+        RowChange {
+            previous: PreviousRow::Absent(PreviousRowAbsence::NotStored),
+            change: RowChangeKind::Upsert {
+                row_id: RowId::new(new_group_id, checklist_dataset_id(), row_key),
+                row: Arc::new(row),
+                previous_value_differences: None,
+            },
+        }
+    }
+
+    #[test]
+    fn reconciliation_wizard_accepts_either_candidate_unchanged() {
+        let reconciliation = test_reconciliation();
+        for (answer, expected) in [
+            ("accept local\n", reconciliation.local.clone()),
+            ("accept remote\n", reconciliation.remote.clone()),
+        ] {
+            let mut input = Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+            let selected = ChecklistRepl::read_reconciliation_choice(&mut dialog, &reconciliation)
+                .expect("accept choice should resolve");
+
+            assert_eq!(selected, expected);
+        }
+    }
+
+    #[test]
+    fn reconciliation_wizard_edits_local_or_remote_as_the_selected_base() {
+        let reconciliation = test_reconciliation();
+        for (answer, expected_text) in [
+            ("edit local\ntext merged local\naccept\n", "merged local"),
+            ("edit remote\ntext merged remote\naccept\n", "merged remote"),
+        ] {
+            let mut input = Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+            let selected = ChecklistRepl::read_reconciliation_choice(&mut dialog, &reconciliation)
+                .expect("edit choice should resolve")
+                .expect("edited candidate remains visible");
+
+            assert_eq!(selected.text, expected_text);
+            assert_eq!(selected.edit_count, 2);
+        }
+    }
+
+    #[test]
+    fn reconciliation_wizard_explains_absent_edit_and_retries() {
+        let mut reconciliation = test_reconciliation();
+        reconciliation.local = None;
+        let mut input = Cursor::new(b"not a choice\nedit local\naccept remote\n");
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+        let selected = ChecklistRepl::read_reconciliation_choice(&mut dialog, &reconciliation)
+            .expect("wizard should retry unavailable edit");
+
+        assert_eq!(selected, reconciliation.remote);
+        let output = String::from_utf8(output).expect("wizard output should be UTF-8");
+        assert!(output.contains("enter one of: `accept local`"));
+        assert!(output.contains("local is absent and cannot be edited"));
+    }
+
+    #[test]
+    fn replacement_input_eof_leaves_the_working_set_and_token_unchanged() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let old_group_id = GroupId(Uuid::from_u128(73_001));
+        let new_group_id = GroupId(Uuid::from_u128(73_002));
+        let row_key = RowKey(Uuid::from_u128(73_003));
+        let (_store, runtime, listener, receivers) =
+            load_test_runtime_with_groups(&member, [new_group_id]);
+        let read_token =
+            snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
+        block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::GroupReplacement {
+                migration_id: MigrationId {
+                    old_group_id,
+                    new_group_id,
+                },
+            },
+            read_token,
+            rows: Box::new(VecRowProvider::new(vec![replacement_collision_change(
+                new_group_id,
+                row_key,
+            )])),
+        }))
+        .expect("replacement should reach the listener");
+        let old_item_id = ChecklistItemId::group(old_group_id, row_key);
+        let mut working_set = ChecklistWorkingSet::new();
+        working_set.add_item_with_id(old_item_id, "local");
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            ChecklistSession::new(working_set),
+        );
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+        let result = repl.drain_listener_queue(&mut dialog);
+
+        assert!(matches!(
+            result,
+            Err(ReplicatedChecklistError::EndOfInput {
+                action: "reading reconciliation choice"
+            })
+        ));
+        assert_eq!(
+            repl.session
+                .working_set
+                .item(old_item_id)
+                .map(|item| item.text.as_str()),
+            Some("local")
+        );
+        assert!(
+            repl.session
+                .working_set
+                .item(ChecklistItemId::group(new_group_id, row_key))
+                .is_none()
+        );
+        assert!(matches!(
+            repl.session.working_set.read_token(),
+            Err(ChecklistWorkingSetError::MissingReadToken)
+        ));
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
+
+    #[test]
+    fn retained_replacement_choice_merges_token_and_prints_next_sync_guidance() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let old_group_id = GroupId(Uuid::from_u128(73_004));
+        let new_group_id = GroupId(Uuid::from_u128(73_005));
+        let row_key = RowKey(Uuid::from_u128(73_006));
+        let (_store, runtime, listener, receivers) =
+            load_test_runtime_with_groups(&member, [new_group_id]);
+        let read_token =
+            snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
+        block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::GroupReplacement {
+                migration_id: MigrationId {
+                    old_group_id,
+                    new_group_id,
+                },
+            },
+            read_token: read_token.clone(),
+            rows: Box::new(VecRowProvider::new(vec![replacement_collision_change(
+                new_group_id,
+                row_key,
+            )])),
+        }))
+        .expect("replacement should reach the listener");
+        let old_item_id = ChecklistItemId::group(old_group_id, row_key);
+        let mut working_set = ChecklistWorkingSet::new();
+        working_set.add_item_with_id(old_item_id, "local");
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            ChecklistSession::new(working_set),
+        );
+        let mut input = Cursor::new(b"accept local\n");
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+        let report = repl
+            .drain_listener_queue(&mut dialog)
+            .expect("local replacement choice should commit");
+        repl.write_reconciliation_follow_up(&mut dialog, &report)
+            .expect("follow-up should render");
+
+        assert_eq!(report.dirty_resolution_count, 1);
+        assert_eq!(
+            repl.session
+                .working_set
+                .read_token()
+                .expect("committed replacement should merge its read token"),
+            read_token
+        );
+        let output = String::from_utf8(output).expect("dialog output should be UTF-8");
+        assert!(output.contains("1 reconciliation change(s) were retained"));
+        assert!(output.contains("Run `sync` again to publish them."));
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
 
     #[test]
     fn shutdown_error_preservation_returns_the_earliest_failure() {
@@ -1312,17 +1926,69 @@ mod tests {
         let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
 
         block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::Update,
             read_token: read_token.clone(),
             rows: Box::new(VecRowProvider::new(Vec::new())),
         }))
         .expect("empty data event should reach the listener");
 
-        let batch = receivers
-            .batches
+        let event = receivers
+            .events
             .try_recv()
-            .expect("empty event should retain one token-only batch");
-        assert_eq!(batch.read_token, read_token);
-        assert!(batch.changes.is_empty());
+            .expect("empty event should retain one token-only event");
+        assert_eq!(event.read_token, read_token);
+        assert!(event.changes.is_empty());
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
+
+    #[test]
+    fn listener_collects_all_provider_pages_into_one_atomic_event() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let group_id = GroupId::new_random();
+        let (_store, runtime, listener, receivers) =
+            load_test_runtime_with_groups(&member, [group_id]);
+        let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
+        let row_ids = [
+            RowId::new(group_id, checklist_dataset_id(), RowKey(Uuid::from_u128(1))),
+            RowId::new(group_id, checklist_dataset_id(), RowKey(Uuid::from_u128(2))),
+        ];
+        let pages = row_ids
+            .iter()
+            .cloned()
+            .map(|row_id| {
+                RowChangeBatch::from_iter([RowChange {
+                    previous: PreviousRow::NotCompared,
+                    change: RowChangeKind::Delete { row_id },
+                }])
+            })
+            .collect();
+
+        block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::Update,
+            read_token: read_token.clone(),
+            rows: Box::new(PagedRowProvider { pages }),
+        }))
+        .expect("paged data event should reach the listener");
+
+        let event = receivers
+            .events
+            .try_recv()
+            .expect("all pages should produce one listener event");
+        assert_eq!(event.lineage, DataChangeLineage::Update);
+        assert_eq!(event.read_token, read_token);
+        assert_eq!(
+            event
+                .changes
+                .iter()
+                .map(RowChange::row_id)
+                .collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            receivers.events.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");
     }
@@ -1404,6 +2070,68 @@ mod tests {
     }
 
     #[test]
+    fn sync_applies_replacement_before_publishing_its_dirty_predecessor() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let old_group = GroupId(Uuid::from_u128(71_101));
+        let new_group = GroupId(Uuid::from_u128(71_102));
+        let row_key = RowKey(Uuid::from_u128(71_103));
+        let (_store, runtime, listener, receivers) =
+            load_test_runtime_with_groups(&member, [new_group]);
+        let read_token = snapshot_read_token(runtime.as_ref(), new_group, checklist_dataset_id());
+        block_on(listener.on_event(ReplicationEvent::DataChanged {
+            lineage: DataChangeLineage::GroupReplacement {
+                migration_id: MigrationId {
+                    old_group_id: old_group,
+                    new_group_id: new_group,
+                },
+            },
+            read_token,
+            rows: Box::new(VecRowProvider::new(Vec::new())),
+        }))
+        .expect("replacement should reach the listener before sync");
+        let old_item_id = ChecklistItemId::group(old_group, row_key);
+        let mut working_set = ChecklistWorkingSet::new();
+        working_set.add_item_with_id(old_item_id, "unpublished predecessor row");
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            ChecklistSession::new(working_set),
+        );
+
+        let first_report = synchronise_test_groups(&mut repl)
+            .expect("replacement should prevent predecessor publication");
+
+        let new_item_id = ChecklistItemId::group(new_group, row_key);
+        assert!(first_report.group_outcomes.is_empty());
+        assert_eq!(first_report.listener_event_count, 1);
+        assert_eq!(first_report.dirty_resolution_count, 1);
+        assert_eq!(first_report.remaining_dirty_groups, vec![new_group]);
+        assert!(repl.session.working_set.item(old_item_id).is_none());
+        assert_eq!(
+            repl.session
+                .working_set
+                .item(new_item_id)
+                .map(|item| item.text.as_str()),
+            Some("unpublished predecessor row")
+        );
+
+        let second_report = synchronise_test_groups(&mut repl)
+            .expect("next sync should publish the retained successor row");
+        assert!(matches!(
+            second_report.group_outcomes.as_slice(),
+            [ChecklistGroupSyncOutcome::Published {
+                group_id,
+                mutation_count: 1,
+            }] if *group_id == new_group
+        ));
+        assert!(second_report.remaining_dirty_groups.is_empty());
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
+
+    #[test]
     fn sync_publishes_every_dirty_group_and_skips_local_items() {
         let member = MemberIdentity::from_array(["alice"]);
         let first_group = GroupId(Uuid::from_u128(72_001));
@@ -1446,7 +2174,7 @@ mod tests {
             session,
         );
 
-        let report = block_on(repl.synchronise_groups()).expect("all groups should synchronise");
+        let report = synchronise_test_groups(&mut repl).expect("all groups should synchronise");
 
         assert!(matches!(
             report.group_outcomes.as_slice(),
@@ -1462,14 +2190,14 @@ mod tests {
             ] if *actual_first == first_group && *actual_second == second_group
         ));
         assert!(!report.listener_drain_deferred);
-        assert_eq!(report.listener_batch_count, 2);
+        assert_eq!(report.listener_event_count, 2);
         assert_eq!(report.applied_event_count, 2);
         assert_eq!(report.dirty_local_item_count, 1);
         assert!(report.remaining_dirty_groups.is_empty());
         assert_eq!(
             repl.format_sync_report(&report)
                 .expect("sync report should format"),
-            "sync complete:\n  groups:\n    first: published 1 mutation(s)\n    second: published 1 mutation(s)\n  listener batches: 2\n  applied events: 2\n  unsynchronised local items: 1\n  dirty groups: none"
+            "sync complete:\n  groups:\n    first: published 1 mutation(s)\n    second: published 1 mutation(s)\n  listener events: 2\n  applied events: 2\n  unsynchronised local items: 1\n  dirty groups: none"
         );
 
         let mut verified = ChecklistWorkingSet::new();
@@ -1540,7 +2268,7 @@ mod tests {
             receivers,
             session,
         );
-        block_on(repl.synchronise_groups()).expect("source setup should publish");
+        synchronise_test_groups(&mut repl).expect("source setup should publish");
 
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
             item: ItemSelector::RowKey(copied_source.row_key),
@@ -1560,7 +2288,7 @@ mod tests {
         }))
         .expect("move command should stage");
 
-        let report = block_on(repl.synchronise_groups()).expect("transfers should publish");
+        let report = synchronise_test_groups(&mut repl).expect("transfers should publish");
 
         assert!(matches!(
             report.group_outcomes.as_slice(),
@@ -1649,8 +2377,8 @@ mod tests {
         }))
         .expect("move should stage against the writable target registry");
 
-        let first_report = block_on(repl.synchronise_groups())
-            .expect("partial publication should return a report");
+        let first_report =
+            synchronise_test_groups(&mut repl).expect("partial publication should return a report");
 
         assert!(matches!(
             first_report.group_outcomes.as_slice(),
@@ -1666,7 +2394,7 @@ mod tests {
             ] if *actual_target == target_group && *actual_source == unavailable_source
         ));
         assert!(first_report.listener_drain_deferred);
-        assert_eq!(first_report.listener_batch_count, 0);
+        assert_eq!(first_report.listener_event_count, 0);
         assert_eq!(first_report.applied_event_count, 0);
         assert!(repl.session.working_set.item(source_id).is_none());
         assert!(repl.session.working_set.item(target_id).is_some());
@@ -1683,11 +2411,11 @@ mod tests {
             "the successful target upsert should be clean"
         );
         assert!(
-            repl.batch_receiver.try_recv().is_ok(),
+            repl.event_receiver.try_recv().is_ok(),
             "the successful target listener echo should remain deferred"
         );
 
-        let retry_report = block_on(repl.synchronise_groups())
+        let retry_report = synchronise_test_groups(&mut repl)
             .expect("ordinary retry should return another partial report");
         assert!(matches!(
             retry_report.group_outcomes.as_slice(),
@@ -1742,7 +2470,7 @@ mod tests {
             session,
         );
 
-        let report = block_on(repl.synchronise_groups())
+        let report = synchronise_test_groups(&mut repl)
             .expect("a group publication failure should remain in the report");
 
         assert!(matches!(
@@ -1759,12 +2487,12 @@ mod tests {
             ] if *actual_unknown == unknown_group && *actual_known == known_group
         ));
         assert!(report.listener_drain_deferred);
-        assert_eq!(report.listener_batch_count, 0);
+        assert_eq!(report.listener_event_count, 0);
         assert_eq!(report.applied_event_count, 0);
         assert_eq!(report.remaining_dirty_groups, vec![unknown_group]);
         assert_eq!(repl.session.working_set.queued_event_count(), 1);
         assert!(
-            repl.batch_receiver.try_recv().is_ok(),
+            repl.event_receiver.try_recv().is_ok(),
             "the successful group's listener echo should remain deferred"
         );
         let failed_report = ChecklistSyncReport {
@@ -1773,15 +2501,16 @@ mod tests {
                 error: ApiError::RuntimeUnavailable,
             }],
             listener_drain_deferred: true,
-            listener_batch_count: 0,
+            listener_event_count: 0,
             applied_event_count: 0,
+            dirty_resolution_count: 0,
             dirty_local_item_count: 0,
             remaining_dirty_groups: vec![known_group],
         };
         assert_eq!(
             repl.format_sync_report(&failed_report)
                 .expect("failed sync report should format"),
-            "sync incomplete:\n  groups:\n    known: failed: Replication runtime component became unavailable.\n  listener batches: deferred because a group publication failed\n  applied events: 0\n  unsynchronised local items: 0\n  dirty groups: known"
+            "sync incomplete:\n  groups:\n    known: failed: Replication runtime component became unavailable.\n  listener events: 0 applied before publication; later events deferred because a group publication failed\n  applied events: 0\n  unsynchronised local items: 0\n  dirty groups: known"
         );
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");

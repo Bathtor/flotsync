@@ -26,6 +26,38 @@ pub(super) enum MemberIndexOrigin {
     Stored,
 }
 
+/// One `u64` bit pattern represented in SQLite's signed `INTEGER` domain.
+///
+/// This representation is suitable only when SQL does not order or compare the
+/// value numerically. Negative integers preserve the upper half of the `u64`
+/// domain and convert back without loss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct U64BitsInI64(i64);
+
+impl From<u64> for U64BitsInI64 {
+    fn from(value: u64) -> Self {
+        Self(i64::from_ne_bytes(value.to_ne_bytes()))
+    }
+}
+
+impl From<i64> for U64BitsInI64 {
+    fn from(value: i64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<U64BitsInI64> for i64 {
+    fn from(value: U64BitsInI64) -> Self {
+        value.0
+    }
+}
+
+impl From<U64BitsInI64> for u64 {
+    fn from(value: U64BitsInI64) -> Self {
+        Self::from_ne_bytes(value.0.to_ne_bytes())
+    }
+}
+
 pub(super) async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -166,6 +198,57 @@ pub(super) fn decode_dataset_row_last_changed_versions(
         .try_get::<Vec<u8>, _>("row_last_changed_versions")
         .context(SqlxSnafu)?;
     decode_stored_version_vector(&versions, member_count)
+}
+
+/// Decode row-creation provenance from the named columns of one stored row.
+pub(super) fn decode_dataset_row_created_by(
+    row: &sqlx::sqlite::SqliteRow,
+    row_key: RowKey,
+    node_index_column: &str,
+    version_column: &str,
+    member_count: NonZeroUsize,
+) -> Result<Option<UpdateId>, StoreError> {
+    let node_index = row
+        .try_get::<Option<i64>, _>(node_index_column)
+        .context(SqlxSnafu)?;
+    let version = row
+        .try_get::<Option<i64>, _>(version_column)
+        .context(SqlxSnafu)?;
+    decode_dataset_row_created_by_values(row_key, node_index, version, member_count)
+}
+
+/// Decode nullable row-creator scalar values after loading them from SQLite.
+pub(super) fn decode_dataset_row_created_by_values(
+    row_key: RowKey,
+    node_index: Option<i64>,
+    version: Option<i64>,
+    member_count: NonZeroUsize,
+) -> Result<Option<UpdateId>, StoreError> {
+    match (node_index, version) {
+        (Some(node_index), Some(version)) => {
+            let node_index = match u32::try_from(node_index) {
+                Ok(node_index) if (node_index as usize) < member_count.get() => node_index,
+                Ok(_) | Err(_) => {
+                    return InvalidStoredRowCreatorIndexSnafu {
+                        row_key,
+                        creator_index: node_index,
+                        member_count: member_count.get(),
+                    }
+                    .fail()
+                    .map_err(StoreError::from);
+                }
+            };
+            let version = u64::from(U64BitsInI64::from(version));
+            Ok(Some(UpdateId {
+                node_index,
+                version,
+            }))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => IncompleteStoredRowCreationProvenanceSnafu { row_key }
+            .fail()
+            .map_err(StoreError::from),
+    }
 }
 
 pub(super) fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {

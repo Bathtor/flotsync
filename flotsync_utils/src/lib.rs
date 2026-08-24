@@ -2,7 +2,15 @@
 
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
-use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
+use std::{
+    convert::Infallible,
+    error::Error,
+    fmt,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    time::Duration,
+};
 
 pub mod claimable_promise;
 pub mod debugging;
@@ -21,6 +29,23 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Heap-allocated, `Send + Sync` error used by dyn-friendly public APIs.
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Non-owning phantom marker for generic parameters that affect a type's API
+/// surface but are neither stored nor dropped by that type.
+///
+/// This is equivalent to `PhantomData<fn() -> T>`, which keeps the generic
+/// parameter visible to the type system without modeling the enclosing type as
+/// logically owning a `T`.
+pub type NonOwningPhantomData<T> = PhantomData<fn() -> T>;
+
+/// Convert an impossible error into any requested error type.
+///
+/// This is useful as the conversion function passed to [`Result::map_err`]
+/// when composing a result whose error type is [`Infallible`].
+#[must_use]
+pub fn coerce_infallible<T>(infallible: Infallible) -> T {
+    match infallible {}
+}
 
 /// Stable timeout extension for futures.
 ///
@@ -56,14 +81,6 @@ pub trait FutureTimeoutExt: Future + Sized {
 }
 
 impl<F> FutureTimeoutExt for F where F: Future {}
-
-/// Non-owning phantom marker for generic parameters that affect a type's API
-/// surface but are neither stored nor dropped by that type.
-///
-/// This is equivalent to `PhantomData<fn() -> T>`, which keeps the generic
-/// parameter visible to the type system without modeling the enclosing type as
-/// logically owning a `T`.
-pub type NonOwningPhantomData<T> = PhantomData<fn() -> T>;
 
 /// Snafu `Whatever` context helpers that immediately classify handler errors.
 pub trait ResultExt<T, E>: Sized {
@@ -375,6 +392,13 @@ impl AsRef<str> for IString {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn coerce_infallible_adapts_infallible_results() {
+        let result: Result<u8, String> = Ok::<u8, Infallible>(7).map_err(coerce_infallible);
+
+        assert_eq!(result, Ok(7));
+    }
 
     proptest! {
         #[test]

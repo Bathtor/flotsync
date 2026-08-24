@@ -55,8 +55,12 @@ pub(super) struct PreparedMembershipDispatch {
 
 /// Result of activating accepted group work into externally readable row state.
 pub(super) struct PendingGroupActivationOutcome {
+    /// Read position pinned after the successor activation and predecessor closure commit.
     pub(super) read_token: ReadToken,
-    pub(super) row_changes: Vec<RowChange>,
+    /// Whether the event is an update or one explicit old-to-new replacement.
+    pub(super) lineage: DataChangeLineage,
+    /// Single-consumer stream which owns any read transaction needed for row comparison.
+    pub(super) rows: Box<RowProvider>,
 }
 
 /// Verified target-group material together with its current activation state.

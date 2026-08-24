@@ -4,6 +4,8 @@ use crate::{
         DatasetRowStateBatch,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
+        DatasetRowStateTransition,
+        DatasetRowStateTransitionBatch,
         DatasetRowStateWrite,
         DatasetSchema,
         DatasetUpdateRecord,
@@ -40,6 +42,7 @@ use crate::{
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
         WritableReplicationGroupVersionRecord,
+        ensure_matching_transition_dataset_references,
         invalid_default_group_security_material,
     },
     codecs::{
@@ -705,6 +708,26 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn scan_dataset_row_transition_batch<'a>(
+        &'a mut self,
+        previous_group: GroupDatasetSchemaRef<'a>,
+        current_group: GroupDatasetSchemaRef<'a>,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        async move {
+            scan_dataset_row_transition_batch(
+                self.assert_open_connection(),
+                previous_group,
+                current_group,
+                after,
+                limit,
+            )
+            .await
+        }
+        .boxed()
+    }
+
     fn load_pending_group_decisions(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
@@ -1043,7 +1066,11 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     row_key TEXT NOT NULL,
     row_snapshot BLOB NOT NULL,
     row_tombstoned INTEGER NOT NULL DEFAULT 0,
+    row_created_by_node_index INTEGER,
+    -- Stores the creator's u64 version bits in SQLite's signed INTEGER domain.
+    row_created_by_version INTEGER,
     row_last_changed_versions BLOB NOT NULL,
+    CHECK ((row_created_by_node_index IS NULL) = (row_created_by_version IS NULL)),
     PRIMARY KEY (group_id, dataset_id, row_key),
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );

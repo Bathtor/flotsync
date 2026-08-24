@@ -566,3 +566,49 @@ Expected result:
   hinted remote IP and port with a signed introduction.
 - Static peer routes are hints, not direct always-available routes. They are useful as a fallback or
   diagnostic input when the local network does not forward peer-announcement traffic reliably.
+
+## Scenario 7: Group Replacement Reconciliation
+
+Goal: a membership replacement changes the active group atomically while preserving deliberate
+local edits which the accepted replacement did not include.
+
+This scenario needs a replacement invitation produced by a migration-capable peer or test harness;
+the checklist example itself rejects migration proposals. Before accepting the invitation, leave an
+unsynchronised edit on a row from the old group. Then accept the invitation or run `sync`, depending
+on which command receives the replacement event.
+
+The checklist compares the complete old and successor views as one event. It remaps identical rows,
+accepts unambiguous successor changes, preserves unpublished local insertions, and safely combines
+dirty updates whose changed fields do not overlap. It pauses for input only when choosing a result
+requires application judgement.
+
+The `events` command remains a low-level diagnostic: it records the raw row transition delivered by
+the framework. A replacement entry therefore shows the successor candidate before application-side
+reconciliation, not an edited or locally retained result selected in the dialogue.
+
+For an ambiguous text change, the dialogue shows both group-scoped identities, both row candidates,
+the differing fields, and the available cut evidence. Choose one of:
+
+```text
+resolution [accept local/accept remote/edit local/edit remote]> edit local
+edit [text/note/tags/status/priority/accept]> text reconciled checklist text
+edit [text/note/tags/status/priority/accept]> accept
+```
+
+`edit local` and `edit remote` select the corresponding candidate as the editor base. The editor
+accepts `text`, `note`, `tags`, `status`, and `priority` commands. If a side represents deletion,
+that side can be accepted but cannot be edited; the dialogue explains this and asks again. Invalid
+choices also ask again.
+
+Expected result:
+
+- The old-to-new transition is not partially visible, even when the framework streams several row
+  pages.
+- `accept remote` leaves the successor row clean.
+- `accept local`, an edited result, or an accepted local deletion remains dirty in the successor
+  group when it differs from the remote result.
+- The command reports the number of retained reconciliation changes, names the affected successor
+  groups, and instructs the user to run `sync` again.
+- The wizard does not publish recursively. Run `sync` once more to publish the retained choices.
+- If the process exits or input ends before all choices are made, no partial replacement is applied;
+  restarting reloads the currently active group state and any unfinished choices are lost.

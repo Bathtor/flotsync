@@ -3,6 +3,7 @@ use crate::{
     SqliteReplicationStoreProvisioner,
     api::{
         ApplicationSchemas,
+        DataChangeLineage,
         DatasetId,
         DatasetSchema,
         EncryptedLocalMemberPrivateKeys,
@@ -31,6 +32,7 @@ use crate::{
         ReplicationStoreTransaction,
         RowChange,
         RowChangeBatch,
+        RowChangeKind,
         RowId,
         RowMutation,
         SchemaSource,
@@ -406,8 +408,8 @@ pub enum CapturedRowChange {
 
 impl CapturedRowChange {
     fn capture(change: RowChange) -> Result<Self, ListenerError> {
-        match change {
-            RowChange::Upsert { row_id, row } => {
+        match change.change {
+            RowChangeKind::Upsert { row_id, row, .. } => {
                 let title = row
                     .get_field_value::<str>("title")
                     .boxed()
@@ -415,7 +417,7 @@ impl CapturedRowChange {
                     .into_owned();
                 Ok(Self::Upsert { row_id, title })
             }
-            RowChange::Delete { row_id } => Ok(Self::Delete { row_id }),
+            RowChangeKind::Delete { row_id } => Ok(Self::Delete { row_id }),
         }
     }
 
@@ -443,6 +445,7 @@ pub struct CapturedDataChange {
 /// Event listener used by runtime integration tests.
 pub struct TestEventListener {
     data_changes: Mutex<Vec<CapturedDataChange>>,
+    data_change_lineages: Mutex<Vec<DataChangeLineage>>,
     data_change_read_tokens: Mutex<Vec<ReadToken>>,
     buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
     buffered_event_tx: mpsc::Sender<CapturedDataChange>,
@@ -453,6 +456,7 @@ impl Default for TestEventListener {
         let (buffered_event_tx, buffered_events) = mpsc::channel();
         Self {
             data_changes: Mutex::new(Vec::new()),
+            data_change_lineages: Mutex::new(Vec::new()),
             data_change_read_tokens: Mutex::new(Vec::new()),
             buffered_events: Mutex::new(buffered_events),
             buffered_event_tx,
@@ -544,6 +548,20 @@ impl TestEventListener {
             .expect("listener read-token capture mutex must not be poisoned")
             .clone()
     }
+
+    /// Return batch lineage values captured from all data-change events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener state mutex is poisoned.
+    #[must_use]
+    pub fn captured_data_change_lineages(&self) -> Vec<DataChangeLineage> {
+        self.drain_buffered_events();
+        self.data_change_lineages
+            .lock()
+            .expect("listener lineage capture mutex must not be poisoned")
+            .clone()
+    }
 }
 
 impl ReplicationEventListener for TestEventListener {
@@ -551,6 +569,7 @@ impl ReplicationEventListener for TestEventListener {
         async move {
             match event {
                 ReplicationEvent::DataChanged {
+                    lineage,
                     read_token,
                     mut rows,
                 } => {
@@ -571,6 +590,10 @@ impl ReplicationEventListener for TestEventListener {
                         .lock()
                         .expect("listener read-token capture mutex must not be poisoned")
                         .push(read_token);
+                    self.data_change_lineages
+                        .lock()
+                        .expect("listener lineage capture mutex must not be poisoned")
+                        .push(lineage);
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,

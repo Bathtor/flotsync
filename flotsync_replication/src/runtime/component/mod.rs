@@ -68,6 +68,7 @@ use crate::{
         BatchProvider,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
+        DataChangeLineage,
         DatasetId,
         DatasetRowStatePatch,
         DatasetRowStateWrite,
@@ -110,6 +111,7 @@ use crate::{
         RowId,
         RowKey,
         RowMutation,
+        RowProvider,
         RowProviderError,
         SnapshotRowsRequest,
         SnapshotValueRowBatch,
@@ -192,11 +194,13 @@ use std::{
 };
 use uuid::Uuid;
 
+mod group_replacement_provider;
 mod group_work;
 mod inbound_support;
 mod listeners;
 mod snapshot_provider;
 
+use group_replacement_provider::StoreGroupReplacementRowProvider;
 use group_work::{
     ComponentBackedPendingGroupResponder,
     MigrationProposalArrival,
@@ -225,7 +229,6 @@ use listeners::{
     ListenerDataChanges,
     notify_listener_batches,
     notify_listener_data_change,
-    notify_listener_data_changes,
     notify_pending_activation_data_changes,
 };
 use snapshot_provider::StoreSnapshotRowProvider;
@@ -538,6 +541,24 @@ impl ReplicationRuntimeComponent {
             activation::ConflictingGroupMaterialSnafu { group_id }
         );
         Ok(group_record)
+    }
+
+    /// Enforce the unchanged-schema invariant for one hosted group replacement.
+    fn validate_migration_activation_schema(
+        old_group: &ReplicationGroupRecord,
+        new_group_id: GroupId,
+        new_group_schema: &GroupSchema,
+    ) -> Result<(), GroupActivationError> {
+        ensure!(
+            old_group
+                .group_schema
+                .has_same_schema_definitions(new_group_schema),
+            activation::MigrationSchemaMismatchSnafu {
+                old_group_id: old_group.group_id,
+                new_group_id,
+            }
+        );
+        Ok(())
     }
 
     async fn snapshot_rows_from_store(
@@ -945,10 +966,20 @@ impl ReplicationRuntimeComponent {
             .context(inbound::UnknownHostedGroupSnafu {
                 group_id: old_group_id,
             })?;
+        let schema_matches = persisted_group
+            .group_schema
+            .has_same_schema_definitions(&proposal.group_schema);
         transaction
             .release()
             .await
             .context(inbound::StoreAccessSnafu)?;
+        ensure!(
+            schema_matches,
+            inbound::MigrationSchemaMismatchSnafu {
+                old_group_id,
+                new_group_id: proposal.migration_id.new_group_id,
+            }
+        );
         let local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
                 .context(inbound::InvalidPersistedGroupSnafu {
@@ -1975,6 +2006,8 @@ impl ReplicationRuntimeComponent {
         let key = activation_record.key;
         let group_id = activation_record.group_id;
         let migration_cutover = activation_record.migration_cutover;
+        let group_schema = activation_record.group_schema;
+        let listener_rows = Self::initial_snapshot_listener_rows(&key);
         let mut transaction = self
             .store
             .begin_transaction()
@@ -1993,7 +2026,7 @@ impl ReplicationRuntimeComponent {
         let group_record = self.validate_activation_group_material(
             group_id,
             activation_record.proposed_members,
-            &activation_record.group_schema,
+            &group_schema,
             &material,
         )?;
         let member_count = group_record.member_count();
@@ -2001,22 +2034,16 @@ impl ReplicationRuntimeComponent {
             .activate_replication_group(group_id, group_record.version_vector.clone())
             .await
             .context(activation::StoreAccessSnafu)?;
-        let row_changes = match activation_record.initial_snapshot {
-            InitialSnapshot::Empty => Vec::new(),
-            InitialSnapshot::Inline(initial_state) => {
-                pending_group::embed_inline_initial_snapshot(
-                    transaction.as_mut(),
-                    group_id,
-                    member_count,
-                    &activation_record.group_schema,
-                    initial_state,
-                )
-                .await?
-            }
-            InitialSnapshot::Metadata(_) => {
-                return activation::UnsupportedInitialSnapshotSnafu { group_id }.fail();
-            }
-        };
+        let update_row_changes = pending_group::embed_initial_snapshot(
+            transaction.as_mut(),
+            group_id,
+            member_count,
+            &group_schema,
+            activation_record.initial_snapshot,
+            listener_rows,
+        )
+        .await?;
+        let mut hosted_predecessor = None;
         if let Some(cutover) = &migration_cutover {
             let old_group = transaction
                 .load_replication_group(&cutover.old_group_id)
@@ -2026,9 +2053,12 @@ impl ReplicationRuntimeComponent {
                     group_id: cutover.old_group_id,
                 })
                 .context(activation::CloseOldGroupSnafu)?;
+            Self::validate_migration_activation_schema(&old_group, group_id, &group_schema)?;
             let closed =
                 Self::accepted_closed_lifecycle(&old_group, group_id, &cutover.final_versions)
                     .context(activation::CloseOldGroupSnafu)?;
+            hosted_predecessor =
+                Some((old_group.local_member_index, cutover.final_versions.clone()));
             transaction
                 .update_replication_group_lifecycle(&cutover.old_group_id, closed)
                 .await
@@ -2055,10 +2085,93 @@ impl ReplicationRuntimeComponent {
             .await
             .context(activation::StoreAccessSnafu)?;
         self.group_memberships.replace(next_group_state);
+        self.build_pending_activation_outcome(
+            key,
+            &group_schema,
+            update_row_changes,
+            hosted_predecessor,
+            read_token,
+        )
+        .await
+    }
+
+    /// Build the listener event payload after the accepted activation has committed.
+    async fn build_pending_activation_outcome(
+        &mut self,
+        key: PendingGroupWorkKey,
+        group_schema: &GroupSchema,
+        update_row_changes: Vec<RowChange>,
+        hosted_predecessor: Option<(MemberIndex, VersionVector)>,
+        read_token: ReadToken,
+    ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
+        let (lineage, rows): (DataChangeLineage, Box<RowProvider>) = match key {
+            PendingGroupWorkKey::GroupInvitation {
+                source: crate::api::GroupInvitationSource::Creation,
+                ..
+            } => (
+                DataChangeLineage::Update,
+                Box::new(VecRowProvider::new(update_row_changes)),
+            ),
+            PendingGroupWorkKey::GroupInvitation {
+                source: crate::api::GroupInvitationSource::Migration { migration_id },
+                ..
+            } => {
+                let read_transaction = self
+                    .store
+                    .begin_read_transaction()
+                    .await
+                    .context(activation::StoreAccessSnafu)?;
+                (
+                    DataChangeLineage::GroupReplacement { migration_id },
+                    Box::new(StoreGroupReplacementRowProvider::unavailable(
+                        read_transaction,
+                        migration_id,
+                        group_schema,
+                    )),
+                )
+            }
+            PendingGroupWorkKey::MigrationProposal { migration_id } => {
+                let (local_member_index, final_versions) = hosted_predecessor
+                    .expect("migration proposal activation must close its hosted predecessor");
+                let read_transaction = self
+                    .store
+                    .begin_read_transaction()
+                    .await
+                    .context(activation::StoreAccessSnafu)?;
+                (
+                    DataChangeLineage::GroupReplacement { migration_id },
+                    Box::new(StoreGroupReplacementRowProvider::hosted(
+                        read_transaction,
+                        migration_id,
+                        group_schema,
+                        local_member_index,
+                        final_versions,
+                    )),
+                )
+            }
+        };
         Ok(PendingGroupActivationOutcome {
             read_token,
-            row_changes,
+            lineage,
+            rows,
         })
+    }
+
+    /// Select whether activation rows are emitted directly or by a replacement provider.
+    fn initial_snapshot_listener_rows(
+        key: &PendingGroupWorkKey,
+    ) -> pending_group::InitialSnapshotListenerRows {
+        if matches!(
+            key,
+            PendingGroupWorkKey::GroupInvitation {
+                source: crate::api::GroupInvitationSource::Creation,
+                ..
+            }
+        ) {
+            pending_group::InitialSnapshotListenerRows::Collect
+        } else {
+            pending_group::InitialSnapshotListenerRows::Omit
+        }
     }
 
     fn next_local_update_id(
@@ -2146,6 +2259,7 @@ impl ReplicationRuntimeComponent {
                 group_id,
                 dataset_id,
                 actions,
+                change_id: update_id,
                 last_changed_versions: last_changed_versions.clone(),
             })
             .collect();
@@ -2406,11 +2520,21 @@ impl ReplicationRuntimeComponent {
             .context(inbound::UnknownHostedGroupSnafu {
                 group_id: old_group_id,
             })?;
+        let schema_matches = old_group
+            .group_schema
+            .has_same_schema_definitions(&proposal.group_schema);
         let arrival = Self::classify_migration_proposal_lifecycle(&old_group.lifecycle, proposal);
         transaction
             .release()
             .await
             .context(inbound::StoreAccessSnafu)?;
+        ensure!(
+            schema_matches,
+            inbound::MigrationSchemaMismatchSnafu {
+                old_group_id,
+                new_group_id: proposal.migration_id.new_group_id,
+            }
+        );
         Ok(arrival)
     }
 
@@ -3636,14 +3760,12 @@ impl ReplicationRuntimeComponent {
                             match activation_result {
                                 Ok(outcome) => {
                                     async_self.submit_membership_migration_messages(&dispatch);
-                                    let notification_result = notify_listener_data_changes(
-                                        async_self.listener.clone(),
-                                        smallvec![ListenerDataChanges {
-                                            read_token: outcome.read_token,
-                                            row_changes: outcome.row_changes,
-                                        }],
-                                    )
-                                    .await;
+                                    let notification_result =
+                                        notify_pending_activation_data_changes(
+                                            async_self.listener.clone(),
+                                            outcome,
+                                        )
+                                        .await;
                                     match notification_result {
                                         Ok(()) => Ok(migration_id),
                                         Err(error) => {

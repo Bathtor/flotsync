@@ -341,7 +341,7 @@ impl RowValuesPatch {
                     field_name,
                 }
             })?;
-            let initial_value = field.initial(value).map_err(Box::new).with_context(|_| {
+            let initial_value = field.initial(value).map_err(Into::into).with_context(|_| {
                 publish::InvalidFieldValueSnafu {
                     row_id: row_id.clone(),
                     dataset_id: row_id.dataset_id.clone(),
@@ -366,7 +366,7 @@ impl RowValuesPatch {
                     field_name,
                 }
             })?;
-            let pending_update = field.set(value).map_err(Box::new).with_context(|_| {
+            let pending_update = field.set(value).map_err(Into::into).with_context(|_| {
                 publish::InvalidFieldValueSnafu {
                     row_id: row_id.clone(),
                     dataset_id: row_id.dataset_id.clone(),
@@ -554,6 +554,7 @@ pub(super) fn apply_one_update(
                 group_id: update.group_id,
                 dataset_id: dataset_update.dataset_id.clone(),
                 actions: row_writes,
+                change_id: update.update_id,
                 last_changed_versions: last_changed_versions.clone(),
             });
         }
@@ -613,10 +614,7 @@ pub(super) fn apply_local_upsert(
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
     Ok(Some(AppliedLocalOperation {
         encoded_operation,
-        row_change: Some(RowChange::Upsert {
-            row_id: row_id.clone(),
-            row: Arc::new(row),
-        }),
+        row_change: Some(RowChange::ordinary_upsert(row_id.clone(), Arc::new(row))),
         row_write: DatasetRowStateWrite::UpsertActive {
             row_key: row_id.row_key,
             snapshot: row_snapshot,
@@ -641,9 +639,7 @@ pub(super) fn apply_local_delete(
     debug_assert!(row.tombstoned);
     Ok(AppliedLocalOperation {
         encoded_operation,
-        row_change: Some(RowChange::Delete {
-            row_id: row_id.clone(),
-        }),
+        row_change: Some(RowChange::ordinary_delete(row_id.clone())),
         row_write: DatasetRowStateWrite::UpsertTombstone {
             row_key: row_id.row_key,
             snapshot: row.snapshot,
@@ -759,18 +755,13 @@ fn apply_decoded_publish_operation(
         if was_tombstoned {
             None
         } else {
-            Some(RowChange::Delete {
-                row_id: row_id.clone(),
-            })
+            Some(RowChange::ordinary_delete(row_id.clone()))
         }
     } else {
         let row = dataset
             .clone_value_row(row_id.row_key)
             .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
-        Some(RowChange::Upsert {
-            row_id: row_id.clone(),
-            row: Arc::new(row),
-        })
+        Some(RowChange::ordinary_upsert(row_id.clone(), Arc::new(row)))
     };
     Ok(AppliedLocalOperation {
         encoded_operation,
@@ -826,9 +817,7 @@ fn apply_remote_operation(
         if was_tombstoned {
             None
         } else {
-            Some(RowChange::Delete {
-                row_id: api_row_id.clone(),
-            })
+            Some(RowChange::ordinary_delete(api_row_id.clone()))
         }
     } else {
         Some({
@@ -837,10 +826,7 @@ fn apply_remote_operation(
                 .unwrap_or_else(|| {
                     panic!("applied inbound upsert must leave row {api_row_id} readable")
                 });
-            RowChange::Upsert {
-                row_id: api_row_id.clone(),
-                row: Arc::new(row),
-            }
+            RowChange::ordinary_upsert(api_row_id.clone(), Arc::new(row))
         })
     };
     Ok(AppliedRemoteOperation {

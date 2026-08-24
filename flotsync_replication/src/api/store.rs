@@ -1,6 +1,8 @@
 //! Replication store records and transaction contracts.
 
 use super::*;
+use futures_util::FutureExt;
+use snafu::{Snafu, ensure};
 
 /// Borrowed group, dataset, and schema arguments for one schema-aware store operation.
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +59,132 @@ pub struct DatasetRowStateBatch {
     pub next_after: Option<RowKey>,
 }
 
+impl DatasetRowStateBatch {
+    /// Build row transitions from two ordered pages for the same dataset reference.
+    ///
+    /// `self` is the previous-group page and `current_batch` is the
+    /// current-group page. Both pages must reference the same dataset.
+    ///
+    /// The result contains at most `limit` transitions in ascending row-key order.
+    /// Each key present in either input page is represented once, with the
+    /// corresponding previous and current records populated when present.
+    /// `next_after` contains the final emitted key when either input page may
+    /// have more rows, and is `None` when both inputs are exhausted. When the
+    /// combined page exceeds `limit`, input records after the final emitted key
+    /// are consumed but omitted from the result. Store-backed callers resume
+    /// their source scans after that key and may fetch those records again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the input pages reference different datasets.
+    #[must_use]
+    pub fn transition_with_limit(
+        self,
+        current_batch: Self,
+        limit: NonZeroUsize,
+    ) -> DatasetRowStateTransitionBatch {
+        assert_eq!(
+            self.dataset_id, current_batch.dataset_id,
+            "row-state transition batches must reference the same dataset"
+        );
+
+        let previous_may_continue = self.next_after.is_some();
+        let current_may_continue = current_batch.next_after.is_some();
+        let mut previous_rows = self.rows.into_iter().peekable();
+        let mut current_rows = current_batch.rows.into_iter().peekable();
+        let mut rows = Vec::with_capacity(limit.get());
+
+        while rows.len() < limit.get() {
+            let transition = match (previous_rows.peek(), current_rows.peek()) {
+                (Some(previous), Some(current)) => match previous.row_id.cmp(&current.row_id) {
+                    std::cmp::Ordering::Less => DatasetRowStateTransition {
+                        row_key: previous.row_id,
+                        previous: previous_rows.next(),
+                        current: None,
+                    },
+                    std::cmp::Ordering::Equal => DatasetRowStateTransition {
+                        row_key: previous.row_id,
+                        previous: previous_rows.next(),
+                        current: current_rows.next(),
+                    },
+                    std::cmp::Ordering::Greater => DatasetRowStateTransition {
+                        row_key: current.row_id,
+                        previous: None,
+                        current: current_rows.next(),
+                    },
+                },
+                (Some(previous), None) => DatasetRowStateTransition {
+                    row_key: previous.row_id,
+                    previous: previous_rows.next(),
+                    current: None,
+                },
+                (None, Some(current)) => DatasetRowStateTransition {
+                    row_key: current.row_id,
+                    previous: None,
+                    current: current_rows.next(),
+                },
+                (None, None) => break,
+            };
+            assert!(
+                transition.previous.is_some() || transition.current.is_some(),
+                "row-state transition must contain at least one record"
+            );
+            rows.push(transition);
+        }
+
+        let has_buffered_rows = previous_rows.peek().is_some() || current_rows.peek().is_some();
+        let may_continue = has_buffered_rows || previous_may_continue || current_may_continue;
+        let last_row_key = rows.last().map(|transition| transition.row_key);
+        let next_after = option_when!(may_continue, last_row_key).flatten();
+
+        DatasetRowStateTransitionBatch {
+            previous_group_id: self.group_id,
+            current_group_id: current_batch.group_id,
+            dataset_id: self.dataset_id,
+            previous_dataset_exists: self.dataset_exists,
+            current_dataset_exists: current_batch.dataset_exists,
+            rows,
+            next_after,
+        }
+    }
+}
+
+/// One row-key-aligned transition between two group occurrences.
+///
+/// At least one record is present. Each present record has a `row_id` equal to
+/// `row_key`; present records retain their stored active or tombstoned state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowStateTransition {
+    /// Row key shared by both optional records.
+    pub row_key: RowKey,
+    /// Stored row from [`DatasetRowStateTransitionBatch::previous_group_id`], when present.
+    pub previous: Option<ReplicationRowStateRecord>,
+    /// Stored row from [`DatasetRowStateTransitionBatch::current_group_id`], when present.
+    pub current: Option<ReplicationRowStateRecord>,
+}
+
+/// Storage result for one ordered batch of dataset row-state transitions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowStateTransitionBatch {
+    /// Replication group owning the previous dataset occurrence.
+    pub previous_group_id: GroupId,
+    /// Replication group owning the current dataset occurrence.
+    pub current_group_id: GroupId,
+    /// Dataset scanned in both replication groups.
+    pub dataset_id: DatasetId,
+    /// Whether the previous dataset occurrence exists in storage.
+    pub previous_dataset_exists: bool,
+    /// Whether the current dataset occurrence exists in storage.
+    pub current_dataset_exists: bool,
+    /// Transitions in ascending order by keys present in either group occurrence.
+    pub rows: Vec<DatasetRowStateTransition>,
+    /// Exclusive lower bound for the next transition scan.
+    ///
+    /// `None` means both scans are exhausted. `Some` may lead to an empty
+    /// follow-up batch when an underlying scan ended exactly at its row count.
+    pub next_after: Option<RowKey>,
+}
+
 /// Complete row state snapshot used by replication storage.
 pub type ReplicationRowStateSnapshot = RowStateSnapshot<'static, UpdateId>;
 
@@ -80,6 +208,11 @@ pub struct ReplicationRowStateRecord {
     pub snapshot: ReplicationRowStateSnapshot,
     /// Whether the row is deleted but still retained for causal updates.
     pub tombstoned: bool,
+    /// Update which first introduced this row key in its replication group.
+    ///
+    /// This is unknown when storage first observes the row as a tombstone and
+    /// therefore cannot prove which earlier update created it.
+    pub created_by: Option<UpdateId>,
     /// Causal version of the last update that changed this row image.
     pub last_changed_versions: VersionVector,
 }
@@ -93,6 +226,8 @@ pub struct DatasetRowStatePatch {
     pub dataset_id: DatasetId,
     /// Ordered row-level writes to apply transactionally.
     pub actions: Vec<DatasetRowStateWrite>,
+    /// Update whose operations produced every row write in this patch.
+    pub change_id: UpdateId,
     /// Causal version to store as the last change for every row in `actions`.
     pub last_changed_versions: VersionVector,
 }
@@ -261,6 +396,47 @@ pub trait ReplicationStoreReadTransaction: Send {
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>>;
+
+    /// Scan one ordered transition batch of a dataset across two replication groups.
+    ///
+    /// `previous_group` and `current_group` supply the owning group, equal
+    /// dataset references, and schema for each occurrence. `after` is an
+    /// exclusive lower bound over row keys; `None` starts before the first key.
+    ///
+    /// The result contains at most `limit` transitions in ascending row-key order.
+    /// Every key greater than `after` which is stored in either group is
+    /// represented once until the limit is reached. Each transition contains the
+    /// stored previous and current records when present, including tombstones.
+    /// The two dataset-existence flags describe whether the dataset is stored
+    /// in each group even when that occurrence contributes no rows.
+    /// `next_after` is the final emitted key when another scan may be needed,
+    /// and `None` when both occurrences are known to be exhausted.
+    ///
+    /// # Default implementation
+    ///
+    /// The default performs two ordinary scans and joins their results in
+    /// memory. Store engines should override it when they can align the two
+    /// row-key sets more efficiently within storage.
+    fn scan_dataset_row_transition_batch<'a>(
+        &'a mut self,
+        previous_group: GroupDatasetSchemaRef<'a>,
+        current_group: GroupDatasetSchemaRef<'a>,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        async move {
+            ensure_matching_transition_dataset_references(previous_group, current_group)
+                .map_err(StoreError::from_classification_source)?;
+            let previous_batch = self
+                .scan_dataset_row_batch(previous_group, after, limit)
+                .await?;
+            let current_batch = self
+                .scan_dataset_row_batch(current_group, after, limit)
+                .await?;
+            Ok(previous_batch.transition_with_limit(current_batch, limit))
+        }
+        .boxed()
+    }
 
     /// Load all unresolved listener-mediated group decisions.
     fn load_pending_group_decisions(
@@ -537,4 +713,128 @@ pub trait ReplicationStore:
     fn begin_read_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>>;
+}
+
+/// Validate that two group-dataset references describe one dataset transition.
+pub(crate) fn ensure_matching_transition_dataset_references(
+    previous_group: GroupDatasetSchemaRef<'_>,
+    current_group: GroupDatasetSchemaRef<'_>,
+) -> Result<(), DatasetTransitionReferenceMismatchError> {
+    ensure!(
+        previous_group.dataset_id == current_group.dataset_id,
+        DatasetTransitionReferenceMismatchSnafu {
+            previous_dataset_id: previous_group.dataset_id.clone(),
+            current_dataset_id: current_group.dataset_id.clone(),
+        }
+    );
+    Ok(())
+}
+
+/// Two sides of a requested row transition referenced different datasets.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Dataset row transition referenced previous dataset '{previous_dataset_id}' and current dataset '{current_dataset_id}'."
+))]
+pub(crate) struct DatasetTransitionReferenceMismatchError {
+    /// Dataset reference supplied for the previous group occurrence.
+    previous_dataset_id: DatasetId,
+    /// Dataset reference supplied for the current group occurrence.
+    current_dataset_id: DatasetId,
+}
+
+impl StoreErrorClassificationSource for DatasetTransitionReferenceMismatchError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        Some(
+            StoreErrorClassification::UNKNOWN
+                .with_scope(StoreErrorScope::Operation)
+                .with_class(StoreErrorClass::Contract)
+                .with_resolution(StoreErrorResolution::FixBug),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn row(row_key: u128) -> ReplicationRowStateRecord {
+        ReplicationRowStateRecord {
+            row_id: RowKey(Uuid::from_u128(row_key)),
+            snapshot: ReplicationRowStateSnapshot::from_owned_fields(Vec::new()),
+            tombstoned: false,
+            created_by: Some(UpdateId::INITIAL_STATE_ORIGIN),
+            last_changed_versions: VersionVector::initial(
+                NonZeroUsize::new(1).expect("test member count is non-zero"),
+            ),
+        }
+    }
+
+    fn batch(
+        group_id: u128,
+        dataset_id: &'static str,
+        rows: impl IntoIterator<Item = u128>,
+        next_after: Option<u128>,
+    ) -> DatasetRowStateBatch {
+        DatasetRowStateBatch {
+            group_id: GroupId(Uuid::from_u128(group_id)),
+            dataset_id: DatasetId::try_from_static(dataset_id).expect("test dataset id is valid"),
+            dataset_exists: true,
+            rows: rows.into_iter().map(row).collect(),
+            next_after: next_after.map(|row_key| RowKey(Uuid::from_u128(row_key))),
+        }
+    }
+
+    #[test]
+    fn transition_batch_aligns_the_row_key_union() {
+        let previous_batch = batch(1, "shared", [1, 3], None);
+        let current_batch = batch(2, "shared", [2, 3], None);
+        let limit = NonZeroUsize::new(4).expect("test limit is non-zero");
+        let merged = previous_batch.transition_with_limit(current_batch, limit);
+
+        let row_presence = merged
+            .rows
+            .iter()
+            .map(|transition| {
+                (
+                    transition.row_key.0.as_u128(),
+                    transition.previous.is_some(),
+                    transition.current.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            row_presence,
+            vec![(1, true, false), (2, false, true), (3, true, true)]
+        );
+        assert_eq!(merged.next_after, None);
+    }
+
+    #[test]
+    fn transition_batch_pages_the_union_without_losing_buffered_keys() {
+        let previous_batch = batch(1, "shared", [1, 4], None);
+        let current_batch = batch(2, "shared", [2, 3], None);
+        let limit = NonZeroUsize::new(2).expect("test limit is non-zero");
+        let merged = previous_batch.transition_with_limit(current_batch, limit);
+
+        let row_keys = merged
+            .rows
+            .iter()
+            .map(|transition| transition.row_key.0.as_u128())
+            .collect::<Vec<_>>();
+
+        assert_eq!(row_keys, vec![1, 2]);
+        assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(2))));
+    }
+
+    #[test]
+    fn transition_batch_preserves_underlying_exact_limit_continuation() {
+        let previous_batch = batch(1, "shared", [1], Some(1));
+        let current_batch = batch(2, "shared", [1], Some(1));
+        let limit = NonZeroUsize::new(1).expect("test limit is non-zero");
+        let merged = previous_batch.transition_with_limit(current_batch, limit);
+
+        assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(1))));
+    }
 }

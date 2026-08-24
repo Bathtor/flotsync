@@ -40,10 +40,12 @@ use crate::{
         AuthorityScope,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
+        DataChangeLineage,
         DatasetId,
         DatasetRowStateBatch,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
+        DatasetRowStateTransitionBatch,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupDatasetSchemaRef,
@@ -101,6 +103,7 @@ use crate::{
         ReplicationUpdateRecord,
         RowChange,
         RowChangeBatch,
+        RowChangeKind,
         RowId,
         RowKey,
         RowKeyIterator,
@@ -183,7 +186,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, LazyLock, Mutex, mpsc},
@@ -314,6 +317,7 @@ where
                 fail_next_activate_replication_group,
                 fail_after_next_pending_group_commit,
                 hide_local_private_keys,
+                provider_scan: None,
                 wrote_pending_group_work: false,
             }) as Box<dyn ReplicationStoreTransaction>)
         }
@@ -341,6 +345,7 @@ where
                 fail_next_apply_dataset_row_patch,
                 fail_next_activate_replication_group,
                 fail_after_next_pending_group_commit,
+                provider_scan: None,
                 wrote_pending_group_work: false,
             }) as Box<dyn ReplicationStoreReadTransaction>)
         }
@@ -387,6 +392,8 @@ struct FailingStoreTransaction {
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
     fail_next_activate_replication_group: Arc<Mutex<bool>>,
     fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
+    /// Optional deterministic scan behaviour for replacement-provider tests.
+    provider_scan: Option<ProviderTestScanBehaviour>,
     wrote_pending_group_work: bool,
 }
 
@@ -573,10 +580,58 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
+        if let Some(provider_scan) = self.provider_scan.as_mut() {
+            provider_scan
+                .state
+                .lock()
+                .expect("provider transaction state mutex must not be poisoned")
+                .row_requests
+                .push(ProviderTestScanRequest {
+                    dataset_id: dataset.dataset_id.clone(),
+                    after,
+                    limit,
+                });
+            let result = provider_scan
+                .row_results
+                .pop_front()
+                .expect("provider test must supply one result per ordinary scan");
+            return futures_util::future::ready(result).boxed();
+        }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .scan_dataset_row_batch(dataset, after, limit)
+    }
+
+    fn scan_dataset_row_transition_batch<'a>(
+        &'a mut self,
+        previous_group: GroupDatasetSchemaRef<'a>,
+        current_group: GroupDatasetSchemaRef<'a>,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        if let Some(provider_scan) = self.provider_scan.as_mut() {
+            assert_eq!(previous_group.dataset_id, current_group.dataset_id);
+            provider_scan
+                .state
+                .lock()
+                .expect("provider transaction state mutex must not be poisoned")
+                .transition_requests
+                .push(ProviderTestScanRequest {
+                    dataset_id: previous_group.dataset_id.clone(),
+                    after,
+                    limit,
+                });
+            let result = provider_scan
+                .transition_results
+                .pop_front()
+                .expect("provider test must supply one result per transition scan");
+            return futures_util::future::ready(result).boxed();
+        }
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .scan_dataset_row_transition_batch(previous_group, current_group, after, limit)
     }
 
     fn load_pending_group_decisions(
@@ -628,7 +683,19 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
     }
 
     fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
-        let Self { inner, .. } = *self;
+        let Self {
+            inner,
+            provider_scan,
+            ..
+        } = *self;
+        if let Some(provider_scan) = provider_scan {
+            provider_scan
+                .state
+                .lock()
+                .expect("provider transaction state mutex must not be poisoned")
+                .release_count += 1;
+            return futures_util::future::ready(Ok(())).boxed();
+        }
         inner
             .expect("failing store transaction must remain open until release")
             .rollback()
@@ -925,8 +992,8 @@ enum CapturedPendingGroupEvent {
 
 impl CapturedRowChange {
     fn capture(change: RowChange) -> Result<Self, ListenerError> {
-        match change {
-            RowChange::Upsert { row_id, row } => {
+        match change.change {
+            RowChangeKind::Upsert { row_id, row, .. } => {
                 let title = row
                     .get_field_value::<str>("title")
                     .boxed()
@@ -934,7 +1001,7 @@ impl CapturedRowChange {
                     .into_owned();
                 Ok(Self::Upsert { row_id, title })
             }
-            RowChange::Delete { row_id } => Ok(Self::Delete { row_id }),
+            RowChangeKind::Delete { row_id } => Ok(Self::Delete { row_id }),
         }
     }
 
@@ -954,6 +1021,7 @@ impl CapturedRowChange {
 
 struct ListenerStub {
     data_changes: Mutex<Vec<CapturedDataChange>>,
+    data_change_lineages: Mutex<Vec<DataChangeLineage>>,
     data_change_read_tokens: Mutex<Vec<ReadToken>>,
     pending_group_events: Mutex<Vec<CapturedPendingGroupEvent>>,
     migration_proposal_event_sizes: Mutex<Vec<usize>>,
@@ -968,6 +1036,7 @@ impl Default for ListenerStub {
         let (buffered_event_tx, buffered_events) = mpsc::channel();
         Self {
             data_changes: Mutex::new(Vec::new()),
+            data_change_lineages: Mutex::new(Vec::new()),
             data_change_read_tokens: Mutex::new(Vec::new()),
             pending_group_events: Mutex::new(Vec::new()),
             migration_proposal_event_sizes: Mutex::new(Vec::new()),
@@ -1025,6 +1094,14 @@ impl ListenerStub {
             .clone()
     }
 
+    fn captured_data_change_lineages(&self) -> Vec<DataChangeLineage> {
+        self.drain_buffered_events();
+        self.data_change_lineages
+            .lock()
+            .expect("listener lineage capture mutex must not be poisoned")
+            .clone()
+    }
+
     fn take_pending_group_events(&self) -> Vec<CapturedPendingGroupEvent> {
         std::mem::take(
             &mut *self
@@ -1075,6 +1152,7 @@ impl ReplicationEventListener for ListenerStub {
         async move {
             match event {
                 ReplicationEvent::DataChanged {
+                    lineage,
                     read_token,
                     mut rows,
                 } => {
@@ -1095,6 +1173,10 @@ impl ReplicationEventListener for ListenerStub {
                         .lock()
                         .expect("listener read-token capture mutex must not be poisoned")
                         .push(read_token);
+                    self.data_change_lineages
+                        .lock()
+                        .expect("listener lineage capture mutex must not be poisoned")
+                        .push(lineage);
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,
@@ -1162,6 +1244,74 @@ impl ReplicationEventListener for ListenerStub {
         }
         .boxed()
     }
+}
+
+/// Deterministic scan results used by the existing store-transaction test wrapper.
+struct ProviderTestScanBehaviour {
+    /// Observations retained after the transaction is consumed.
+    state: Arc<Mutex<ProviderTestTransactionState>>,
+    /// Results returned by ordinary current-group scans.
+    row_results: VecDeque<Result<DatasetRowStateBatch, StoreError>>,
+    /// Results returned by hosted transition scans.
+    transition_results: VecDeque<Result<DatasetRowStateTransitionBatch, StoreError>>,
+}
+
+impl Drop for ProviderTestScanBehaviour {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("provider transaction state mutex must not be poisoned")
+            .drop_count += 1;
+    }
+}
+
+/// Build the existing store transaction wrapper with deterministic provider scans.
+pub(in crate::runtime) fn provider_test_read_transaction(
+    row_results: impl IntoIterator<Item = Result<DatasetRowStateBatch, StoreError>>,
+    transition_results: impl IntoIterator<Item = Result<DatasetRowStateTransitionBatch, StoreError>>,
+) -> (
+    Box<dyn ReplicationStoreReadTransaction>,
+    Arc<Mutex<ProviderTestTransactionState>>,
+) {
+    let state = Arc::new(Mutex::new(ProviderTestTransactionState::default()));
+    let transaction = FailingStoreTransaction {
+        inner: None,
+        hide_local_private_keys: false,
+        fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
+        fail_next_activate_replication_group: Arc::new(Mutex::new(false)),
+        fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
+        provider_scan: Some(ProviderTestScanBehaviour {
+            state: state.clone(),
+            row_results: row_results.into_iter().collect(),
+            transition_results: transition_results.into_iter().collect(),
+        }),
+        wrote_pending_group_work: false,
+    };
+    (Box::new(transaction), state)
+}
+
+/// One scan request observed by replacement-provider tests.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::runtime) struct ProviderTestScanRequest {
+    /// Dataset requested by the provider.
+    pub(in crate::runtime) dataset_id: DatasetId,
+    /// Exclusive row-key lower bound supplied to storage.
+    pub(in crate::runtime) after: Option<RowKey>,
+    /// Requested page limit.
+    pub(in crate::runtime) limit: NonZeroUsize,
+}
+
+/// Shared lifecycle and request observations for a provider test transaction.
+#[derive(Default)]
+pub(in crate::runtime) struct ProviderTestTransactionState {
+    /// Ordinary current-group scans in call order.
+    pub(in crate::runtime) row_requests: Vec<ProviderTestScanRequest>,
+    /// Hosted transition scans in call order.
+    pub(in crate::runtime) transition_requests: Vec<ProviderTestScanRequest>,
+    /// Number of explicit release calls.
+    pub(in crate::runtime) release_count: usize,
+    /// Number of transaction values dropped.
+    pub(in crate::runtime) drop_count: usize,
 }
 
 mod changes;

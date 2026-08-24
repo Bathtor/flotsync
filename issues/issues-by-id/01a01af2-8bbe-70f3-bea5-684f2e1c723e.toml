@@ -1,0 +1,161 @@
+id = "01a01af2-8bbe-70f3-bea5-684f2e1c723e"
+ref = "flotsync-v76"
+title = "Emit group replacement row lineage"
+body = """
+Expose group-replacement lineage to listeners and implement the streaming replication-layer comparison using the transition scan and provenance foundation from flotsync-j6x.
+
+Parent context:
+C01. Parent task flotsync-9fs keeps RowId group-scoped while relating matching DatasetId and RowKey occurrences within one explicit group replacement.
+C02. Applications own reconciliation of dirty state; Flotsync reports conservative correspondence, divergence, and cut evidence without choosing a merge.
+C03. This child consumes the raw row-transition scan and created_by provenance supplied by the completed storage child.
+C04. Substantive replicated-checklist dirty-state reconciliation remains separated into follow-up child flotsync-fk0; this child makes only minimal API-conformance changes to that example.
+
+Agreed listener API:
+A01. Keep ReplicationEvent::DataChanged and add DataChangeLineage distinguishing Update changes within a group from GroupReplacement { migration_id }.
+A02. RowChange contains PreviousRow metadata and a RowChangeKind Upsert or Delete action.
+A03. PreviousRow distinguishes NotCompared updates, a Present visible predecessor, an Absent predecessor with not-stored or tombstone evidence, and Unavailable predecessor state.
+A04. NotStored means Flotsync inspected the locally hosted old group and found no stored occurrence for the corresponding key. Unavailable means the old group could not be inspected, so past existence is unknown.
+A05. Corresponding visible rows emit one successor Upsert naming the previous RowId. Previous-visible and current-missing rows emit Delete for the previous RowId. Current-only rows emit successor Upsert with absent or unavailable evidence.
+A06. Upserts carry Option<Box<[RowFieldDifference]>> previous-value differences. Some means visible predecessor and successor values were compared; an empty collection means identical. None means no comparison, with PreviousRow explaining why.
+A07. RowFieldDifference uses Cow<'static, str> field names so static schema names can be borrowed and shared/dynamic schema names remain owned.
+A08. Previous stored rows carry conservative evidence as Option values: creator is Local or Other when known; creation and latest state are Included or NotIncluded relative to the accepted cut when provable; None means Flotsync cannot establish the answer.
+A09. Included means the accepted old-group state used to create the successor contained the operation or latest state. NotIncluded means locally known old-group work is newer than the accepted cut and is not known to have reached the member that created the successor.
+A10. One GroupReplacement DataChanged event is the atomic application transition across all datasets, including an empty provider. Applications merge its ReadToken only after consuming and recording the complete replacement.
+
+Repository-specific behaviour:
+R01. A locally accepted MigrationProposal carries the hosted predecessor and final cut required for comparison.
+R02. A migration-sourced GroupInvitation carries its MigrationId but deliberately has no hosted predecessor or cut. It still emits GroupReplacement lineage, with current rows marked PreviousRow::Unavailable and no value comparison.
+R03. Ordinary creation invitations use DataChangeLineage::Update.
+R04. Hosted membership changes preserve the predecessor schema. Preparation clones it, inbound proposal admission rejects changed schema definitions before setup work, and activation repeats the check before committing.
+R05. Visibility mapping is: visible and visible to successor Upsert with comparison; visible and missing or tombstoned to old-row Delete; missing or tombstoned and visible to successor Upsert with absence evidence; neither visible to no row change.
+R06. A tombstoned predecessor is application-absent but retains its RowId and latest-state cut evidence. A missing stored predecessor is represented separately.
+R07. Cut comparison uses Option and VersionVector::partial_cmp: less or equal is Included, greater is NotIncluded, and an undefined comparison is None.
+
+Implementation work:
+I01. Rewrite the public rustdoc in application terms, including the concrete distinction between NotStored and Unavailable and the reconciliation consequence of cut evidence.
+I02. Remove Unknown evidence variants in favour of Option fields and remove PreviousValueComparison in favour of optional previous-value differences.
+I03. Add Cow<'static, str> field names, borrowing from SchemaSource::Static and owning names for shared schemas.
+I04. Put differing-field iteration on RowValues, field-name access on RowFieldDifference, and construction on RowId.
+I05. Remove the component-local GroupReplacementRowReadTransaction and use Box<dyn ReplicationStoreReadTransaction> directly.
+I06. Refactor hosted transition translation into readable visibility branches calling small named helpers. Use PreviousRow constructors and Option utilities for absence.
+I07. Preserve one consistent read transaction, deterministic dataset order, bounded reusable batches, release-on-drain, release-on-drop, opaque multi-group ReadToken semantics, and the current post-commit listener failure model.
+I08. Refactor activation so snapshot embedding writes successor state without building the replacement listener Vec. After atomic activation and old-group closure commit, construct the appropriate update or replacement notification and its pinned read transaction.
+I09. Keep visibility, correspondence, field comparison, creator classification, and causal interpretation in replication. Storage transition records remain raw inputs.
+I10. Make only minimal replicated-checklist source and test adaptations required by the API change.
+
+Review remediation and tests:
+Q01. Adapt provider state-machine tests to the existing ReplicationStoreReadTransaction test infrastructure rather than retaining a production-only mocking trait.
+Q02. Cover multi-page and multi-dataset traversal, invisible-only pages, scan failure propagation, and transaction release on drain and drop.
+Q03. Cover every previous/current visibility combination, identical and divergent values, stable field ordering, creator classifications, and included/not-included/unknown cut evidence.
+Q04. Cover borrowed field names from static schemas and owned field names from shared schemas.
+Q05. Reuse established LazyLock schema fixtures and use constants for fixed const-constructible identifiers.
+Q06. Retain secure migration listener-delivery waits, schema-mismatch rejection, empty replacement, invitation, restart, repeated-change, and read-token ordering coverage.
+
+Validation and documentation:
+V01. Update public rustdoc and the relevant OKF API and group-replacement documents using the project-local OKF conventions; regenerate and check the index.
+V02. Update listeners, runtime tests, secure integration tests, examples, and documentation for DataChangeLineage::Update and the simplified upsert comparison field.
+V03. Run formatting, focused data-type/provider/runtime tests, broader single-threaded replication tests as appropriate, replicated-checklist tests, and pedantic clippy for touched Rust targets.
+V04. Before hand-off, audit every item in .agent_local_docs/tmp/flotsync-v76-review-2026-08-23.md and report anything unresolved or intentionally deferred.
+
+Explicit exclusions:
+X01. Replicated-checklist dirty-state reconciliation, conflict presentation, and user resolution remain deferred to priority-2 child flotsync-fk0, blocked by this task.
+X02. Detailed schema-added, defaulted, and removed field semantics and the columnar schema helper remain deferred.
+X03. Application-specific dirty-state merging and automatic framework conflict resolution remain out of scope.
+X04. Stable group-lineage identity remains in priority-4 follow-up flotsync-2js.
+X05. A general retryable listener outbox is not introduced; post-commit listener failure retains the existing recovery model.
+
+Estimate:
+E01. Public API and rustdoc: 90-150 changed LOC.
+E02. RowValues, Cow ownership, and helper placement: 70-130 changed LOC.
+E03. Provider simplification: 100-180 changed LOC, likely a net deletion.
+E04. Test restructuring: 180-300 changed LOC.
+E05. Call sites and OKF documentation: 80-140 changed LOC.
+E06. Expected review delta: 520-900 changed LOC, below 1,000 LOC and not requiring another task split.
+
+Review round 3 implementation:
+Q07. Generalise RowValues::differing_field_names terminology from previous to other and require equal field counts with a documented assertion.
+Q08. Export coerce_infallible from flotsync_utils and use that shared adapter for the provider's Result::map_err conversion.
+Q09. Express optional creator and version-order evidence with Option filtering/mapping while preserving synthetic-origin and unknown semantics.
+Q10. Add focused field-count and utility coverage, then rerun the touched-crate and replication validation before returning the issue to review.
+
+Review round 4 implementation:
+Q11. Require RowValues comparisons to use identical field sets, failing immediately when an equal-length row contains a different field name; schema evolution remains outside this comparison path.
+Q12. Extend focused RowValues coverage for equal-count/different-field rows, then rerun data-types, provider, formatting, and pedantic clippy validation."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+labels = ["area:replication"]
+assignee = "codex"
+blocked_by = ["01a01af2-7b1b-71c3-bf8b-6a8747152a65"]
+blocks = ["01a0202d-5496-7740-9ec8-b264c2971798"]
+parent = "019f5b3a-ee57-7413-b39b-55e107995695"
+created_at = "2026-08-19T16:54:58.238942Z"
+updated_at = "2026-08-24T12:16:06.957764Z"
+closed_at = "2026-08-24T12:16:06.957764Z"
+
+[[comments]]
+id = "01a0202e-a6de-7712-a7da-47782fcf46f2"
+author = "codex"
+body = "Plan aligned after repository audit. Substantive replicated-checklist dirty-state reconciliation is split into sibling child flotsync-fk0, blocked by this task. flotsync-v76 now owns the public/runtime replacement API, comparison provider, evidence, tests, OKF updates, and only minimal checklist API conformance."
+created_at = "2026-08-20T17:18:43.422839Z"
+
+[[comments]]
+id = "01a0204a-efa6-73d3-91a2-bc408f48537f"
+author = "codex"
+body = "Implementation ready for review. Added the agreed public DataChangeLineage/PreviousRow/field-difference/cut-evidence API, store-backed hosted and unavailable replacement providers, activation integration including empty replacement events, and minimal checklist API conformance. Substantive checklist reconciliation remains in flotsync-fk0. Validation passed: 333 flotsync_replication library tests, 72 replicated-checklist example tests, nine focused provider lineage tests, hosted/new-member secure migration lineage, pending activation resume tests, pedantic clippy with test-support, formatting, diff check, and the OKF documentation check."
+created_at = "2026-08-20T17:49:37.062393Z"
+
+[[comments]]
+id = "01a02057-c87f-78a1-ae85-01e7647b5e87"
+author = "lkroll"
+body = "Review delta agreed: enforce unchanged schemas at inbound admission and activation, add direct provider pagination and transaction-lifecycle coverage, wait explicitly for secure listener delivery, remove page-state clones and the intermediate difference allocation, clarify accessors and pending activation ownership, rename the fixed batch constant, and restore module ordering."
+created_at = "2026-08-20T18:03:39.007108Z"
+
+[[comments]]
+id = "01a02061-e53f-77a3-b77d-010cdc81caf0"
+author = "lkroll"
+body = "Agreed review fixes complete. Hosted replacements now reject schema-definition changes at inbound admission and revalidate before activation commit. Direct provider tests cover reusable multi-page and multi-dataset traversal, invisible-only pages, empty streams, explicit release, drop after scan failure, and error propagation. The secure migration test now waits for listener delivery. Page-state clones and the intermediate field-name allocation were removed; accessor visibility, rustdoc, constant naming, and module ordering were cleaned up. Validation passed: 337 replication library tests, all 6 secure runtime integration tests with test-support, 72 replicated-checklist example tests, pedantic clippy for replication and examples, formatting, and diff checks."
+created_at = "2026-08-20T18:14:41.727771Z"
+
+[[comments]]
+id = "01a02fc3-4bf7-78c1-bdbc-b63b038037d9"
+author = "codex"
+body = "Review plan agreed: simplify unknown evidence with Option, replace PreviousValueComparison with optional previous-value differences, borrow static field names through Cow, rename ordinary lineage to Update, remove the component-local transaction trait in favour of ReplicationStoreReadTransaction, move helpers to their owning types, clarify application-facing semantics, and clean up provider control flow and fixtures."
+created_at = "2026-08-23T17:55:23.255913Z"
+
+[[comments]]
+id = "01a02fd7-cfbf-7fc2-bd10-9ad7ab2d4237"
+author = "codex"
+body = "Review feedback implementation complete. All 22 captured comments are resolved with no deferrals: application-facing lineage documentation is clearer; unknown provenance and cut evidence use Option; previous-value comparison is optional differences; static field names use Cow; lineage is named Update; the provider uses ReplicationStoreReadTransaction directly; helpers moved to their owning types; and provider control flow and fixtures were simplified. Final validation passed: 338 replication library tests, 72 replicated-checklist example tests, 6 secure-runtime integration tests, 105 data-types unit tests plus 16 public-API tests, pedantic clippy for replication/examples/data types, rustdoc generation, formatting, diff checks, and the OKF check. The final focused provider suite passed all 13 tests."
+created_at = "2026-08-23T18:17:47.711928Z"
+
+[[comments]]
+id = "01a03397-0fa6-7b80-b988-abbab1b16305"
+author = "codex"
+body = "Review round 3 plan agreed: generalise RowValues comparison terminology, assert equal field counts, move coerce_infallible to flotsync_utils, and express creator/version-order evidence through Option filtering and mapping. Focused tests will cover the new invariant and shared utility before the full validation pass."
+created_at = "2026-08-24T11:45:33.094899Z"
+
+[[comments]]
+id = "01a0339b-8a34-72b1-9053-e4195aea8ff3"
+author = "codex"
+body = "Review round 3 complete with no deferrals. RowValues comparison now uses general other terminology and rejects unequal field counts; coerce_infallible is exported from flotsync_utils; creator provenance filters the synthetic origin before mapping; and version-cut evidence maps the optional ordering. Validation passed: 12 utility unit tests plus 2 doc tests, 106 data-types unit tests plus 16 public-API tests, 13 focused provider tests, 338 replication library tests, pedantic clippy for all touched crates/targets, formatting, diff checks, and rustdoc generation. Rustdoc reported only pre-existing unrelated link warnings."
+created_at = "2026-08-24T11:50:26.612298Z"
+
+[[comments]]
+id = "01a033a1-0df2-77c2-81ac-9c4bb1e1ce34"
+author = "codex"
+body = "Final review direction confirmed: RowValues::differing_field_names must require identical field names, not only equal counts. The implementation will retain the count assertion, expect each self field in the other row, and add equal-count/different-field coverage; schema evolution remains a separate future path."
+created_at = "2026-08-24T11:56:28.01886Z"
+
+[[comments]]
+id = "01a033a2-33ae-7fb2-955a-71466afcf9d6"
+author = "codex"
+body = "Final review comment complete. RowValues::differing_field_names now requires equal counts and expects every self field in the other row, so equal-length schema differences fail immediately. A dedicated regression test covers that case. Validation passed: 3 focused RowValues tests, 13 provider tests, pedantic clippy for data-types and replication, formatting, and diff checks."
+created_at = "2026-08-24T11:57:43.214318Z"
+
+[[comments]]
+id = "01a033b3-0b2d-71e2-a545-7050884d3914"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-24T12:16:06.957764Z"

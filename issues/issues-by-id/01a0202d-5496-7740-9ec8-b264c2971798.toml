@@ -1,0 +1,148 @@
+id = "01a0202d-5496-7740-9ec8-b264c2971798"
+ref = "flotsync-fk0"
+title = "Add checklist group replacement reconciliation"
+body = """
+Teach the replicated checklist application to consume group-replacement lineage as one atomic application-view transition and reconcile local working state deliberately before merging the event read token.
+
+Context:
+C01. flotsync-v76 emits `DataChangeLineage::GroupReplacement { migration_id }` with parent `PreviousRow` metadata, optional canonical `previous_value_differences`, and optional `PreviousRowEvidence` facts.
+C02. A `DataChanged` row provider may yield several pages, but one group replacement spans the complete provider and its `ReadToken` is merged only after the complete replacement is recorded and applied.
+C03. The checklist currently discards lineage, forwards provider pages independently, and rejects every incoming change that overlaps dirty local state.
+C04. The checklist rebuilds after restart from currently active groups, so interactive reconciliation state may remain process-local for this example.
+C05. Successful group invitation acceptance guarantees that its activation `DataChanged` event has already been delivered through the listener before `accept` returns.
+
+Agreed event boundary:
+A01. Consume each complete `DataChanged` provider into one checklist listener event containing its lineage, read token, and all row changes.
+A02. Validate ordinary updates against readable groups and validate replacements against their `MigrationId`: successor upserts use the new group, predecessor identities use the old group, and old-group deletes remain valid after predecessor closure.
+A03. Decode and stage a complete replacement before mutating the working set.
+A04. Resolve every ambiguous row in memory, atomically apply the resolved transition, record its event history, and only then merge the event read token.
+A05. Event history records the raw framework-delivered transition, not the application result selected by reconciliation; document that diagnostic distinction explicitly.
+A06. If interactive input fails or reaches EOF, do not apply the staged transition or merge its token. A restart reloads the active group view.
+A07. At sync entry, apply already delivered listener events before preparing publications so a closed dirty predecessor is remapped before publication. After publication begins, retain the existing rule that any failed publication defers later listener draining.
+
+Agreed reconciliation policy:
+R01. Ordinary `DataChangeLineage::Update` events retain the existing dirty-row conflict rejection policy.
+R02. Clean corresponding rows with identical projected values remap automatically from the old group-scoped identity to the successor identity.
+R03. A clean divergent successor is accepted automatically when the evidence establishes that the accepted cut included the latest old state. If old state may have been omitted, retain both candidates for interactive resolution.
+R04. Treat every local value meeting a successor value uniformly, regardless of whether the local value began as an insert or update. Identical values resolve cleanly. A dirty update may be rebased automatically when its locally changed fields and canonical successor differences are disjoint, an actual comparison is present, and the cut evidence makes that safe. `None` comparison data never establishes equality; only `Some([])` does. Other divergent pairs require interactive resolution.
+R05. A local deletion meeting a corresponding successor row uses absence as the local candidate and requires interactive resolution. If the successor already removed the row, the deletion is satisfied.
+R06. An unpublished local insertion which has no successor row remaps to the successor group as a dirty insertion.
+R07. Clean old-only rows are removed when evidence confirms that the accepted cut included their relevant old state. A locally created occurrence whose creation is explicitly not included is retained as a dirty successor insertion; ambiguous cases require interactive resolution.
+R08. Successor-only rows with `PreviousRow::Absent(NotStored)` or `PreviousRow::Unavailable` are accepted cleanly. When an old tombstone may have been omitted from the accepted cut, absence and the successor value require interactive resolution.
+R09. Later replacements use the same rules against the then-current working state; no unresolved conflict survives a completed command.
+R10. Dirty successor state is invalid when staging its own activation replacement. The invitation contract and immediate command-side drain prevent this normal state; reject it defensively rather than silently overwriting it or adding unsupported two-sided reconciliation.
+
+Agreed wizard:
+W01. For each ambiguous row, display the old and successor identities, local value or absence, remote successor value or absence, canonical differing fields, and available creator/creation/latest-state evidence.
+W02. Offer `accept local`, `accept remote`, `edit local`, and `edit remote` choices. An edit choice selects that value as the base and accepts the edited result.
+W03. The editor supports checklist text, note, tags, status, and priority. `edit_count` remains application-maintained and advances when edits change the selected base.
+W04. An edit option is unavailable when its selected side is absence; accepting absence remains a valid deletion choice.
+W05. Invalid input prompts again. No persistent conflict collection or long-lived `reconcile` command surface is added.
+
+Post-resolution behaviour:
+P01. Accepting the remote successor produces clean successor state.
+P02. Accepting or editing a local value produces a dirty successor update when a remote row exists, or a dirty successor insertion when it does not.
+P03. Accepting local absence against a remote row produces a dirty successor deletion.
+P04. If an edited result equals the remote value, it is clean and needs no publication.
+P05. Resolved local or edited results are not recursively republished from the wizard. The command reports how many choices remain dirty, names the affected successor groups, and explicitly instructs the user to run `sync` again.
+P06. Apply the same resolution path from every command which drains listener events, including `sync`, group creation, and invitation acceptance.
+
+Agreed review refactor:
+Q01. Use unordered group aggregation and sort only at presentation; simplify the single-replacement outcome and rename report combination to merge.
+Q02. Add a typed multi-option ChecklistDialog facility, share ChecklistItem field-edit behaviour with ordinary commands, and reduce reconciliation output to one write/context per coherent rendering function.
+Q03. Replace the indexed resolution API with resolve-next semantics.
+Q04. Split replacement decoding into named valid-shape helpers and document exact dataset/group validation requirements.
+Q05. Carry one named per-row reconciliation context through clean and dirty policy, return named resolution variants instead of nested options/booleans, use explicit branches, and replace positional application arguments with named data.
+Q06. Reuse one non-allocating ChecklistItem changed-field representation for publication, conflict checks, and rebasing; document monotonic edit-count max semantics.
+Q07. Retain RowFieldDifference values without allocating copied names, preserving None versus Some([]).
+Q08. Add RowId::same_dataset_row for dataset-and-key identity across groups and cover its semantics.
+Q09. Implement the refactor in three self-contained passes: interaction/rendering, reconciliation model, then shared field/identity APIs and tests. Expected review delta is roughly 640-1,050 touched LOC and should reduce or hold net production size.
+Q10. Keep retry loops minimal: omit redundant terminal continues and keep reconciliation choice labels on ReconciliationChoice.
+Q11. Use native multi-line literals for coherent multi-line REPL output while retaining one write and one I/O context per rendering function.
+Q12. Represent checklist changed fields with the existing workspace enumset dependency rather than custom raw bit masks, while retaining allocation-free patching, conflict detection, and rebasing.
+Q13. Explain intentionally empty state-machine branches where absence produces neither a visible row nor dirty successor work.
+
+Validation and documentation:
+V01. Cover complete multi-page event collection and token ordering.
+V02. Cover identity validation for ordinary updates and old-to-new replacements, including rejection of dirty successor state and missing corresponding-row comparisons where equality would otherwise be inferred.
+V03. Cover clean identical/divergent, introduced, removed, tombstoned, unavailable, dirty insert/update/delete, matching and incompatible fields, and repeated replacement cases.
+V04. Cover all four wizard choices, unavailable edit choices for absence, invalid input retry, edited-result cleanliness, and dirty successor results.
+V05. Cover the explicit next-sync guidance from sync, creation, and invitation handling.
+V06. Cover that migration invitation acceptance applies its already delivered replacement before returning and that sync drains queued replacements before publishing predecessor state.
+V07. Use complete-event terminology throughout listener types, counters, helpers, documentation, and user-facing output. Label non-trivial wizard retry loops as required by repository conventions.
+V08. Update the replicated-checklist scenario documentation with the example-specific policy, raw-event-history semantics, and one guided resolution walkthrough.
+V09. Keep all reconciliation policy inside the example; do not add framework-level automatic conflict resolution.
+
+Dependencies and exclusions:
+X01. flotsync-v76 is complete and supplies the final public APIs consumed here.
+X02. Schema-added/defaulted/removed reconciliation remains outside this task.
+X03. Stable group-lineage identity remains deferred to flotsync-2js.
+X04. Persistent conflict storage and automatic recursive publication from the wizard are explicitly excluded.
+X05. Supporting dirty state independently created in a successor before its activation event is excluded because it violates the invitation-delivery contract and command ordering.
+
+Estimate and implementation phases:
+E01. Whole-event listener transport and validation: 90-150 LOC.
+E02. Staging and automatic reconciliation: 240-380 LOC.
+E03. Editable wizard and command integration: 200-350 LOC.
+E04. Tests: 360-560 LOC.
+E05. Documentation: 50-90 LOC.
+E06. Expected total: approximately 930-1,530 LOC, so implementation remains split into two reviewable phases: atomic staging and policy first, followed by the editable wizard and scenario coverage."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+assignee = "codex"
+blocked_by = ["01a01af2-8bbe-70f3-bea5-684f2e1c723e"]
+parent = "019f5b3a-ee57-7413-b39b-55e107995695"
+created_at = "2026-08-20T17:17:16.822347Z"
+updated_at = "2026-08-24T16:37:36.677393Z"
+closed_at = "2026-08-24T16:37:36.677393Z"
+
+[[comments]]
+id = "01a033f4-0b39-7eb0-a287-2b534c8c8d79"
+author = "codex"
+body = "Plan aligned after review: dirty inserts and updates share one local-versus-successor policy; conflicts remain in memory only; the command runs an editable four-choice local/remote wizard before applying the replacement and merging its token; retained local resolutions become dirty successor changes with explicit guidance to run sync again."
+created_at = "2026-08-24T13:27:06.809418Z"
+
+[[comments]]
+id = "01a0340f-c4ce-7e61-b5bf-66992c701591"
+author = "lkroll"
+body = "Implementation ready for review: listener events are collected atomically; group replacements stage and reconcile against clean and dirty checklist state; ambiguous rows use the four-choice editable wizard; EOF preserves the pre-event working set and token; retained successor changes explicitly request another sync. Added policy, wizard, token-ordering, multi-page, lineage-validation, repeated-replacement, and guidance tests, plus the manual scenario walkthrough."
+created_at = "2026-08-24T13:57:23.790139Z"
+
+[[comments]]
+id = "01a0342f-1eb6-72e3-a11e-98bbe38915c4"
+author = "lkroll"
+body = "Review feedback applied: dirty deletion now reconciles absence against a surviving successor; sync drains queued replacements before selecting predecessor publications; dirty successor state is rejected defensively and migration acceptance timing is covered; missing value comparisons no longer imply equality; raw event history is documented; complete-event terminology and labelled wizard retries are in place. Validation: 96 example tests pass and pedantic clippy is clean."
+created_at = "2026-08-24T14:31:38.422625Z"
+
+[[comments]]
+id = "01a03474-9ff6-79f3-9e18-9d67474f30ca"
+author = "codex"
+body = "Review plan agreed: simplify report ordering and resolution APIs; add generic dialog choices and shared item editing; collapse reconciliation output; split decoding; replace positional tuples and booleans with named reconciliation data; reuse changed-field logic; retain RowFieldDifference values; and move same-dataset-row identity onto RowId."
+created_at = "2026-08-24T15:47:33.494183Z"
+
+[[comments]]
+id = "01a03487-78d6-7d81-9bef-cb76f81e10d5"
+author = "codex"
+body = "Implemented RC01-RC21: unordered aggregation with presentation sorting; generic typed dialog choices; shared checklist editing and changed-field semantics; consolidated rendering writes; resolve-next staging; named reconciliation context, decisions, and application state; split row-shape decoding; retained framework field differences; and RowId logical dataset-row identity. No review item is deferred. Coverage: 96 replicated-checklist tests and the focused RowId identity test pass; both affected crates are pedantic-clippy clean; formatting and diff checks pass."
+created_at = "2026-08-24T16:08:08.662121Z"
+
+[[comments]]
+id = "01a03499-ceba-76d3-a01f-6a7931a84abf"
+author = "codex"
+body = "Second review plan agreed: remove redundant retry continues, use native multi-line literals, move choice metadata onto ReconciliationChoice, replace custom field masks with enumset, and explain the intentionally empty absence branch."
+created_at = "2026-08-24T16:28:10.298272Z"
+
+[[comments]]
+id = "01a0349e-1071-7831-a66d-44cdec1bf8c0"
+author = "codex"
+body = "Implemented RC22-RC27: removed the redundant generic-choice retry continue and allowance; converted coherent REPL output to native multi-line literals; moved choice metadata onto ReconciliationChoice; replaced custom raw field masks with the workspace enumset dependency; and documented the intentionally empty absence branch. No item is deferred. Validation: 96 checklist tests and the focused RowId test pass, both affected crates are pedantic-clippy clean, formatting passes, and git diff --check is clean."
+created_at = "2026-08-24T16:32:49.265284Z"
+
+[[comments]]
+id = "01a034a2-7325-7802-825f-6b267484aa8c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-24T16:37:36.677393Z"
