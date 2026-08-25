@@ -1,0 +1,40 @@
+id = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+ref = "flotsync-d3k"
+title = "Prepare FlotSync for MaintainRS integration"
+body = """
+Goal
+
+Prepare the FlotSync library for initial integration into the MaintainRS todo application using the SQLite replication store and a Tokio/Tauri application runtime.
+
+Included work
+
+M01. Make ReadToken opaquely serialisable so MaintainRS can store and restore application read positions.
+M02. Establish a stable application-facing replication API boundary suitable for Tokio/Tauri ownership rather than Kompact-owned embedding.
+M03. Redesign schema-bound snapshot/storage row batching before MaintainRS depends deeply on the current inefficient API shape.
+M04. Make the workspace build and test on stable Rust.
+M05. Finish memory-bounded listener delivery for non-replacement inline activation snapshots by reusing the store-backed batching introduced for group replacement.
+M06. Automatically initiate Summary-based catch-up when a direct peer route becomes available again, so missed best-effort broadcasts can be repaired without a later edit or an application-issued manual summary request.
+
+Explicit deferrals
+
+D01. ReplicationStore conformance tests and the headless local store-secret backend are test infrastructure, not MaintainRS integration blockers.
+D02. Kompact-owned runtime topology embedding is not needed because MaintainRS uses Tokio through Tauri.
+D03. Browser and public mDNS component work can remain later.
+D04. Large resumable snapshot transfer, strict Ack semantics, explicit leave/GroupClose handling, relay/mailbox support, and broader internal protocol redesign remain outside this epic.
+
+Implementation size
+
+The combined implementation is expected to exceed 1000 LOC. The epic is therefore split into independently planned child tasks, each of which must be aligned and estimated separately before implementation."""
+status = "open"
+type = "epic"
+priority = 1
+children = [
+    "019f0542-b0cc-70a2-9d97-5faadb954349",
+    "019f0542-b0cc-70a2-9d97-5fb762bcf154",
+    "019f0542-b0cc-70a2-9d97-60b4c9f35b52",
+    "019f6edb-fadb-7fc2-a851-d7d919537b1a",
+    "019f7474-9d0a-7d21-ad30-d57c359543ed",
+    "01a039c6-cba7-7f72-a2cb-42106e06c80f",
+]
+created_at = "2026-08-25T16:35:10.400462Z"
+updated_at = "2026-08-25T16:36:42.680572Z"

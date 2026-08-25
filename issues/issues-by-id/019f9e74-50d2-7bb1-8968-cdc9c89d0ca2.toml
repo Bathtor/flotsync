@@ -31,13 +31,14 @@ Constraints
 - Do not iterate indefinitely on Windows-only behaviour from macOS; after this final pushed Windows run, continue any remaining platform-specific work on a Windows development machine.
 - Remove Windows cache-on-failure once Windows CI is stabilised.
 - Expected total implementation size: approximately 140-300 LOC, below 1000 LOC."""
-status = "in-progress"
-status_reason = "Windows-local diagnosis required"
+status = "closed"
+status_reason = "completed; remaining Windows work finished in flotsync-j3v"
 type = "task"
 priority = 3
 assignee = "codex"
 created_at = "2026-07-26T12:44:10.834567Z"
-updated_at = "2026-07-26T17:22:26.193786Z"
+updated_at = "2026-08-25T16:40:46.887032Z"
+closed_at = "2026-08-25T16:40:46.887032Z"
 
 [[comments]]
 id = "019f9e86-8d2a-7950-875a-3c5223187a45"
@@ -74,3 +75,9 @@ id = "019f9f73-1111-78f3-a050-96f7203e403f"
 author = "codex"
 body = "Final bounded platforms run 30212119324 still timed out in driver::tcp::tests::tcp_connect_failure_is_reported after registering WRITABLE interest: the post-registration SO_ERROR probe observed no failure and Mio produced no readiness event. The Windows failure-cache path worked and uploaded 387,686,905 bytes under the expected cache key. macOS passed. Ubuntu independently timed out in tcp_listener_empty_scripted_line_closes_cleanly. No further remote Windows attempts; continue the explicit local-bind pending-connect diagnosis on a Windows development machine."
 created_at = "2026-07-26T17:22:26.193786Z"
+
+[[comments]]
+id = "01a039cb-b627-7d83-9782-2b97bd48eeb8"
+author = "lkroll"
+body = "completed; remaining Windows work finished in flotsync-j3v"
+created_at = "2026-08-25T16:40:46.887032Z"

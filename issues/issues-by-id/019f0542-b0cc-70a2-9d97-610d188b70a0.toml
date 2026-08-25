@@ -7,12 +7,20 @@ Future replication protocol specification outside the manual replication slice.
 Current status: the narrow live path needed by the manual slice is already implemented. The runtime can publish and receive UpdateBatch messages for fixed-membership live peers, uses read_versions on the wire, deduplicates by UpdateId, and drops unknown-group live updates instead of buffering pre-bootstrap races.
 
 Remaining work: define the full replication sub-protocol for offline and long-running operation, including Summary, NeedRange, Snapshot, Ack, reconnect and resynchronisation flows, causality-blocked replay policy, migration, and group close. This is not required before the current checklist slice works."""
-status = "open"
+status = "closed"
+status_reason = "superseded by flotsync-w1o and focused follow-ups"
 type = "task"
 priority = 3
 created_at = "2026-03-10T08:33:06Z"
-updated_at = "2026-05-29T14:42:35Z"
+updated_at = "2026-08-25T16:36:55.018377Z"
+closed_at = "2026-08-25T16:36:55.018377Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
 label = "discovered from"
+
+[[comments]]
+id = "01a039c8-2c6a-70b2-92b9-91cef23500d1"
+author = "lkroll"
+body = "superseded by flotsync-w1o and focused follow-ups"
+created_at = "2026-08-25T16:36:55.018377Z"

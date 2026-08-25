@@ -1,9 +1,31 @@
 id = "019f0542-b0cc-70a2-9d97-5faadb954349"
 ref = "flotsync-ozi"
 title = "Rethink replication component public API boundary"
-body = "Summary requests currently enter through ReplicationRuntimeComponent and are temporarily forwarded to SummaryRequestManager. Revisit whether public API asks should be routed directly to capability-specific Kompact components or through a dedicated stable facade."
+body = """
+Goal
+
+Establish a stable application-facing replication API boundary suitable for MaintainRS, whose Tauri application runtime uses Tokio and must not own or address FlotSync Kompact components directly.
+
+Context
+
+C01. ReplicationApi currently exposes the intended application capabilities through a runtime handle, but public asks still enter ReplicationRuntimeComponent and some are forwarded to capability-specific components such as SummaryRequestManager.
+C02. The Kompact-owned embedding alternative is tracked separately by flotsync-3ht and is not the MaintainRS direction.
+C03. Important API ownership and lifecycle choices should settle before MaintainRS accumulates application code that depends on temporary component routing.
+
+Plan
+
+P01. Audit the current ReplicationApi and runtime loading/shutdown surface against MaintainRS needs: Tokio-compatible futures, Send/Sync boundaries, event delivery, startup errors, runtime ownership, and orderly shutdown.
+P02. Keep Kompact topology and capability components internal. Decide whether the existing handle is the stable facade or should delegate to narrower internal capability handles.
+P03. Remove temporary public-to-component forwarding where a stable facade can route directly without exposing actor details.
+P04. Preserve one coherent application API for publishing, snapshots, summaries, group lifecycle operations, security feedback, and listener events.
+P05. Add focused API/lifecycle tests for the selected boundary and document the supported Tokio/Tauri integration pattern.
+
+Estimate
+
+Approximately 250-600 LOC depending on how much existing forwarding can remain internal, below 1000 LOC."""
 status = "open"
 type = "task"
-priority = 3
+priority = 1
+parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-05-03T14:08:55Z"
-updated_at = "2026-05-29T14:42:19Z"
+updated_at = "2026-08-25T16:36:31.69986Z"

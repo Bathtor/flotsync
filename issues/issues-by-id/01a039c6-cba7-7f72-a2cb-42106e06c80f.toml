@@ -1,0 +1,38 @@
+id = "01a039c6-cba7-7f72-a2cb-42106e06c80f"
+ref = "flotsync-w1o"
+title = "Trigger replication synchronisation when peer routes become available"
+body = """
+Goal
+
+Automatically start Summary-based replication catch-up when a direct route to a peer transitions from unavailable to available. This repairs updates missed while peers were disconnected even when no later update exposes a causal gap and MaintainRS does not manually request a summary.
+
+Plan
+
+S01. Let the replication summary-request owner consume the same complete per-peer route snapshots already published to semantic delivery.
+S02. Track peer availability and trigger only on an empty-to-non-empty route transition. Replacing one usable route set with another must not create duplicate synchronisation work; a withdrawal followed by renewed availability must permit a new synchronisation.
+S03. For every locally hosted group shared with the available peer, submit an internal SummaryRequest through reliable delivery. Exclude groups that do not contain the peer and never target the local member.
+S04. Reuse the existing inbound Summary observation, NeedRange calculation, retrying catch-up manager, and UpdateBatch response path rather than creating a parallel reconciliation mechanism.
+S05. Track or deduplicate outstanding peer/group summary work so repeated route notifications and symmetric link establishment remain benign. Internal requests must not require an application promise, and replies must not be reported as unknown application correlations.
+S06. Keep the trigger independent of relay support. Direct route establishment is sufficient for this slice.
+
+Tests
+
+T01. Initial non-empty peer routes trigger one summary request for every shared hosted group.
+T02. Non-empty route replacement does not retrigger synchronisation.
+T03. Route withdrawal followed by renewed availability triggers synchronisation again.
+T04. Non-members and the local member are excluded.
+T05. An integration test demonstrates that an update missed while disconnected is repaired after route re-establishment without a later edit or an explicit application summary request.
+
+Estimate
+
+Approximately 180-350 LOC including topology wiring and focused tests, below 1000 LOC."""
+status = "open"
+type = "task"
+priority = 2
+parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+created_at = "2026-08-25T16:35:24.711927Z"
+updated_at = "2026-08-25T16:36:51.015332Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-610d188b70a0"
+label = "supersedes"

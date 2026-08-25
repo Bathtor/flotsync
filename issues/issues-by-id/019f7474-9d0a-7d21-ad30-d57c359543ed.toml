@@ -2,22 +2,34 @@ id = "019f7474-9d0a-7d21-ad30-d57c359543ed"
 ref = "flotsync-6p3"
 title = "Redesign activation change delivery for memory-bounded listener batches"
 body = """
-Redesign activation change delivery so large InitialSnapshot::Inline activations do not require holding every listener row change in memory.
+Goal
 
-Context:
-P01. flotsync-git-pow.4 keeps one listener DataChanged event per activation to avoid pre-commit visibility and partial listener failure semantics.
-P02. Large inline or fetched snapshots may require a post-commit path that rederives the change-set and emits batches, each with suitable ReadTokens.
+Finish memory-bounded listener delivery for non-replacement InitialSnapshot::Inline activation without exposing listener state before the activation transaction commits.
 
-Expected outcome:
-P03. Define consistency semantics for activation listener batches after commit.
-P04. Bound memory for store patching and listener emission.
-P05. Decide whether and where to rederive activation row changes from store after commit."""
+Current state
+
+R01. Group-replacement activation already omits in-memory listener rows and rederives replacement changes after commit through a store-backed batched provider.
+R02. Creation-sourced inline activation still selects InitialSnapshotListenerRows::Collect, builds one Vec<RowChange> while embedding the snapshot, and wraps it in VecRowProvider after commit.
+R03. The public create_group path currently creates groups empty and publishes initial application rows through ordinary updates, but creation invitations can represent inline initial snapshots and the API should not retain this accidental memory multiplier.
+
+Plan
+
+I01. Reuse or minimally generalise the recent store-backed activation provider machinery for creation-sourced inline snapshots.
+I02. Omit listener row materialisation during the activation transaction and open a post-commit read transaction pinned to the activated group state.
+I03. Emit DataChangeLineage::Update rows in bounded reusable batches with the activation read token.
+I04. Preserve one DataChanged event/provider per activation and current listener failure semantics.
+I05. Add focused coverage proving creation activation reads rows from the committed store in bounded batches and does not affect the replacement provider path.
+
+Estimate
+
+Approximately 80-180 LOC if the group-replacement provider can be reused as expected, below 1000 LOC."""
 status = "open"
 type = "task"
-priority = 2
+priority = 0
 labels = ["area:replication"]
+parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-07-18T09:00:27.274771Z"
-updated_at = "2026-07-26T12:04:18.015342Z"
+updated_at = "2026-08-25T16:36:25.592001Z"
 
 [[links]]
 target = "019f51c0-171b-7cf2-b327-0cc4670d4ef0"
