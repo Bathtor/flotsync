@@ -19,6 +19,8 @@ use flotsync_data_types::{
         values,
     },
 };
+#[cfg(not(flotsync_nightly))]
+use itertools::Itertools as _;
 use snafu::prelude::*;
 use std::{borrow::Cow, collections::HashSet};
 use uuid::Uuid;

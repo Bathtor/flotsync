@@ -1,10 +1,85 @@
 id = "019f0542-b0cc-70a2-9d97-60b4c9f35b52"
 ref = "flotsync-8la"
 title = "Track stable Rust compatibility"
-body = "Plan and execute the work needed to make the workspace build and test on stable Rust. Cover removal or replacement of nightly-only features, toolchain/CI updates, and any crate-level API or dependency changes required for stable compatibility."
-status = "open"
+body = """
+Objective
+
+Keep Rust nightly as the primary development toolchain while making the workspace build, test, release-build, and expose benchmark targets on the declared stable MSRV in the agreed CI scopes.
+
+Agreed constraints
+
+- Preserve nightly-only standard-library APIs where they provide value and select functional stable fallbacks at compile time.
+- Use established compiler-channel detection rather than parsing compiler output.
+- Declare Rust 1.96 as the workspace MSRV and pin CI to Rust 1.96.0.
+- Pull-request jobs run no release builds.
+- Pull-request macOS runs Rust-nightly tests and benchmark compilation only.
+- Pull-request Linux reuses one job for Rust-nightly tests/benchmarks and MSRV tests/benchmarks.
+- Scheduled native CI provides the full Linux, macOS, and Windows matrix for both toolchains, including tests, release builds, and benchmark compilation.
+- Scheduled mobile portability remains compile-only but covers both toolchains.
+- Do not add stable formatting or stable Clippy.
+
+Implementation plan
+
+1. Add a small flotsync_build_support workspace crate that depends on rustversion and exposes the checked flotsync_nightly cfg emission. Call it from the existing flotsync_messages build script and the flotsync_udpour build script, removing duplicated channel-detection code and direct rustversion build dependencies.
+2. In flotsync_messages, enable iterator_try_collect only under flotsync_nightly. Add itertools directly and conditionally import Itertools in the three modules containing the seven current try_collect calls only when flotsync_nightly is absent. Keep every call expression unchanged.
+3. In flotsync_udpour, enable deque_extend_front only under flotsync_nightly. Keep VecDeque::prepend on nightly and select an order-preserving reverse/push_front fallback on stable through cfg_select!.
+4. Declare rust-version = "1.96" in workspace package metadata and inherit it explicitly in every member package.
+5. Document Rust nightly as the development toolchain and Rust 1.96 as the minimum supported Rust version, including local MSRV test, release-build, and benchmark commands.
+6. In pr-linux, run workspace tests and benchmark compilation on Rust nightly and Rust 1.96.0 in the existing shared job. Remove the MSRV release-build step.
+7. In pr-macos, retain Rust-nightly workspace tests and add Rust-nightly benchmark compilation. Add no MSRV or release-build phase.
+8. In platforms, install Rust nightly and Rust 1.96.0 once per native OS job, then run workspace tests, release builds, and benchmark compilation explicitly on both toolchains across Linux, macOS, and Windows.
+9. In mobile-portability, install both toolchains and target components, then run the existing compile-only library subset check explicitly with each toolchain for every scheduled target.
+
+Validation coverage
+
+- Existing codec tests cover all seven result-collection sites on Rust nightly and the MSRV.
+- Existing UDPour repair tests cover the nightly prepend implementation and stable ordered fallback in their respective toolchain suites.
+- Run pinned-nightly formatting and pedantic Clippy.
+- Run full workspace tests and compile benchmarks without execution on Rust nightly and Rust 1.96.0.
+- Run local release workspace builds on both toolchains to mirror scheduled native CI.
+- Validate locked dependency metadata and workflow diffs.
+
+Explicit deferrals
+
+- No stable formatting or stable Clippy.
+- No MSRV checks outside Linux on pull requests.
+- No release builds in pull-request workflows.
+- No runnable tests, release links, or benchmarks in cross-target mobile portability jobs.
+- No support below Rust 1.96.
+
+Estimated size
+
+Approximately 120 to 180 LOC overall, well below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-03-25T07:11:18Z"
-updated_at = "2026-08-25T16:36:39.13276Z"
+updated_at = "2026-08-26T18:49:00.106361Z"
+closed_at = "2026-08-26T18:49:00.106361Z"
+
+[[comments]]
+id = "01a03f30-4cdb-7e82-8d47-e181548454f4"
+author = "codex"
+body = "Plan alignment: nightly remains the development and full-matrix toolchain; stable support targets the pinned Rust 1.96 MSRV. Stable try_collect calls will resolve through itertools while nightly keeps the standard-library feature. MSRV build, tests, and benchmark compilation will reuse the existing Linux test job setup."
+created_at = "2026-08-26T17:48:45.147891Z"
+
+[[comments]]
+id = "01a03f38-5545-7dc3-95e3-101605a327ca"
+author = "codex"
+body = "Plan amendment: the MSRV check showed that deque_extend_front is active through VecDeque::prepend. Keep that API on nightly, add an order-preserving reverse/push_front fallback on stable, and select the branches with the standard-library cfg_select! macro stabilised in Rust 1.95."
+created_at = "2026-08-26T17:57:31.589461Z"
+
+[[comments]]
+id = "01a03f5a-86d2-7f33-a292-aab344ae17dc"
+author = "codex"
+body = "Review delta agreed: distinguish scheduled daily CI from the Rust nightly toolchain; PR jobs add benchmark compilation but no release builds, with MSRV coverage remaining Linux-only. Scheduled native CI runs the full OS-by-toolchain test, release, and benchmark matrix; scheduled mobile compile-checks both toolchains. Compiler-channel cfg emission moves into a shared build-support crate."
+created_at = "2026-08-26T18:34:52.498185Z"
+
+[[comments]]
+id = "01a03f67-75ca-78c0-9309-2f33846bf41f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-26T18:49:00.106361Z"

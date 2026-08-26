@@ -49,3 +49,6 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      - name: Compile benchmarks
+        run: cargo bench --workspace --no-run --locked

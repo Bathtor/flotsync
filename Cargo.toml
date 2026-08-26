@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "flotsync_build_support",
     "flotsync_core",
     "flotsync_messages",
     "flotsync_discovery",
@@ -15,6 +16,9 @@ members = [
     "flotsync_replication_examples",
 ]
 resolver = "3"
+
+[workspace.package]
+rust-version = "1.96"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -32,6 +36,7 @@ snafu = "0.9"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
 roaring = "0.10"
+rustversion = "1"
 sealed = "0.7"
 uuid = "1"
 kompact = "0.12"

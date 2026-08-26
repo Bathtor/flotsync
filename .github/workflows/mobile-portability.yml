@@ -15,6 +15,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_NIGHTLY_TOOLCHAIN: nightly
+  RUST_MSRV_TOOLCHAIN: 1.96.0
 
 jobs:
   compile-only:
@@ -46,7 +48,13 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Install minimum supported Rust version
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Install Buf
@@ -72,9 +80,21 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Check portability-target libraries
+      - name: Check portability-target libraries on Rust nightly
         run: >
-          cargo check --locked --lib --no-default-features --target ${{ matrix.target }}
+          cargo +${{ env.RUST_NIGHTLY_TOOLCHAIN }} check
+          --locked --lib --no-default-features --target ${{ matrix.target }}
+          -p flotsync_core
+          -p flotsync_udpour
+          -p flotsync_data_types
+          -p flotsync_messages
+          -p flotsync_replication
+          -p flotsync_utils
+
+      - name: Check portability-target libraries on the MSRV
+        run: >
+          cargo +${{ env.RUST_MSRV_TOOLCHAIN }} check
+          --locked --lib --no-default-features --target ${{ matrix.target }}
           -p flotsync_core
           -p flotsync_udpour
           -p flotsync_data_types

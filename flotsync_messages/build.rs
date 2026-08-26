@@ -5,6 +5,8 @@ use std::{
 };
 
 fn main() {
+    flotsync_build_support::emit_rust_channel_cfg();
+
     let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
         .join("..")
         .canonicalize()

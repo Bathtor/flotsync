@@ -1504,6 +1504,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "flotsync_build_support"
+version = "0.1.0"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "flotsync_core"
 version = "0.1.0"
 dependencies = [
@@ -1628,11 +1635,13 @@ dependencies = [
  "buffa-build",
  "bytes",
  "criterion",
+ "flotsync_build_support",
  "flotsync_core",
  "flotsync_data_types",
  "flotsync_io",
  "flotsync_utils",
  "futures-util",
+ "itertools 0.14.0",
  "ordered-float",
  "snafu",
  "uuid",
@@ -1749,6 +1758,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "flotsync_build_support",
  "flotsync_io",
  "flotsync_utils",
  "kompact",
