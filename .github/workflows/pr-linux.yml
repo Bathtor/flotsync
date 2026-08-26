@@ -120,11 +120,12 @@ jobs:
             - name: Run nightly workspace tests
               run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} test --workspace --locked
 
-            - name: Compile nightly benchmarks
-              run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} bench --workspace --no-run --locked
+            # PRs avoid costly optimised builds; scheduled CI compiles and links benchmarks.
+            - name: Check nightly benchmarks
+              run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} check --workspace --benches --locked
 
             - name: Run MSRV workspace tests
               run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} test --workspace --locked
 
-            - name: Compile MSRV benchmarks
-              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} bench --workspace --no-run --locked
+            - name: Check MSRV benchmarks
+              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} check --workspace --benches --locked
