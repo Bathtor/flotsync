@@ -240,15 +240,35 @@ impl<S> Drop for RuntimeFixture<S> {
     }
 }
 
+/// State machine for failing the provider read opened after activation commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActivationReadFailure {
+    /// Do not inject an activation-provider read failure.
+    #[default]
+    Disabled,
+    /// Wait for the next transaction which commits an activation.
+    AfterNextActivationCommit,
+    /// Fail the next read transaction, then disable the injection.
+    NextReadTransaction,
+}
+
+/// Shared failure controls consulted by the store and its delegated transactions.
+#[derive(Default)]
+struct FailingStoreControlState {
+    fail_next_apply_dataset_row_patch: Option<DatasetId>,
+    fail_next_activate_replication_group: bool,
+    fail_after_next_pending_group_commit: bool,
+    activation_read_failure: ActivationReadFailure,
+}
+
 /// Test-only store wrapper that can fail selected future writes while
 /// delegating all stored state to the wrapped `SQLite` store.
 struct FailingStore<S> {
     inner: Arc<S>,
     /// Whether delegated read transactions should hide all local-private key records.
     hide_local_private_keys: bool,
-    fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
-    fail_next_activate_replication_group: Arc<Mutex<bool>>,
-    fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
+    /// Failure injection shared with every delegated transaction.
+    control: Arc<Mutex<FailingStoreControlState>>,
 }
 
 impl<S> FailingStore<S> {
@@ -256,9 +276,7 @@ impl<S> FailingStore<S> {
         Self {
             inner,
             hide_local_private_keys: false,
-            fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
-            fail_next_activate_replication_group: Arc::new(Mutex::new(false)),
-            fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
+            control: Arc::new(Mutex::new(FailingStoreControlState::default())),
         }
     }
 
@@ -270,24 +288,32 @@ impl<S> FailingStore<S> {
     }
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
-        *self
-            .fail_next_apply_dataset_row_patch
+        self.control
             .lock()
-            .expect("failing store mutex must not be poisoned") = Some(dataset_id);
+            .expect("failing store mutex must not be poisoned")
+            .fail_next_apply_dataset_row_patch = Some(dataset_id);
     }
 
     fn fail_after_next_pending_group_commit(&self) {
-        *self
-            .fail_after_next_pending_group_commit
+        self.control
             .lock()
-            .expect("failing store mutex must not be poisoned") = true;
+            .expect("failing store mutex must not be poisoned")
+            .fail_after_next_pending_group_commit = true;
     }
 
     fn fail_next_activate_replication_group(&self) {
-        *self
-            .fail_next_activate_replication_group
+        self.control
             .lock()
-            .expect("failing store mutex must not be poisoned") = true;
+            .expect("failing store mutex must not be poisoned")
+            .fail_next_activate_replication_group = true;
+    }
+
+    /// Fail the provider read transaction opened after the next activation commit.
+    fn fail_activation_read_after_next_commit(&self) {
+        self.control
+            .lock()
+            .expect("failing store mutex must not be poisoned")
+            .activation_read_failure = ActivationReadFailure::AfterNextActivationCommit;
     }
 }
 
@@ -303,22 +329,17 @@ where
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let inner = self.inner.clone();
-        let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
-        let fail_next_activate_replication_group =
-            self.fail_next_activate_replication_group.clone();
-        let fail_after_next_pending_group_commit =
-            self.fail_after_next_pending_group_commit.clone();
+        let control = self.control.clone();
         let hide_local_private_keys = self.hide_local_private_keys;
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
                 inner: Some(inner),
-                fail_next_apply_dataset_row_patch,
-                fail_next_activate_replication_group,
-                fail_after_next_pending_group_commit,
+                control,
                 hide_local_private_keys,
                 provider_scan: None,
                 wrote_pending_group_work: false,
+                removed_pending_group_activation: false,
             }) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -327,26 +348,44 @@ where
     fn begin_read_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
+        let should_fail = {
+            let mut failure = self
+                .control
+                .lock()
+                .expect("failing store mutex must not be poisoned");
+            if failure.activation_read_failure == ActivationReadFailure::NextReadTransaction {
+                failure.activation_read_failure = ActivationReadFailure::Disabled;
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return async move {
+                let source = std::io::Error::other(
+                    "failing store intentionally failed activation provider read transaction",
+                );
+                Err::<Box<dyn ReplicationStoreReadTransaction>, _>(source)
+                    .boxed()
+                    .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
+            }
+            .boxed();
+        }
         if !self.hide_local_private_keys {
             return self.inner.begin_read_transaction();
         }
 
         let inner = self.inner.clone();
-        let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
-        let fail_next_activate_replication_group =
-            self.fail_next_activate_replication_group.clone();
-        let fail_after_next_pending_group_commit =
-            self.fail_after_next_pending_group_commit.clone();
+        let control = self.control.clone();
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
                 inner: Some(inner),
                 hide_local_private_keys: true,
-                fail_next_apply_dataset_row_patch,
-                fail_next_activate_replication_group,
-                fail_after_next_pending_group_commit,
+                control,
                 provider_scan: None,
                 wrote_pending_group_work: false,
+                removed_pending_group_activation: false,
             }) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
@@ -389,12 +428,13 @@ struct FailingStoreTransaction {
     inner: Option<Box<dyn ReplicationStoreTransaction>>,
     /// Whether this transaction emulates an absent local-private key record.
     hide_local_private_keys: bool,
-    fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
-    fail_next_activate_replication_group: Arc<Mutex<bool>>,
-    fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
+    /// Failure injection shared with the wrapping store.
+    control: Arc<Mutex<FailingStoreControlState>>,
     /// Optional deterministic scan behaviour for replacement-provider tests.
     provider_scan: Option<ProviderTestScanBehaviour>,
     wrote_pending_group_work: bool,
+    /// Whether this transaction removed a pending activation before committing.
+    removed_pending_group_activation: bool,
 }
 
 impl ReplicationStoreReadTransaction for FailingStoreTransaction {
@@ -729,11 +769,11 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         version_vector: VersionVector,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let should_fail = {
-            let mut failure = self
-                .fail_next_activate_replication_group
+            let mut control = self
+                .control
                 .lock()
                 .expect("failing store mutex must not be poisoned");
-            std::mem::take(&mut *failure)
+            std::mem::take(&mut control.fail_next_activate_replication_group)
         };
         if should_fail {
             return async move {
@@ -818,14 +858,14 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         dataset: GroupDatasetSchemaRef<'a>,
         patch: &'a DatasetRowStatePatch,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        let failure = self.fail_next_apply_dataset_row_patch.clone();
+        let control = self.control.clone();
         async move {
             let should_fail = {
-                let mut failure = failure
+                let mut control = control
                     .lock()
                     .expect("failing store mutex must not be poisoned");
-                if failure.as_ref() == Some(&patch.dataset_id) {
-                    *failure = None;
+                if control.fail_next_apply_dataset_row_patch.as_ref() == Some(&patch.dataset_id) {
+                    control.fail_next_apply_dataset_row_patch = None;
                     true
                 } else {
                     false
@@ -911,6 +951,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         key: PendingGroupWorkKey,
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        self.removed_pending_group_activation = true;
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")
@@ -930,8 +971,9 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         let Self {
             inner,
-            fail_after_next_pending_group_commit,
+            control,
             wrote_pending_group_work,
+            removed_pending_group_activation,
             ..
         } = *self;
         async move {
@@ -939,13 +981,18 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                 .expect("failing store transaction must remain open until commit")
                 .commit()
                 .await?;
-            let should_fail = if wrote_pending_group_work {
-                let mut failure = fail_after_next_pending_group_commit
+            let should_fail = {
+                let mut control = control
                     .lock()
                     .expect("failing store mutex must not be poisoned");
-                std::mem::take(&mut *failure)
-            } else {
-                false
+                if removed_pending_group_activation
+                    && control.activation_read_failure
+                        == ActivationReadFailure::AfterNextActivationCommit
+                {
+                    control.activation_read_failure = ActivationReadFailure::NextReadTransaction;
+                }
+                wrote_pending_group_work
+                    && std::mem::take(&mut control.fail_after_next_pending_group_commit)
             };
             if should_fail {
                 let source = std::io::Error::other(
@@ -1019,15 +1066,21 @@ impl CapturedRowChange {
     }
 }
 
+/// Captures and controls protected together by the listener test double.
+struct ListenerStubState {
+    data_changes: Vec<CapturedDataChange>,
+    data_change_batch_sizes: Vec<Vec<usize>>,
+    data_change_lineages: Vec<DataChangeLineage>,
+    data_change_read_tokens: Vec<ReadToken>,
+    pending_group_events: Vec<CapturedPendingGroupEvent>,
+    migration_proposal_event_sizes: Vec<usize>,
+    reject_pending_group_events: bool,
+    rejected_pending_group_event_count: usize,
+    buffered_events: mpsc::Receiver<CapturedDataChange>,
+}
+
 struct ListenerStub {
-    data_changes: Mutex<Vec<CapturedDataChange>>,
-    data_change_lineages: Mutex<Vec<DataChangeLineage>>,
-    data_change_read_tokens: Mutex<Vec<ReadToken>>,
-    pending_group_events: Mutex<Vec<CapturedPendingGroupEvent>>,
-    migration_proposal_event_sizes: Mutex<Vec<usize>>,
-    reject_pending_group_events: Mutex<bool>,
-    rejected_pending_group_event_count: Mutex<usize>,
-    buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
+    state: Mutex<ListenerStubState>,
     buffered_event_tx: mpsc::Sender<CapturedDataChange>,
 }
 
@@ -1035,14 +1088,17 @@ impl Default for ListenerStub {
     fn default() -> Self {
         let (buffered_event_tx, buffered_events) = mpsc::channel();
         Self {
-            data_changes: Mutex::new(Vec::new()),
-            data_change_lineages: Mutex::new(Vec::new()),
-            data_change_read_tokens: Mutex::new(Vec::new()),
-            pending_group_events: Mutex::new(Vec::new()),
-            migration_proposal_event_sizes: Mutex::new(Vec::new()),
-            reject_pending_group_events: Mutex::new(false),
-            rejected_pending_group_event_count: Mutex::new(0),
-            buffered_events: Mutex::new(buffered_events),
+            state: Mutex::new(ListenerStubState {
+                data_changes: Vec::new(),
+                data_change_batch_sizes: Vec::new(),
+                data_change_lineages: Vec::new(),
+                data_change_read_tokens: Vec::new(),
+                pending_group_events: Vec::new(),
+                migration_proposal_event_sizes: Vec::new(),
+                reject_pending_group_events: false,
+                rejected_pending_group_event_count: 0,
+                buffered_events,
+            }),
             buffered_event_tx,
         }
     }
@@ -1050,16 +1106,12 @@ impl Default for ListenerStub {
 
 impl ListenerStub {
     fn drain_buffered_events(&self) {
-        let receiver = self
-            .buffered_events
+        let mut state = self
+            .state
             .lock()
-            .expect("listener event receiver mutex must not be poisoned");
-        let mut data_changes = self
-            .data_changes
-            .lock()
-            .expect("listener capture mutex must not be poisoned");
-        while let Ok(change) = receiver.try_recv() {
-            data_changes.push(change);
+            .expect("listener state mutex must not be poisoned");
+        while let Ok(change) = state.buffered_events.try_recv() {
+            state.data_changes.push(change);
         }
     }
 
@@ -1068,9 +1120,10 @@ impl ListenerStub {
             TEST_WAIT_TIMEOUT,
             || {
                 self.drain_buffered_events();
-                self.data_changes
+                self.state
                     .lock()
-                    .expect("listener capture mutex must not be poisoned")
+                    .expect("listener state mutex must not be poisoned")
+                    .data_changes
                     .len()
                     >= count
             },
@@ -1080,41 +1133,55 @@ impl ListenerStub {
 
     fn captured_data_changes(&self) -> Vec<CapturedDataChange> {
         self.drain_buffered_events();
-        self.data_changes
+        self.state
             .lock()
-            .expect("listener capture mutex must not be poisoned")
+            .expect("listener state mutex must not be poisoned")
+            .data_changes
             .clone()
     }
 
     fn captured_data_change_read_tokens(&self) -> Vec<ReadToken> {
         self.drain_buffered_events();
-        self.data_change_read_tokens
+        self.state
             .lock()
-            .expect("listener read-token capture mutex must not be poisoned")
+            .expect("listener state mutex must not be poisoned")
+            .data_change_read_tokens
+            .clone()
+    }
+
+    fn captured_data_change_batch_sizes(&self) -> Vec<Vec<usize>> {
+        self.drain_buffered_events();
+        self.state
+            .lock()
+            .expect("listener state mutex must not be poisoned")
+            .data_change_batch_sizes
             .clone()
     }
 
     fn captured_data_change_lineages(&self) -> Vec<DataChangeLineage> {
         self.drain_buffered_events();
-        self.data_change_lineages
+        self.state
             .lock()
-            .expect("listener lineage capture mutex must not be poisoned")
+            .expect("listener state mutex must not be poisoned")
+            .data_change_lineages
             .clone()
     }
 
     fn take_pending_group_events(&self) -> Vec<CapturedPendingGroupEvent> {
         std::mem::take(
-            &mut *self
-                .pending_group_events
+            &mut self
+                .state
                 .lock()
-                .expect("pending-group listener capture mutex must not be poisoned"),
+                .expect("listener state mutex must not be poisoned")
+                .pending_group_events,
         )
     }
 
     fn migration_proposal_event_sizes(&self) -> Vec<usize> {
-        self.migration_proposal_event_sizes
+        self.state
             .lock()
-            .expect("migration proposal event-size mutex must not be poisoned")
+            .expect("listener state mutex must not be poisoned")
+            .migration_proposal_event_sizes
             .clone()
     }
 
@@ -1122,9 +1189,10 @@ impl ListenerStub {
         eventually(
             TEST_WAIT_TIMEOUT,
             || {
-                self.pending_group_events
+                self.state
                     .lock()
-                    .expect("pending-group listener capture mutex must not be poisoned")
+                    .expect("listener state mutex must not be poisoned")
+                    .pending_group_events
                     .len()
                     >= count
             },
@@ -1133,17 +1201,17 @@ impl ListenerStub {
     }
 
     fn reject_pending_group_events(&self) {
-        *self
-            .reject_pending_group_events
+        self.state
             .lock()
-            .expect("pending-group rejection flag mutex must not be poisoned") = true;
+            .expect("listener state mutex must not be poisoned")
+            .reject_pending_group_events = true;
     }
 
     fn rejected_pending_group_event_count(&self) -> usize {
-        *self
-            .rejected_pending_group_event_count
+        self.state
             .lock()
-            .expect("pending-group rejection count mutex must not be poisoned")
+            .expect("listener state mutex must not be poisoned")
+            .rejected_pending_group_event_count
     }
 }
 
@@ -1157,7 +1225,9 @@ impl ReplicationEventListener for ListenerStub {
                     mut rows,
                 } => {
                     let mut captured_rows = Vec::new();
+                    let mut batch_sizes = Vec::new();
                     process_batches::<RowChangeBatch>(rows.as_mut(), |batch| {
+                        batch_sizes.push(batch.len());
                         for change in batch.drain(..) {
                             let captured = CapturedRowChange::capture(change)
                                 .boxed()
@@ -1169,14 +1239,15 @@ impl ReplicationEventListener for ListenerStub {
                     .await
                     .boxed()
                     .context(ListenerExternalSnafu)?;
-                    self.data_change_read_tokens
-                        .lock()
-                        .expect("listener read-token capture mutex must not be poisoned")
-                        .push(read_token);
-                    self.data_change_lineages
-                        .lock()
-                        .expect("listener lineage capture mutex must not be poisoned")
-                        .push(lineage);
+                    {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .expect("listener state mutex must not be poisoned");
+                        state.data_change_batch_sizes.push(batch_sizes);
+                        state.data_change_read_tokens.push(read_token);
+                        state.data_change_lineages.push(lineage);
+                    }
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,
@@ -1187,56 +1258,42 @@ impl ReplicationEventListener for ListenerStub {
                     invitation,
                     respond,
                 } => {
-                    if *self
-                        .reject_pending_group_events
+                    let mut state = self
+                        .state
                         .lock()
-                        .expect("pending-group rejection flag mutex must not be poisoned")
-                    {
-                        *self
-                            .rejected_pending_group_event_count
-                            .lock()
-                            .expect("pending-group rejection count mutex must not be poisoned") +=
-                            1;
+                        .expect("listener state mutex must not be poisoned");
+                    if state.reject_pending_group_events {
+                        state.rejected_pending_group_event_count += 1;
                         return Err(ListenerError::Rejected {
                             message: "pending group event rejected by test listener".to_owned(),
                         });
                     }
-                    self.pending_group_events
-                        .lock()
-                        .expect("pending-group listener capture mutex must not be poisoned")
+                    state
+                        .pending_group_events
                         .push(CapturedPendingGroupEvent::GroupInvitation {
                             invitation,
                             respond,
                         });
                 }
                 ReplicationEvent::MigrationProposals { proposals } => {
-                    if *self
-                        .reject_pending_group_events
+                    let mut state = self
+                        .state
                         .lock()
-                        .expect("pending-group rejection flag mutex must not be poisoned")
-                    {
-                        *self
-                            .rejected_pending_group_event_count
-                            .lock()
-                            .expect("pending-group rejection count mutex must not be poisoned") +=
-                            1;
+                        .expect("listener state mutex must not be poisoned");
+                    if state.reject_pending_group_events {
+                        state.rejected_pending_group_event_count += 1;
                         return Err(ListenerError::Rejected {
                             message: "pending group event rejected by test listener".to_owned(),
                         });
                     }
-                    self.migration_proposal_event_sizes
-                        .lock()
-                        .expect("migration proposal event-size mutex must not be poisoned")
-                        .push(proposals.len());
-                    let mut captured = self
-                        .pending_group_events
-                        .lock()
-                        .expect("pending-group listener capture mutex must not be poisoned");
+                    state.migration_proposal_event_sizes.push(proposals.len());
                     for proposal in proposals {
-                        captured.push(CapturedPendingGroupEvent::MigrationProposal {
-                            proposal: proposal.proposal,
-                            respond: proposal.respond,
-                        });
+                        state.pending_group_events.push(
+                            CapturedPendingGroupEvent::MigrationProposal {
+                                proposal: proposal.proposal,
+                                respond: proposal.respond,
+                            },
+                        );
                     }
                 }
             }
@@ -1277,15 +1334,14 @@ pub(in crate::runtime) fn provider_test_read_transaction(
     let transaction = FailingStoreTransaction {
         inner: None,
         hide_local_private_keys: false,
-        fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
-        fail_next_activate_replication_group: Arc::new(Mutex::new(false)),
-        fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
+        control: Arc::new(Mutex::new(FailingStoreControlState::default())),
         provider_scan: Some(ProviderTestScanBehaviour {
             state: state.clone(),
             row_results: row_results.into_iter().collect(),
             transition_results: transition_results.into_iter().collect(),
         }),
         wrote_pending_group_work: false,
+        removed_pending_group_activation: false,
     };
     (Box::new(transaction), state)
 }

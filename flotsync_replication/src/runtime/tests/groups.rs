@@ -307,6 +307,99 @@ fn create_group_persists_membership_across_runtime_restart() {
 }
 
 #[test]
+fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resync() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let row_key = RowKey(Uuid::from_u128(33_001));
+    let sqlite_store = sqlite_store(alice_member.clone());
+    let failing_store = Arc::new(FailingStore::new(sqlite_store.clone()));
+    let runtime = load_runtime_with_parts_and_application_schemas(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        failing_store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..CreateGroupRequest::default()
+    }))
+    .expect("initial group creation should succeed");
+    let old_row_id = RowId::new(old_group_id, dataset_id.clone(), row_key);
+    let read_token = snapshot_read_token(runtime.as_ref(), old_group_id, dataset_id.clone());
+    publish_changes(
+        runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: old_row_id,
+            row: crate::row_values! {
+                "title" => "survives missed activation event",
+            },
+        }],
+    );
+    failing_store.fail_activation_read_after_next_commit();
+
+    let error = wait_for_test_reply(runtime.change_group_membership(
+        ChangeGroupMembershipRequest {
+            group_id: old_group_id,
+            ..ChangeGroupMembershipRequest::default()
+        },
+    ))
+    .expect_err("post-commit provider failure should fault the runtime");
+    assert!(matches!(error, ApiError::RuntimeUnavailable));
+
+    let groups = load_persisted_groups(sqlite_store.as_ref());
+    assert_eq!(groups.len(), 2);
+    let successor_group_id = groups
+        .iter()
+        .find(|group| group.group_id != old_group_id)
+        .expect("committed replacement group should exist")
+        .group_id;
+    assert!(load_pending_group_activations(sqlite_store.as_ref()).is_empty());
+    let successor_row = load_persisted_row_slice(
+        sqlite_store.as_ref(),
+        successor_group_id,
+        &dataset_id,
+        [row_key],
+    );
+    assert!(
+        successor_row
+            .rows
+            .get(&row_key)
+            .is_some_and(Option::is_some)
+    );
+    wait_for_test_reply(runtime.shutdown())
+        .expect("runtime host should shut down after the induced component fault");
+
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime = load_runtime_with_parts_and_application_schemas(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        sqlite_store.clone(),
+        restarted_listener.clone(),
+    );
+    wait_for_group_install(&restarted_runtime, successor_group_id);
+    assert!(restarted_listener.captured_data_changes().is_empty());
+    assert_eq!(
+        drain_snapshot_rows(
+            restarted_runtime.as_ref(),
+            SnapshotRowsRequest {
+                group_id: successor_group_id,
+                datasets: HashSet::from([dataset_id.clone()]),
+                max_rows_per_batch: NonZeroUsize::new(16)
+                    .expect("snapshot batch size should be non-zero"),
+                include_tombstones: false,
+            },
+        ),
+        vec![CapturedRowChange::Upsert {
+            row_id: RowId::new(successor_group_id, dataset_id, row_key),
+            title: "survives missed activation event".to_owned(),
+        }]
+    );
+    wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
+}
+
+#[test]
 fn create_group_rejects_empty_name_after_trimming() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
@@ -658,14 +751,48 @@ fn failed_auto_accepted_migration_activation_keeps_published_source_read_only() 
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
+/// Build enough activation rows to cross one provider batch boundary.
+fn batched_activation_snapshot(
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+) -> (InitialSnapshot, Vec<CapturedRowChange>, RowKey) {
+    let mut initial_rows = Vec::with_capacity(129);
+    let mut expected_rows = Vec::with_capacity(129);
+    for offset in 0_u128..129 {
+        let row_key = RowKey(Uuid::from_u128(60_106 + offset));
+        let title = format!("activated row {offset}");
+        initial_rows.push(InitialValueRow {
+            row_key,
+            row: title_row_values(&title),
+        });
+        expected_rows.push(CapturedRowChange::Upsert {
+            row_id: RowId {
+                group_id,
+                dataset_id: dataset_id.clone(),
+                row_key,
+            },
+            title,
+        });
+    }
+    let first_row_key = initial_rows[0].row_key;
+    let snapshot = InitialSnapshot::Inline(InitialGroupValueRows {
+        datasets: vec![InitialDatasetValueRows {
+            dataset_id: dataset_id.clone(),
+            rows: initial_rows,
+        }],
+    });
+    (snapshot, expected_rows, first_row_key)
+}
+
 #[test]
-fn runtime_resumes_pending_group_activation_with_global_read_token() {
+fn runtime_resumes_pending_group_activation_with_bounded_batches_and_global_read_token() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let group_id = GroupId(Uuid::from_u128(60_105));
     let unrelated_group_id = GroupId(Uuid::from_u128(60_104));
-    let row_key = RowKey(Uuid::from_u128(60_106));
+    let (initial_snapshot, expected_rows, first_row_key) =
+        batched_activation_snapshot(group_id, &dataset_id);
     let store = sqlite_store(alice_member.clone());
     let members = vec![alice_member.clone(), bob_member.clone()];
     let member_count = NonZeroUsize::new(members.len()).expect("group should have members");
@@ -705,7 +832,7 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
             group_id,
             members,
             docs_group_schema(),
-            one_title_row_snapshot(dataset_id.clone(), row_key, "activated on startup"),
+            initial_snapshot,
             None,
             None,
         )),
@@ -717,22 +844,20 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
     assert_eq!(
         listener.captured_data_changes(),
         vec![CapturedDataChange {
-            rows: vec![CapturedRowChange::Upsert {
-                row_id: RowId {
-                    group_id,
-                    dataset_id: dataset_id.clone(),
-                    row_key,
-                },
-                title: "activated on startup".to_owned(),
-            }],
+            rows: expected_rows,
         }]
     );
-    let stored_row = load_persisted_row_slice(store.as_ref(), group_id, &dataset_id, [row_key])
-        .rows
-        .get(&row_key)
-        .cloned()
-        .flatten()
-        .expect("activated row should persist");
+    assert_eq!(
+        listener.captured_data_change_batch_sizes(),
+        vec![vec![128, 1]]
+    );
+    let stored_row =
+        load_persisted_row_slice(store.as_ref(), group_id, &dataset_id, [first_row_key])
+            .rows
+            .get(&first_row_key)
+            .cloned()
+            .flatten()
+            .expect("activated row should persist");
     assert_eq!(stored_row.created_by, Some(UpdateId::INITIAL_STATE_ORIGIN));
     assert_eq!(
         listener.captured_data_change_lineages(),

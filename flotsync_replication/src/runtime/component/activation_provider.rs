@@ -1,4 +1,4 @@
-//! Store-backed row streaming for one committed group replacement.
+//! Store-backed row streaming for one committed group activation.
 
 use super::*;
 use crate::api::{
@@ -16,25 +16,38 @@ use crate::api::{
 use flotsync_utils::coerce_infallible;
 use std::{borrow::Cow, cmp::Ordering, convert::Infallible};
 
-/// Row provider for one replacement whose predecessor may or may not be hosted locally.
-pub(super) struct StoreGroupReplacementRowProvider {
-    /// Store view pinned after successor activation and predecessor closure commit.
+/// Row provider for one committed activation event.
+pub(super) struct StoreActivationRowProvider {
+    /// Store view pinned after the activation transaction commits.
     transaction: Option<Box<dyn ReplicationStoreReadTransaction>>,
-    /// Explicit old-to-new group relationship represented by this provider.
-    migration_id: MigrationId,
-    /// Deterministically ordered schemas scanned from the successor group.
+    /// Lineage-specific row projection represented by this provider.
+    source: ActivationRowSource,
+    /// Deterministically ordered schemas scanned from the activated group.
     datasets: Vec<crate::api::DatasetSchema>,
     /// Index of the dataset currently being scanned.
     dataset_index: usize,
     /// Exclusive lower row-key bound within the current dataset.
     after_row_key: Option<RowKey>,
-    /// Predecessor context available to the local runtime.
-    predecessor: ReplacementPredecessor,
 }
 
-impl StoreGroupReplacementRowProvider {
+impl StoreActivationRowProvider {
+    /// Build a provider for ordinary rows introduced by a creation activation.
+    pub(super) fn for_creation(
+        transaction: Box<dyn ReplicationStoreReadTransaction>,
+        group_id: GroupId,
+        group_schema: &GroupSchema,
+    ) -> Self {
+        Self {
+            transaction: Some(transaction),
+            source: ActivationRowSource::Creation { group_id },
+            datasets: group_schema.datasets(),
+            dataset_index: 0,
+            after_row_key: None,
+        }
+    }
+
     /// Build a provider which can compare a locally hosted predecessor.
-    pub(super) fn hosted(
+    pub(super) fn hosted_replacement(
         transaction: Box<dyn ReplicationStoreReadTransaction>,
         migration_id: MigrationId,
         group_schema: &GroupSchema,
@@ -43,35 +56,39 @@ impl StoreGroupReplacementRowProvider {
     ) -> Self {
         Self {
             transaction: Some(transaction),
-            migration_id,
+            source: ActivationRowSource::GroupReplacement {
+                migration_id,
+                predecessor: ReplacementPredecessor::Hosted {
+                    local_member_index,
+                    final_versions,
+                },
+            },
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
-            predecessor: ReplacementPredecessor::Hosted {
-                local_member_index,
-                final_versions,
-            },
         }
     }
 
     /// Build a provider for a migration invitation whose predecessor is not hosted locally.
-    pub(super) fn unavailable(
+    pub(super) fn unavailable_replacement(
         transaction: Box<dyn ReplicationStoreReadTransaction>,
         migration_id: MigrationId,
         group_schema: &GroupSchema,
     ) -> Self {
         Self {
             transaction: Some(transaction),
-            migration_id,
+            source: ActivationRowSource::GroupReplacement {
+                migration_id,
+                predecessor: ReplacementPredecessor::Unavailable,
+            },
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
-            predecessor: ReplacementPredecessor::Unavailable,
         }
     }
 }
 
-impl StoreGroupReplacementRowProvider {
+impl StoreActivationRowProvider {
     /// Release the pinned read transaction after the provider is exhausted.
     async fn release_transaction(&mut self) -> Result<(), RowProviderError> {
         let Some(transaction) = self.transaction.take() else {
@@ -100,83 +117,59 @@ impl StoreGroupReplacementRowProvider {
         output: &mut RowChangeBatch,
     ) -> Result<(), RowProviderError> {
         let after = self.after_row_key;
-        let migration_id = self.migration_id;
         let dataset_index = self.dataset_index;
         let next_after = {
             let dataset_schema = self
                 .datasets
                 .get(dataset_index)
-                .expect("replacement provider must have a current dataset");
-            let dataset_id = &dataset_schema.dataset_id;
-            let schema_source = &dataset_schema.schema;
-            let schema = schema_source.as_schema();
-            let Some(transaction) = self.transaction.as_mut() else {
-                return Ok(());
-            };
+                .expect("activation provider must have a current dataset");
+            let transaction = self
+                .transaction
+                .as_mut()
+                .expect("activation provider must retain its transaction while datasets remain");
 
-            match &self.predecessor {
-                ReplacementPredecessor::Hosted {
-                    local_member_index,
-                    final_versions,
-                } => {
-                    let previous_group = GroupDatasetSchemaRef {
-                        group_id: &migration_id.old_group_id,
-                        dataset_id,
-                        schema,
-                    };
-                    let current_group = GroupDatasetSchemaRef {
-                        group_id: &migration_id.new_group_id,
-                        dataset_id,
-                        schema,
-                    };
-                    let batch = transaction
-                        .scan_dataset_row_transition_batch(
-                            previous_group,
-                            current_group,
-                            after,
-                            GROUP_REPLACEMENT_ROWS_PER_BATCH,
-                        )
-                        .await
-                        .boxed()
-                        .context(ProviderExternalSnafu)?;
-                    for transition in batch.rows {
-                        append_hosted_transition(
-                            output,
-                            migration_id,
-                            dataset_id,
-                            schema_source,
-                            *local_member_index,
-                            final_versions,
-                            transition,
-                        )?;
-                    }
-                    batch.next_after
+            match &self.source {
+                ActivationRowSource::Creation { group_id } => {
+                    fill_creation_dataset(
+                        transaction.as_mut(),
+                        output,
+                        *group_id,
+                        dataset_schema,
+                        after,
+                    )
+                    .await?
                 }
-                ReplacementPredecessor::Unavailable => {
-                    let current_group = GroupDatasetSchemaRef {
-                        group_id: &migration_id.new_group_id,
-                        dataset_id,
-                        schema,
-                    };
-                    let batch = transaction
-                        .scan_dataset_row_batch(
-                            current_group,
-                            after,
-                            GROUP_REPLACEMENT_ROWS_PER_BATCH,
-                        )
-                        .await
-                        .boxed()
-                        .context(ProviderExternalSnafu)?;
-                    for current in batch.rows {
-                        append_unavailable_current(
-                            output,
-                            migration_id.new_group_id,
-                            dataset_id,
-                            schema,
-                            &current,
-                        )?;
-                    }
-                    batch.next_after
+                ActivationRowSource::GroupReplacement {
+                    migration_id,
+                    predecessor:
+                        ReplacementPredecessor::Hosted {
+                            local_member_index,
+                            final_versions,
+                        },
+                } => {
+                    fill_hosted_replacement_dataset(
+                        transaction.as_mut(),
+                        output,
+                        *migration_id,
+                        dataset_schema,
+                        *local_member_index,
+                        final_versions,
+                        after,
+                    )
+                    .await?
+                }
+                ActivationRowSource::GroupReplacement {
+                    migration_id,
+                    predecessor: ReplacementPredecessor::Unavailable,
+                } => {
+                    fill_unavailable_replacement_dataset(
+                        transaction.as_mut(),
+                        output,
+                        migration_id.new_group_id,
+                        dataset_schema,
+                        after,
+                    )
+                    .await?
                 }
             }
         };
@@ -190,7 +183,7 @@ impl StoreGroupReplacementRowProvider {
     }
 }
 
-impl BatchProvider for StoreGroupReplacementRowProvider {
+impl BatchProvider for StoreActivationRowProvider {
     type Batch = RowChangeBatch;
 
     fn new_batch(&self) -> Self::Batch {
@@ -216,9 +209,115 @@ impl BatchProvider for StoreGroupReplacementRowProvider {
     }
 }
 
-/// Number of stored row transitions requested for one listener batch.
-const GROUP_REPLACEMENT_ROWS_PER_BATCH: NonZeroUsize =
-    NonZeroUsize::new(128).expect("group replacement batch size must be non-zero");
+/// Number of stored activation rows requested for one listener batch.
+const ACTIVATION_ROWS_PER_BATCH: NonZeroUsize =
+    NonZeroUsize::new(128).expect("activation batch size must be non-zero");
+
+/// Load one ordinary committed activation page.
+async fn fill_creation_dataset(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    output: &mut RowChangeBatch,
+    group_id: GroupId,
+    dataset_schema: &crate::api::DatasetSchema,
+    after: Option<RowKey>,
+) -> Result<Option<RowKey>, RowProviderError> {
+    let dataset = GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_schema.dataset_id,
+        schema: dataset_schema.schema.as_schema(),
+    };
+    let batch = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+        .await
+        .boxed()
+        .context(ProviderExternalSnafu)?;
+    for current in batch.rows {
+        append_creation_row(
+            output,
+            group_id,
+            &dataset_schema.dataset_id,
+            dataset_schema.schema.as_schema(),
+            &current,
+        )?;
+    }
+    Ok(batch.next_after)
+}
+
+/// Load one committed replacement page with a locally hosted predecessor.
+async fn fill_hosted_replacement_dataset(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    output: &mut RowChangeBatch,
+    migration_id: MigrationId,
+    dataset_schema: &crate::api::DatasetSchema,
+    local_member_index: MemberIndex,
+    final_versions: &VersionVector,
+    after: Option<RowKey>,
+) -> Result<Option<RowKey>, RowProviderError> {
+    let schema = dataset_schema.schema.as_schema();
+    let previous_group = GroupDatasetSchemaRef {
+        group_id: &migration_id.old_group_id,
+        dataset_id: &dataset_schema.dataset_id,
+        schema,
+    };
+    let current_group = GroupDatasetSchemaRef {
+        group_id: &migration_id.new_group_id,
+        dataset_id: &dataset_schema.dataset_id,
+        schema,
+    };
+    let batch = transaction
+        .scan_dataset_row_transition_batch(
+            previous_group,
+            current_group,
+            after,
+            ACTIVATION_ROWS_PER_BATCH,
+        )
+        .await
+        .boxed()
+        .context(ProviderExternalSnafu)?;
+    for transition in batch.rows {
+        append_hosted_transition(
+            output,
+            migration_id,
+            &dataset_schema.dataset_id,
+            &dataset_schema.schema,
+            local_member_index,
+            final_versions,
+            transition,
+        )?;
+    }
+    Ok(batch.next_after)
+}
+
+/// Load one committed replacement page whose predecessor is unavailable locally.
+async fn fill_unavailable_replacement_dataset(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    output: &mut RowChangeBatch,
+    group_id: GroupId,
+    dataset_schema: &crate::api::DatasetSchema,
+    after: Option<RowKey>,
+) -> Result<Option<RowKey>, RowProviderError> {
+    let schema = dataset_schema.schema.as_schema();
+    let dataset = GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_schema.dataset_id,
+        schema,
+    };
+    let batch = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+        .await
+        .boxed()
+        .context(ProviderExternalSnafu)?;
+    for current in batch.rows {
+        append_unavailable_current(
+            output,
+            group_id,
+            &dataset_schema.dataset_id,
+            schema,
+            &current,
+        )?;
+    }
+    Ok(batch.next_after)
+}
 
 /// Translate one raw hosted row transition into an application-visible operation.
 fn append_hosted_transition(
@@ -390,6 +489,25 @@ fn append_new_row(
     Ok(())
 }
 
+/// Emit one visible row from a creation-sourced activation.
+fn append_creation_row(
+    output: &mut RowChangeBatch,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    schema: &flotsync_data_types::schema::Schema,
+    current: &ReplicationRowStateRecord,
+) -> Result<(), RowProviderError> {
+    if current.tombstoned {
+        return Ok(());
+    }
+    let row_id = RowId::new(group_id, dataset_id.clone(), current.row_id);
+    let row = RowValues::from_row(schema, &current.snapshot)
+        .boxed()
+        .context(ProviderExternalSnafu)?;
+    output.push(RowChange::ordinary_upsert(row_id, Arc::new(row)));
+    Ok(())
+}
+
 /// Emit one visible successor row when the predecessor group is unavailable.
 fn append_unavailable_current(
     output: &mut RowChangeBatch,
@@ -514,6 +632,19 @@ fn changed_value_fields(
     differences.into_boxed_slice()
 }
 
+/// Store projection used to build one activation event.
+enum ActivationRowSource {
+    /// Ordinary rows introduced by a creation-sourced activation.
+    Creation { group_id: GroupId },
+    /// Old-to-new rows introduced by a group replacement.
+    GroupReplacement {
+        /// Explicit old-to-new group relationship.
+        migration_id: MigrationId,
+        /// Predecessor context available to the local runtime.
+        predecessor: ReplacementPredecessor,
+    },
+}
+
 /// Locally available evidence used to interpret predecessor rows.
 enum ReplacementPredecessor {
     /// The old group and accepted final cut are available in local storage.
@@ -543,15 +674,15 @@ mod tests {
     use std::sync::LazyLock;
     use uuid::Uuid;
 
-    /// Single-field schema used by provider translation tests.
-    static TITLE_SCHEMA: LazyLock<Schema> =
-        LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
-
     /// Fixed old-to-new migration id for provider translation tests.
     const TEST_MIGRATION_ID: MigrationId = MigrationId {
         old_group_id: GroupId(Uuid::from_u128(1)),
         new_group_id: GroupId(Uuid::from_u128(2)),
     };
+
+    /// Single-field schema used by provider translation tests.
+    static TITLE_SCHEMA: LazyLock<Schema> =
+        LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
 
     /// Build one stored row image with explicit provenance.
     fn stored_row(
@@ -620,12 +751,12 @@ mod tests {
     fn test_store_error() -> StoreError {
         StoreError::new(
             StoreErrorClassification::UNKNOWN,
-            std::io::Error::other("injected group replacement scan failure"),
+            std::io::Error::other("injected activation scan failure"),
         )
     }
 
     #[test]
-    fn provider_skips_invisible_pages_advances_datasets_and_releases_after_drain() {
+    fn creation_provider_skips_invisible_pages_advances_datasets_and_releases_after_drain() {
         let versions =
             VersionVector::initial(NonZeroUsize::new(2).expect("test group must have members"));
         let first_key = RowKey(Uuid::from_u128(1));
@@ -667,13 +798,14 @@ mod tests {
             ],
             [],
         );
-        let mut provider = StoreGroupReplacementRowProvider {
+        let mut provider = StoreActivationRowProvider {
             transaction: Some(transaction),
-            migration_id: TEST_MIGRATION_ID,
+            source: ActivationRowSource::Creation {
+                group_id: TEST_MIGRATION_ID.new_group_id,
+            },
             datasets: group_schema(["beta", "alpha"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
-            predecessor: ReplacementPredecessor::Unavailable,
         };
 
         let first = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()))
@@ -681,6 +813,7 @@ mod tests {
             .expect("alpha must emit one visible row");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].row_id().dataset_id.as_str(), "alpha");
+        assert_eq!(first[0].previous, PreviousRow::NotCompared);
         let second = wait_for_test_future(provider.fill_batch(first))
             .expect("second provider batch must load")
             .expect("beta must emit one visible row");
@@ -704,39 +837,86 @@ mod tests {
                     dataset_id: DatasetId::try_from_static("alpha")
                         .expect("test dataset id must be valid"),
                     after: None,
-                    limit: GROUP_REPLACEMENT_ROWS_PER_BATCH,
+                    limit: ACTIVATION_ROWS_PER_BATCH,
                 },
                 ProviderTestScanRequest {
                     dataset_id: DatasetId::try_from_static("alpha")
                         .expect("test dataset id must be valid"),
                     after: Some(first_key),
-                    limit: GROUP_REPLACEMENT_ROWS_PER_BATCH,
+                    limit: ACTIVATION_ROWS_PER_BATCH,
                 },
                 ProviderTestScanRequest {
                     dataset_id: DatasetId::try_from_static("beta")
                         .expect("test dataset id must be valid"),
                     after: None,
-                    limit: GROUP_REPLACEMENT_ROWS_PER_BATCH,
+                    limit: ACTIVATION_ROWS_PER_BATCH,
                 },
             ]
         );
     }
 
     #[test]
-    fn provider_propagates_transition_scan_failure_and_drops_transaction() {
-        let (transaction, state) = provider_test_read_transaction([], [Err(test_store_error())]);
-        let mut provider = StoreGroupReplacementRowProvider {
+    fn creation_provider_propagates_scan_failure_and_drops_transaction() {
+        let (transaction, state) = provider_test_read_transaction([Err(test_store_error())], []);
+        let mut provider = StoreActivationRowProvider {
             transaction: Some(transaction),
-            migration_id: TEST_MIGRATION_ID,
+            source: ActivationRowSource::Creation {
+                group_id: TEST_MIGRATION_ID.new_group_id,
+            },
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
-            predecessor: ReplacementPredecessor::Hosted {
-                local_member_index: MemberIndex::new(0),
-                final_versions: VersionVector::initial(
-                    NonZeroUsize::new(2).expect("test group must have members"),
-                ),
+        };
+
+        let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
+        let Err(_error) = result else {
+            panic!("row scan failure must reach the listener provider");
+        };
+        drop(provider);
+
+        let state = state
+            .lock()
+            .expect("test transaction state mutex must not be poisoned");
+        assert_eq!(state.release_count, 0);
+        assert_eq!(state.drop_count, 1);
+        assert_eq!(state.row_requests.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "activation provider must retain its transaction while datasets remain"
+    )]
+    fn provider_panics_if_its_transaction_is_missing_before_exhaustion() {
+        let mut provider = StoreActivationRowProvider {
+            transaction: None,
+            source: ActivationRowSource::Creation {
+                group_id: TEST_MIGRATION_ID.new_group_id,
             },
+            datasets: group_schema(["docs"]).datasets(),
+            dataset_index: 0,
+            after_row_key: None,
+        };
+
+        let _batch = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
+    }
+
+    #[test]
+    fn provider_propagates_transition_scan_failure_and_drops_transaction() {
+        let (transaction, state) = provider_test_read_transaction([], [Err(test_store_error())]);
+        let mut provider = StoreActivationRowProvider {
+            transaction: Some(transaction),
+            source: ActivationRowSource::GroupReplacement {
+                migration_id: TEST_MIGRATION_ID,
+                predecessor: ReplacementPredecessor::Hosted {
+                    local_member_index: MemberIndex::new(0),
+                    final_versions: VersionVector::initial(
+                        NonZeroUsize::new(2).expect("test group must have members"),
+                    ),
+                },
+            },
+            datasets: group_schema(["docs"]).datasets(),
+            dataset_index: 0,
+            after_row_key: None,
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -756,13 +936,14 @@ mod tests {
     #[test]
     fn empty_provider_releases_transaction_without_scanning() {
         let (transaction, state) = provider_test_read_transaction([], []);
-        let mut provider = StoreGroupReplacementRowProvider {
+        let mut provider = StoreActivationRowProvider {
             transaction: Some(transaction),
-            migration_id: TEST_MIGRATION_ID,
+            source: ActivationRowSource::Creation {
+                group_id: TEST_MIGRATION_ID.new_group_id,
+            },
             datasets: Vec::new(),
             dataset_index: 0,
             after_row_key: None,
-            predecessor: ReplacementPredecessor::Unavailable,
         };
 
         assert!(

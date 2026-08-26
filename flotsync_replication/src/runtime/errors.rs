@@ -434,6 +434,15 @@ pub(crate) enum GroupActivationError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display(
+        "Activation for group {group_id} committed, but its listener row transaction could not be opened at {location}: {source}"
+    ))]
+    PostCommitStoreAccess {
+        group_id: GroupId,
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Failed to install activated group {group_id}: {source}"))]
     InstallGroup {
         group_id: GroupId,
@@ -448,13 +457,22 @@ pub(crate) enum GroupActivationError {
     NotifyListener { source: ListenerError },
 }
 
+impl GroupActivationError {
+    /// Return whether the runtime component cannot safely continue after this error.
+    pub(crate) const fn is_unrecoverable(&self) -> bool {
+        matches!(self, Self::PostCommitStoreAccess { .. })
+    }
+}
+
 impl StoreErrorClassificationSource for GroupActivationError {
     fn store_error_classification(&self) -> Option<StoreErrorClassification> {
         match self {
             Self::InvalidPersistedGroup { source, .. } | Self::InstallGroup { source, .. } => {
                 source.store_error_classification()
             }
-            Self::StoreAccess { source, .. } => source.store_error_classification(),
+            Self::StoreAccess { source, .. } | Self::PostCommitStoreAccess { source, .. } => {
+                source.store_error_classification()
+            }
             Self::MissingGroupMaterial { .. }
             | Self::UnsupportedInitialSnapshot { .. }
             | Self::InvalidMembers { .. }
@@ -806,6 +824,15 @@ impl StoreErrorClassificationSource for InboundDeliveryError {
 }
 
 impl InboundDeliveryError {
+    /// Return whether the runtime component cannot safely continue after this error.
+    pub(crate) fn is_unrecoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::PendingGroupActivation { source }
+                if source.is_unrecoverable()
+        )
+    }
+
     pub(crate) fn failure_action(&self) -> InboundFailureAction {
         match self {
             Self::StoreAccess { .. }
