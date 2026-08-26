@@ -75,6 +75,12 @@ pub enum ApiError {
         /// Concrete operation error retained for diagnostics and downcasting.
         source: BoxError,
     },
+    /// The runtime no longer accepts API operations through this handle.
+    ///
+    /// Discard the handle and load a fresh runtime. When this follows an
+    /// unexpectedly unavailable mutating operation, do not assume that the
+    /// operation rolled back: its store commit may have completed before the
+    /// runtime faulted. Resynchronise group and row state before continuing.
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
     #[snafu(display("Replication runtime lifecycle state was poisoned while {operation}."))]

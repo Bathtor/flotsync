@@ -194,13 +194,13 @@ use std::{
 };
 use uuid::Uuid;
 
-mod group_replacement_provider;
+mod activation_provider;
 mod group_work;
 mod inbound_support;
 mod listeners;
 mod snapshot_provider;
 
-use group_replacement_provider::StoreGroupReplacementRowProvider;
+use activation_provider::StoreActivationRowProvider;
 use group_work::{
     ComponentBackedPendingGroupResponder,
     MigrationProposalArrival,
@@ -1472,11 +1472,11 @@ impl ReplicationRuntimeComponent {
         Ok(PendingGroupAcceptOutcome::Activation(Box::new(activation)))
     }
 
-    /// Apply one listener response to a replayed pending group decision.
+    /// Apply one listener response and return accepted work requiring activation.
     async fn apply_pending_group_decision_response(
         &mut self,
         response: PendingGroupDecisionResponse,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<Box<PendingGroupActivationRecord>>, ApiError> {
         let mut accepted_activation = None;
         let mut unsupported_activation = None;
         let mut transaction = self
@@ -1545,21 +1545,11 @@ impl ReplicationRuntimeComponent {
         }
         if let Some(group_id) = unsupported_activation {
             return activation::UnsupportedInitialSnapshotSnafu { group_id }
-                .fail::<()>()
+                .fail::<Option<Box<PendingGroupActivationRecord>>>()
                 .boxed()
                 .context(ApiExternalSnafu);
         }
-        if let Some(activation) = accepted_activation {
-            let outcome = self
-                .activate_pending_group_record(*activation)
-                .await
-                .map_err(ApiError::from_store_classification_source)?;
-            notify_pending_activation_data_changes(self.listener.clone(), outcome)
-                .await
-                .boxed()
-                .context(ApiExternalSnafu)?;
-        }
-        Ok(())
+        Ok(accepted_activation)
     }
 
     /// Submit one encoded live update to the group-broadcast layer.
@@ -2007,7 +1997,6 @@ impl ReplicationRuntimeComponent {
         let group_id = activation_record.group_id;
         let migration_cutover = activation_record.migration_cutover;
         let group_schema = activation_record.group_schema;
-        let listener_rows = Self::initial_snapshot_listener_rows(&key);
         let mut transaction = self
             .store
             .begin_transaction()
@@ -2034,13 +2023,12 @@ impl ReplicationRuntimeComponent {
             .activate_replication_group(group_id, group_record.version_vector.clone())
             .await
             .context(activation::StoreAccessSnafu)?;
-        let update_row_changes = pending_group::embed_initial_snapshot(
+        pending_group::embed_initial_snapshot(
             transaction.as_mut(),
             group_id,
             member_count,
             &group_schema,
             activation_record.initial_snapshot,
-            listener_rows,
         )
         .await?;
         let mut hosted_predecessor = None;
@@ -2085,62 +2073,59 @@ impl ReplicationRuntimeComponent {
             .await
             .context(activation::StoreAccessSnafu)?;
         self.group_memberships.replace(next_group_state);
-        self.build_pending_activation_outcome(
-            key,
-            &group_schema,
-            update_row_changes,
-            hosted_predecessor,
-            read_token,
-        )
-        .await
+        let outcome = self
+            .build_pending_activation_outcome(key, &group_schema, hosted_predecessor, read_token)
+            .await?;
+        Ok(outcome)
     }
 
     /// Build the listener event payload after the accepted activation has committed.
+    ///
+    /// Failure to open the provider transaction occurs after pending work has
+    /// been removed. Callers must turn that error into an unrecoverable runtime
+    /// fault so the application can restart and explicitly resynchronise rows.
     async fn build_pending_activation_outcome(
         &mut self,
         key: PendingGroupWorkKey,
         group_schema: &GroupSchema,
-        update_row_changes: Vec<RowChange>,
         hosted_predecessor: Option<(MemberIndex, VersionVector)>,
         read_token: ReadToken,
     ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
+        let group_id = key.group_id();
+        let read_transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(activation::PostCommitStoreAccessSnafu { group_id })?;
         let (lineage, rows): (DataChangeLineage, Box<RowProvider>) = match key {
             PendingGroupWorkKey::GroupInvitation {
+                group_id,
                 source: crate::api::GroupInvitationSource::Creation,
-                ..
             } => (
                 DataChangeLineage::Update,
-                Box::new(VecRowProvider::new(update_row_changes)),
+                Box::new(StoreActivationRowProvider::for_creation(
+                    read_transaction,
+                    group_id,
+                    group_schema,
+                )),
             ),
             PendingGroupWorkKey::GroupInvitation {
                 source: crate::api::GroupInvitationSource::Migration { migration_id },
                 ..
-            } => {
-                let read_transaction = self
-                    .store
-                    .begin_read_transaction()
-                    .await
-                    .context(activation::StoreAccessSnafu)?;
-                (
-                    DataChangeLineage::GroupReplacement { migration_id },
-                    Box::new(StoreGroupReplacementRowProvider::unavailable(
-                        read_transaction,
-                        migration_id,
-                        group_schema,
-                    )),
-                )
-            }
+            } => (
+                DataChangeLineage::GroupReplacement { migration_id },
+                Box::new(StoreActivationRowProvider::unavailable_replacement(
+                    read_transaction,
+                    migration_id,
+                    group_schema,
+                )),
+            ),
             PendingGroupWorkKey::MigrationProposal { migration_id } => {
                 let (local_member_index, final_versions) = hosted_predecessor
                     .expect("migration proposal activation must close its hosted predecessor");
-                let read_transaction = self
-                    .store
-                    .begin_read_transaction()
-                    .await
-                    .context(activation::StoreAccessSnafu)?;
                 (
                     DataChangeLineage::GroupReplacement { migration_id },
-                    Box::new(StoreGroupReplacementRowProvider::hosted(
+                    Box::new(StoreActivationRowProvider::hosted_replacement(
                         read_transaction,
                         migration_id,
                         group_schema,
@@ -2155,23 +2140,6 @@ impl ReplicationRuntimeComponent {
             lineage,
             rows,
         })
-    }
-
-    /// Select whether activation rows are emitted directly or by a replacement provider.
-    fn initial_snapshot_listener_rows(
-        key: &PendingGroupWorkKey,
-    ) -> pending_group::InitialSnapshotListenerRows {
-        if matches!(
-            key,
-            PendingGroupWorkKey::GroupInvitation {
-                source: crate::api::GroupInvitationSource::Creation,
-                ..
-            }
-        ) {
-            pending_group::InitialSnapshotListenerRows::Collect
-        } else {
-            pending_group::InitialSnapshotListenerRows::Omit
-        }
     }
 
     fn next_local_update_id(
@@ -2494,6 +2462,10 @@ impl ReplicationRuntimeComponent {
             }
             .await;
             if let Err(error) = reply {
+                if error.is_unrecoverable() {
+                    return Err(error)
+                        .whatever_unrecoverable("inbound group activation failed after commit");
+                }
                 let failure = InboundDeliveryFailure::new(context, error);
                 let action = async_self.record_inbound_failure(&failure);
                 panic_if_fatal_inbound_failure(action, &failure);
@@ -3777,6 +3749,11 @@ impl ReplicationRuntimeComponent {
                                         }
                                     }
                                 }
+                                Err(error) if error.is_unrecoverable() => {
+                                    return Err(error).whatever_unrecoverable(
+                                        "membership activation failed after commit",
+                                    );
+                                }
                                 Err(error) => {
                                     let error =
                                         change_membership::ActivateGroupSnafu.into_error(error);
@@ -3800,9 +3777,31 @@ impl ReplicationRuntimeComponent {
     ) -> HandlerResult {
         let (promise, response) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
+            let reply = match async_self
                 .apply_pending_group_decision_response(response)
-                .await;
+                .await
+            {
+                Ok(Some(activation)) => {
+                    match async_self.activate_pending_group_record(*activation).await {
+                        Ok(outcome) => {
+                            let res = notify_pending_activation_data_changes(
+                                async_self.listener.clone(),
+                                outcome,
+                            )
+                            .await;
+                            res.boxed().context(ApiExternalSnafu)
+                        }
+                        Err(error) if error.is_unrecoverable() => {
+                            return Err(error).whatever_unrecoverable(
+                                "pending group activation failed after commit",
+                            );
+                        }
+                        Err(error) => Err(ApiError::from_store_classification_source(error)),
+                    }
+                }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
             async_self.reply_api(promise, "pending_group_decision_response", reply);
             Handled::OK
         })
@@ -3916,6 +3915,14 @@ impl ReplicationRuntimeComponent {
             let reply = async_self
                 .install_pending_group_delivery(*record, group_setup, sender)
                 .await;
+            let reply = match reply {
+                Err(error) if error.is_unrecoverable() => {
+                    return Err(error).whatever_unrecoverable(
+                        "test pending group activation failed after commit",
+                    );
+                }
+                reply => reply,
+            };
             let _ = promise.fulfil(reply);
             Handled::OK
         })

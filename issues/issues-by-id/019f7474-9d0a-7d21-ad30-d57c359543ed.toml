@@ -4,33 +4,114 @@ title = "Redesign activation change delivery for memory-bounded listener batches
 body = """
 Goal
 
-Finish memory-bounded listener delivery for non-replacement InitialSnapshot::Inline activation without exposing listener state before the activation transaction commits.
+Finish memory-bounded listener delivery for creation-sourced InitialSnapshot::Inline activation without exposing listener rows before the activation transaction commits.
 
-Current state
+Current aligned state
 
-R01. Group-replacement activation already omits in-memory listener rows and rederives replacement changes after commit through a store-backed batched provider.
-R02. Creation-sourced inline activation still selects InitialSnapshotListenerRows::Collect, builds one Vec<RowChange> while embedding the snapshot, and wraps it in VecRowProvider after commit.
-R03. The public create_group path currently creates groups empty and publishes initial application rows through ordinary updates, but creation invitations can represent inline initial snapshots and the API should not retain this accidental memory multiplier.
+R01. Pending-group snapshot embedding writes only store patches; it no longer constructs listener RowChange values.
+R02. StoreActivationRowProvider covers creation, hosted replacement, and unavailable replacement activation from one pinned post-commit read transaction.
+R03. The provider scans deterministic datasets in reusable RowChangeBatch values with a 128-row store limit, filters tombstones, and explicitly releases an exhausted transaction.
+R04. Creation delivery uses ordinary upserts with PreviousRow::NotCompared; replacement translation and evidence semantics remain unchanged.
+R05. Runtime coverage observes provider batch boundaries and verifies a 129-row creation activation as one Update event with batches of 128 and 1.
+R06. Provider lifecycle, naming, documentation, and item-order review feedback has been incorporated.
+R07. A post-commit provider transaction failure is an unrecoverable runtime-component fault, not a process panic. The application remains responsible for handling runtime unavailability and explicitly resynchronising after restart.
+R08. The post-commit regression exercises real successor row state, proves that restart does not replay the missed event, and proves explicit snapshot resynchronisation.
+R09. Public RuntimeUnavailable documentation needs to distinguish normal unavailability from an unknown mutating-operation outcome and give application recovery guidance.
+R10. Shared test controls and listener captures should use one mutex-protected state per test double rather than one mutex per field.
+R11. Internal unrecoverable classification should describe the general component-continuation contract rather than the sole current error variant.
 
-Plan
+Implementation plan
 
-I01. Reuse or minimally generalise the recent store-backed activation provider machinery for creation-sourced inline snapshots.
-I02. Omit listener row materialisation during the activation transaction and open a post-commit read transaction pinned to the activated group state.
-I03. Emit DataChangeLineage::Update rows in bounded reusable batches with the activation read token.
-I04. Preserve one DataChanged event/provider per activation and current listener failure semantics.
-I05. Add focused coverage proving creation activation reads rows from the committed store in bounded batches and does not affect the replacement provider path.
+I01. Keep pending-group snapshot embedding store-only and retain dataset-at-a-time store patching.
+I02. Keep StoreActivationRowProvider as the shared creation and replacement provider.
+I03. Keep one pinned transaction, deterministic dataset cursor, reusable RowChangeBatch, and 128-row scan limit across all activation modes.
+I04. In creation mode, scan the committed activated group, skip tombstones, and emit RowChange::ordinary_upsert so PreviousRow remains NotCompared.
+I05. Preserve hosted and unavailable replacement translation and evidence semantics.
+I06. After activation commits, open a read transaction for the activation event. Preserve acquisition failure as a distinct post-commit activation error and classify it as HandlerError::Unrecoverable at activation handler boundaries. Do not panic the process; pre-commit activation errors retain their existing API or inbound handling.
+I07. Document that pending activation has already been removed at this boundary, so restart does not replay the missed listener event and the application must explicitly resynchronise row state.
+I08. Keep activation free of collected update-row and listener-selection plumbing while leaving VecRowProvider available for unrelated ordinary listener batches.
+I09. Assert that the provider retains its transaction while datasets remain so an internal lifecycle violation fails immediately rather than spinning.
+I10. Retain the creation-specific naming and repository item ordering established during review.
+I11. Retain and extend provider tests for creation pagination, tombstones, NotCompared lineage, batch reuse, scan limits, release, errors, and the transaction invariant.
+I12. Retain post-commit runtime coverage with a schema-backed predecessor row, runtime unavailability without a panic, committed successor row state, no listener-event replay after restart, and successful explicit snapshot resynchronisation.
+I13. Document ApiError::RuntimeUnavailable for application developers: discard the unusable handle, load a fresh runtime, and resynchronise after an unexpectedly unavailable mutating call because commit may have preceded the fault.
+I14. Generalise activation and inbound error predicates to is_unrecoverable, defined by whether the component may safely continue processing.
+I15. Consolidate all four shared FailingStore failure controls behind one Arc<Mutex<FailingStoreControlState>> shared by the store and delegated transactions. Keep immutable configuration and transaction-local flags outside it.
+I16. Consolidate ListenerStub captures, counters, rejection control, and buffered receiver behind one Mutex<ListenerStubState>; keep the channel sender outside it.
+I17. Validate with rustfmt, the focused regression, runtime group tests, the full replication library suite, pedantic Clippy, and diff whitespace checks, all sequentially.
 
 Estimate
 
-Approximately 80-180 LOC if the group-replacement provider can be reused as expected, below 1000 LOC."""
-status = "open"
+E01. Original implementation remains approximately 205-355 touched LOC.
+E02. First review follow-up remains approximately 30-70 touched LOC.
+E03. Second review follow-up remains approximately 80-140 touched LOC.
+E04. Third review follow-up is approximately 120-205 touched LOC, mostly mechanical consolidation with a net reduction in test plumbing.
+E05. The complete task remains comfortably below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 labels = ["area:replication"]
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-07-18T09:00:27.274771Z"
-updated_at = "2026-08-25T16:36:25.592001Z"
+updated_at = "2026-08-26T06:47:16.007277Z"
+closed_at = "2026-08-26T06:47:16.007277Z"
 
 [[links]]
 target = "019f51c0-171b-7cf2-b327-0cc4670d4ef0"
 label = "discovered from"
+
+[[comments]]
+id = "01a039df-aa4d-7d92-84d5-24355a68b956"
+author = "codex"
+body = "Plan aligned against merged main: make inline embedding store-only, generalise the replacement provider into one activation provider with ordinary and replacement modes, open its pinned read transaction only after commit, and prove creation delivery is split into bounded reusable batches."
+created_at = "2026-08-25T17:02:34.573883Z"
+
+[[comments]]
+id = "01a039ea-50a8-7a92-b027-807e2153a013"
+author = "codex"
+body = "Implementation complete for review. Creation activation now embeds rows only into the committed store and streams listener changes through the shared StoreActivationRowProvider in 128-row pages. Hosted and unavailable replacement modes retain their prior semantics. Provider tests cover ordinary pagination, tombstones, NotCompared lineage, reuse, release, limits, and scan errors; runtime coverage verifies a 129-row activation arrives as one Update event with batches [128, 1], the global read token, and committed row state. The complete 340-test library suite and pedantic Clippy pass."
+created_at = "2026-08-25T17:14:12.520128Z"
+
+[[comments]]
+id = "01a039f4-32b7-7370-a5e7-9da2b3572381"
+author = "codex"
+body = "Review plan agreed: correct the stale store-only documentation, make the provider transaction lifecycle fail fast, rename the creation mode, restore item ordering, and escalate post-commit provider transaction acquisition failure to the fatal runtime path so restart requires application resynchronisation."
+created_at = "2026-08-25T17:25:00.215274Z"
+
+[[comments]]
+id = "01a03a01-e702-7041-87eb-91e0190cbdf3"
+author = "lkroll"
+body = "Review follow-up complete. Store-only embedding documentation and provider item order are corrected; the creation constructor/source are renamed; a missing live provider transaction now fails fast with direct invariant coverage; and post-commit provider read acquisition is fatal. Integration coverage verifies that the runtime becomes unavailable after the committed failure boundary, the successor remains stored with no pending activation, and restart reconstructs it without replaying the missed listener event. Provider tests, all 25 runtime group tests, all 342 replication library tests, pedantic Clippy, rustfmt check, and diff whitespace check pass."
+created_at = "2026-08-25T17:39:58.338827Z"
+
+[[comments]]
+id = "01a03a0e-411a-7e72-bb73-4d39868d7dfa"
+author = "lkroll"
+body = "Second review correction agreed: post-commit provider acquisition will use the Kompact unrecoverable-handler fault path rather than panic, and the regression will prove a real successor row is missed by listener replay but recoverable through explicit snapshot resynchronisation."
+created_at = "2026-08-25T17:53:27.834976Z"
+
+[[comments]]
+id = "01a03a13-ec59-7103-b97f-98ca7f1fdb6c"
+author = "lkroll"
+body = "Second review follow-up complete. Post-commit activation provider acquisition now returns a phase-specific error which direct membership, listener-mediated, inbound, test-inbound, and startup handler boundaries escalate through HandlerError::Unrecoverable without panicking the process. The regression carries a schema-backed row into the committed successor, verifies no listener replay after restart, and retrieves the row through explicit snapshot resynchronisation. The focused regression, all 25 runtime group tests, all 342 replication library tests, pedantic Clippy, rustfmt check, and diff whitespace check pass."
+created_at = "2026-08-25T17:59:39.353072Z"
+
+[[comments]]
+id = "01a03cbe-fb72-7da3-a8b1-79bb05df26f7"
+author = "lkroll"
+body = "Third review plan agreed: add application recovery guidance to ApiError::RuntimeUnavailable, generalise unrecoverable error classification, consolidate all shared FailingStore controls into one mutex-protected state, and consolidate ListenerStub captures and controls likewise while retaining transaction-local and immutable fields outside shared state."
+created_at = "2026-08-26T06:25:44.306481Z"
+
+[[comments]]
+id = "01a03cc7-52ae-7663-8960-8dc7a3a0baa2"
+author = "lkroll"
+body = "Third review follow-up complete. ApiError::RuntimeUnavailable now tells application developers to discard the unusable handle, load a fresh runtime, and resynchronise after an unexpectedly unavailable mutating operation because its commit may already have completed. Activation and inbound errors now expose the general is_unrecoverable component-continuation classification. FailingStore and its transactions share one consolidated failure-control mutex, while ListenerStub keeps all captures and controls in one listener-state mutex. The focused regression, all 25 runtime group tests, all 342 replication library tests, pedantic Clippy, rustfmt check, and diff whitespace check pass."
+created_at = "2026-08-26T06:34:50.926237Z"
+
+[[comments]]
+id = "01a03cd2-b127-7920-8e62-ede7c764912b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-26T06:47:16.007277Z"
