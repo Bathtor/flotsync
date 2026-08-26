@@ -49,3 +49,7 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      # PRs avoid costly optimised builds; scheduled CI compiles and links benchmarks.
+      - name: Check benchmarks
+        run: cargo check --workspace --benches --locked

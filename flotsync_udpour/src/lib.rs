@@ -157,7 +157,7 @@
 //! - it emits fully reassembled inbound deliveries
 //! - it surfaces route-transport send failures separately from higher-level
 //!   semantic-delivery acknowledgments
-#![feature(deque_extend_front)]
+#![cfg_attr(flotsync_nightly, feature(deque_extend_front))]
 
 mod codec;
 mod receiver;

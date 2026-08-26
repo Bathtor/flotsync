@@ -218,7 +218,15 @@ impl UDPourComponent {
     where
         I: DoubleEndedIterator<Item = QueuedDatagram>,
     {
-        self.dispatcher.queue.prepend(datagrams);
+        cfg_select! {
+            flotsync_nightly => self.dispatcher.queue.prepend(datagrams),
+            _ => {
+                // Reverse before pushing to the front so the input order is preserved.
+                for datagram in datagrams.rev() {
+                    self.dispatcher.queue.push_front(datagram);
+                }
+            }
+        }
         self.try_dispatch_outbound();
     }
 

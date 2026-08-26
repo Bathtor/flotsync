@@ -15,6 +15,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_NIGHTLY_TOOLCHAIN: nightly
+  RUST_MSRV_TOOLCHAIN: 1.96.0
 
 jobs:
   native-tests:
@@ -61,7 +63,12 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
+
+      - name: Install minimum supported Rust version
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
 
       - name: Install Buf
         uses: bufbuild/buf-setup-action@v1
@@ -72,5 +79,20 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run workspace tests
-        run: cargo test --workspace --locked
+      - name: Run nightly workspace tests
+        run: cargo +${{ env.RUST_NIGHTLY_TOOLCHAIN }} test --workspace --locked
+
+      - name: Build nightly release workspace
+        run: cargo +${{ env.RUST_NIGHTLY_TOOLCHAIN }} build --workspace --release --locked
+
+      - name: Compile nightly benchmarks
+        run: cargo +${{ env.RUST_NIGHTLY_TOOLCHAIN }} bench --workspace --no-run --locked
+
+      - name: Run MSRV workspace tests
+        run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} test --workspace --locked
+
+      - name: Build MSRV release workspace
+        run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} build --workspace --release --locked
+
+      - name: Compile MSRV benchmarks
+        run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} bench --workspace --no-run --locked

@@ -24,6 +24,8 @@ use flotsync_data_types::{
         values::{NullablePrimitiveValueArray, PrimitiveValueArray},
     },
 };
+#[cfg(not(flotsync_nightly))]
+use itertools::Itertools as _;
 use ordered_float::OrderedFloat;
 use snafu::prelude::*;
 use std::collections::HashMap;

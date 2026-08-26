@@ -38,6 +38,8 @@ use flotsync_data_types::{
         },
     },
 };
+#[cfg(not(flotsync_nightly))]
+use itertools::Itertools as _;
 use ordered_float::OrderedFloat;
 use snafu::prelude::*;
 

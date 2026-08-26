@@ -108,8 +108,9 @@ dependencies, follow-ups, and implementation detail belong in `gitrack`.
 
 ### Toolchain
 
-The workspace currently uses nightly Rust features, so a nightly Rust toolchain
-is expected. CI is the canonical source for the exact check set. Some local
+Nightly Rust remains the development toolchain and is required for formatting
+and clippy. Release builds also support Rust 1.96 as the minimum supported Rust
+version (MSRV). CI is the canonical source for the exact check set. Some local
 checks also require:
 
 - `buf` for protobuf formatting and linting;
@@ -124,6 +125,14 @@ amm scripts/okf-docs.sc check
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 cargo test --workspace --locked
+```
+
+To validate the stable release path at the MSRV, install Rust 1.96 and run:
+
+```bash
+cargo +1.96.0 test --workspace --locked
+cargo +1.96.0 build --workspace --release --locked
+cargo +1.96.0 bench --workspace --no-run --locked
 ```
 
 For focused Rust work, run the relevant package tests first and broaden to the

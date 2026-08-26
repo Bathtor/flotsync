@@ -19,6 +19,7 @@ env:
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     RUST_TEST_TOOLCHAIN: nightly
     RUST_STYLE_TOOLCHAIN: nightly-2026-07-18
+    RUST_MSRV_TOOLCHAIN: 1.96.0
 
 jobs:
     linux-style:
@@ -102,6 +103,11 @@ jobs:
               with:
                   toolchain: ${{ env.RUST_TEST_TOOLCHAIN }}
 
+            - name: Install minimum supported Rust version
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
+
             - name: Install Buf
               uses: bufbuild/buf-setup-action@v1
               with:
@@ -111,5 +117,15 @@ jobs:
             - name: Cache Rust build artifacts
               uses: Swatinem/rust-cache@v2
 
-            - name: Run workspace tests
-              run: cargo test --workspace --locked
+            - name: Run nightly workspace tests
+              run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} test --workspace --locked
+
+            # PRs avoid costly optimised builds; scheduled CI compiles and links benchmarks.
+            - name: Check nightly benchmarks
+              run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} check --workspace --benches --locked
+
+            - name: Run MSRV workspace tests
+              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} test --workspace --locked
+
+            - name: Check MSRV benchmarks
+              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} check --workspace --benches --locked

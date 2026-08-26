@@ -1,4 +1,4 @@
-#![feature(iterator_try_collect)]
+#![cfg_attr(flotsync_nightly, feature(iterator_try_collect))]
 
 // Re-export buffa, so we use a consistent version.
 pub use buffa;
