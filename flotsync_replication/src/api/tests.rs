@@ -2,8 +2,15 @@
 
 use super::*;
 use crate::test_support::docs_group_schema;
+use base64::engine::general_purpose::STANDARD;
+use flotsync_core::versions::{OverrideVersion, PureVersionVector};
 use flotsync_data_types::Field;
+use flotsync_messages::{
+    buffa::{Message as _, MessageField},
+    versions as versions_proto,
+};
 use std::sync::{Arc, LazyLock};
+use uuid::Uuid;
 
 static REPRESENTATION_TEST_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
@@ -24,6 +31,28 @@ fn member_public_keys_record() -> MemberPublicKeysRecord {
         signing_public_key: Box::from([1_u8, 2, 3]),
         encryption_public_key: Box::from([4_u8, 5, 6]),
     }
+}
+
+fn read_token_group_id(value: u128) -> GroupId {
+    GroupId(Uuid::from_u128(value))
+}
+
+fn decode_read_token_proto(token: &ReadToken) -> versions_proto::ReadToken {
+    let bytes = token.to_bytes();
+    let (&format, payload) = bytes
+        .split_first()
+        .expect("runtime-produced read token should contain a format discriminator");
+    assert_eq!(format, 1);
+    versions_proto::ReadToken::decode_from_slice(payload)
+        .expect("runtime-produced read token should decode as its protobuf envelope")
+}
+
+fn encode_read_token_proto(proto: &versions_proto::ReadToken) -> Vec<u8> {
+    let payload = proto.encode_to_vec();
+    let mut bytes = Vec::with_capacity(payload.len() + 1);
+    bytes.push(1);
+    bytes.extend(payload);
+    bytes
 }
 
 #[test]
@@ -383,5 +412,200 @@ fn member_public_keys_alternate_debug_prints_base64url() {
     signing_public_key: "AQID",
     encryption_public_key: "BAUG",
 }"#,
+    );
+}
+
+#[test]
+fn read_token_bytes_and_text_are_canonical_across_vector_representations() {
+    let member_count = NonZeroUsize::new(3).expect("three is non-zero");
+    let synced_group = read_token_group_id(1);
+    let override_group = read_token_group_id(2);
+    let full_group = read_token_group_id(3);
+    let entries = [
+        (
+            full_group,
+            VersionVector::Full(PureVersionVector::from([4, 1, 3])),
+        ),
+        (
+            synced_group,
+            VersionVector::Synced {
+                num_members: member_count,
+                version: 7,
+            },
+        ),
+        (
+            override_group,
+            VersionVector::Override {
+                num_members: member_count,
+                version: OverrideVersion::new(7, 1, 8),
+            },
+        ),
+    ];
+    let first = ReadToken::from_group_versions(HashMap::from(entries.clone()));
+    let second = ReadToken::from_group_versions(HashMap::from([
+        entries[1].clone(),
+        entries[2].clone(),
+        entries[0].clone(),
+    ]));
+
+    assert_eq!(first.to_bytes(), second.to_bytes());
+    assert_eq!(
+        ReadToken::from_bytes(&first.to_bytes()).expect("canonical bytes should decode"),
+        first
+    );
+
+    let text = first.to_string();
+    assert_eq!(text, STANDARD.encode(first.to_bytes()));
+    assert_eq!(
+        text.parse::<ReadToken>()
+            .expect("canonical token text should parse"),
+        first
+    );
+
+    let empty = ReadToken::from_group_versions(HashMap::new());
+    assert_eq!(
+        ReadToken::from_bytes(&empty.to_bytes()).expect("empty token bytes should decode"),
+        empty
+    );
+}
+
+#[test]
+fn read_token_merge_updates_common_groups_and_inserts_new_groups() {
+    let existing_group = read_token_group_id(10);
+    let added_group = read_token_group_id(11);
+    let mut token = ReadToken::from_group_versions(HashMap::from([(
+        existing_group,
+        VersionVector::Full(PureVersionVector::from([1, 4])),
+    )]));
+    let applied = ReadToken::from_group_versions(HashMap::from([
+        (
+            existing_group,
+            VersionVector::Full(PureVersionVector::from([3, 2])),
+        ),
+        (
+            added_group,
+            VersionVector::Synced {
+                num_members: NonZeroUsize::new(2).expect("two is non-zero"),
+                version: 5,
+            },
+        ),
+    ]));
+
+    token.merge_applied(&applied);
+
+    assert_eq!(token.group_count(), 2);
+    assert_eq!(
+        token.group_version(&existing_group),
+        Some(&VersionVector::Override {
+            num_members: NonZeroUsize::new(2).expect("two is non-zero"),
+            version: OverrideVersion::new(3, 1, 4),
+        })
+    );
+    assert_eq!(
+        token.group_version(&added_group),
+        applied.group_version(&added_group)
+    );
+}
+
+#[test]
+fn read_token_debug_is_opaque_normally_and_diagnostic_when_alternate() {
+    let group_id = read_token_group_id(20);
+    let token = ReadToken::from_group_versions(HashMap::from([(
+        group_id,
+        VersionVector::initial(NonZeroUsize::new(1).expect("one is non-zero")),
+    )]));
+
+    let ordinary = format!("{token:?}");
+    assert!(ordinary.contains("group_count"));
+    assert!(!ordinary.contains(&group_id.to_string()));
+    assert!(!ordinary.contains("Synced"));
+
+    let alternate = format!("{token:#?}");
+    assert!(alternate.contains("groups"));
+    assert!(alternate.contains(&group_id.to_string()));
+    assert!(alternate.contains("Synced"));
+}
+
+#[test]
+fn read_token_decode_rejects_invalid_formats_and_structures() {
+    let first_group = read_token_group_id(30);
+    let second_group = read_token_group_id(31);
+    let token = ReadToken::from_group_versions(HashMap::from([
+        (
+            first_group,
+            VersionVector::initial(NonZeroUsize::new(1).expect("one is non-zero")),
+        ),
+        (
+            second_group,
+            VersionVector::initial(NonZeroUsize::new(1).expect("one is non-zero")),
+        ),
+    ]));
+    assert!(ReadToken::from_bytes(&[]).is_err());
+    assert!(ReadToken::from_bytes(&[2]).is_err());
+    assert!(ReadToken::from_bytes(&[1, 0xff]).is_err());
+
+    let canonical_proto = decode_read_token_proto(&token);
+
+    let mut invalid_group = canonical_proto.clone();
+    invalid_group.groups[0].group_id = vec![0];
+    assert!(ReadToken::from_bytes(&encode_read_token_proto(&invalid_group)).is_err());
+
+    let mut missing_vector = canonical_proto.clone();
+    missing_vector.groups[0].versions = MessageField::none();
+    assert!(ReadToken::from_bytes(&encode_read_token_proto(&missing_vector)).is_err());
+
+    let mut invalid_vector = canonical_proto.clone();
+    let mut vector = invalid_vector.groups[0]
+        .versions
+        .take()
+        .expect("canonical token entry should contain a vector");
+    vector.num_members = 0;
+    invalid_vector.groups[0].versions = MessageField::some(vector);
+    assert!(ReadToken::from_bytes(&encode_read_token_proto(&invalid_vector)).is_err());
+
+    let mut duplicate_group = canonical_proto.clone();
+    duplicate_group
+        .groups
+        .push(duplicate_group.groups[0].clone());
+    assert!(ReadToken::from_bytes(&encode_read_token_proto(&duplicate_group)).is_err());
+
+    assert!(matches!(
+        "not base64!".parse::<ReadToken>(),
+        Err(ParseReadTokenError::InvalidBase64 { .. })
+    ));
+    assert!(matches!(
+        "AQ".parse::<ReadToken>(),
+        Err(ParseReadTokenError::InvalidBase64 { .. })
+    ));
+}
+
+#[test]
+fn read_token_decode_accepts_compatible_protobuf_entry_order() {
+    let first_group = read_token_group_id(40);
+    let second_group = read_token_group_id(41);
+    let token = ReadToken::from_group_versions(HashMap::from([
+        (
+            first_group,
+            VersionVector::initial(NonZeroUsize::new(1).expect("one is non-zero")),
+        ),
+        (
+            second_group,
+            VersionVector::initial(NonZeroUsize::new(1).expect("one is non-zero")),
+        ),
+    ]));
+    let mut reordered = decode_read_token_proto(&token);
+    reordered.groups.reverse();
+    let reordered_bytes = encode_read_token_proto(&reordered);
+    assert_eq!(
+        ReadToken::from_bytes(&reordered_bytes)
+            .expect("compatible protobuf bytes may use a different entry order"),
+        token
+    );
+    let reordered_text = STANDARD.encode(reordered_bytes);
+    assert_eq!(
+        reordered_text
+            .parse::<ReadToken>()
+            .expect("canonical Base64 may contain a compatible protobuf ordering"),
+        token
     );
 }

@@ -1,6 +1,14 @@
 //! Change publication requests and provider contracts.
 
 use super::*;
+use crate::codecs::ReadTokenProtoCodec;
+use base64::engine::general_purpose::STANDARD;
+use bytes::{BufMut as _, Bytes, BytesMut};
+use flotsync_core::SortedArrayMap;
+use flotsync_messages::proto::{DecodeProto, EncodeProto};
+
+/// Outer format discriminator for a protobuf read-token payload.
+const READ_TOKEN_PROTOBUF_FORMAT_V1: u8 = 1;
 
 /// Write-only row payload submitted by applications.
 ///
@@ -50,16 +58,43 @@ pub struct ReadToken {
     versions: Arc<ReadTokenVersions>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReadTokenVersions {
-    pub(crate) groups: HashMap<GroupId, VersionVector>,
-}
-
 impl ReadToken {
     pub(crate) fn from_group_versions(groups: HashMap<GroupId, VersionVector>) -> Self {
+        let groups =
+            SortedArrayMap::try_from_entries(groups).expect("hash map has no duplicate keys");
+        Self::from_sorted_group_versions(groups)
+    }
+
+    pub(crate) fn from_sorted_group_versions(
+        groups: SortedArrayMap<GroupId, VersionVector>,
+    ) -> Self {
         Self {
             versions: Arc::new(ReadTokenVersions { groups }),
         }
+    }
+
+    /// Encode this token as canonical opaque bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Bytes {
+        // 65 bytes is enough to hold the version plus a small 2 group token with a few members
+        // per group without reallocating.
+        let mut output = BytesMut::with_capacity(65);
+        output.put_u8(READ_TOKEN_PROTOBUF_FORMAT_V1);
+        ReadTokenProtoCodec::from(&self.versions.groups).encode_proto_into(&mut output);
+        output.freeze()
+    }
+
+    /// Decode an opaque token previously returned by the replication runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadTokenDecodeError`] when `input` is not a structurally valid
+    /// read-token encoding supported by this runtime.
+    pub fn from_bytes(input: &[u8]) -> Result<Self, ReadTokenDecodeError> {
+        let groups = Self::decode_group_versions(input)
+            .boxed()
+            .context(ReadTokenDecodeSnafu)?;
+        Ok(Self::from_sorted_group_versions(groups))
     }
 
     pub(crate) fn group_version(&self, group_id: &GroupId) -> Option<&VersionVector> {
@@ -77,7 +112,7 @@ impl ReadToken {
     ) -> Self {
         let mut groups = self.versions.groups.clone();
         groups.insert(group_id, version_vector);
-        Self::from_group_versions(groups)
+        Self::from_sorted_group_versions(groups)
     }
 
     pub(crate) fn with_update_applied(&self, group_id: GroupId, update_id: UpdateId) -> Self {
@@ -100,13 +135,35 @@ impl ReadToken {
     /// counts.
     pub fn merge_applied(&mut self, applied: &ReadToken) {
         let versions = Arc::make_mut(&mut self.versions);
-        for (group_id, applied_versions) in &applied.versions.groups {
-            let merged_versions = match versions.groups.get(group_id) {
-                Some(existing_versions) => existing_versions.least_upper_bound(applied_versions),
-                None => applied_versions.clone(),
-            };
-            versions.groups.insert(*group_id, merged_versions);
+        for (group_id, applied_versions) in applied.versions.groups.iter() {
+            if let Some(existing_versions) = versions.groups.get_mut(group_id) {
+                *existing_versions = existing_versions.least_upper_bound(applied_versions);
+            } else {
+                // Group membership changes are rare, so most merges update an
+                // existing entry in place and avoid this sorted-vector insertion.
+                versions.groups.insert(*group_id, applied_versions.clone());
+            }
         }
+    }
+
+    /// Decode the outer format discriminator and its selected payload.
+    fn decode_group_versions(
+        input: &[u8],
+    ) -> Result<SortedArrayMap<GroupId, VersionVector>, ReadTokenBytesDecodeError> {
+        let Some((&format, payload)) = input.split_first() else {
+            return MissingFormatSnafu.fail();
+        };
+        ensure!(
+            format == READ_TOKEN_PROTOBUF_FORMAT_V1,
+            UnsupportedFormatSnafu {
+                actual: format,
+                supported: READ_TOKEN_PROTOBUF_FORMAT_V1,
+            }
+        );
+        let groups = ReadTokenProtoCodec::decode_proto_from_slice(payload)
+            .context(InvalidPayloadSnafu)?
+            .into_groups();
+        Ok(groups)
     }
 }
 
@@ -122,6 +179,70 @@ impl std::fmt::Debug for ReadToken {
             .field("group_count", &self.group_count())
             .finish_non_exhaustive()
     }
+}
+
+impl std::fmt::Display for ReadToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&STANDARD.encode(self.to_bytes()))
+    }
+}
+
+impl FromStr for ReadToken {
+    type Err = ParseReadTokenError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let bytes = STANDARD.decode(input).context(InvalidBase64Snafu)?;
+        // Only check for base64 canonicity. Protobuf is more lenient in encoding between versions.
+        ensure!(STANDARD.encode(&bytes) == input, NonCanonicalSnafu);
+        Self::from_bytes(&bytes).context(InvalidTokenSnafu)
+    }
+}
+
+/// Failure while decoding opaque read-token bytes.
+#[derive(Debug, Snafu)]
+#[snafu(display("Read-token bytes were invalid: {source}"))]
+pub struct ReadTokenDecodeError {
+    /// Structural protobuf or token-format failure.
+    source: BoxError,
+}
+
+/// Failure while parsing a read token from its canonical string representation.
+#[derive(Debug, Snafu)]
+pub enum ParseReadTokenError {
+    /// The text was not standard Base64.
+    #[snafu(display("Read-token text was not valid standard Base64: {source}"))]
+    InvalidBase64 { source: base64::DecodeError },
+    /// The decoded bytes were not a valid read token.
+    #[snafu(display("Read-token text did not contain a valid token: {source}"))]
+    InvalidToken { source: ReadTokenDecodeError },
+    /// The text decoded successfully but was not the canonical token spelling.
+    #[snafu(display("Read-token text was not canonically encoded."))]
+    NonCanonical,
+}
+
+/// Group-scoped positions hidden behind the public opaque token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadTokenVersions {
+    /// Canonically ordered group vectors used by codecs and runtime operations.
+    groups: SortedArrayMap<GroupId, VersionVector>,
+}
+
+/// Failure while decoding the outer read-token byte format.
+#[derive(Debug, Snafu)]
+enum ReadTokenBytesDecodeError {
+    /// The bytes omitted the format discriminator.
+    #[snafu(display("Read token omitted its format discriminator."))]
+    MissingFormat,
+    /// The format discriminator is not understood by this runtime.
+    #[snafu(display(
+        "Read token used unsupported format {actual}; supported format is {supported}."
+    ))]
+    UnsupportedFormat { actual: u8, supported: u8 },
+    /// The version-selected payload was structurally invalid.
+    #[snafu(display("Read-token payload was invalid: {source}"))]
+    InvalidPayload {
+        source: crate::codecs::ReadTokenCodecError,
+    },
 }
 
 /// Request to publish one local set of row mutations from a known read token.

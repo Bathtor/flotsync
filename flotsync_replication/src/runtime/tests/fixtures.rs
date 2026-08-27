@@ -446,7 +446,7 @@ pub(super) fn load_runtime_fixture(
 
 #[test]
 pub(super) fn runtime_api_returns_local_public_key_bundle() {
-    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), &ApplicationSchemas::EMPTY);
+    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), ApplicationSchemas::EMPTY);
 
     let bundle = wait_for_test_reply(fixture.runtime.local_public_key_bundle())
         .expect("local public key bundle should load");
@@ -460,7 +460,7 @@ pub(super) fn runtime_api_returns_local_public_key_bundle() {
 #[test]
 pub(super) fn runtime_api_reports_known_member_key_trust() {
     let alice = alice_member();
-    let fixture = load_runtime_fixture(app_alice_id(), alice.clone(), &ApplicationSchemas::EMPTY);
+    let fixture = load_runtime_fixture(app_alice_id(), alice.clone(), ApplicationSchemas::EMPTY);
     let record = MemberPublicKeysRecord::from_public_keys(&test_public_keys(&alice));
     let mut transaction =
         wait_for_test_reply(fixture.store.begin_transaction()).expect("transaction should start");
@@ -491,7 +491,7 @@ pub(super) fn runtime_api_reports_known_member_key_trust() {
 #[test]
 pub(super) fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
     let bob = bob_member();
-    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), &ApplicationSchemas::EMPTY);
+    let fixture = load_runtime_fixture(app_alice_id(), alice_member(), ApplicationSchemas::EMPTY);
     let bundle = test_public_keys(&bob).public_key_bundle();
     let fingerprint = bundle.fingerprint();
     let key_id = MemberKeyId {
@@ -649,7 +649,7 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHo
     let listener = Arc::new(ListenerStub::default());
     let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
         local_member,
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -671,7 +671,7 @@ where
 {
     load_runtime_with_parts_and_application_schemas_and_config(
         application_id,
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store,
         listener,
         ReplicationConfig::default(),
@@ -707,7 +707,7 @@ where
 {
     load_runtime_with_parts_and_application_schemas_and_config(
         application_id,
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store,
         listener,
         config,

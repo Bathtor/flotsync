@@ -314,10 +314,10 @@ fn group_invitation_persists_group_schema() {
     let alice_fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
     );
     let bob_fixture =
-        load_runtime_fixture(app_bob_id(), bob_member.clone(), &ApplicationSchemas::EMPTY);
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), ApplicationSchemas::EMPTY);
     provision_test_security(
         alice_fixture.store.as_ref(),
         &alice_member,

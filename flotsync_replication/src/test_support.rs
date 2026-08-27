@@ -100,7 +100,7 @@ pub fn replication_group_snapshot(
     local_member: &MemberIdentity,
     records: impl IntoIterator<Item = ReplicationGroupRecord>,
 ) -> Arc<dyn ReplicationGroupSnapshot> {
-    application_snapshot_from_records(local_member, &ApplicationSchemas::EMPTY, records)
+    application_snapshot_from_records(local_member, ApplicationSchemas::EMPTY, records)
         .expect("test group records should pass production runtime projection")
 }
 

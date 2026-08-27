@@ -2,3 +2,6 @@
 
 pub(crate) mod messages;
 pub(crate) mod pending_group;
+mod read_token;
+
+pub(crate) use read_token::{ReadTokenCodecError, ReadTokenProtoCodec};

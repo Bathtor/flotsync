@@ -26,7 +26,7 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
         application_id,
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -138,7 +138,7 @@ fn load_replication_runtime_reports_unsupported_identity_without_private_keys() 
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -173,7 +173,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -206,7 +206,7 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -243,7 +243,7 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -281,7 +281,7 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
         application_id.clone(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -411,7 +411,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         store.clone(),
         listener,
         runtime_config_toml.as_str(),
@@ -446,7 +446,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     );
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         alice_store.clone(),
         alice_listener,
         runtime_config_toml.as_str(),
@@ -470,7 +470,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
-            &ApplicationSchemas::EMPTY,
+            ApplicationSchemas::EMPTY,
             store.clone(),
             listener,
             ReplicationConfig::default(),
@@ -496,7 +496,7 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
-            &ApplicationSchemas::EMPTY,
+            ApplicationSchemas::EMPTY,
             store.clone(),
             listener,
             ReplicationConfig::default(),
