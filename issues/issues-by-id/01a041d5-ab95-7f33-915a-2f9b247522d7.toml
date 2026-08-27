@@ -1,0 +1,41 @@
+id = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+ref = "flotsync-5ou"
+title = "Resume persisted application state incrementally"
+body = """
+Goal
+
+Let disk-backed applications such as MaintainRS resume from their atomically stored application state and ReadToken, normally receiving only changes since that position instead of rebuilding every group from fresh snapshots.
+
+Context
+
+C01. The replicated checklist rebuilds an in-memory working set by reading current snapshots on every start.
+C02. MaintainRS owns a more complex application database and should usually preserve that state across restarts.
+C03. A decoded ReadToken may legitimately describe older group versions and lifecycle state.
+C04. Publish already validates the target group position at write time; application synchronisation needs its own validation and fallback rules.
+C05. Current runtime startup replays unresolved group decisions and accepted activations, but not ordinary application data changes.
+C06. Completed activation lineage is not always reconstructable from current group records, especially for a member added through migration, so correct restart replay may require retained delivery metadata or an acknowledgement boundary.
+
+Investigation and implementation direction
+
+P01. Define how an application supplies its latest atomically stored ReadToken before live listener delivery begins.
+P02. Define a completion or acknowledgement boundary so application state and token advancement remain crash-consistent.
+P03. Support the common case of replaying ordinary applied updates after a valid stored group position without sending complete snapshots.
+P04. Preserve and replay creation and group-replacement lineage when sufficient retained evidence exists.
+P05. Detect unsupported, missing, ahead, pruned, or ambiguous positions and explicitly fall back to bounded fresh snapshots for only the affected groups where practical.
+P06. Keep unaffected groups incremental when another group requires snapshot fallback.
+P07. Specify ordering between startup replay, pending decisions and activations, catch-up, and later live listener events.
+P08. Cover ordinary restart deltas, offline peer progress, creation, migration chains, added-member lineage, mixed incremental/fallback recovery, listener failure, and crashes around application acknowledgement.
+
+Sizing
+
+The complete implementation is likely to exceed 1000 LOC. After the replay and acknowledgement contract is designed, split implementation into self-contained children for the application resume boundary, ordinary update delta replay, and activation/migration lineage plus snapshot fallback."""
+status = "open"
+type = "task"
+priority = 1
+parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+created_at = "2026-08-27T06:08:37.269924Z"
+updated_at = "2026-08-27T06:08:47.946181Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5fb762bcf154"
+label = "discovered from"

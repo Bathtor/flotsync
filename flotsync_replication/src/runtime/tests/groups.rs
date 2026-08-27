@@ -14,7 +14,7 @@ fn runtime_group_state_projection_rejects_duplicate_group_ids() {
 
     let result = RuntimeGroupStateSnapshot::from_records(
         &local_member,
-        &ApplicationSchemas::EMPTY,
+        ApplicationSchemas::EMPTY,
         [record.clone(), record],
     );
     let Err(error) = result else {
@@ -90,7 +90,7 @@ fn runtime_group_state_keeps_non_matching_loaded_schema() {
 fn runtime_group_state_reuses_resolved_schema_arc_for_hosted_group() {
     let local_member = alice_member();
     let group_id = GroupId(Uuid::from_u128(33));
-    let state = SharedGroupState::new(&ApplicationSchemas::EMPTY);
+    let state = SharedGroupState::new(ApplicationSchemas::EMPTY);
     let first_record = inactive_group_record(
         group_id,
         vec![local_member.clone(), bob_member()],
@@ -1450,7 +1450,7 @@ fn runtime_replay_listener_failure_keeps_pending_group_decision() {
     let start_result =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
             &alice_member,
-            &ApplicationSchemas::EMPTY,
+            ApplicationSchemas::EMPTY,
             store.clone(),
             listener.clone(),
             ReplicationConfig::default(),

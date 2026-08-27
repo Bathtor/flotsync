@@ -446,11 +446,12 @@ impl ReservedSocketBroker {
 
             // Not enough idle sockets, try to acquire a socket.
             let next_kind = kinds[acquired.len()];
+            let occupied_addrs = state.occupied_addrs(next_kind);
 
             // Drop state while we acquire so other threads can get the mutex to return leases.
             drop(state);
 
-            let open_result = ReservedSocket::open(next_kind);
+            let open_result = ReservedSocket::open(next_kind, &occupied_addrs);
 
             // Re-acquire state before completing the loop.
             state = self.lock_state("socket reservation");
@@ -653,6 +654,14 @@ impl ReservedSocketBrokerState {
             ReservedSocketKind::TcpListener => self.waiting_tcp,
             ReservedSocketKind::UdpSocket => self.waiting_udp,
         }
+    }
+
+    /// Return addresses which a fresh reservation of `kind` must not reuse.
+    fn occupied_addrs(&self, kind: ReservedSocketKind) -> HashSet<SocketAddr> {
+        self.slots
+            .values()
+            .filter_map(|slot| option_when!(slot.kind == kind, slot.addr))
+            .collect()
     }
 
     fn take_idle_for_trim(&mut self, kind: ReservedSocketKind) -> Option<ReservedSocket> {
@@ -1317,7 +1326,7 @@ struct ReservedSocket {
 }
 
 impl ReservedSocket {
-    fn open(kind: ReservedSocketKind) -> io::Result<Self> {
+    fn open(kind: ReservedSocketKind, occupied_addrs: &HashSet<SocketAddr>) -> io::Result<Self> {
         let slot_id = RESERVED_SOCKET_SLOT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut last_error = None;
         for _attempt in 0..RESERVED_SOCKET_BIND_ATTEMPTS {
@@ -1336,6 +1345,15 @@ impl ReservedSocket {
                             "reserved {kind:?} socket was assigned a non-IP local address"
                         ))
                     })?;
+                    if occupied_addrs.contains(&addr) {
+                        last_error = Some(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            format!(
+                                "OS assigned reserved {kind:?} socket address {addr}, which is already tracked by the broker"
+                            ),
+                        ));
+                        continue;
+                    }
                     return Ok(Self {
                         slot_id,
                         kind,

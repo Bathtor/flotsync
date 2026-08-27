@@ -70,6 +70,11 @@ pub trait EncodeProto {
         Box::new(self.encode_proto())
     }
 
+    /// Append this value's encoded protobuf bytes to `output`.
+    fn encode_proto_into(&self, output: &mut impl bytes::BufMut) {
+        self.encode_proto().encode(output);
+    }
+
     /// Encode this value into owned bytes through its generated protobuf shape.
     fn encode_proto_to_bytes(&self) -> bytes::Bytes {
         self.encode_proto().encode_to_bytes()
@@ -818,12 +823,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_proto_helpers_return_owned_bytes() {
+    fn encode_proto_helpers_write_into_buffers_and_return_owned_bytes() {
         let version = SyncedVersion(13);
         let proto = version.encode_proto();
+        let prefix = b"prefix";
+        let mut output = bytes::BytesMut::from(&prefix[..]);
+
+        version.encode_proto_into(&mut output);
 
         assert_eq!(version.encode_proto_to_bytes(), proto.encode_to_bytes());
         assert_eq!(version.encode_proto_to_vec(), proto.encode_to_vec());
+        assert_eq!(&output[..prefix.len()], prefix);
+        assert_eq!(&output[prefix.len()..], proto.encode_to_vec());
     }
 
     #[test]

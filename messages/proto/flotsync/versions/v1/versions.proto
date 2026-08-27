@@ -2,6 +2,18 @@ syntax = "proto3";
 
 package flotsync.versions.v1;
 
+// Opaque application read position persisted outside the replication runtime.
+message ReadToken {
+  repeated ReadTokenGroup groups = 1;
+}
+
+// Version vector observed by an application for one replication group.
+message ReadTokenGroup {
+  // Canonical 16-byte UUID representation of the replication group id.
+  bytes group_id = 1;
+  VersionVector versions = 2;
+}
+
 // A self-describing version vector that carries the member count required to
 // expand compact synced and override representations.
 message VersionVector {

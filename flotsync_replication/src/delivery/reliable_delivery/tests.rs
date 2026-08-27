@@ -357,10 +357,13 @@ impl FullStackHarness {
         }
     }
 
-    fn wait_for_ingress_envelope_count(&self, message_id: MessageId, expected_count: usize) {
+    /// Return the next ingress envelope for `message_id` so a test can replay its exact frame.
+    fn wait_for_ingress_envelope(
+        &self,
+        message_id: MessageId,
+    ) -> delivery_proto::ReliableDeliveryFrame {
         let deadline = Instant::now() + WAIT_TIMEOUT;
-        let mut observed_count = 0;
-        while observed_count < expected_count {
+        loop {
             let timeout = deadline.saturating_duration_since(Instant::now());
             let observed = self
                 .ingress_probe
@@ -370,15 +373,16 @@ impl FullStackHarness {
                 .expect("timed out waiting for reliable delivery ingress envelope")
                 .expect("reliable delivery ingress probe should stay live");
             self.ingress_cursor.set(observed.index() + 1);
+            let frame = observed.indication().frame.clone();
             let Some(delivery_proto::reliable_delivery_frame::Body::Envelope(envelope)) =
-                observed.indication().frame.body.as_ref()
+                frame.body.as_ref()
             else {
                 continue;
             };
             let envelope = reliable_envelope_from_wire((**envelope).clone())
                 .expect("ingress probe should observe decodable reliable envelopes");
             if envelope.header.message_id == message_id {
-                observed_count += 1;
+                return frame;
             }
         }
     }
@@ -2174,8 +2178,7 @@ fn duplicate_inbound_envelope_is_dropped_while_awaiting_processed() {
 fn duplicate_inbound_envelope_retries_pending_recipient_ack_without_redelivery() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
-    let sender =
-        FullStackHarness::with_recipient_ack_timeout(alice.clone(), TEST_RECIPIENT_ACK_TIMEOUT);
+    let sender = FullStackHarness::new(alice.clone());
     let receiver = FullStackHarness::new(bob.clone());
 
     sender.publish_direct_route(bob.clone(), receiver.local_addr);
@@ -2189,6 +2192,7 @@ fn duplicate_inbound_envelope_retries_pending_recipient_ack_without_redelivery()
     ));
 
     let deliver = receiver.wait_for_delivery();
+    let duplicate = receiver.wait_for_ingress_envelope(message_id);
     sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
     deliver
         .processed
@@ -2196,7 +2200,7 @@ fn duplicate_inbound_envelope_retries_pending_recipient_ack_without_redelivery()
         .expect("processed completion should succeed exactly once");
     receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AckPending);
 
-    receiver.wait_for_ingress_envelope_count(message_id, 2);
+    receiver.inject_reliable_frame(duplicate);
     receiver.expect_no_delivery(Duration::from_millis(20));
     receiver.publish_direct_route(alice, sender.local_addr);
     sender.wait_for_sender_work_clear(message_id);

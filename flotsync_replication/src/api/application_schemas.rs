@@ -1,6 +1,7 @@
 //! Process-static application schema registration.
 
 use super::{DatasetId, DatasetIdError};
+use flotsync_core::{SortOrder, SortedArrayMap};
 use flotsync_data_types::schema::Schema;
 use snafu::prelude::*;
 use std::{cmp::Ordering, sync::LazyLock};
@@ -13,12 +14,12 @@ use std::{cmp::Ordering, sync::LazyLock};
 #[derive(Debug)]
 pub struct ApplicationSchemas {
     /// Process-static schemas ordered by identifier byte length and then contents.
-    schemas: Option<Box<[(&'static str, &'static Schema)]>>,
+    schemas: SortedArrayMap<&'static str, &'static Schema, DatasetIdOrder>,
 }
 
 impl ApplicationSchemas {
     /// Empty application schema registry requiring no allocation or lazy initialisation.
-    pub const EMPTY: Self = Self { schemas: None };
+    pub const EMPTY: &'static Self = &EMPTY_APPLICATION_SCHEMAS;
 
     /// Build an application schema registry from process-static definitions.
     ///
@@ -33,26 +34,17 @@ impl ApplicationSchemas {
     pub fn try_from_entries(
         entries: impl IntoIterator<Item = (&'static str, &'static Schema)>,
     ) -> Result<Self, ApplicationSchemasError> {
-        let mut schemas = entries.into_iter().collect::<Vec<_>>();
+        let schemas = entries.into_iter().collect::<Vec<_>>();
         for &(dataset_id, _) in &schemas {
             DatasetId::validate(dataset_id).context(InvalidDatasetIdSnafu { dataset_id })?;
         }
 
-        schemas.sort_unstable_by(|(left, _), (right, _)| compare_dataset_ids(left, right));
-        for adjacent in schemas.windows(2) {
-            let [(left, _), (right, _)] = adjacent else {
-                unreachable!("two-entry windows always contain two entries")
-            };
-            if left == right {
-                return DuplicateDatasetSnafu { dataset_id: *right }.fail();
+        let schemas = SortedArrayMap::try_from_entries(schemas).map_err(|error| {
+            DuplicateDatasetSnafu {
+                dataset_id: error.into_key(),
             }
-        }
-
-        let schemas = if schemas.is_empty() {
-            None
-        } else {
-            Some(schemas.into_boxed_slice())
-        };
+            .build()
+        })?;
         Ok(Self { schemas })
     }
 
@@ -68,7 +60,7 @@ impl ApplicationSchemas {
     ) -> Result<Self, ApplicationSchemasError> {
         DatasetId::validate(dataset_id).context(InvalidDatasetIdSnafu { dataset_id })?;
         Ok(Self {
-            schemas: Some(Box::new([(dataset_id, schema)])),
+            schemas: SortedArrayMap::from_entry(dataset_id, schema),
         })
     }
 
@@ -106,23 +98,19 @@ impl ApplicationSchemas {
     /// Return the registered schema for `dataset_id`, if the application supplies one.
     #[must_use]
     pub fn get(&self, dataset_id: &DatasetId) -> Option<&'static Schema> {
-        let schemas = self.as_slice();
-        let index = schemas
-            .binary_search_by(|(candidate, _)| compare_dataset_ids(candidate, dataset_id.as_str()))
-            .ok()?;
-        Some(schemas[index].1)
+        self.schemas.get(dataset_id.as_str()).copied()
     }
 
     /// Return whether the registry contains no application schemas.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.schemas.is_none()
+        self.schemas.is_empty()
     }
 
     /// Return the number of registered application schemas.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.as_slice().len()
+        self.schemas.len()
     }
 
     /// Iterate over every registered dataset identifier and schema.
@@ -132,14 +120,9 @@ impl ApplicationSchemas {
     /// so constructing them neither allocates nor repeats validation.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (DatasetId, &'static Schema)> + '_ {
-        self.as_slice()
+        self.schemas
             .iter()
-            .map(|&(dataset_id, schema)| (DatasetId::from_static_unchecked(dataset_id), schema))
-    }
-
-    /// Return the registry entries as an empty or populated slice.
-    fn as_slice(&self) -> &[(&'static str, &'static Schema)] {
-        self.schemas.as_deref().unwrap_or_default()
+            .map(|(dataset_id, schema)| (DatasetId::from_static_unchecked(dataset_id), *schema))
     }
 }
 
@@ -164,9 +147,20 @@ pub enum ApplicationSchemasError {
     },
 }
 
-/// Compare validated dataset identifier strings in registry storage order.
-fn compare_dataset_ids(left: &str, right: &str) -> Ordering {
-    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+/// Shared empty registry for APIs which require process-static schemas.
+static EMPTY_APPLICATION_SCHEMAS: ApplicationSchemas = ApplicationSchemas {
+    schemas: SortedArrayMap::new(),
+};
+
+/// Length-first ordering retained from the application schema registry.
+struct DatasetIdOrder;
+
+impl SortOrder<&'static str> for DatasetIdOrder {
+    type LookupKey = str;
+
+    fn compare(left: &Self::LookupKey, right: &Self::LookupKey) -> Ordering {
+        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    }
 }
 
 #[cfg(test)]

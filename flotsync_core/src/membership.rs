@@ -115,7 +115,6 @@ impl GroupMembers {
     }
 
     /// Return the canonical bootstrap order for this group.
-    // Panics here only indicate a broken private `GroupMembers` representation invariant.
     #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn ordered_members(&self) -> Vec<MemberIdentity> {

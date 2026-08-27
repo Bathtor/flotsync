@@ -1,14 +1,121 @@
 id = "019f0542-b0cc-70a2-9d97-5fb762bcf154"
 ref = "flotsync-261"
 title = "Make ReadToken opaquely serialisable"
-body = "Follow-up to flotsync-0ns. The first manual-slice ReadToken can be an opaque in-memory API value because replicated-checklist is in-memory, but later slices need applications to persist and restore tokens without inspecting replication group scoping. Design and implement opaque serialisation/deserialisation for ReadToken with versioning and validation against the runtime/store state."
-status = "open"
+body = """
+Goal
+
+Make ReadToken opaquely and canonically serialisable so disk-backed applications can persist and restore application read positions without inspecting replication-group scoping.
+
+Context
+
+C01. flotsync_core::SortedArrayMap is implemented and reviewed as a contiguous Vec-backed sorted map with natural or custom ordering, immutable slice exposure, binary-search lookup, mutable lookup, and ordered insertion.
+C02. Applications are trusted to restore only opaque token bytes previously returned by the runtime. Decode therefore performs format and structural validation, not runtime or store compatibility validation.
+C03. Restored positions may intentionally be behind current state or contain outdated lifecycle information. Publish retains authoritative validation for the group it changes.
+C04. Application restart synchronisation from a stored token is tracked separately by flotsync-5ou under flotsync-d3k, including incremental replay and per-group snapshot fallback.
+C05. The existing self-describing VersionVectorProtoCodec already carries the member count needed for standalone persistence and should be reused.
+C06. Token output is deterministic because groups are encoded in sorted order. Decoding accepts compatible protobuf payloads even when the current encoder would emit a different field or entry order.
+C07. ApplicationSchemas retains its custom length-first dataset-id order but can store an empty SortedArrayMap directly.
+C08. Ordinary ReadToken Debug output remains opaque and count-based. Alternate Debug remains an explicit diagnostic representation containing group details.
+C09. Public-key-bundle pasteable text already uses standard padded Base64. ReadToken text follows that convention and canonicalises only the Base64 spelling of the exact encoded bytes.
+C10. Group membership changes rarely. Most ReadToken merges update vectors for existing groups; inserting a newly encountered group is an exceptional path.
+C11. A one-byte discriminator belongs outside protobuf so later values can select a completely different encoding rather than only another protobuf schema.
+C12. Encoding the protobuf into a temporary Vec and then copying it behind the outer discriminator is unnecessary. Buffa messages already encode directly into BufMut, and Bytes is accepted directly by Base64 through AsRef<[u8]>.
+
+Plan
+
+P01. Retain the reviewed SortedArrayMap<K, V, O = NaturalOrder> implementation and immutable contiguous access through as_slice, AsRef, and Deref. Do not expose mutable slice access.
+P02. Keep bulk collision resolution out of the generic collection. ReadToken::merge_applied updates existing entries through get_mut and inserts only groups introduced by rare membership changes, with that workload assumption documented at the use site.
+P03. Move ApplicationSchemas to a direct SortedArrayMap<&static str, &static Schema, DatasetIdOrder> field and remove Option handling. Expose EMPTY as an associated &static ApplicationSchemas backed by one actual static, because borrowing a Vec-containing associated const value cannot satisfy the runtime APIs requiring a static reference. Translate duplicate-key construction errors with map_err.
+P04. Keep ReadToken group storage in SortedArrayMap<GroupId, VersionVector> behind Arc. Preserve binary-search lookup, single-group advancement, and least-upper-bound merging. Its HashMap conversion retains the checked generic constructor with the direct invariant message that a hash map has no duplicate keys.
+P05. Define opaque bytes as one u8 format discriminator followed by the selected format payload. Format 1 contains protobuf. Reject a missing or unsupported discriminator before payload decoding.
+P06. Define the protobuf ReadToken message as only repeated group entries. Each entry contains the canonical 16-byte UUID representation of GroupId plus the existing self-describing VersionVector protobuf. Remove protobuf-level format_version handling and translate duplicate groups with map_err.
+P07. Keep ReadToken::to_bytes deterministic and return Bytes. Build one BytesMut, append the format discriminator, encode sorted protobuf groups directly into that buffer, and freeze it without copying. Keep ReadToken::from_bytes independent of runtime state and accept structurally valid protobuf payloads without requiring re-encoding to reproduce the original bytes.
+P08. Implement Display and FromStr with standard padded Base64. Parsing verifies canonical Base64 by re-encoding the decoded bytes themselves, then decodes the token. Display passes Bytes directly to Base64 without an intermediate vector.
+P09. Keep runtime compatibility validation at actual use sites. Publish continues validating its target group; startup synchronisation validation belongs to flotsync-5ou.
+P10. Preserve ordinary opaque Debug output and restore alternate Debug output containing internal group vectors for diagnostics.
+P11. Keep Snafu context wrapping where errors retain sources. Use map_err only for the real source-free translations from duplicate sorted-map keys to duplicate datasets or groups.
+P12. Cover ApplicationSchemas empty and populated behaviour; ReadToken storage and merging; empty and populated byte and text round trips; every VersionVector representation; deterministic output; compatible differently ordered protobuf input; malformed payloads; missing and unsupported format discriminators; invalid ids and vectors; duplicate groups; invalid and non-canonical Base64; and both Debug modes.
+P13. Run protobuf formatting and linting, focused unit tests, the complete replication suite serially, and all-target pedantic Clippy. Reconcile every review item before returning the work for review.
+P14. Extend EncodeProto with direct encoding into a caller-supplied BufMut using the generated Buffa Message::encode implementation. Retain the existing Bytes and Vec convenience methods and test that all three paths produce identical protobuf bytes.
+P15. Do not add a dedicated ReadToken vector-returning method until a caller needs it. Callers which specifically require Vec<u8> can explicitly convert the returned Bytes.
+
+Size estimate
+
+S01. Reviewed SortedArrayMap implementation and tests: about 250-350 LOC.
+S02. ApplicationSchemas and ReadToken representation changes: about 120-200 LOC.
+S03. Outer format byte, protobuf codec, public byte and text API, errors, and tests: about 280-440 LOC.
+S04. Direct BufMut encoding and Bytes-returning token refinement: about 30-60 LOC.
+S05. Total expected implementation: about 680-1050 LOC. The upper estimate crosses 1000 only when counting all staged tests and reviewed collection work together; the buffer refinement is a small self-contained addition and does not warrant a separate child issue."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-05-01T14:38:40Z"
-updated_at = "2026-08-25T16:36:28.478804Z"
+updated_at = "2026-08-27T17:36:02.413252Z"
+closed_at = "2026-08-27T17:36:02.413252Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-56068f44e30a"
 label = "discovered from"
+
+[[comments]]
+id = "01a041e6-f78e-7b30-b4f4-359d4b52b7ae"
+author = "codex"
+body = "Plan aligned after review: decoding remains structurally validated but independent of runtime/store state; startup resumption moved to linked child flotsync-5ou; token text uses canonical padded Base64; and canonical storage is based on a reusable SortedArrayMap with custom SortOrder policy and LookupKey. This implementation stage is deliberately limited to the core collection and its focused tests."
+created_at = "2026-08-27T06:27:30.830005Z"
+
+[[comments]]
+id = "01a041ed-5a2f-77e0-96f3-5f635d2860f9"
+author = "codex"
+body = "P01 implementation stage complete: flotsync_core now exports SortedArrayMap with NaturalOrder, custom SortOrder LookupKey support, checked canonical construction, borrowed binary-search lookup, insertion, and linear collision-resolving merge. Focused collection coverage and the complete core suite pass; all-target pedantic Clippy is clean. P02-P09 production work remains intentionally deferred."
+created_at = "2026-08-27T06:34:29.295018Z"
+
+[[comments]]
+id = "01a043b1-3059-7a71-94c6-3912d576dca0"
+author = "codex"
+body = "First-review plan delta agreed: use Vec backing; expose the immutable contiguous entries through public as_slice, AsRef, and Deref without mutable slice access; reuse NonOwningPhantomData; remove the specialised bulk merge; and add get_mut. ReadToken merging will update existing groups in place and insert only after rare group membership changes, with that workload assumption documented at the use site."
+created_at = "2026-08-27T14:48:00.857629Z"
+
+[[comments]]
+id = "01a043b4-9b83-7930-95a4-7ab673235dc0"
+author = "codex"
+body = "SortedArrayMap first-review revision complete: Vec now backs the contiguous sorted entries; as_slice is public with AsRef and immutable Deref; get_mut replaces the specialised collision-resolving merge API; insertion shifts in place; and the shared non-owning phantom alias is used. Five focused tests and all 59 flotsync_core tests pass serially, and all-target pedantic Clippy is clean. The requested rare-group-insertion production comment remains attached to P03 and will be added beside ReadToken::merge_applied during the explicitly deferred consumer stage."
+created_at = "2026-08-27T14:51:44.899275Z"
+
+[[comments]]
+id = "01a043e0-5e59-7553-ba1a-0c1a4b27d212"
+author = "codex"
+body = "Full flotsync-261 implementation is ready for review. ApplicationSchemas and ReadToken now use SortedArrayMap while preserving ApplicationSchemas::EMPTY as an owned associated constant. ReadToken exposes canonical to_bytes/from_bytes plus padded standard-Base64 Display/FromStr, reuses the self-describing VersionVector protobuf codec, sorts group entries canonically, rejects malformed/unsupported/duplicate structures, and keeps both Debug formats opaque. ReadToken merging performs common in-place updates and documents that sorted insertion occurs only for rare group additions. Coverage includes empty tokens, all vector representations, ordering independence, merge behaviour, malformed bytes, invalid ids/vectors, duplicates, unsupported formats, invalid Base64, and non-canonical text. Final validation: buf format/lint clean; 45 flotsync_messages tests pass; all 346 flotsync_replication tests pass serially; all-target pedantic Clippy is clean. Startup replay remains intentionally tracked in flotsync-5ou."
+created_at = "2026-08-27T15:39:32.825859Z"
+
+[[comments]]
+id = "01a0441d-a968-7e00-9a63-81a6de28336d"
+author = "codex"
+body = "Second-review plan aligned: remove ApplicationSchemas Option storage and expose its empty registry through an associated static reference; keep the HashMap uniqueness assertion direct; restore alternate diagnostic ReadToken Debug; prefix token bytes with an outer u8 format discriminator so protobuf is only the version-1 payload; canonicalise only Base64 spelling; simplify duplicate-error translations; and clarify UUID protobuf documentation."
+created_at = "2026-08-27T16:46:29.7363Z"
+
+[[comments]]
+id = "01a04424-2910-7da0-8f9c-1e4def43e47d"
+author = "codex"
+body = "Second-review revisions are ready: ApplicationSchemas now stores its SortedArrayMap directly and exposes EMPTY as an associated static reference; duplicate translations use map_err; ReadToken restores alternate diagnostic Debug; opaque bytes use an outer u8 discriminator followed by a protobuf payload without an internal version field; string parsing checks only Base64 spelling; and the protobuf documents group ids as 16-byte UUIDs. Compatible protobuf entry order is accepted. Validation: buf format/lint clean, all 45 flotsync_messages tests pass, all 347 flotsync_replication tests pass serially, and all-target pedantic Clippy is clean."
+created_at = "2026-08-27T16:53:35.632226Z"
+
+[[comments]]
+id = "01a04439-4fa9-7c52-a3da-8d6b967df030"
+author = "codex"
+body = "Third-review plan aligned: extend EncodeProto with direct encoding into a caller-supplied BufMut; make ReadToken::to_bytes return Bytes built from one BytesMut containing the format byte and directly encoded protobuf payload; pass Bytes directly to Base64; and add no dedicated Vec API until a caller needs it."
+created_at = "2026-08-27T17:16:41.769784Z"
+
+[[comments]]
+id = "01a0443c-1987-7101-b394-46353a9f1897"
+author = "codex"
+body = "Direct buffer encoding is ready for review. EncodeProto::encode_proto_into appends to any BufMut and has focused coverage against the existing Bytes and Vec helpers. ReadToken::to_bytes now returns Bytes from one BytesMut containing the discriminator and directly encoded protobuf payload; Display passes that Bytes value directly to Base64. Validation: all 45 flotsync_messages tests and all 347 flotsync_replication tests pass serially, both crates pass all-target pedantic Clippy, and formatting/diff checks are clean."
+created_at = "2026-08-27T17:19:44.519579Z"
+
+[[comments]]
+id = "01a0444b-056d-7a12-a017-286d7b20467b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-27T17:36:02.413252Z"
