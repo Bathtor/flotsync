@@ -14,13 +14,14 @@ M03. Redesign schema-bound snapshot/storage row batching before MaintainRS depen
 M04. Make the workspace build and test on stable Rust.
 M05. Finish memory-bounded listener delivery for non-replacement inline activation snapshots by reusing the store-backed batching introduced for group replacement.
 M06. Automatically initiate Summary-based catch-up when a direct peer route becomes available again, so missed best-effort broadcasts can be repaired without a later edit or an application-issued manual summary request.
+M07. Let disk-backed applications resume from atomically stored application state and ReadToken positions, normally replaying incremental changes after restart while falling back to bounded fresh snapshots for affected groups when exact replay is unavailable.
 
 Explicit deferrals
 
 D01. ReplicationStore conformance tests and the headless local store-secret backend are test infrastructure, not MaintainRS integration blockers.
 D02. Kompact-owned runtime topology embedding is not needed because MaintainRS uses Tokio through Tauri.
 D03. Browser and public mDNS component work can remain later.
-D04. Large resumable snapshot transfer, strict Ack semantics, explicit leave/GroupClose handling, relay/mailbox support, and broader internal protocol redesign remain outside this epic.
+D04. Large resumable snapshot transfer, strict transport Ack semantics, explicit leave/GroupClose handling, relay/mailbox support, and broader internal protocol redesign remain outside this epic.
 
 Implementation size
 
@@ -35,6 +36,7 @@ children = [
     "019f6edb-fadb-7fc2-a851-d7d919537b1a",
     "019f7474-9d0a-7d21-ad30-d57c359543ed",
     "01a039c6-cba7-7f72-a2cb-42106e06c80f",
+    "01a041d5-ab95-7f33-915a-2f9b247522d7",
 ]
 created_at = "2026-08-25T16:35:10.400462Z"
-updated_at = "2026-08-25T16:36:42.680572Z"
+updated_at = "2026-08-27T06:09:07.236048Z"

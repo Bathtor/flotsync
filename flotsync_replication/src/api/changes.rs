@@ -40,8 +40,8 @@ impl RowMutation {
 
 /// Opaque read-position token returned by the replication runtime.
 ///
-/// Applications should store this value alongside their in-memory application
-/// state and pass it back to [`ReplicationApi::publish_changes`].
+/// Applications should store this value alongside their application
+/// state and pass it back to [`ReplicationApi::publish_changes`] and other APIs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReadToken {
     // Developer note: the token intentionally hides its group-scoped version

@@ -1,14 +1,78 @@
 id = "019f0542-b0cc-70a2-9d97-5fb762bcf154"
 ref = "flotsync-261"
 title = "Make ReadToken opaquely serialisable"
-body = "Follow-up to flotsync-0ns. The first manual-slice ReadToken can be an opaque in-memory API value because replicated-checklist is in-memory, but later slices need applications to persist and restore tokens without inspecting replication group scoping. Design and implement opaque serialisation/deserialisation for ReadToken with versioning and validation against the runtime/store state."
-status = "open"
+body = """
+Goal
+
+Make ReadToken opaquely and canonically serialisable so disk-backed applications can persist and restore application read positions without inspecting replication-group scoping.
+
+Context
+
+C01. ReadToken currently stores group-scoped VersionVector values in a private HashMap behind Arc and has no persistence format.
+C02. Applications are trusted to restore only opaque token bytes previously returned by the runtime. Decode therefore performs structural format validation, not runtime/store compatibility validation.
+C03. Restored positions may intentionally be behind current state or contain outdated lifecycle information. Publish retains authoritative validation for the group it changes.
+C04. Application restart synchronisation from a stored token is tracked separately by flotsync-5ou under flotsync-d3k, including incremental replay and per-group snapshot fallback.
+C05. The existing self-describing VersionVectorProtoCodec already carries the member count needed for standalone persistence and should be reused.
+C06. Canonical token bytes require deterministic group ordering.
+C07. ApplicationSchemas currently uses a private sorted boxed slice with a custom length-first dataset-id order. ReadToken group ids are fixed-length UUID values with efficient natural comparison.
+C08. Public ReadToken debug output must remain opaque in every formatting mode.
+C09. Public-key-bundle pasteable text already uses standard padded Base64 over canonical protobuf bytes; ReadToken text should follow the same convention.
+C10. Group membership changes rarely. Most ReadToken merges update vectors for existing groups; inserting a newly encountered group is an exceptional path.
+
+Plan
+
+P01. Add flotsync_core::SortedArrayMap<K, V, O = NaturalOrder> backed by a Vec<(K, V)> whose entries remain contiguous, unique, and sorted by O. Define SortOrder<K> with an associated borrowed LookupKey type and a static comparison function. Provide zero-allocation empty construction, checked unsorted bulk construction with duplicate-key reporting, singleton construction, borrowed binary-search lookup, mutable lookup, length and emptiness, ordered exact-size iteration, and replace-or-insert.
+P02. Expose the immutable contiguous representation through public as_slice, AsRef<[(K, V)]>, and Deref<Target = [(K, V)]>. Do not expose mutable slice conversion or DerefMut because arbitrary key mutation could violate ordering and uniqueness. Use flotsync_utils::NonOwningPhantomData for the type-level ordering marker.
+P03. Keep bulk collision-resolution logic out of the generic collection. ReadToken::merge_applied will iterate applied groups, update the common in-place case through get_mut, and insert only groups added by rare membership changes. Document this workload assumption at the use site.
+P04. Move ApplicationSchemas to SortedArrayMap<&static str, &static Schema, DatasetIdOrder>, retaining its existing length-first comparison and public ordering abstraction.
+P05. Move ReadToken group storage to SortedArrayMap<GroupId, VersionVector>, retaining Arc-backed cheap cloning, binary-search lookup, single-group advancement, and least-upper-bound merging at the use site.
+P06. Add a thin format-versioned protobuf ReadToken envelope whose entries contain group-id bytes and the existing self-describing VersionVector representation. Encode entries in map order and reject unsupported versions, malformed group ids and vectors, and duplicate groups.
+P07. Add canonical ReadToken::to_bytes and structurally checked ReadToken::from_bytes. Preserve decoded positions exactly without consulting current runtime or store state.
+P08. Implement Display and FromStr so ordinary to_string and parse calls use canonical standard padded Base64 over the canonical serialised bytes. Reject non-canonical equivalent text after decode and re-encode comparison.
+P09. Keep runtime compatibility validation at actual use sites. Publish continues validating its target group; startup synchronisation validation belongs to flotsync-5ou.
+P10. Remove alternate Debug exposure of internal group vectors.
+P11. Cover SortedArrayMap ordering policies and invariants, immutable slice exposure, ApplicationSchemas behaviour, ReadToken storage and merging, canonical byte and string round trips, all VersionVector representations, ordering independence, duplicates, malformed formats, unsupported versions, and opaque debug output.
+P12. Stage implementation safely: revise and validate only SortedArrayMap in flotsync_core after its first review. Consumer and serialisation work follows in later turns after this reusable base is accepted.
+
+Size estimate
+
+S01. Revised SortedArrayMap implementation and focused tests: about 250-350 LOC.
+S02. ApplicationSchemas and ReadToken representation changes: about 100-180 LOC.
+S03. Protobuf, byte/string codecs, errors, and tests: about 260-430 LOC.
+S04. Total expected implementation: about 610-960 LOC, below 1000 LOC. If later codec requirements make the issue likely to exceed 1000 LOC, split a self-contained codec or consumer child before expanding further."""
+status = "in-progress"
+status_reason = "in review; SortedArrayMap revised after first review"
 type = "task"
 priority = 1
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-05-01T14:38:40Z"
-updated_at = "2026-08-25T16:36:28.478804Z"
+updated_at = "2026-08-27T14:51:44.899275Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-56068f44e30a"
 label = "discovered from"
+
+[[comments]]
+id = "01a041e6-f78e-7b30-b4f4-359d4b52b7ae"
+author = "codex"
+body = "Plan aligned after review: decoding remains structurally validated but independent of runtime/store state; startup resumption moved to linked child flotsync-5ou; token text uses canonical padded Base64; and canonical storage is based on a reusable SortedArrayMap with custom SortOrder policy and LookupKey. This implementation stage is deliberately limited to the core collection and its focused tests."
+created_at = "2026-08-27T06:27:30.830005Z"
+
+[[comments]]
+id = "01a041ed-5a2f-77e0-96f3-5f635d2860f9"
+author = "codex"
+body = "P01 implementation stage complete: flotsync_core now exports SortedArrayMap with NaturalOrder, custom SortOrder LookupKey support, checked canonical construction, borrowed binary-search lookup, insertion, and linear collision-resolving merge. Focused collection coverage and the complete core suite pass; all-target pedantic Clippy is clean. P02-P09 production work remains intentionally deferred."
+created_at = "2026-08-27T06:34:29.295018Z"
+
+[[comments]]
+id = "01a043b1-3059-7a71-94c6-3912d576dca0"
+author = "codex"
+body = "First-review plan delta agreed: use Vec backing; expose the immutable contiguous entries through public as_slice, AsRef, and Deref without mutable slice access; reuse NonOwningPhantomData; remove the specialised bulk merge; and add get_mut. ReadToken merging will update existing groups in place and insert only after rare group membership changes, with that workload assumption documented at the use site."
+created_at = "2026-08-27T14:48:00.857629Z"
+
+[[comments]]
+id = "01a043b4-9b83-7930-95a4-7ab673235dc0"
+author = "codex"
+body = "SortedArrayMap first-review revision complete: Vec now backs the contiguous sorted entries; as_slice is public with AsRef and immutable Deref; get_mut replaces the specialised collision-resolving merge API; insertion shifts in place; and the shared non-owning phantom alias is used. Five focused tests and all 59 flotsync_core tests pass serially, and all-target pedantic Clippy is clean. The requested rare-group-insertion production comment remains attached to P03 and will be added beside ReadToken::merge_applied during the explicitly deferred consumer stage."
+created_at = "2026-08-27T14:51:44.899275Z"
