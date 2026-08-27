@@ -415,11 +415,15 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
 
 impl Drop for SqliteReplicationStore {
     fn drop(&mut self) {
-        debug_assert_eq!(
-            self.pool.state(),
-            SqliteStoreState::Closed,
-            "SqliteReplicationStore must complete explicit close before drop"
-        );
+        // A destructor panic during unwinding aborts the process and masks the
+        // original test failure which prevented orderly shutdown.
+        if !std::thread::panicking() {
+            debug_assert_eq!(
+                self.pool.state(),
+                SqliteStoreState::Closed,
+                "SqliteReplicationStore must complete explicit close before drop"
+            );
+        }
     }
 }
 
