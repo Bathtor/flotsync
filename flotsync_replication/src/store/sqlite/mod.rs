@@ -4,8 +4,7 @@ use crate::{
         DatasetRowScanPage,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
-        DatasetRowStateTransition,
-        DatasetRowStateTransitionBatch,
+        DatasetRowStateTransitionPage,
         DatasetRowStateWrite,
         DatasetSchema,
         DatasetUpdateRecord,
@@ -29,9 +28,9 @@ use crate::{
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationRowMetadata,
-        ReplicationRowStateRecord,
         ReplicationRowStateSnapshot,
         ReplicationStateRowBatch,
+        ReplicationStateRowTransitionBatch,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -77,7 +76,7 @@ use flotsync_core::{
 };
 use flotsync_messages::{
     buffa::Message as _,
-    codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
+    codecs::datamodel::encode_row_snapshot,
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
     snapshots::datamodel::ProtoSchemaSnapshotDecoder,
@@ -717,7 +716,8 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         current_group: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowTransitionBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
         async move {
             scan_dataset_row_transition_batch(
                 self.assert_open_connection(),
@@ -725,6 +725,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
                 current_group,
                 after,
                 limit,
+                output,
             )
             .await
         }

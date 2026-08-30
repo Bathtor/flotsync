@@ -2,6 +2,8 @@
 
 use super::{
     InMemoryFieldState,
+    InMemoryStateData,
+    InMemoryStateDataError,
     InMemoryStateDataSnapshotDecodeError,
     InMemoryStateRow,
     OrderedSchema,
@@ -11,6 +13,7 @@ use super::{
     RowValueRead,
     Schema,
     SchemaSnapshotDecoder,
+    SchemaSource,
 };
 use std::{fmt, hash::Hash};
 
@@ -153,8 +156,63 @@ impl<Metadata, OperationId> InMemoryStateRowBatch<Metadata, OperationId> {
     }
 }
 
+impl<RowId, OperationId> InMemoryStateData<RowId, OperationId>
+where
+    RowId: PartialEq + Eq + Hash,
+{
+    /// Consume a positional row batch into one in-memory dataset.
+    ///
+    /// Field states are moved into the dataset. Field names are borrowed only
+    /// while mapping the batch's opaque order into the dataset's opaque order.
+    ///
+    /// # Errors
+    ///
+    /// See [`InMemoryStateDataError`] for failure conditions.
+    pub fn from_row_batch<Metadata>(
+        schema: impl Into<SchemaSource>,
+        batch: InMemoryStateRowBatch<Metadata, OperationId>,
+        map_metadata: impl Fn(Metadata) -> (RowId, bool),
+    ) -> Result<Self, InMemoryStateDataError>
+    where
+        RowId: fmt::Display,
+    {
+        let InMemoryStateRowBatch {
+            schema: batch_schema,
+            rows: row_metadata,
+            fields,
+        } = batch;
+        let mut data = Self::new(schema);
+        data.row_id_map.reserve(row_metadata.len());
+        data.rows.reserve(row_metadata.len());
+
+        let fields_per_row = batch_schema.len();
+        let mut fields = fields.into_iter();
+        for metadata in row_metadata {
+            let (row_id, tombstoned) = map_metadata(metadata);
+            if data.row_id_map.contains_key(&row_id) {
+                return Err(InMemoryStateDataError::DuplicateRowId {
+                    row_id: row_id.to_string(),
+                });
+            }
+
+            let named_fields = batch_schema
+                .fields()
+                .map(|field| field.name.as_str())
+                .zip(fields.by_ref().take(fields_per_row));
+            let mut row = data.row_from_named_fields(named_fields)?;
+            row.deleted = tombstoned;
+
+            let row_index = data.rows.len();
+            data.rows.push(row);
+            data.row_id_map.insert(row_id, row_index);
+        }
+        debug_assert_eq!(fields.len(), 0);
+        Ok(data)
+    }
+}
+
 /// Borrowed view over one row in an [`InMemoryStateRowBatch`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct InMemoryStateRowView<'a, Metadata, OperationId> {
     /// Batch owning the schema, metadata, and field states.
     batch: &'a InMemoryStateRowBatch<Metadata, OperationId>,
@@ -163,6 +221,14 @@ pub struct InMemoryStateRowView<'a, Metadata, OperationId> {
     /// Offset of this row's first state in the flat field vector.
     field_offset: usize,
 }
+
+impl<Metadata, OperationId> Clone for InMemoryStateRowView<'_, Metadata, OperationId> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Metadata, OperationId> Copy for InMemoryStateRowView<'_, Metadata, OperationId> {}
 
 impl<'a, Metadata, OperationId> InMemoryStateRowView<'a, Metadata, OperationId> {
     /// Return this row's metadata.
@@ -411,6 +477,56 @@ mod tests {
         for (field_name, field_state) in snapshot_fields {
             assert_eq!(Some(&field_state), row.get_field(&field_name));
         }
+    }
+
+    #[test]
+    fn consuming_row_batch_moves_non_clone_field_states() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct NonCloneOperationId;
+
+        let schema = counter_schema();
+        let batch_schema = OrderedSchema::from_schema(&schema).into_owned();
+        let mut fields = Vec::new();
+        for (first, second) in [(11, 22), (33, 44)] {
+            for field in batch_schema.fields() {
+                let value = match field.name.as_str() {
+                    "first" => first,
+                    "second" => second,
+                    name => panic!("unexpected test field '{name}'"),
+                };
+                fields.push(InMemoryFieldState::MonotonicCounter(CounterValue::UInt(
+                    value,
+                )));
+            }
+        }
+        let batch = InMemoryStateRowBatch::<_, NonCloneOperationId> {
+            schema: batch_schema,
+            rows: vec![(7_u8, false), (8_u8, true)],
+            fields,
+        };
+
+        let data = InMemoryStateData::from_row_batch(schema, batch, |metadata| metadata)
+            .expect("compatible positional rows must transfer");
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.row_is_tombstoned(&7), Some(false));
+        assert_eq!(data.row_is_tombstoned(&8), Some(true));
+        let first_field_index = data
+            .field_index("first")
+            .expect("transferred schema must contain first");
+        let second_field_index = data
+            .field_index("second")
+            .expect("transferred schema must contain second");
+        let first_row_index = data.row_id_map[&7];
+        let second_row_index = data.row_id_map[&8];
+        assert_eq!(
+            data.rows[first_row_index].fields[first_field_index],
+            InMemoryFieldState::MonotonicCounter(CounterValue::UInt(11))
+        );
+        assert_eq!(
+            data.rows[second_row_index].fields[second_field_index],
+            InMemoryFieldState::MonotonicCounter(CounterValue::UInt(44))
+        );
     }
 
     #[test]

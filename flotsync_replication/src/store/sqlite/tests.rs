@@ -18,7 +18,6 @@ use crate::{
         MigrationId,
         MigrationProposal,
         PendingGroupDecisionRecord,
-        ReplicationRowStateRecord,
         ReplicationUpdateFilter,
         SnapshotRef,
         StoreErrorClass,
@@ -51,6 +50,21 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+/// Owned row fixture used to prepare and inspect stored snapshots.
+#[derive(Clone, Debug, PartialEq)]
+struct ReplicationRowStateFixture {
+    /// Stable row key.
+    row_id: RowKey,
+    /// Complete state snapshot.
+    snapshot: ReplicationRowStateSnapshot,
+    /// Whether the row is retained as a tombstone.
+    tombstoned: bool,
+    /// Update which created the row, when known.
+    created_by: Option<UpdateId>,
+    /// Causal frontier of the last state change.
+    last_changed_versions: VersionVector,
+}
+
 const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wait_for_store_future<F>(future: F) -> F::Output
@@ -62,6 +76,25 @@ where
         future,
         "timed out waiting for sqlite store future",
     )
+}
+
+/// Materialise one loaded positional row for assertions which compare owned fixtures.
+fn loaded_row_fixture(
+    slice: &DatasetRowStateSlice,
+    row_key: RowKey,
+) -> Option<ReplicationRowStateFixture> {
+    let row = slice
+        .state_rows
+        .rows()
+        .find(|row| row.metadata().row_key == row_key)?;
+    let metadata = row.metadata();
+    Some(ReplicationRowStateFixture {
+        row_id: metadata.row_key,
+        snapshot: row.snapshot().into_owned(),
+        tombstoned: metadata.tombstoned,
+        created_by: metadata.created_by,
+        last_changed_versions: metadata.last_changed_versions.clone(),
+    })
 }
 
 async fn apply_row_patch(
@@ -1618,7 +1651,7 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
         encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
     let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
     let expected_row = match &row_patch.actions[0] {
-        DatasetRowStateWrite::UpsertActive { row_key, snapshot } => ReplicationRowStateRecord {
+        DatasetRowStateWrite::UpsertActive { row_key, snapshot } => ReplicationRowStateFixture {
             row_id: *row_key,
             snapshot: snapshot.clone(),
             tombstoned: false,
@@ -1684,12 +1717,13 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
     ))
     .expect("row slice should load");
     assert!(loaded_snapshot.dataset_exists);
-    assert_eq!(loaded_snapshot.rows.len(), 2);
+    assert_eq!(loaded_snapshot.state_rows.len(), 1);
+    assert_eq!(loaded_snapshot.missing_row_keys.len(), 1);
     assert_eq!(
-        loaded_snapshot.rows.get(&row_key).cloned().flatten(),
+        loaded_row_fixture(&loaded_snapshot, row_key),
         Some(expected_row)
     );
-    assert_eq!(loaded_snapshot.rows.get(&missing_row_key), Some(&None));
+    assert!(loaded_snapshot.missing_row_keys.contains(&missing_row_key));
 
     let loaded_update =
         wait_for_store_future(transaction.load_replication_update(&group_id, update.update_id))
@@ -2154,7 +2188,7 @@ fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
     let RowOperation::Insert { snapshot, .. } = &operation.operation else {
         panic!("expected insert operation");
     };
-    let stored_row = ReplicationRowStateRecord {
+    let stored_row = ReplicationRowStateFixture {
         row_id: row_key,
         snapshot: snapshot.clone().into_owned(),
         tombstoned: true,
@@ -2198,10 +2232,7 @@ fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
     .expect("row slice should load");
     wait_for_store_future(transaction.commit()).expect("commit should succeed");
 
-    assert_eq!(
-        loaded_rows.rows.get(&row_key).cloned().flatten(),
-        Some(stored_row)
-    );
+    assert_eq!(loaded_row_fixture(&loaded_rows, row_key), Some(stored_row));
 }
 
 #[test]
@@ -2503,18 +2534,32 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
         dataset_id: &dataset_id,
         schema: &current_schema,
     };
+    let mut transition_rows =
+        ReplicationStateRowTransitionBatch::new(&previous_schema, &current_schema);
     let first_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
         previous_group,
         current_group,
         None,
         NonZeroUsize::new(2).expect("limit should be non-zero"),
+        &mut transition_rows,
     ))
     .expect("first transition batch should scan");
+    let first_row_presence = transition_rows
+        .rows()
+        .map(|transition| {
+            (
+                transition.row_key(),
+                transition.previous().is_some(),
+                transition.current().is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
     let second_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
         previous_group,
         current_group,
         first_batch.next_after,
         NonZeroUsize::new(2).expect("limit should be non-zero"),
+        &mut transition_rows,
     ))
     .expect("second transition batch should scan");
     wait_for_store_future(transaction.release()).expect("read should release");
@@ -2524,40 +2569,32 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
     assert_eq!(first_batch.current_group_id, current_group_id);
     assert!(first_batch.previous_dataset_exists);
     assert!(first_batch.current_dataset_exists);
-    let first_row_presence = first_batch
-        .rows
-        .iter()
-        .map(|transition| {
-            (
-                transition.row_key,
-                transition.previous.is_some(),
-                transition.current.is_some(),
-            )
-        })
-        .collect::<Vec<_>>();
     assert_eq!(
         first_row_presence,
         vec![(previous_only, true, false), (current_only, false, true)]
     );
     assert_eq!(first_batch.next_after, Some(current_only));
-    assert_eq!(second_batch.rows.len(), 1);
-    let transition = &second_batch.rows[0];
-    assert_eq!(transition.row_key, corresponding);
+    assert_eq!(transition_rows.len(), 1);
+    let transition = transition_rows.row(0).expect("transition must exist");
+    assert_eq!(transition.row_key(), corresponding);
     assert_eq!(
-        transition.previous.as_ref().map(|row| row.created_by),
+        transition.previous().map(|row| row.metadata().created_by),
         Some(Some(previous_change_id))
     );
     assert_eq!(
         transition
-            .current
-            .as_ref()
-            .map(|row| (row.created_by, row.tombstoned)),
+            .current()
+            .map(|row| (row.metadata().created_by, row.metadata().tombstoned)),
         Some((None, true))
     );
     assert_eq!(second_batch.next_after, None);
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one store lifecycle covers dataset absence and exact-limit continuation together"
+)]
 fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhaustion() {
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
@@ -2602,20 +2639,27 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
     let limit = NonZeroUsize::new(1).expect("limit should be non-zero");
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let mut transition_rows = ReplicationStateRowTransitionBatch::new(&schema, &schema);
     let batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
         previous_group,
         current_group,
         None,
         limit,
+        &mut transition_rows,
     ))
     .expect("transition batch should scan");
+    let first_presence = transition_rows
+        .row(0)
+        .map(|row| (row.previous().is_some(), row.current().is_some()));
     let exhausted = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
         previous_group,
         current_group,
         batch.next_after,
         limit,
+        &mut transition_rows,
     ))
     .expect("exhaustion batch should scan");
+    let exhausted_is_empty = transition_rows.is_empty();
     let empty_dataset_id =
         DatasetId::try_from_static("empty").expect("empty dataset id should build");
     let empty_previous_group = GroupDatasetSchemaRef {
@@ -2633,28 +2677,29 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
         empty_current_group,
         None,
         limit,
+        &mut transition_rows,
     ))
     .expect("empty transition batch should scan");
+    let empty_is_empty = transition_rows.is_empty();
     let mismatch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
         previous_group,
         empty_current_group,
         None,
         limit,
+        &mut transition_rows,
     ))
     .expect_err("different dataset references should be rejected");
     wait_for_store_future(transaction.release()).expect("read should release");
 
     assert!(batch.previous_dataset_exists);
     assert!(!batch.current_dataset_exists);
-    assert_eq!(batch.rows.len(), 1);
-    assert!(batch.rows[0].previous.is_some());
-    assert!(batch.rows[0].current.is_none());
+    assert_eq!(first_presence, Some((true, false)));
     assert_eq!(batch.next_after, Some(row_key));
-    assert!(exhausted.rows.is_empty());
+    assert!(exhausted_is_empty);
     assert_eq!(exhausted.next_after, None);
     assert!(!empty.previous_dataset_exists);
     assert!(!empty.current_dataset_exists);
-    assert!(empty.rows.is_empty());
+    assert!(empty_is_empty);
     assert_eq!(empty.next_after, None);
     assert_eq!(mismatch.classification().class, StoreErrorClass::Contract);
 }
@@ -2731,10 +2776,11 @@ fn sqlite_store_preserves_row_creator_through_updates_and_tombstoning() {
     wait_for_store_future(transaction.release()).expect("read should release");
 
     let row = loaded
-        .rows
-        .get(&row_key)
-        .and_then(Option::as_ref)
+        .state_rows
+        .rows()
+        .find(|row| row.metadata().row_key == row_key)
         .expect("stored row should be present");
+    let row = row.metadata();
     assert_eq!(row.created_by, Some(created_by));
     assert!(row.tombstoned);
 }

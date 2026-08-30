@@ -45,7 +45,7 @@ use crate::{
         DatasetRowScanPage,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
-        DatasetRowStateTransitionBatch,
+        DatasetRowStateTransitionPage,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupDatasetSchemaRef,
@@ -56,6 +56,7 @@ use crate::{
         GroupMemberKeys,
         GroupNameUpdate,
         GroupSchema,
+        InMemoryStateRowView,
         InitialDatasetValueRows,
         InitialGroupValueRows,
         InitialSnapshot,
@@ -96,9 +97,10 @@ use crate::{
         ReplicationGroupSnapshot,
         ReplicationGroupView,
         ReplicationRowMetadata,
-        ReplicationRowStateRecord,
+        ReplicationRowStateSnapshot,
         ReplicationSecuritySecrets,
         ReplicationStateRowBatch,
+        ReplicationStateRowTransitionBatch,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -227,6 +229,62 @@ static TITLE_EDIT_COUNT_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = Lazy
     ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_EDIT_COUNT_SCHEMA)
         .expect("title/edit-count application schemas should build")
 });
+
+/// Find one present positional row in a point-load result.
+pub(in crate::runtime) fn loaded_state_row<'a>(
+    slice: &'a DatasetRowStateSlice,
+    row_key: &RowKey,
+) -> Option<InMemoryStateRowView<'a, ReplicationRowMetadata, UpdateId>> {
+    slice
+        .state_rows
+        .rows()
+        .find(|row| &row.metadata().row_key == row_key)
+}
+
+/// Owned row-state test fixture converted into positional store outputs.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::runtime) struct ReplicationRowStateFixture {
+    /// Stable row key in the fixture dataset.
+    pub(in crate::runtime) row_id: RowKey,
+    /// Complete owned state snapshot.
+    pub(in crate::runtime) snapshot: ReplicationRowStateSnapshot,
+    /// Whether the row is retained as a tombstone.
+    pub(in crate::runtime) tombstoned: bool,
+    /// Update which created the row, when known.
+    pub(in crate::runtime) created_by: Option<UpdateId>,
+    /// Causal frontier of the last state change.
+    pub(in crate::runtime) last_changed_versions: VersionVector,
+}
+
+/// Owned transition fixture converted into one borrowed transition view.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::runtime) struct DatasetRowStateTransitionFixture {
+    /// Shared row key.
+    pub(in crate::runtime) row_key: RowKey,
+    /// Previous occurrence, when present.
+    pub(in crate::runtime) previous: Option<ReplicationRowStateFixture>,
+    /// Current occurrence, when present.
+    pub(in crate::runtime) current: Option<ReplicationRowStateFixture>,
+}
+
+/// Owned transition-page fixture used by provider tests.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::runtime) struct DatasetRowStateTransitionPageFixture {
+    /// Previous group identifier.
+    pub(in crate::runtime) previous_group_id: GroupId,
+    /// Current group identifier.
+    pub(in crate::runtime) current_group_id: GroupId,
+    /// Shared dataset identifier.
+    pub(in crate::runtime) dataset_id: DatasetId,
+    /// Whether the previous dataset exists.
+    pub(in crate::runtime) previous_dataset_exists: bool,
+    /// Whether the current dataset exists.
+    pub(in crate::runtime) current_dataset_exists: bool,
+    /// Owned row fixtures for this page.
+    pub(in crate::runtime) rows: Vec<DatasetRowStateTransitionFixture>,
+    /// Exclusive lower bound for the next page.
+    pub(in crate::runtime) next_after: Option<RowKey>,
+}
 
 struct RuntimeFixture<S> {
     local_member: MemberIdentity,
@@ -681,7 +739,8 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         current_group: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowTransitionBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
         if let Some(provider_scan) = self.provider_scan.as_mut() {
             assert_eq!(previous_group.dataset_id, current_group.dataset_id);
             provider_scan
@@ -698,12 +757,39 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
                 .transition_results
                 .pop_front()
                 .expect("provider test must supply one result per transition scan");
+            let result = result.map(|result| {
+                output.reuse_for_schemas(previous_group.schema, current_group.schema);
+                output.reserve_rows(result.rows.len());
+                for transition in result.rows {
+                    let previous_index = transition.previous.map(|row| {
+                        assert_eq!(row.row_id, transition.row_key);
+                        push_provider_test_row(
+                            output.previous_rows_mut(),
+                            previous_group.schema,
+                            row,
+                        )
+                    });
+                    let current_index = transition.current.map(|row| {
+                        assert_eq!(row.row_id, transition.row_key);
+                        push_provider_test_row(output.current_rows_mut(), current_group.schema, row)
+                    });
+                    output.push_alignment(previous_index, current_index);
+                }
+                DatasetRowStateTransitionPage {
+                    previous_group_id: result.previous_group_id,
+                    current_group_id: result.current_group_id,
+                    dataset_id: result.dataset_id,
+                    previous_dataset_exists: result.previous_dataset_exists,
+                    current_dataset_exists: result.current_dataset_exists,
+                    next_after: result.next_after,
+                }
+            });
             return futures_util::future::ready(result).boxed();
         }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .scan_dataset_row_transition_batch(previous_group, current_group, after, limit)
+            .scan_dataset_row_transition_batch(previous_group, current_group, after, limit, output)
     }
 
     fn load_pending_group_decisions(
@@ -1342,15 +1428,41 @@ struct ProviderTestScanBehaviour {
     /// Results returned by ordinary current-group scans.
     row_results: VecDeque<Result<ProviderTestRowScanResult, StoreError>>,
     /// Results returned by hosted transition scans.
-    transition_results: VecDeque<Result<DatasetRowStateTransitionBatch, StoreError>>,
+    transition_results: VecDeque<Result<DatasetRowStateTransitionPageFixture, StoreError>>,
 }
 
-/// One deterministic ordinary scan page and the records decoded into its output batch.
+/// One deterministic ordinary scan page and the fixtures decoded into its output batch.
 pub(in crate::runtime) struct ProviderTestRowScanResult {
     /// Page metadata returned by the test transaction.
     pub(in crate::runtime) page: DatasetRowScanPage,
-    /// Stored records decoded into the caller-owned state batch.
-    pub(in crate::runtime) rows: Vec<ReplicationRowStateRecord>,
+    /// Stored-row fixtures decoded into the caller-owned state batch.
+    pub(in crate::runtime) rows: Vec<ReplicationRowStateFixture>,
+}
+
+/// Decode one owned provider fixture into a reusable positional row batch.
+fn push_provider_test_row(
+    output: &mut ReplicationStateRowBatch,
+    schema: &Schema,
+    row: ReplicationRowStateFixture,
+) -> usize {
+    let encoded = flotsync_messages::codecs::datamodel::encode_row_snapshot(&row.snapshot, schema)
+        .expect("provider test row must encode against its dataset schema");
+    let mut decoder =
+        flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
+            .expect("provider test row must create a snapshot decoder");
+    let row_index = output.len();
+    output
+        .push_decoded_row(
+            ReplicationRowMetadata {
+                row_key: row.row_id,
+                tombstoned: row.tombstoned,
+                created_by: row.created_by,
+                last_changed_versions: row.last_changed_versions,
+            },
+            &mut decoder,
+        )
+        .expect("provider test row must decode into the reusable batch");
+    row_index
 }
 
 impl Drop for ProviderTestScanBehaviour {
@@ -1365,7 +1477,9 @@ impl Drop for ProviderTestScanBehaviour {
 /// Build the existing store transaction wrapper with deterministic provider scans.
 pub(in crate::runtime) fn provider_test_read_transaction(
     row_results: impl IntoIterator<Item = Result<ProviderTestRowScanResult, StoreError>>,
-    transition_results: impl IntoIterator<Item = Result<DatasetRowStateTransitionBatch, StoreError>>,
+    transition_results: impl IntoIterator<
+        Item = Result<DatasetRowStateTransitionPageFixture, StoreError>,
+    >,
 ) -> (
     Box<dyn ReplicationStoreReadTransaction>,
     Arc<Mutex<ProviderTestTransactionState>>,

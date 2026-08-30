@@ -1,6 +1,7 @@
 //! Replication store records and transaction contracts.
 
 use super::*;
+use flotsync_data_types::OrderedSchema;
 use futures_util::FutureExt;
 use snafu::{Snafu, ensure};
 
@@ -18,11 +19,11 @@ pub struct GroupDatasetSchemaRef<'a> {
 /// One row-granular dataset view loaded for a single transaction.
 ///
 /// If `dataset_exists` is `true`, the dataset entry already exists for
-/// `(group_id, dataset_id)`, even when every requested row key maps to
-/// `None`. If `dataset_exists` is `false`, the dataset itself has not been
-/// initialised in the group yet, so every requested key is absent because the
-/// dataset is absent. Callers can then decide whether to seed an empty
-/// in-memory working set from the application schema.
+/// `(group_id, dataset_id)`, even when every requested row key is absent. If
+/// `dataset_exists` is `false`, the dataset itself has not been initialised in
+/// the group yet, so every requested key is absent because the dataset is
+/// absent. Callers can then decide whether to seed an empty in-memory working
+/// set from the application schema.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DatasetRowStateSlice {
     /// Replication group that owns this dataset slice.
@@ -31,13 +32,10 @@ pub struct DatasetRowStateSlice {
     pub dataset_id: DatasetId,
     /// Whether this dataset already exists in the store for `group_id`.
     pub dataset_exists: bool,
-    /// Stored state for each requested row key.
-    ///
-    /// `None` means the requested row is absent. A present
-    /// [`ReplicationRowStateRecord`] with `tombstoned = true` means the row is
-    /// deleted for application visibility but retained so causally later CRDT
-    /// operations can still target the row.
-    pub rows: HashMap<RowKey, Option<ReplicationRowStateRecord>>,
+    /// Stored state for requested rows which are present.
+    pub state_rows: ReplicationStateRowBatch,
+    /// Requested row keys which are absent from storage.
+    pub missing_row_keys: HashSet<RowKey>,
 }
 
 /// Page metadata for one ordered dataset-row scan.
@@ -60,9 +58,9 @@ pub struct DatasetRowScanPage {
 impl DatasetRowScanPage {
     /// Build row transitions from two ordered pages for the same dataset reference.
     ///
-    /// `self` and `previous_rows` describe the previous group;
-    /// `current_page` and `current_rows` describe the current group. Both pages
-    /// must reference the same dataset.
+    /// `self` describes the previous group and `current_page` describes the
+    /// current group. `output` must contain the rows loaded for those pages.
+    /// Both pages must reference the same dataset.
     ///
     /// The result contains at most `limit` transitions in ascending row-key order.
     /// Each key present in either input page is represented once, with the
@@ -79,11 +77,10 @@ impl DatasetRowScanPage {
     #[must_use]
     pub fn transition_with_limit(
         self,
-        previous_rows: &ReplicationStateRowBatch,
         current_page: &Self,
-        current_rows: &ReplicationStateRowBatch,
+        output: &mut ReplicationStateRowTransitionBatch,
         limit: NonZeroUsize,
-    ) -> DatasetRowStateTransitionBatch {
+    ) -> DatasetRowStateTransitionPage {
         assert_eq!(
             self.dataset_id, current_page.dataset_id,
             "row-state transition batches must reference the same dataset"
@@ -91,88 +88,28 @@ impl DatasetRowScanPage {
 
         let previous_may_continue = self.next_after.is_some();
         let current_may_continue = current_page.next_after.is_some();
-        let mut previous_rows = previous_rows
-            .rows()
-            .map(|row| replication_row_state_record(&row))
-            .peekable();
-        let mut current_rows = current_rows
-            .rows()
-            .map(|row| replication_row_state_record(&row))
-            .peekable();
-        let mut rows = Vec::with_capacity(limit.get());
-
-        while rows.len() < limit.get() {
-            let transition = match (previous_rows.peek(), current_rows.peek()) {
-                (Some(previous), Some(current)) => match previous.row_id.cmp(&current.row_id) {
-                    std::cmp::Ordering::Less => DatasetRowStateTransition {
-                        row_key: previous.row_id,
-                        previous: previous_rows.next(),
-                        current: None,
-                    },
-                    std::cmp::Ordering::Equal => DatasetRowStateTransition {
-                        row_key: previous.row_id,
-                        previous: previous_rows.next(),
-                        current: current_rows.next(),
-                    },
-                    std::cmp::Ordering::Greater => DatasetRowStateTransition {
-                        row_key: current.row_id,
-                        previous: None,
-                        current: current_rows.next(),
-                    },
-                },
-                (Some(previous), None) => DatasetRowStateTransition {
-                    row_key: previous.row_id,
-                    previous: previous_rows.next(),
-                    current: None,
-                },
-                (None, Some(current)) => DatasetRowStateTransition {
-                    row_key: current.row_id,
-                    previous: None,
-                    current: current_rows.next(),
-                },
-                (None, None) => break,
-            };
-            assert!(
-                transition.previous.is_some() || transition.current.is_some(),
-                "row-state transition must contain at least one record"
-            );
-            rows.push(transition);
-        }
-
-        let has_buffered_rows = previous_rows.peek().is_some() || current_rows.peek().is_some();
+        let has_buffered_rows = output.align_scanned_rows(limit);
         let may_continue = has_buffered_rows || previous_may_continue || current_may_continue;
-        let last_row_key = rows.last().map(|transition| transition.row_key);
+        let last_row_key = output
+            .rows()
+            .next_back()
+            .map(|transition| transition.row_key());
         let next_after = option_when!(may_continue, last_row_key).flatten();
 
-        DatasetRowStateTransitionBatch {
+        DatasetRowStateTransitionPage {
             previous_group_id: self.group_id,
             current_group_id: current_page.group_id,
             dataset_id: self.dataset_id,
             previous_dataset_exists: self.dataset_exists,
             current_dataset_exists: current_page.dataset_exists,
-            rows,
             next_after,
         }
     }
 }
 
-/// One row-key-aligned transition between two group occurrences.
-///
-/// At least one record is present. Each present record has a `row_id` equal to
-/// `row_key`; present records retain their stored active or tombstoned state.
+/// Page metadata for one ordered batch of dataset row-state transitions.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowStateTransition {
-    /// Row key shared by both optional records.
-    pub row_key: RowKey,
-    /// Stored row from [`DatasetRowStateTransitionBatch::previous_group_id`], when present.
-    pub previous: Option<ReplicationRowStateRecord>,
-    /// Stored row from [`DatasetRowStateTransitionBatch::current_group_id`], when present.
-    pub current: Option<ReplicationRowStateRecord>,
-}
-
-/// Storage result for one ordered batch of dataset row-state transitions.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowStateTransitionBatch {
+pub struct DatasetRowStateTransitionPage {
     /// Replication group owning the previous dataset occurrence.
     pub previous_group_id: GroupId,
     /// Replication group owning the current dataset occurrence.
@@ -183,8 +120,6 @@ pub struct DatasetRowStateTransitionBatch {
     pub previous_dataset_exists: bool,
     /// Whether the current dataset occurrence exists in storage.
     pub current_dataset_exists: bool,
-    /// Transitions in ascending order by keys present in either group occurrence.
-    pub rows: Vec<DatasetRowStateTransition>,
     /// Exclusive lower bound for the next transition scan.
     ///
     /// `None` means both scans are exhausted. `Some` may lead to an empty
@@ -211,18 +146,271 @@ pub struct ReplicationRowMetadata {
 /// Reusable positional state rows returned by ordinary replication-store scans.
 pub type ReplicationStateRowBatch = InMemoryStateRowBatch<ReplicationRowMetadata, UpdateId>;
 
-/// Materialise one positional row view at a named-record compatibility boundary.
-fn replication_row_state_record(
-    row: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
-) -> ReplicationRowStateRecord {
-    let metadata = row.metadata();
-    ReplicationRowStateRecord {
-        row_id: metadata.row_key,
-        snapshot: row.snapshot().into_owned(),
-        tombstoned: metadata.tombstoned,
-        created_by: metadata.created_by,
-        last_changed_versions: metadata.last_changed_versions.clone(),
+/// Reusable schema-bound state transitions between two dataset occurrences.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplicationStateRowTransitionBatch {
+    /// Rows loaded from the previous group, governed by its schema.
+    previous_rows: ReplicationStateRowBatch,
+    /// Rows loaded from the current group, governed by its schema.
+    current_rows: ReplicationStateRowBatch,
+    /// Row-key-ordered pairings into the two state batches.
+    alignments: Vec<ReplicationRowTransitionAlignment>,
+}
+
+impl ReplicationStateRowTransitionBatch {
+    /// Create an empty transition batch for two independently ordered schemas.
+    #[must_use]
+    pub fn new(previous_schema: &Schema, current_schema: &Schema) -> Self {
+        Self {
+            previous_rows: ReplicationStateRowBatch::new(previous_schema),
+            current_rows: ReplicationStateRowBatch::new(current_schema),
+            alignments: Vec::new(),
+        }
     }
+
+    /// Clear all transitions and prepare both sides for the supplied schemas.
+    pub fn reuse_for_schemas(&mut self, previous_schema: &Schema, current_schema: &Schema) {
+        self.previous_rows.reuse_for_schema(previous_schema);
+        self.current_rows.reuse_for_schema(current_schema);
+        self.alignments.clear();
+    }
+
+    /// Clear all transitions while retaining schemas and allocations.
+    pub fn reset_rows(&mut self) {
+        self.previous_rows.reset_rows();
+        self.current_rows.reset_rows();
+        self.alignments.clear();
+    }
+
+    /// Reserve enough storage for at least `additional_rows` more transitions.
+    pub fn reserve_rows(&mut self, additional_rows: usize) {
+        self.previous_rows.reserve_rows(additional_rows);
+        self.current_rows.reserve_rows(additional_rows);
+        self.alignments.reserve(additional_rows);
+    }
+
+    /// Return the number of aligned transitions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.alignments.len()
+    }
+
+    /// Return true iff the batch contains no transitions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.alignments.is_empty()
+    }
+
+    /// Return the ordered schema governing previous rows.
+    #[must_use]
+    pub fn previous_schema(&self) -> &OrderedSchema<'_> {
+        self.previous_rows.schema()
+    }
+
+    /// Return the ordered schema governing current rows.
+    #[must_use]
+    pub fn current_schema(&self) -> &OrderedSchema<'_> {
+        self.current_rows.schema()
+    }
+
+    /// Return one transition by its ordered index.
+    #[must_use]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "private alignments are validated before insertion"
+    )]
+    pub fn row(&self, index: usize) -> Option<ReplicationStateRowTransitionView<'_>> {
+        let alignment = self.alignments.get(index)?;
+        let previous = alignment.previous_index.map(|row_index| {
+            self.previous_rows
+                .row(row_index)
+                .expect("previous transition row index must be valid")
+        });
+        let current = alignment.current_index.map(|row_index| {
+            self.current_rows
+                .row(row_index)
+                .expect("current transition row index must be valid")
+        });
+        let row_key = previous
+            .as_ref()
+            .map(|row| row.metadata().row_key)
+            .or_else(|| current.as_ref().map(|row| row.metadata().row_key))?;
+        debug_assert!(
+            previous
+                .as_ref()
+                .is_none_or(|row| row.metadata().row_key == row_key)
+        );
+        debug_assert!(
+            current
+                .as_ref()
+                .is_none_or(|row| row.metadata().row_key == row_key)
+        );
+        Some(ReplicationStateRowTransitionView {
+            row_key,
+            previous,
+            current,
+        })
+    }
+
+    /// Iterate over transitions in ascending row-key order.
+    #[must_use]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "iteration only visits private alignments already validated on insertion"
+    )]
+    pub fn rows(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = ReplicationStateRowTransitionView<'_>> + ExactSizeIterator
+    {
+        (0..self.len()).map(|index| {
+            self.row(index)
+                .expect("transition indices must be valid while iterating")
+        })
+    }
+
+    /// Borrow mutable previous-row storage for one store scan.
+    pub(crate) fn previous_rows_mut(&mut self) -> &mut ReplicationStateRowBatch {
+        &mut self.previous_rows
+    }
+
+    /// Borrow mutable current-row storage for one store scan.
+    pub(crate) fn current_rows_mut(&mut self) -> &mut ReplicationStateRowBatch {
+        &mut self.current_rows
+    }
+
+    /// Add one verified pairing of optional previous and current row indices.
+    pub(crate) fn push_alignment(
+        &mut self,
+        previous_index: Option<usize>,
+        current_index: Option<usize>,
+    ) {
+        let alignment = ReplicationRowTransitionAlignment {
+            previous_index,
+            current_index,
+        };
+        let previous = previous_index.map(|row_index| {
+            self.previous_rows
+                .row(row_index)
+                .expect("previous transition row index must be valid")
+        });
+        let current = current_index.map(|row_index| {
+            self.current_rows
+                .row(row_index)
+                .expect("current transition row index must be valid")
+        });
+        let row_key = previous
+            .as_ref()
+            .map(|row| row.metadata().row_key)
+            .or_else(|| current.as_ref().map(|row| row.metadata().row_key))
+            .expect("transition alignment must contain at least one valid row");
+        assert!(
+            previous
+                .as_ref()
+                .is_none_or(|row| row.metadata().row_key == row_key),
+            "previous transition row must have the aligned row key"
+        );
+        assert!(
+            current
+                .as_ref()
+                .is_none_or(|row| row.metadata().row_key == row_key),
+            "current transition row must have the aligned row key"
+        );
+        assert!(
+            self.rows()
+                .next_back()
+                .is_none_or(|row| row.row_key() < row_key),
+            "transition rows must be appended in ascending row-key order"
+        );
+        self.alignments.push(alignment);
+    }
+
+    /// Align the ordered union of rows already loaded into both side batches.
+    ///
+    /// Returns true when either side contains rows omitted by `limit`.
+    fn align_scanned_rows(&mut self, limit: NonZeroUsize) -> bool {
+        self.alignments.clear();
+        self.alignments.reserve(limit.get());
+        let mut previous_index = 0;
+        let mut current_index = 0;
+        while self.alignments.len() < limit.get() {
+            let previous = self.previous_rows.row(previous_index);
+            let current = self.current_rows.row(current_index);
+            let alignment = match (previous, current) {
+                (Some(previous), Some(current)) => {
+                    match previous.metadata().row_key.cmp(&current.metadata().row_key) {
+                        std::cmp::Ordering::Less => {
+                            previous_index += 1;
+                            (Some(previous_index - 1), None)
+                        }
+                        std::cmp::Ordering::Equal => {
+                            previous_index += 1;
+                            current_index += 1;
+                            (Some(previous_index - 1), Some(current_index - 1))
+                        }
+                        std::cmp::Ordering::Greater => {
+                            current_index += 1;
+                            (None, Some(current_index - 1))
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    previous_index += 1;
+                    (Some(previous_index - 1), None)
+                }
+                (None, Some(_)) => {
+                    current_index += 1;
+                    (None, Some(current_index - 1))
+                }
+                (None, None) => break,
+            };
+            self.push_alignment(alignment.0, alignment.1);
+        }
+        previous_index < self.previous_rows.len() || current_index < self.current_rows.len()
+    }
+}
+
+/// Borrowed view of one row-key-aligned state transition.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplicationStateRowTransitionView<'batch> {
+    /// Shared key derived from either present row.
+    row_key: RowKey,
+    /// Previous-group row, when present.
+    previous: Option<InMemoryStateRowView<'batch, ReplicationRowMetadata, UpdateId>>,
+    /// Current-group row, when present.
+    current: Option<InMemoryStateRowView<'batch, ReplicationRowMetadata, UpdateId>>,
+}
+
+impl<'batch> ReplicationStateRowTransitionView<'batch> {
+    /// Return the row key shared by both optional occurrences.
+    #[must_use]
+    pub fn row_key(&self) -> RowKey {
+        self.row_key
+    }
+
+    /// Return the previous-group row, when present.
+    #[must_use]
+    pub fn previous(
+        &self,
+    ) -> Option<InMemoryStateRowView<'batch, ReplicationRowMetadata, UpdateId>> {
+        self.previous
+    }
+
+    /// Return the current-group row, when present.
+    #[must_use]
+    pub fn current(
+        &self,
+    ) -> Option<InMemoryStateRowView<'batch, ReplicationRowMetadata, UpdateId>> {
+        self.current
+    }
+}
+
+/// Indices for one row key present on at least one transition side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplicationRowTransitionAlignment {
+    /// Index in `previous_rows`, when that occurrence contains the row.
+    previous_index: Option<usize>,
+    /// Index in `current_rows`, when that occurrence contains the row.
+    current_index: Option<usize>,
 }
 
 /// Stored progress for one writable replication group.
@@ -234,24 +422,6 @@ pub struct WritableReplicationGroupVersionRecord {
     pub group_id: GroupId,
     /// Last applied version vector stored for the group.
     pub version_vector: VersionVector,
-}
-
-/// Row image loaded from or written to replication storage.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReplicationRowStateRecord {
-    /// Stable row key in the dataset that owns this record.
-    pub row_id: RowKey,
-    /// Complete state snapshot for the row.
-    pub snapshot: ReplicationRowStateSnapshot,
-    /// Whether the row is deleted but still retained for causal updates.
-    pub tombstoned: bool,
-    /// Update which first introduced this row key in its replication group.
-    ///
-    /// This is unknown when storage first observes the row as a tombstone and
-    /// therefore cannot prove which earlier update created it.
-    pub created_by: Option<UpdateId>,
-    /// Causal version of the last update that changed this row image.
-    pub last_changed_versions: VersionVector,
 }
 
 /// One explicit transactional row patch for a dataset.
@@ -408,8 +578,8 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Implementations must use its borrowed values only while executing the returned future and
     /// must not clone them into retained store state.
     ///
-    /// Implementations must include every iterated `row_key` exactly once in
-    /// `DatasetRowStateSlice.rows`.
+    /// Implementations must include every distinct iterated `row_key` either as
+    /// present row metadata or in `DatasetRowStateSlice.missing_row_keys`.
     fn load_dataset_rows<'a>(
         &'a mut self,
         dataset: GroupDatasetSchemaRef<'a>,
@@ -441,7 +611,8 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// dataset references, and schema for each occurrence. `after` is an
     /// exclusive lower bound over row keys; `None` starts before the first key.
     ///
-    /// The result contains at most `limit` transitions in ascending row-key order.
+    /// `output` is reset for the two supplied schemas and receives at most
+    /// `limit` transitions in ascending row-key order.
     /// Every key greater than `after` which is stored in either group is
     /// represented once until the limit is reached. Each transition contains the
     /// stored previous and current records when present, including tombstones.
@@ -461,24 +632,19 @@ pub trait ReplicationStoreReadTransaction: Send {
         current_group: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowTransitionBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
         async move {
             ensure_matching_transition_dataset_references(previous_group, current_group)
                 .map_err(StoreError::from_classification_source)?;
-            let mut previous_rows = ReplicationStateRowBatch::new(previous_group.schema);
+            output.reuse_for_schemas(previous_group.schema, current_group.schema);
             let previous_batch = self
-                .scan_dataset_row_batch(previous_group, after, limit, &mut previous_rows)
+                .scan_dataset_row_batch(previous_group, after, limit, output.previous_rows_mut())
                 .await?;
-            let mut current_rows = ReplicationStateRowBatch::new(current_group.schema);
             let current_batch = self
-                .scan_dataset_row_batch(current_group, after, limit, &mut current_rows)
+                .scan_dataset_row_batch(current_group, after, limit, output.current_rows_mut())
                 .await?;
-            Ok(previous_batch.transition_with_limit(
-                &previous_rows,
-                &current_batch,
-                &current_rows,
-                limit,
-            ))
+            Ok(previous_batch.transition_with_limit(&current_batch, output, limit))
         }
         .boxed()
     }
@@ -801,12 +967,12 @@ impl StoreErrorClassificationSource for DatasetTransitionReferenceMismatchError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotsync_data_types::Field;
     use uuid::Uuid;
 
-    fn row(row_key: u128) -> ReplicationRowStateRecord {
-        ReplicationRowStateRecord {
-            row_id: RowKey(Uuid::from_u128(row_key)),
-            snapshot: ReplicationRowStateSnapshot::from_owned_fields(Vec::new()),
+    fn row(row_key: u128) -> ReplicationRowMetadata {
+        ReplicationRowMetadata {
+            row_key: RowKey(Uuid::from_u128(row_key)),
             tombstoned: false,
             created_by: Some(UpdateId::INITIAL_STATE_ORIGIN),
             last_changed_versions: VersionVector::initial(
@@ -824,22 +990,15 @@ mod tests {
         let schema = Schema::empty();
         let mut state_rows = ReplicationStateRowBatch::new(&schema);
         for row in rows.into_iter().map(row) {
+            let snapshot = ReplicationRowStateSnapshot::from_owned_fields(Vec::new());
             let encoded =
-                flotsync_messages::codecs::datamodel::encode_row_snapshot(&row.snapshot, &schema)
+                flotsync_messages::codecs::datamodel::encode_row_snapshot(&snapshot, &schema)
                     .expect("test row must encode against the empty schema");
             let mut decoder =
                 flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
                     .expect("test row must create a snapshot decoder");
             state_rows
-                .push_decoded_row(
-                    ReplicationRowMetadata {
-                        row_key: row.row_id,
-                        tombstoned: row.tombstoned,
-                        created_by: row.created_by,
-                        last_changed_versions: row.last_changed_versions,
-                    },
-                    &mut decoder,
-                )
+                .push_decoded_row(row, &mut decoder)
                 .expect("test row must decode into the state batch");
         }
         let page = DatasetRowScanPage {
@@ -856,21 +1015,20 @@ mod tests {
         let (previous_page, previous_rows) = batch(1, "shared", [1, 3], None);
         let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
         let limit = NonZeroUsize::new(4).expect("test limit is non-zero");
-        let merged = previous_page.transition_with_limit(
-            &previous_rows,
-            &current_page,
-            &current_rows,
-            limit,
-        );
+        let mut output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: Vec::new(),
+        };
+        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
 
-        let row_presence = merged
-            .rows
-            .iter()
+        let row_presence = output
+            .rows()
             .map(|transition| {
                 (
-                    transition.row_key.0.as_u128(),
-                    transition.previous.is_some(),
-                    transition.current.is_some(),
+                    transition.row_key().0.as_u128(),
+                    transition.previous().is_some(),
+                    transition.current().is_some(),
                 )
             })
             .collect::<Vec<_>>();
@@ -887,17 +1045,16 @@ mod tests {
         let (previous_page, previous_rows) = batch(1, "shared", [1, 4], None);
         let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
         let limit = NonZeroUsize::new(2).expect("test limit is non-zero");
-        let merged = previous_page.transition_with_limit(
-            &previous_rows,
-            &current_page,
-            &current_rows,
-            limit,
-        );
+        let mut output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: Vec::new(),
+        };
+        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
 
-        let row_keys = merged
-            .rows
-            .iter()
-            .map(|transition| transition.row_key.0.as_u128())
+        let row_keys = output
+            .rows()
+            .map(|transition| transition.row_key().0.as_u128())
             .collect::<Vec<_>>();
 
         assert_eq!(row_keys, vec![1, 2]);
@@ -909,13 +1066,94 @@ mod tests {
         let (previous_page, previous_rows) = batch(1, "shared", [1], Some(1));
         let (current_page, current_rows) = batch(2, "shared", [1], Some(1));
         let limit = NonZeroUsize::new(1).expect("test limit is non-zero");
-        let merged = previous_page.transition_with_limit(
-            &previous_rows,
-            &current_page,
-            &current_rows,
-            limit,
-        );
+        let mut output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: Vec::new(),
+        };
+        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
 
         assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(1))));
+    }
+
+    #[test]
+    #[should_panic(expected = "previous transition row index must be valid")]
+    fn transition_batch_rejects_invalid_previous_index_on_insertion() {
+        let (_, previous_rows) = batch(1, "shared", [1], None);
+        let (_, current_rows) = batch(2, "shared", [1], None);
+        let mut output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: Vec::new(),
+        };
+
+        output.push_alignment(Some(1), Some(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "current transition row index must be valid")]
+    fn transition_batch_rejects_invalid_current_index_on_insertion() {
+        let (_, previous_rows) = batch(1, "shared", [1], None);
+        let (_, current_rows) = batch(2, "shared", [1], None);
+        let mut output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: Vec::new(),
+        };
+
+        output.push_alignment(Some(0), Some(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "previous transition row index must be valid")]
+    fn transition_batch_rejects_invalid_stored_previous_index() {
+        let (_, previous_rows) = batch(1, "shared", [1], None);
+        let (_, current_rows) = batch(2, "shared", [1], None);
+        let output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: vec![ReplicationRowTransitionAlignment {
+                previous_index: Some(1),
+                current_index: Some(0),
+            }],
+        };
+
+        let _transition = output.row(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "current transition row index must be valid")]
+    fn transition_batch_rejects_invalid_stored_current_index() {
+        let (_, previous_rows) = batch(1, "shared", [1], None);
+        let (_, current_rows) = batch(2, "shared", [1], None);
+        let output = ReplicationStateRowTransitionBatch {
+            previous_rows,
+            current_rows,
+            alignments: vec![ReplicationRowTransitionAlignment {
+                previous_index: Some(0),
+                current_index: Some(1),
+            }],
+        };
+
+        let _transition = output.row(0);
+    }
+
+    #[test]
+    fn transition_batch_retains_allocations_across_independent_schema_reuse() {
+        let previous_schema = Schema::from_fields([Field::linear_string("title")]);
+        let current_schema = Schema::from_fields([Field::monotonic_counter("count")]);
+        let mut batch = ReplicationStateRowTransitionBatch::new(&previous_schema, &current_schema);
+        batch.reserve_rows(4);
+        let previous_capacity = batch.previous_rows.capacity();
+        let current_capacity = batch.current_rows.capacity();
+        let alignment_capacity = batch.alignments.capacity();
+
+        batch.reuse_for_schemas(&previous_schema, &current_schema);
+
+        assert_eq!(batch.previous_schema(), &previous_schema);
+        assert_eq!(batch.current_schema(), &current_schema);
+        assert!(batch.previous_rows.capacity() >= previous_capacity);
+        assert!(batch.current_rows.capacity() >= current_capacity);
+        assert!(batch.alignments.capacity() >= alignment_capacity);
     }
 }

@@ -12,23 +12,24 @@ pub(super) async fn load_dataset_rows(
     let dataset_id = dataset.dataset_id;
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     let mut row_keys = row_keys.peekable();
+    let mut state_rows = ReplicationStateRowBatch::new(dataset.schema);
     if row_keys.peek().is_none() {
         return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
-            rows: HashMap::new(),
+            state_rows,
+            missing_row_keys: HashSet::new(),
         });
     }
-    let mut rows = row_keys
-        .map(|row_key| (*row_key, None))
-        .collect::<HashMap<_, _>>();
+    let mut missing_row_keys = row_keys.copied().collect::<HashSet<_>>();
     if !dataset_exists {
         return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
-            rows,
+            state_rows,
+            missing_row_keys,
         });
     }
 
@@ -50,7 +51,7 @@ WHERE group_id = ",
     query_builder.push(" AND row_key IN (");
     {
         let mut separated = query_builder.separated(", ");
-        for row_key in rows.keys() {
+        for row_key in &missing_row_keys {
             separated.push_bind(row_key.to_string());
         }
     }
@@ -60,10 +61,11 @@ WHERE group_id = ",
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
+    state_rows.reserve_rows(stored_rows.len());
     for row in stored_rows {
         let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let row_snapshot =
-            decode_dataset_row_snapshot(dataset.schema, &row.get::<Vec<u8>, _>("row_snapshot"))?;
+        let mut row_decoder =
+            decode_dataset_row_snapshot_decoder(&row.get::<Vec<u8>, _>("row_snapshot"))?;
         let created_by = decode_dataset_row_created_by(
             &row,
             row_key,
@@ -72,22 +74,23 @@ WHERE group_id = ",
             member_count,
         )?;
         let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
-        rows.insert(
+        let metadata = ReplicationRowMetadata {
             row_key,
-            Some(ReplicationRowStateRecord {
-                row_id: row_key,
-                snapshot: row_snapshot,
-                tombstoned: row.get::<bool, _>("row_tombstoned"),
-                created_by,
-                last_changed_versions,
-            }),
-        );
+            tombstoned: row.get::<bool, _>("row_tombstoned"),
+            created_by,
+            last_changed_versions,
+        };
+        state_rows
+            .push_decoded_row(metadata, &mut row_decoder)
+            .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
+        missing_row_keys.remove(&row_key);
     }
     Ok(DatasetRowStateSlice {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
-        rows,
+        state_rows,
+        missing_row_keys,
     })
 }
 
@@ -189,9 +192,11 @@ pub(super) async fn scan_dataset_row_transition_batch(
     current_group: GroupDatasetSchemaRef<'_>,
     after: Option<RowKey>,
     limit: NonZeroUsize,
-) -> Result<DatasetRowStateTransitionBatch, StoreError> {
+    output: &mut ReplicationStateRowTransitionBatch,
+) -> Result<DatasetRowStateTransitionPage, StoreError> {
     ensure_matching_transition_dataset_references(previous_group, current_group)
         .map_err(StoreError::from_classification_source)?;
+    output.reuse_for_schemas(previous_group.schema, current_group.schema);
     let dataset_id = previous_group.dataset_id;
     let metadata =
         load_transition_dataset_metadata(connection, previous_group, current_group).await?;
@@ -234,23 +239,24 @@ pub(super) async fn scan_dataset_row_transition_batch(
         .await
         .context(SqlxSnafu)?;
 
-    let rows = decode_dataset_row_transitions(
+    decode_dataset_row_transitions(
         stored_rows,
-        previous_group.schema,
         metadata.previous_member_count,
-        current_group.schema,
         metadata.current_member_count,
+        output,
     )?;
 
-    let last_row_key = rows.last().map(|transition| transition.row_key);
-    let next_after = option_when!(rows.len() == limit.get(), last_row_key).flatten();
-    Ok(DatasetRowStateTransitionBatch {
+    let last_row_key = output
+        .rows()
+        .next_back()
+        .map(|transition| transition.row_key());
+    let next_after = option_when!(output.len() == limit.get(), last_row_key).flatten();
+    Ok(DatasetRowStateTransitionPage {
         previous_group_id: *previous_group.group_id,
         current_group_id: *current_group.group_id,
         dataset_id: dataset_id.clone(),
         previous_dataset_exists: metadata.previous_dataset_exists,
         current_dataset_exists: metadata.current_dataset_exists,
-        rows,
         next_after,
     })
 }
@@ -500,36 +506,31 @@ WHERE active.group_id IN (?1, ?2)
 /// Decode all stored rows returned by one dataset-transition query.
 fn decode_dataset_row_transitions(
     stored_rows: Vec<sqlx::sqlite::SqliteRow>,
-    previous_schema: &flotsync_data_types::schema::Schema,
     previous_member_count: NonZeroUsize,
-    current_schema: &flotsync_data_types::schema::Schema,
     current_member_count: NonZeroUsize,
-) -> Result<Vec<DatasetRowStateTransition>, StoreError> {
-    let mut rows = Vec::with_capacity(stored_rows.len());
+    output: &mut ReplicationStateRowTransitionBatch,
+) -> Result<(), StoreError> {
+    output.reserve_rows(stored_rows.len());
     for stored_row in stored_rows {
         let row_key =
             decode_row_key(&stored_row.get::<String, _>(JoinedRowColumnLayout::ROW_KEY_COLUMN))?;
-        let previous = decode_transition_row_record(
+        let previous_index = decode_transition_row_into_batch(
             &stored_row,
             row_key,
-            previous_schema,
             previous_member_count,
             JoinedRowColumnLayout::PREVIOUS,
+            output.previous_rows_mut(),
         )?;
-        let current = decode_transition_row_record(
+        let current_index = decode_transition_row_into_batch(
             &stored_row,
             row_key,
-            current_schema,
             current_member_count,
             JoinedRowColumnLayout::CURRENT,
+            output.current_rows_mut(),
         )?;
-        rows.push(DatasetRowStateTransition {
-            row_key,
-            previous,
-            current,
-        });
+        output.push_alignment(previous_index, current_index);
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Decode one nullable side of a dataset-row transition query result.
@@ -537,20 +538,20 @@ fn decode_dataset_row_transitions(
 /// `None` means the corresponding side of the left join was `NULL`. A stored
 /// row always has a non-null snapshot, so the snapshot column identifies
 /// whether that side exists.
-fn decode_transition_row_record(
+fn decode_transition_row_into_batch(
     row: &sqlx::sqlite::SqliteRow,
     row_key: RowKey,
-    schema: &flotsync_data_types::schema::Schema,
     member_count: NonZeroUsize,
     columns: JoinedRowColumnLayout,
-) -> Result<Option<ReplicationRowStateRecord>, StoreError> {
+    output: &mut ReplicationStateRowBatch,
+) -> Result<Option<usize>, StoreError> {
     let snapshot = row
         .try_get::<Option<Vec<u8>>, _>(columns.snapshot())
         .context(SqlxSnafu)?;
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    let snapshot = decode_dataset_row_snapshot(schema, &snapshot)?;
+    let mut row_decoder = decode_dataset_row_snapshot_decoder(&snapshot)?;
     let tombstoned = row
         .try_get::<bool, _>(columns.tombstoned())
         .context(SqlxSnafu)?;
@@ -570,13 +571,17 @@ fn decode_transition_row_record(
         .try_get::<Vec<u8>, _>(columns.last_changed_versions())
         .context(SqlxSnafu)?;
     let last_changed_versions = decode_stored_version_vector(&last_changed_versions, member_count)?;
-    Ok(Some(ReplicationRowStateRecord {
-        row_id: row_key,
-        snapshot,
+    let metadata = ReplicationRowMetadata {
+        row_key,
         tombstoned,
         created_by,
         last_changed_versions,
-    }))
+    };
+    let row_index = output.len();
+    output
+        .push_decoded_row(metadata, &mut row_decoder)
+        .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
+    Ok(Some(row_index))
 }
 
 /// Ordinal positions for one repeated joined-row projection.

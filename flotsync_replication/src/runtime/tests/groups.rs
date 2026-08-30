@@ -362,12 +362,7 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
         &dataset_id,
         [row_key],
     );
-    assert!(
-        successor_row
-            .rows
-            .get(&row_key)
-            .is_some_and(Option::is_some)
-    );
+    assert!(loaded_state_row(&successor_row, &row_key).is_some());
     wait_for_test_reply(runtime.shutdown())
         .expect("runtime host should shut down after the induced component fault");
 
@@ -851,14 +846,14 @@ fn runtime_resumes_pending_group_activation_with_bounded_batches_and_global_read
         listener.captured_data_change_batch_sizes(),
         vec![vec![128, 1]]
     );
+    let stored_rows =
+        load_persisted_row_slice(store.as_ref(), group_id, &dataset_id, [first_row_key]);
     let stored_row =
-        load_persisted_row_slice(store.as_ref(), group_id, &dataset_id, [first_row_key])
-            .rows
-            .get(&first_row_key)
-            .cloned()
-            .flatten()
-            .expect("activated row should persist");
-    assert_eq!(stored_row.created_by, Some(UpdateId::INITIAL_STATE_ORIGIN));
+        loaded_state_row(&stored_rows, &first_row_key).expect("activated row should persist");
+    assert_eq!(
+        stored_row.metadata().created_by,
+        Some(UpdateId::INITIAL_STATE_ORIGIN)
+    );
     assert_eq!(
         listener.captured_data_change_lineages(),
         vec![DataChangeLineage::Update]

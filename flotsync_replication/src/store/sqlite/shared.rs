@@ -176,20 +176,6 @@ pub(super) fn encode_dataset_row_snapshot(
     Ok(row.encode_to_bytes().to_vec())
 }
 
-pub(super) fn decode_dataset_row_snapshot(
-    schema: &flotsync_data_types::schema::Schema,
-    bytes: &[u8],
-) -> Result<ReplicationRowStateSnapshot, StoreError> {
-    let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
-        SqliteStoreError::DecodeStoredProto {
-            object: "dataset row snapshot",
-            source,
-        }
-    })?;
-    decode_row_snapshot(row, schema)
-        .map_err(|source| invalid_stored_object("dataset row snapshot", source))
-}
-
 /// Decode stored protobuf bytes into the streaming schema snapshot adapter.
 pub(super) fn decode_dataset_row_snapshot_decoder(
     bytes: &[u8],
