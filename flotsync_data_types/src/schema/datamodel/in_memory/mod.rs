@@ -35,15 +35,13 @@ pub use decode::*;
 /// Storage-level, in-memory dataset for one schema.
 ///
 /// The schema is immutable while this value exists.
-/// Field names are mapped once to positional indices and rows only store per-field values.
+/// Its ordered view defines the positional layout used by every row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InMemoryStateData<RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
-    schema: SchemaSource,
-    field_names: Vec<String>,
-    field_index_by_name: HashMap<String, usize>,
+    schema: OrderedSchemaSource,
     row_id_map: HashMap<RowId, usize>,
     rows: Vec<InMemoryStateRow<OperationId>>,
 }
@@ -53,21 +51,8 @@ where
 {
     /// Create an empty in-memory dataset for `schema`.
     pub fn new(schema: impl Into<SchemaSource>) -> Self {
-        let schema = schema.into();
-        let schema_ref = schema.as_schema();
-        let mut field_names = Vec::with_capacity(schema_ref.columns.len());
-        let mut field_index_by_name = HashMap::with_capacity(schema_ref.columns.len());
-
-        field_names.extend(schema_ref.columns.keys().cloned());
-        field_names.sort();
-        for (index, field_name) in field_names.iter().enumerate() {
-            field_index_by_name.insert(field_name.clone(), index);
-        }
-
         Self {
-            schema,
-            field_names,
-            field_index_by_name,
+            schema: OrderedSchemaSource::new(schema.into()),
             row_id_map: HashMap::new(),
             rows: Vec::new(),
         }
@@ -187,10 +172,10 @@ where
     {
         let schema = schema.into();
         let mut data = Self::new(schema.clone());
-        let field_names = data.field_names.clone();
+        let ordered_schema = OrderedSchema::from_schema(schema.as_schema());
         for (row_id, row) in rows {
             let initial_values = row
-                .initial_values_in_field_order(schema.as_schema(), &field_names)
+                .initial_values_in_field_order(&ordered_schema)
                 .with_context(|_| initial_value_rows_embedding::SchemaMismatchSnafu {
                     row_id: row_id.clone(),
                 })?;
@@ -206,28 +191,35 @@ where
     /// Get the immutable schema associated with this dataset.
     #[must_use]
     pub fn schema(&self) -> &Schema {
-        self.schema.as_schema()
+        self.schema.schema()
     }
 
     /// Return the number of fields expected in every row.
     #[must_use]
     pub fn num_fields(&self) -> usize {
-        self.field_names.len()
+        self.schema.ordered_schema().len()
     }
 
     /// Resolve a field name to its storage index in row vectors.
     pub(crate) fn field_index(&self, field_name: &str) -> Option<usize> {
-        self.field_index_by_name.get(field_name).copied()
+        self.schema.ordered_schema().field_index(field_name)
     }
 
     /// Resolve a storage index to its field name.
+    #[must_use]
     pub fn field_name(&self, field_index: usize) -> Option<&str> {
-        self.field_names.get(field_index).map(String::as_str)
+        self.schema
+            .ordered_schema()
+            .field_at(field_index)
+            .map(|field| field.name.as_str())
     }
 
     /// Iterate all field names in the dataset's storage order.
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
-        self.field_names.iter().map(String::as_str)
+        self.schema
+            .ordered_schema()
+            .fields()
+            .map(|field| field.name.as_str())
     }
 
     /// Return the number of stored rows.
@@ -418,11 +410,7 @@ where
     > {
         let row = self.row(row_index)?;
         debug_assert_eq!(self.num_fields(), row.field_count());
-        Ok(self
-            .field_names
-            .iter()
-            .map(String::as_str)
-            .zip(row.fields.iter()))
+        Ok(self.field_names().zip(row.fields.iter()))
     }
 
     /// Encode all rows as schema snapshots via a dataset-level encoder.
@@ -447,7 +435,7 @@ where
 
         for (row_index, row) in self.rows.iter().enumerate() {
             let mut row_encoder = encoder.begin_row(row_index).context(EncoderSnafu)?;
-            row.encode_snapshot(self.schema(), &self.field_names, &mut row_encoder)
+            row.encode_snapshot(self.schema.ordered_schema(), &mut row_encoder)
                 .context(SchemaVisitSnafu)?;
             drop(row_encoder);
             encoder.end_row(row_index).context(EncoderSnafu)?;
@@ -478,11 +466,8 @@ where
 
         for row_index in 0..row_count {
             let mut row_decoder = decoder.begin_row(row_index).context(DecoderSnafu)?;
-            let row = InMemoryStateRow::decode_snapshot(
-                data.schema(),
-                &data.field_names,
-                &mut row_decoder,
-            )?;
+            let row =
+                InMemoryStateRow::decode_snapshot(data.schema.ordered_schema(), &mut row_decoder)?;
             drop(row_decoder);
             decoder.end_row(row_index).context(DecoderSnafu)?;
 
@@ -515,13 +500,8 @@ where
             });
         }
 
-        for (field_index, value) in row.fields.iter().enumerate() {
-            let field_name = self.field_names[field_index].as_str();
-            let schema_field = self
-                .schema()
-                .columns
-                .get(field_name)
-                .expect("field index map and schema are in sync");
+        for (schema_field, value) in self.schema.ordered_schema().fields().zip(row.fields.iter()) {
+            let field_name = schema_field.name.as_str();
             validate_in_memory_field_value(&schema_field.data_type, value).context(
                 InvalidFieldValueSnafu {
                     field_name: field_name.to_owned(),
@@ -542,7 +522,7 @@ where
     {
         let mut row_slots: Vec<Option<InMemoryFieldState<OperationId>>> =
             std::iter::repeat_with(|| None)
-                .take(self.field_names.len())
+                .take(self.num_fields())
                 .collect();
 
         for (field_name, value) in fields {
@@ -559,10 +539,10 @@ where
             }
 
             let schema_field = self
-                .schema()
-                .columns
-                .get(field_name)
-                .expect("field index map and schema are in sync");
+                .schema
+                .ordered_schema()
+                .field_at(field_index)
+                .expect("field index resolves inside the ordered schema");
             validate_in_memory_field_value(&schema_field.data_type, &value).context(
                 InvalidFieldValueSnafu {
                     field_name: field_name.to_owned(),
@@ -578,7 +558,13 @@ where
             .find(|(_, slot)| slot.is_none())
         {
             return Err(InMemoryStateDataError::MissingField {
-                field_name: self.field_names[missing_index].clone(),
+                field_name: self
+                    .schema
+                    .ordered_schema()
+                    .field_at(missing_index)
+                    .expect("missing slot index resolves inside the ordered schema")
+                    .name
+                    .clone(),
             });
         }
 
@@ -600,7 +586,7 @@ where
     {
         let mut row_slots: Vec<Option<InMemoryFieldState<OperationId>>> =
             std::iter::repeat_with(|| None)
-                .take(self.field_names.len())
+                .take(self.num_fields())
                 .collect();
 
         for (field_name, value) in fields {
@@ -616,10 +602,10 @@ where
             }
 
             let schema_field = self
-                .schema()
-                .columns
-                .get(field_name.as_str())
-                .expect("field_names and schema are in sync");
+                .schema
+                .ordered_schema()
+                .field_at(field_index)
+                .expect("field index resolves inside the ordered schema");
             validate_in_memory_field_value(&schema_field.data_type, &value).map_err(|source| {
                 crate::OperationError::SchemaValue {
                     source: SchemaValueError::InvalidSnapshotFieldValue {
@@ -637,12 +623,12 @@ where
                 continue;
             }
 
-            let field_name = self.field_names[field_index].as_str();
             let schema_field = self
-                .schema()
-                .columns
-                .get(field_name)
-                .expect("field_names and schema are in sync");
+                .schema
+                .ordered_schema()
+                .field_at(field_index)
+                .expect("field index resolves inside the ordered schema");
+            let field_name = schema_field.name.as_str();
             let default_value = materialize_default_target_value(field_name, schema_field)?;
             let Some(default_value) = default_value else {
                 return Err(crate::OperationError::SchemaValue {
@@ -806,7 +792,7 @@ where
         OperationId: Clone,
     {
         RowStateSnapshot::borrowed_in_memory(
-            &self.data.field_names,
+            self.data.schema.ordered_schema(),
             &self.data.rows[self.row_index],
         )
         .into_owned()
@@ -936,3 +922,21 @@ pub(crate) use field_state::{InMemoryStateRow, validate_in_memory_field_value};
     reason = "The parent module reuses the local snapshot implementation details across its state and operation code."
 )]
 use snapshots::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_schema_reuses_state_data_source_fields() {
+        let data = InMemoryStateData::<u64, u64>::with_owned_schema(Schema::from_fields([
+            crate::schema::Field::linear_string("title"),
+            crate::schema::Field::monotonic_counter("count"),
+        ]));
+
+        let source_field = data.schema().field("title").unwrap();
+        let ordered_field = data.schema.ordered_schema().field("title").unwrap();
+
+        assert!(std::ptr::eq(source_field, ordered_field));
+    }
+}

@@ -21,6 +21,7 @@ use flotsync_data_types::{
         PrimitiveType,
         ReplicatedDataType,
         Schema,
+        SchemaBuildError,
         values::{NullablePrimitiveValueArray, PrimitiveValueArray},
     },
 };
@@ -28,7 +29,6 @@ use flotsync_data_types::{
 use itertools::Itertools as _;
 use ordered_float::OrderedFloat;
 use snafu::prelude::*;
-use std::collections::HashMap;
 
 type SchemaResult<T> = Result<T, SchemaCodecError>;
 
@@ -116,19 +116,27 @@ pub enum SchemaCodecError {
     InvalidDate { year: i32, month: u32, day: u32 },
     #[snafu(display("Shared datamodel protobuf codec failed."))]
     Codec { source: CodecError },
-    #[snafu(display(
-        "Field '{field_name}' has a default value incompatible with its schema data type."
-    ))]
-    InvalidFieldDefault {
-        field_name: String,
-        source: FieldValueBuildError,
-    },
+    #[snafu(display("Invalid schema field default: {source}"))]
+    InvalidFieldDefault { source: FieldValueBuildError },
 }
 impl SchemaCodecError {
     fn from_datamodel_date_error(error: CodecError) -> Self {
         match error {
             CodecError::InvalidDate { year, month, day } => Self::InvalidDate { year, month, day },
             source => Self::Codec { source },
+        }
+    }
+}
+
+impl From<SchemaBuildError> for SchemaCodecError {
+    fn from(error: SchemaBuildError) -> Self {
+        match error {
+            SchemaBuildError::DuplicateFieldName { field_name } => {
+                Self::DuplicateFieldName { field_name }
+            }
+            SchemaBuildError::InvalidDefaultValue { source } => {
+                Self::InvalidFieldDefault { source }
+            }
         }
     }
 }
@@ -160,18 +168,13 @@ pub fn encode_schema_definition(schema: &Schema) -> SchemaResult<proto::SchemaDe
 ///
 /// See `SchemaCodecError` for failure conditions.
 pub fn decode_schema_definition(mut schema: proto::SchemaDefinition) -> SchemaResult<Schema> {
-    let mut columns = HashMap::with_capacity(schema.fields.len());
-    for field in schema.fields.drain(..) {
-        let field = decode_field_definition(field)?;
-        let field_name = field.name.clone();
-        if columns.insert(field_name.clone(), field).is_some() {
-            return DuplicateFieldNameSnafu { field_name }.fail();
-        }
-    }
-    Ok(Schema {
-        columns,
-        metadata: schema.metadata.into_iter().collect(),
-    })
+    let fields = schema.fields.drain(..).map(decode_field_definition);
+    // A closure is required because the function item's iterator lifetime is
+    // not general enough for `process_results`' temporary error slot.
+    let decoded = itertools::process_results(fields, |fields| Schema::try_from_fields(fields))?;
+    let mut decoded = decoded?;
+    decoded.metadata = schema.metadata.into_iter().collect();
+    Ok(decoded)
 }
 
 fn encode_field_definition(field: &Field) -> SchemaResult<proto::FieldDefinition> {
@@ -205,20 +208,12 @@ fn decode_field_definition(mut field: proto::FieldDefinition) -> SchemaResult<Fi
         .map(|value| decode_nullable_basic_value(value).context(CodecSnafu))
         .transpose()?;
 
-    let decoded_field = Field {
+    Ok(Field {
         name: field.name,
         data_type,
         default_value,
         metadata: field.metadata.into_iter().collect(),
-    };
-    if let Some(default_value) = decoded_field.default_value.clone() {
-        decoded_field
-            .initial(default_value)
-            .context(InvalidFieldDefaultSnafu {
-                field_name: decoded_field.name.clone(),
-            })?;
-    }
-    Ok(decoded_field)
+    })
 }
 
 fn encode_replicated_data_type(

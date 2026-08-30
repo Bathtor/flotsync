@@ -1,0 +1,45 @@
+id = "01a04cec-91ea-7080-b62a-4526ffb32621"
+ref = "flotsync-nk9.2"
+title = "Add schema-bound state row batches"
+body = """
+Replace per-row named replication snapshots with a reusable schema-bound positional state-row batch, building on OrderedSchema from flotsync-nk9.1.
+
+Scope:
+- Add InMemoryStateRowBatch that owns an OrderedSchema wrapper, row metadata, and flat row-major field-state storage.
+- Use ReplicationRowMetadata as the replication-store row metadata: row key, tombstone state, creator version, and last-changed version.
+- Add append-oriented push_decoded_row. The caller constructs row metadata and a snapshot decoder; metadata becomes visible only after the complete row decodes successfully, and partial field-state appends are rolled back on error.
+- Add reset_rows to clear logical contents while retaining allocations under the current ordered schema.
+- Add reuse_for_schema to clear rows, retain reusable vectors, and replace the owned OrderedSchema wrapper only when positional OrderedSchema equality says the layout differs.
+- Implement row views and RowValueRead/field-state access through the ordered schema index, avoiding repeated field names and quadratic name scans.
+- Change the replication store scan API and SQLite implementation to fill or return this batch rather than Vec<ReplicationRowStateRecord> with owned named snapshots.
+- Adapt snapshot-provider, unavailable-dataset activation, inline initial snapshot, and transition scan consumers.
+- Keep transition-specific two-schema concerns out of this child unless required for correctness; record follow-up work if a general multi-schema batch is discovered.
+
+Concrete API direction:
+- InMemoryStateRowBatch::new, push_decoded_row, rows, row, reset_rows, reuse_for_schema, schema, len, is_empty, and capacity.
+- InMemoryStateRowView borrows its batch and exposes metadata plus positional/name-based state access.
+- Store scan accepts the relevant Schema or OrderedSchema context explicitly enough for SQLite decoding without constructing generic metadata internally.
+
+Validation:
+- Data-types unit tests cover successful append, failed-decode rollback, row bounds, name lookup, reset allocation reuse, same-order reuse, and different-order schema replacement.
+- SQLite/store tests cover batch limits, continuation, metadata fidelity, tombstones, and malformed snapshots.
+- Snapshot-provider and activation tests cover projection into SnapshotValueRowBatch without per-row names.
+- Existing transition tests remain green.
+
+Estimated size:
+- Generic state-row batch and views: 260-360 LOC.
+- Replication metadata and store API integration: 170-250 LOC.
+- SQLite/provider/activation adapters: 160-230 LOC.
+- Tests: 180-260 LOC.
+- Total: approximately 770-1,100 LOC; if transition adaptation pushes the child materially beyond this range, split that adapter into a follow-up child before implementation."""
+status = "open"
+type = "task"
+priority = 1
+labels = [
+    "area:replication",
+    "area:store",
+]
+blocked_by = ["01a04cec-591e-7a31-a545-d82a3d62a9c8"]
+parent = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
+created_at = "2026-08-29T09:49:27.40294Z"
+updated_at = "2026-08-29T09:49:32.170887Z"

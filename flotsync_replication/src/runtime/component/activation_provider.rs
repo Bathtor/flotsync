@@ -621,7 +621,7 @@ fn changed_value_fields(
                         .columns
                         .get_key_value(field_name)
                         .expect("row field must exist in its static schema");
-                    Cow::Borrowed(field_name.as_str())
+                    Cow::Borrowed(field_name)
                 }
                 SchemaSource::Shared(_) => Cow::Owned(field_name.to_owned()),
             };

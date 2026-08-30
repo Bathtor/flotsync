@@ -1519,10 +1519,7 @@ static TEST_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
         },
     );
 
-    Schema {
-        columns,
-        metadata: HashMap::new(),
-    }
+    Schema::try_from_fields(columns.into_values()).unwrap()
 });
 
 #[test]

@@ -9,6 +9,7 @@ default = []
 test-support = []
 
 [dependencies]
+ahash = { workspace = true }
 flotsync_utils = { path = "../flotsync_utils" }
 itertools = { workspace = true }
 similar = { version = "2.7", features = ["unicode"] }
@@ -16,6 +17,7 @@ unicode-segmentation = "1"
 snafu = { workspace = true }
 chrono = { workspace = true }
 ordered-float = { workspace = true }
+self_cell = { workspace = true }
 
 [dev-dependencies]
 bytes = "1"

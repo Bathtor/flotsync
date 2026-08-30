@@ -15,7 +15,7 @@ where
         Self: 'a;
 
     fn schema(&self) -> &Schema {
-        self.schema.as_schema()
+        self.schema.schema()
     }
 
     fn get_row(&self, row_id: &RowId) -> Option<Self::Row<'_>> {
@@ -47,22 +47,18 @@ where
         }
 
         let initial_values = collect_initial_values(self.schema(), initial_values)?;
-        let mut fields = Vec::with_capacity(self.field_names.len());
-        for field_name in &self.field_names {
-            let schema_field = self
-                .schema()
-                .columns
-                .get(field_name.as_str())
-                .expect("field_names and schema are in sync");
-            let Some(target_value) = initial_values.get(field_name.as_str()) else {
+        let mut fields = Vec::with_capacity(self.num_fields());
+        for schema_field in self.schema.ordered_schema().fields() {
+            let field_name = schema_field.name.as_str();
+            let Some(target_value) = initial_values.get(field_name) else {
                 return Err(crate::OperationError::SchemaValue {
                     source: SchemaValueError::MissingField {
-                        field_name: field_name.clone(),
+                        field_name: field_name.to_owned(),
                     },
                 });
             };
             let field_value = build_initial_field_value(
-                field_name.as_str(),
+                field_name,
                 &schema_field.data_type,
                 target_value,
                 &operation_id,
@@ -82,7 +78,7 @@ where
             operation: RowOperation::Insert {
                 row_id,
                 snapshot: RowStateSnapshot::borrowed_in_memory(
-                    &self.field_names,
+                    self.schema.ordered_schema(),
                     &self.rows[index],
                 ),
             },
@@ -200,7 +196,8 @@ fn collect_initial_values<'a>(
         }
         collected.insert(field_name.to_owned(), initial_value.value().clone());
     }
-    for (field_name, schema_field) in &schema.columns {
+    for schema_field in &schema.columns {
+        let field_name = &schema_field.name;
         if collected.contains_key(field_name.as_str()) {
             continue;
         }

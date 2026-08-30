@@ -1,0 +1,118 @@
+id = "01a04cec-591e-7a31-a545-d82a3d62a9c8"
+ref = "flotsync-nk9.1"
+title = "Add projected hash map and ordered schema"
+body = """
+Implement the reusable unordered and positional projected-key collections and apply them throughout Schema, OrderedSchema, and in-memory schema consumers.
+
+Scope:
+- Add flotsync_utils::ProjectedHashMap<Value, Projection, HashBuilder = std::collections::hash_map::RandomState> as a representation-hiding newtype around iddqd::IdHashMap.
+- Expose representation-independent construction, iteration, lookup, insertion/replacement, removal, length, equality, caller-selected hashing, and guarded mutable access. The mutable guard checks on drop that the projected key did not change; Field::name remains public.
+- Keep the contiguous positional implementation as ProjectedIndexHashMap. It retains input order, boxed contiguous values, and projected-key-to-index lookup.
+- Place ProjectedHashMap and ProjectedIndexHashMap in the same public projected_hash_map module while keeping their representations independently replaceable.
+- Give both generic collections the safe standard RandomState default. OrderedSchema explicitly selects ahash::RandomState because schema data is trusted and the layout is performance-sensitive.
+- Keep checked ProjectedIndexHashMap constructors and add safe from_values_unchecked variants that skip duplicate detection. Their contract requires unique projected keys and leaves lookup behaviour unspecified when violated.
+- Make DuplicateProjectedIndexKeyError index fields public. Use neutral loop index names, enumerate values directly, and name lookup results before branching.
+- Change Schema columns to a ProjectedHashMap specialisation keyed by Field::name, eliminating duplicate field-name storage while preserving arbitrary iteration order, unordered equality, and the existing serialisation shape.
+- Make Schema::try_from_fields insert incrementally, validate each field as encountered, and stop at the first duplicate or invalid default.
+- Feed decoded protobuf fields lazily into Schema::try_from_fields so decoding stops at the first codec or schema-construction error without an intermediate field vector. Retain the process_results closure required by its borrowed error-slot lifetime and explain that briefly.
+- Translate SchemaBuildError through From<SchemaBuildError> for SchemaCodecError.
+- Store invalid-default field context only in FieldValueBuildError; SchemaBuildError and SchemaCodecError wrap that source without duplicating the field name.
+- Keep OrderedSchema as a whole-schema borrowed-or-owned representation. Construction uses source Schema iteration order without allowing callers to choose it.
+- Compare OrderedSchema values positionally, compare OrderedSchema with Schema unordered, and retain eq_unordered for two ordered schemas.
+- Convert borrowed OrderedSchema values to owned by cloning fields and metadata; reconstruct the already-owned variant to express the static result lifetime.
+- Keep public OrderedSchema documentation focused on order and allocation behaviour. Remove opaque terminology, internal representation details, impossible panic contracts, key/name assertions, and their mismatch test.
+- Replace duplicated field-name vectors and lookup maps in both InMemoryStateData and InMemoryValueData with a private owner/dependent wrapper that owns SchemaSource and borrows it through OrderedSchema. Preserve source Field pointer identity and do not clone field names merely to establish positional lookup.
+- Adapt row snapshots, field-state encoding/decoding, operations, replication, examples, codecs, and tests to use the new schema APIs.
+- Keep all work under this task; do not split further.
+
+Concrete API direction:
+- Shared KeyProjection<Value> trait.
+- ProjectedHashMap constructors with safe defaults and explicit hash-builder variants; get, get_mut guard, contains_key, iter, len, is_empty, insert_unique, insert_overwrite, and remove.
+- ProjectedIndexHashMap checked and unchecked constructors; get, get_index_of, get_index, values, iter, len, is_empty, and into_values.
+- Schema::from_fields plus an incremental fallible iterator-based Schema::try_from_fields path for dynamic callers.
+- OrderedSchema::from_schema, from_owned_schema, into_owned, field, field_index, field_at, fields, len, is_empty, metadata, and eq_unordered.
+- Private shared ordered-schema owner wrapper used by both in-memory data stores.
+
+Validation:
+- Unit tests cover unordered projected lookup, insertion policies, guarded non-key mutation, runtime rejection of projected-key mutation, duplicate rejection, collision correctness, arbitrary-order equality, and safe default plus explicit hashing.
+- Unit tests cover positional lookup, duplicate checking, public duplicate indices, valid unchecked construction, collision correctness, and preserved input order.
+- Unit tests cover Schema duplicate rejection, structured invalid-default rejection, unordered equality, and ergonomic guarded field metadata mutation.
+- Message-codec tests cover structured duplicate-field and invalid-default failures.
+- Unit tests cover borrowed and owned OrderedSchema values, ownership conversion, retained owned field-name allocations, positional equality, unordered comparisons, metadata, and source-field reuse.
+- In-memory state/value tests cover OrderedSchema-backed lookup, row layout, snapshots, and source Field pointer identity.
+- Run formatting, focused crate tests, relevant workspace checks, and pedantic Clippy serially.
+
+Estimated final size:
+- Existing projected collection and schema implementation remains approximately 950-1450 LOC.
+- This review round adds or changes approximately 500-750 LOC, primarily the shared owner/dependent schema wrapper, in-memory adaptations, mutable guard, module consolidation, and tests.
+- The agreed review delta remains below 1000 LOC and stays cohesive within this task.
+
+Fourth-review refinements:
+- Generalise the private snapshot writer over schema-field lookup so it can validate against either Schema or OrderedSchema.
+- Pass only OrderedSchema through the in-memory state-row encode path; do not thread the unordered and ordered views together when they come from the same owner.
+- Preserve SchemaSource representation-sensitive equality in OrderedSchemaSource. Ordered equality covers schema content and position; owner equality additionally distinguishes documented Static and Shared representations.
+- Describe row initialisation as following the supplied OrderedSchema instance's field order, without implying a canonical Schema order.
+- Keep the existing generic projected-key mutation rejection test as the single contract test.
+
+Fourth-review validation:
+- Cover the Static-versus-Shared equality counterexample directly.
+- Run focused data-type tests, formatting, workspace all-target checking, pedantic Clippy, and diff whitespace checks.
+
+Fourth-review estimate:
+- Private snapshot schema-view abstraction and call-site cleanup: 50-90 LOC.
+- Equality explanation and coverage: 15-30 LOC.
+- Documentation adjustment: 1-5 LOC.
+- Total: approximately 65-125 LOC, below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+labels = ["area:data-types"]
+assignee = "codex"
+blocks = ["01a04cec-91ea-7080-b62a-4526ffb32621"]
+parent = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
+created_at = "2026-08-29T09:49:12.862233Z"
+updated_at = "2026-08-30T11:12:11.904862Z"
+closed_at = "2026-08-30T11:12:11.904862Z"
+
+[[comments]]
+id = "01a04d2c-85f5-7372-937e-999f5f592506"
+author = "codex"
+body = "Review plan agreed: add unordered ProjectedHashMap newtype around iddqd, rename the dense positional collection to ProjectedIndexHashMap, use safe generic hashing defaults with explicit AHash only in OrderedSchema, convert Schema storage, add safe unchecked positional construction, and simplify OrderedSchema contracts. Continue under this task without further splitting."
+created_at = "2026-08-29T10:59:18.645401Z"
+
+[[comments]]
+id = "01a04d3e-798f-7e63-9cb3-21d6a4e71f3b"
+author = "lkroll"
+body = "Implementation ready for review: added the unordered IdHashMap-backed ProjectedHashMap wrapper and positional ProjectedIndexHashMap, converted Schema and OrderedSchema, removed duplicate field-name storage and impossible mismatch paths, and adapted consumers. Focused flotsync_utils, flotsync_data_types, and flotsync_messages tests pass; workspace all-target checks, formatting, and workspace pedantic Clippy are clean."
+created_at = "2026-08-29T11:18:55.119794Z"
+
+[[comments]]
+id = "01a04e22-9db3-7c53-bc2b-50e5d4fbefaf"
+author = "lkroll"
+body = "Resolved second-round review CR01–CR04: protobuf schema decoding now streams decoded fields into Schema::try_from_fields and short-circuits on the first duplicate; invalid-default wrappers no longer duplicate field names; structured construction/codec failures have direct coverage; and owned OrderedSchema construction verifies field-name allocation pointer retention. Affected crate tests, workspace pedantic Clippy, formatting, and diff checks pass."
+created_at = "2026-08-29T15:28:06.579329Z"
+
+[[comments]]
+id = "01a05232-75ac-78a2-8213-8bef238f8267"
+author = "lkroll"
+body = "Third review plan agreed: reuse OrderedSchema in both in-memory stores through a shared owner/dependent wrapper; add guarded ProjectedHashMap mutation while keeping Field::name public; retain and explain the process_results closure; add SchemaBuildError conversion; consolidate both projected-map types into one public module; and apply the requested positional-map naming and control-flow cleanups."
+created_at = "2026-08-30T10:23:53.772433Z"
+
+[[comments]]
+id = "01a0523b-8d52-7f21-a88b-b9ede99dc1f4"
+author = "lkroll"
+body = "Resolved CR05–CR13: both existing in-memory stores now reuse source fields through one OrderedSchema owner/dependent wrapper; projected-map mutation uses a key-checking guard without hiding Field::name; codec error translation is centralised and the required process_results closure is explained; both projected maps share one public module; and the positional-map error/loop cleanups are applied. Utility, data-type, and message tests pass; workspace all-target check, formatting, diff whitespace, and workspace pedantic Clippy are clean."
+created_at = "2026-08-30T10:33:49.650846Z"
+
+[[comments]]
+id = "01a0525a-7535-7982-b757-a503bd49dd66"
+author = "lkroll"
+body = "Resolved CR14–CR20: snapshot validation now accepts Schema or OrderedSchema through one private field-view contract, so in-memory row encoding passes only its OrderedSchema; decoding remains unchanged. OrderedSchemaSource equality retains the owner comparison because Static and Shared sources are intentionally distinct even with equal ordered layouts, now covered directly. Row initialisation documentation uses the agreed instance-specific order wording, and the existing generic key-mutation guard test remains the sole contract test. The full data-types suite passes; workspace all-target checking, formatting, diff whitespace, and workspace pedantic Clippy are clean."
+created_at = "2026-08-30T11:07:35.093845Z"
+
+[[comments]]
+id = "01a0525e-ae80-7ee0-a463-152f5debb036"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-30T11:12:11.904862Z"

@@ -2,37 +2,57 @@ id = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
 ref = "flotsync-nk9"
 title = "Rethink replication snapshot batching and storage row batch API"
 body = """
-The current storage snapshot batch API returns row records whose RowStateSnapshot payload repeats field names for every row. That makes the replication snapshot export path choose between per-row allocation/index material, repeated field-name storage, or O(rows * fields^2) projection when building application-facing value batches.
+The replication snapshot scan currently returns one owned named RowStateSnapshot per row. That repeats schema field names, allocates per-row structures, and makes projection into SnapshotValueRowBatch either quadratic in the field count or dependent on more per-row indexing.
 
-Problem:
-- Store scans return Vec<ReplicationRowStateRecord>, each with an owned RowStateSnapshot.
-- RowStateSnapshot::Owned stores Vec<(field_name, field_state)> per row.
-- SnapshotValueRowBatch/InMemoryValueData already knows the schema mapping once per batch, but the current storage shape does not expose row fields in a schema-bound batch layout.
-- The result is an awkward impedance mismatch between the replication API batching system and storage API batch fetches.
+Agreed design:
+- Keep Schema position-independent and preserve its unordered equality semantics.
+- Add a reusable immutable projected-key map: contiguous values plus hashbrown::HashTable<usize>, with keys borrowed through a projection and indexed using a cheap trusted-data hasher.
+- Build an opaque OrderedSchema on that collection. It chooses the source Schema hashmap iteration order; callers cannot select or sort the order.
+- OrderedSchema uses one whole-schema borrowed/owned enum rather than Cow per field. Borrowed construction indexes references to the original fields and metadata; owned construction stores them directly.
+- OrderedSchema equality is intentionally contextual: OrderedSchema-to-OrderedSchema PartialEq is positional, OrderedSchema-to-Schema is unordered, and eq_unordered explicitly compares two ordered schemas without considering position.
+- Add a schema-bound row-major state batch that owns its OrderedSchema wrapper, stores row metadata separately, and stores field states flat without names.
+- Decode rows append-first with rollback on failure. reset_rows retains allocation under one layout; reuse_for_schema clears rows and changes the wrapper only when positional equality says the batch layout differs.
+- Adapt replication storage and snapshot consumers to the batch without coupling SQLite directly to SnapshotValueRowBatch.
 
-Design goal:
-- Fetch and project snapshot rows without repeating field names per row.
-- Preserve reusable batch allocations across provider calls.
-- Keep schema/field order information at the batch level, not duplicated inside every row.
-- Avoid per-row name-to-index map construction and avoid quadratic field-name traversals.
+Child split:
+- flotsync-nk9.1 implements ProjectedHashMap and OrderedSchema, including ownership and comparison semantics.
+- flotsync-nk9.2 implements InMemoryStateRowBatch and integrates it through the replication store and snapshot consumers. It is blocked by flotsync-nk9.1.
 
-Possible directions:
-- Make storage row-snapshot scan return a schema-bound row-major batch with field order once and per-row state vectors.
-- Add a storage/API batch adapter that carries field names/index maps once per batch and exposes rows as indexed views.
-- Reconsider whether replication SnapshotValueRowBatch should be built directly by storage implementations rather than via per-row RowStateSnapshot records.
+Efficiency and complexity:
+- Field names and Field allocations remain authoritative in Schema for the common borrowed path.
+- OrderedSchema pays one O(fields) index build and O(fields) index storage per reusable layout.
+- Each decoded row stores only metadata and field states, reducing name storage from O(rows * fields) to O(fields) references/index entries and making field lookup expected O(1).
+- Positional equality prevents accidental reuse across different batch layouts, while explicit unordered comparison preserves data-model semantics where position is irrelevant.
 
-This was discovered while addressing flotsync-git-d3w review feedback R50. R50 is deferred for now; the inefficient access is tolerated temporarily until this design is redone."""
-status = "open"
+Estimated size:
+- flotsync-nk9.1: approximately 500-750 LOC including tests.
+- flotsync-nk9.2: approximately 770-1,100 LOC including integration tests; split transition adaptation further if this estimate grows materially.
+- Combined: approximately 1,270-1,850 LOC, which is why the work is divided into independently reviewable children.
+
+Validation is specified independently in each child issue. The parent remains open until both children are accepted."""
+status = "in-progress"
+status_reason = "plan agreed; split into child tasks"
 type = "task"
 priority = 1
 labels = [
     "area:replication",
     "area:store",
 ]
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+children = [
+    "01a04cec-591e-7a31-a545-d82a3d62a9c8",
+    "01a04cec-91ea-7080-b62a-4526ffb32621",
+]
 created_at = "2026-07-17T06:55:38.203915Z"
-updated_at = "2026-08-25T16:36:36.174438Z"
+updated_at = "2026-08-29T09:57:54.794693Z"
 
 [[links]]
 target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
 label = "discovered from"
+
+[[comments]]
+id = "01a04cf4-4fea-7380-a22d-234c68e7902b"
+author = "codex"
+body = "Plan review aligned on three final refinements: OrderedSchema uses one whole-schema borrowed/owned representation rather than Cow per field; OrderedSchema PartialEq is positional while Schema cross-comparison and eq_unordered are unordered; and InMemoryStateRowBatch will own its OrderedSchema wrapper. Work was split into flotsync-nk9.1 for projected storage/schema and flotsync-nk9.2 for batch/store integration."
+created_at = "2026-08-29T09:57:54.794693Z"

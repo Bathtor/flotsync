@@ -12,6 +12,7 @@ use crate::{
         PrimitiveType,
         ReplicatedDataType,
         Schema,
+        SchemaFields,
         datamodel::{
             CounterValue,
             NullableBasicValue,
@@ -64,29 +65,30 @@ pub enum ExampleBuildError {
     },
 }
 
-fn insert_field(columns: &mut HashMap<String, Field>, name: String, data_type: ReplicatedDataType) {
-    columns.insert(
-        name.clone(),
-        Field {
+fn insert_field(columns: &mut SchemaFields, name: String, data_type: ReplicatedDataType) {
+    columns
+        .insert_unique(Field {
             name,
             data_type,
             default_value: None,
             metadata: HashMap::new(),
-        },
-    );
+        })
+        .expect("exhaustive schema field names must be unique");
 }
 
-fn set_field_default<V>(columns: &mut HashMap<String, Field>, field_name: String, value: V)
+fn set_field_default<V>(columns: &mut SchemaFields, field_name: &str, value: V)
 where
     V: Into<NullableBasicValue>,
 {
     let field = columns
-        .remove(field_name.as_str())
+        .remove(field_name)
         .expect("field must exist when assigning exhaustive defaults");
     let field = field
         .with_default(value)
         .expect("exhaustive defaults must be type-compatible");
-    columns.insert(field_name, field);
+    columns
+        .insert_unique(field)
+        .expect("reinserted exhaustive schema field must remain unique");
 }
 
 fn field<Id>(field_name: String, value: OperationValue<Id>) -> OperationFieldValue<'static, Id> {

@@ -12,6 +12,7 @@ use super::{
     BasicDataType,
     NullableBasicDataType,
     NullablePrimitiveType,
+    OrderedSchema,
     PrimitiveType,
     ReplicatedDataType,
     Schema,
@@ -28,6 +29,7 @@ use super::{
 };
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
+use self_cell::self_cell;
 use snafu::prelude::*;
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
@@ -121,6 +123,70 @@ impl From<Cow<'static, Schema>> for SchemaSource {
         }
     }
 }
+
+self_cell!(
+    /// Self-referential storage for a schema source and its positional view.
+    struct OrderedSchemaSourceCell {
+        owner: SchemaSource,
+
+        #[covariant]
+        dependent: OrderedSchema,
+    }
+);
+
+/// Owns a schema source together with a positional view borrowing its fields.
+pub(crate) struct OrderedSchemaSource {
+    /// Stable owner/dependent allocation keeping the positional references valid.
+    cell: OrderedSchemaSourceCell,
+}
+
+impl OrderedSchemaSource {
+    /// Build a positional view over the supplied schema owner.
+    pub(crate) fn new(schema: SchemaSource) -> Self {
+        Self {
+            cell: OrderedSchemaSourceCell::new(schema, |schema| {
+                OrderedSchema::from_schema(schema.as_schema())
+            }),
+        }
+    }
+
+    /// Borrow the source schema.
+    pub(crate) fn schema(&self) -> &Schema {
+        self.cell.borrow_owner().as_schema()
+    }
+
+    /// Borrow the positional schema view.
+    pub(crate) fn ordered_schema(&self) -> &OrderedSchema<'_> {
+        self.cell.borrow_dependent()
+    }
+}
+
+impl Clone for OrderedSchemaSource {
+    fn clone(&self) -> Self {
+        Self::new(self.cell.borrow_owner().clone())
+    }
+}
+
+impl std::fmt::Debug for OrderedSchemaSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrderedSchemaSource")
+            .field("source", self.cell.borrow_owner())
+            .field("ordered", self.cell.borrow_dependent())
+            .finish()
+    }
+}
+
+impl PartialEq for OrderedSchemaSource {
+    fn eq(&self, other: &Self) -> bool {
+        // Ordered equality covers field contents and position. Owner equality
+        // additionally preserves SchemaSource's documented ownership distinction.
+        self.cell.borrow_owner() == other.cell.borrow_owner()
+            && self.cell.borrow_dependent() == other.cell.borrow_dependent()
+    }
+}
+
+impl Eq for OrderedSchemaSource {}
 
 /// A borrowed array of primitive values, flattened by primitive type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,4 +578,27 @@ where
     InvalidDecodedValue { source: DataModelValueError },
     #[snafu(display("Value decoder failed."))]
     DecoderSource { source: E },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::Field;
+
+    #[test]
+    fn ordered_schema_source_equality_preserves_source_representation() {
+        let schema: &'static Schema =
+            Box::leak(Box::new(Schema::from_fields([Field::linear_string(
+                "title",
+            )])));
+        let static_source = OrderedSchemaSource::new(SchemaSource::Static(schema));
+        let shared_source =
+            OrderedSchemaSource::new(SchemaSource::Shared(Arc::new(schema.clone())));
+
+        assert_eq!(
+            static_source.ordered_schema(),
+            shared_source.ordered_schema()
+        );
+        assert_ne!(static_source, shared_source);
+    }
 }

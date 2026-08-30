@@ -22,61 +22,49 @@ impl<OperationId> InMemoryStateRow<OperationId> {
 
     pub(super) fn encode_snapshot<V>(
         &self,
-        schema: &Schema,
-        field_names: &[String],
+        ordered_schema: &OrderedSchema<'_>,
         encoder: &mut V,
     ) -> Result<(), SchemaVisitError<V::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         V: SchemaSnapshotEncoder<OperationId>,
     {
-        let mut writer = prepare_schema_snapshot_encoder(encoder, schema)?;
-        self.encode_snapshot_fields(field_names, &mut writer)?;
+        let mut writer = prepare_schema_snapshot_encoder(encoder, ordered_schema)?;
+        self.encode_snapshot_fields(ordered_schema, &mut writer)?;
         writer.end()
     }
 
     pub(crate) fn encode_snapshot_fields<V>(
         &self,
-        field_names: &[String],
+        ordered_schema: &OrderedSchema<'_>,
         writer: &mut SchemaSnapshotEncodingWriter<'_, OperationId, V>,
     ) -> Result<(), SchemaVisitError<V::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         V: SchemaSnapshotEncoder<OperationId>,
     {
-        debug_assert_eq!(field_names.len(), self.fields.len());
-        for (field_name, field_value) in field_names
-            .iter()
-            .map(String::as_str)
-            .zip(self.fields.iter())
-        {
-            field_value.encode_snapshot_field(field_name, writer)?;
+        debug_assert_eq!(ordered_schema.len(), self.fields.len());
+        for (field, field_value) in ordered_schema.fields().zip(self.fields.iter()) {
+            field_value.encode_snapshot_field(&field.name, writer)?;
         }
         Ok(())
     }
 
     pub(super) fn decode_snapshot<D>(
-        schema: &Schema,
-        field_names: &[String],
+        ordered_schema: &OrderedSchema<'_>,
         decoder: &mut D,
     ) -> Result<Self, InMemoryStateDataSnapshotDecodeError<D::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: SchemaSnapshotDecoder<OperationId>,
     {
-        decoder.begin(field_names.len()).context(DecoderSnafu)?;
+        decoder.begin(ordered_schema.len()).context(DecoderSnafu)?;
 
-        let mut fields = Vec::with_capacity(field_names.len());
-        for field_name in field_names {
-            let schema_field = schema
-                .columns
-                .get(field_name.as_str())
-                .expect("field names and schema are in sync");
-            let field_value = InMemoryFieldState::decode_snapshot_field(
-                field_name.as_str(),
-                schema_field,
-                decoder,
-            )?;
+        let mut fields = Vec::with_capacity(ordered_schema.len());
+        for schema_field in ordered_schema.fields() {
+            let field_name = &schema_field.name;
+            let field_value =
+                InMemoryFieldState::decode_snapshot_field(field_name, schema_field, decoder)?;
             fields.push(field_value);
         }
 
