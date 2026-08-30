@@ -18,11 +18,23 @@ pub mod err;
 pub mod kompact_config;
 pub mod kompact_fsm;
 pub mod kompact_testing;
+pub mod projected_hash_map;
+mod projected_index_hash_map;
 pub mod testing;
 
 pub use async_std::future::TimeoutError;
 pub use claimable_promise::KClaimablePromise;
 pub use kompact;
+pub use projected_hash_map::{
+    DuplicateProjectedIndexKeyError,
+    DuplicateProjectedKeyError,
+    KeyProjection,
+    ProjectedHashMap,
+    ProjectedHashMapIntoIter,
+    ProjectedHashMapIter,
+    ProjectedHashMapRefMut,
+    ProjectedIndexHashMap,
+};
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

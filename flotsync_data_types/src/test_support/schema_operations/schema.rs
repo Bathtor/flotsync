@@ -13,7 +13,7 @@ use super::*;
     reason = "The exhaustive schema intentionally lists every supported CRDT/data-type combination."
 )]
 pub fn exhaustive_schema() -> Schema {
-    let mut columns = HashMap::with_capacity(EXHAUSTIVE_SCHEMA_FIELD_COUNT);
+    let mut columns = SchemaFields::with_capacity(EXHAUSTIVE_SCHEMA_FIELD_COUNT);
 
     for primitive_type in primitive_types() {
         insert_field(
@@ -113,28 +113,24 @@ pub fn exhaustive_schema() -> Schema {
 
     set_field_default(
         &mut columns,
-        lvw_field_name(false, false, PrimitiveType::String),
+        &lvw_field_name(false, false, PrimitiveType::String),
         nullable_basic_value(false, false, PrimitiveType::String),
     );
+    set_field_default(&mut columns, "linear_string", "default-linear-string");
     set_field_default(
         &mut columns,
-        "linear_string".to_owned(),
-        "default-linear-string",
-    );
-    set_field_default(
-        &mut columns,
-        linear_list_field_name(PrimitiveType::Int),
+        &linear_list_field_name(PrimitiveType::Int),
         vec![-7i64, 0, 9],
     );
-    set_field_default(&mut columns, "monotonic_counter_uint".to_owned(), 42u64);
+    set_field_default(&mut columns, "monotonic_counter_uint", 42u64);
     set_field_default(
         &mut columns,
-        total_order_register_field_name(&Direction::Ascending, PrimitiveType::UInt),
+        &total_order_register_field_name(&Direction::Ascending, PrimitiveType::UInt),
         42u64,
     );
     set_field_default(
         &mut columns,
-        finite_state_register_field_name(true, PrimitiveType::String),
+        &finite_state_register_field_name(true, PrimitiveType::String),
         "review",
     );
 

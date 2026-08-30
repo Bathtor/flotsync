@@ -1,0 +1,75 @@
+id = "01a05265-e37a-7d93-911a-d4db04183368"
+ref = "flotsync-pcj"
+title = "Add schema-bound transition row batches"
+body = """
+Extend the positional state-row batch design from flotsync-nk9.2 across the remaining named-record boundaries.
+
+Agreed design:
+- Add ReplicationStateRowTransitionBatch with separate previous_rows and current_rows ReplicationStateRowBatch values plus a compact Vec<ReplicationRowTransitionAlignment>.
+- Each private alignment stores only previous_index and current_index. At least one index is present; both referenced rows have the same RowKey when both sides exist. Row keys are derived from row metadata rather than stored again.
+- Expose read-only ReplicationStateRowTransitionView values containing the derived RowKey and optional borrowed previous/current InMemoryStateRowView values.
+- The two state batches own independent OrderedSchema values, so previous and current group schemas may differ.
+- Provide new, reuse_for_schemas, reset_rows, reserve_rows, len, is_empty, schema access, indexed row access, and ordered row iteration. Keep decoded append and alignment construction crate-private so callers cannot manufacture invalid pairings.
+- Separate transition page metadata from reusable row storage. scan_dataset_row_transition_batch fills a caller-supplied transition batch and returns group ids, dataset existence, and pagination metadata.
+- Rewrite the default transition implementation to ordinary-scan both sides into the reusable batch and align the ordered key union without materialising named snapshots.
+- Keep SQLite's union-first transition query, but decode each nullable side directly into its schema-bound batch.
+- Give StoreActivationRowProvider a reusable transition batch and consume borrowed row views directly for value projection and provenance.
+- Change DatasetRowStateSlice to own a schema-bound batch of present rows plus a HashSet<RowKey> of missing requested keys. Decode point loads directly into the batch and adapt replay/materialisation consumers.
+- Remove ReplicationRowStateRecord if no production use remains after the conversion.
+- Preserve row provenance, tombstones, pagination, dataset-existence semantics, and independent previous/current schemas.
+- Keep DatasetRowStatePatch, DatasetRowStateWrite, and write snapshots record-oriented.
+
+Agreed review adjustments:
+- Strictly reject every present transition alignment index that is outside its corresponding row batch, both during alignment construction and indexed access; cover invalid previous and current indices.
+- Add a consuming InMemoryStateData::from_row_batch constructor in row_batch.rs. It accepts an immutable Fn(Metadata) -> (RowId, bool), moves field states out of the batch, borrows field names only while mapping them into the destination schema order, and supports differing opaque positional orders without snapshot clones.
+- Consume DatasetRowStateSlice during LocalDataset materialisation so its state-row batch can be transferred through the new constructor.
+- Reserve the point-load state-row batch using the returned row count before decoding.
+- Rename legacy production-sounding store test types to explicit fixture names.
+
+Validation:
+- Cover transition alignment for previous-only, current-only, and paired rows, including different schemas.
+- Cover invalid present previous/current transition indices.
+- Cover reset/reuse allocation retention and row-key ordering invariants.
+- Cover default and SQLite transition pagination, exact-limit continuation, tombstones, and provenance.
+- Cover point-load present/missing rows, absent datasets, invalid stored snapshots, replay decisions, consuming row-batch transfer, and LocalDataset materialisation.
+- Cover activation output using borrowed transition views and update store fixtures to exercise the reusable output contract.
+
+Estimated size:
+- Transition batch and store API: approximately 220-320 LOC.
+- SQLite transition decoding: approximately 180-280 LOC.
+- Point-load and replay conversion: approximately 120-200 LOC.
+- Runtime adaptation and test-fixture churn: approximately 300-480 LOC.
+- Review adjustments: approximately 150-220 LOC.
+- Total: approximately 970-1,500 LOC. The task remains one coherent child as explicitly agreed, despite the total exceeding 1,000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 3
+labels = [
+    "area:replication",
+    "area:store",
+]
+assignee = "codex"
+blocked_by = ["01a04cec-91ea-7080-b62a-4526ffb32621"]
+parent = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
+created_at = "2026-08-30T11:20:04.218163Z"
+updated_at = "2026-08-30T13:51:10.422068Z"
+closed_at = "2026-08-30T13:51:10.422068Z"
+
+[[comments]]
+id = "01a052c0-fefb-7bf0-970d-8c51d8ac4984"
+author = "codex"
+body = "Implemented the agreed schema-bound transition and point-load design. Added reusable independent-schema transition batches and borrowed views; changed store transition scans to caller-owned output plus page metadata; decoded SQLite union pages and point loads directly into positional batches; adapted activation, replay, runtime consumers, and test stores; removed the production named row-state record while retaining record-oriented writes. Validation passed: 350 flotsync_replication tests, 123 flotsync_data_types tests, cargo fmt check, git diff check, and clippy pedantic for flotsync_replication tests."
+created_at = "2026-08-30T12:59:35.035674Z"
+
+[[comments]]
+id = "01a052e5-9f2e-7763-bb5a-dac8af88869f"
+author = "codex"
+body = "Resolved the agreed review findings: transition alignment indices now reject every invalid present index with negative coverage; LocalDataset consumes positional row batches through a clone-free InMemoryStateData constructor using an immutable metadata mapper; SQLite point loads reserve decoded row capacity; and removed production names were replaced with explicit test-fixture names. Validation passed: 124 flotsync_data_types tests, 354 flotsync_replication tests, pedantic clippy for all targets in both crates, formatting, and git diff check."
+created_at = "2026-08-30T13:39:35.34266Z"
+
+[[comments]]
+id = "01a052f0-3a56-76d2-a50d-ea7c9228da0b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-30T13:51:10.422068Z"

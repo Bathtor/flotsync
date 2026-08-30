@@ -34,13 +34,22 @@ pub use schema::{
     Field,
     InitialFieldValue,
     NULL,
+    OrderedSchema,
     OrderedValue,
     OrderedValueError,
     PendingFieldUpdate,
     PrimitiveType,
     ReplicatedDataType,
     Schema,
-    datamodel::{InMemoryFieldState, NullableBasicValue, SchemaOperation},
+    SchemaBuildError,
+    SchemaFields,
+    datamodel::{
+        InMemoryFieldState,
+        InMemoryStateRowBatch,
+        InMemoryStateRowView,
+        NullableBasicValue,
+        SchemaOperation,
+    },
 };
 
 #[derive(Debug, Snafu)]

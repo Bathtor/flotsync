@@ -68,12 +68,12 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
             .fail();
         };
         ensure!(
-            self.seen_fields.insert(schema_field_name.as_str()),
+            self.seen_fields.insert(schema_field_name),
             DuplicateFieldSnafu {
                 field_name: field_name.to_owned(),
             }
         );
-        Ok((schema_field_name.as_str(), &schema_field.data_type))
+        Ok((schema_field_name, &schema_field.data_type))
     }
 
     fn push_state_field(&mut self, field_name: &'schema str, wire_value: StateSnapshotWireValue) {

@@ -8,12 +8,14 @@ use crate::{
     schema::{
         FieldValueBuildError,
         InitialFieldValue,
+        OrderedSchema,
         Schema,
         datamodel::{
             BasicValue,
             BasicValueRef,
             NullableBasicValue,
             NullableBasicValueRef,
+            OrderedSchemaSource,
             PrimitiveValueArrayRef,
             SchemaSource,
         },
@@ -322,35 +324,29 @@ impl RowValues {
             let value = row
                 .get_value(field_name)
                 .ok_or_else(|| InMemoryValueDataError::MissingField {
-                    field_name: field_name.clone(),
+                    field_name: field_name.to_owned(),
                 })?
                 .into_owned();
-            fields.insert(field_name.clone(), value);
+            fields.insert(field_name.to_owned(), value);
         }
         Self::try_from_fields(schema, fields)
     }
 
-    /// Convert this complete value row into schema initial field values in a
-    /// caller-supplied field order.
+    /// Convert this complete value row into initial field values in the supplied
+    /// [`OrderedSchema`] instance's field order.
     ///
     /// # Errors
     ///
-    /// Returns `InMemoryValueDataError` if the row is not complete for `schema`,
-    /// if `field_names` does not name schema fields, or if any value cannot
-    /// initialise its field.
+    /// Returns `InMemoryValueDataError` if the row is not complete for the
+    /// schema or if any value cannot initialise its field.
     pub(crate) fn initial_values_in_field_order<'schema>(
         &self,
-        schema: &'schema Schema,
-        field_names: &[String],
+        ordered_schema: &'schema OrderedSchema<'_>,
     ) -> Result<Vec<InitialFieldValue<'schema>>, InMemoryValueDataError> {
-        validate_complete_value_row(schema, &self.fields)?;
-        let mut initial_values = Vec::with_capacity(field_names.len());
-        for field_name in field_names {
-            let field = schema.columns.get(field_name.as_str()).ok_or_else(|| {
-                InMemoryValueDataError::UnknownField {
-                    field_name: field_name.clone(),
-                }
-            })?;
+        validate_complete_value_row_ordered(ordered_schema, &self.fields)?;
+        let mut initial_values = Vec::with_capacity(ordered_schema.len());
+        for field in ordered_schema.fields() {
+            let field_name = &field.name;
             let value = self.fields.get(field_name.as_str()).ok_or_else(|| {
                 InMemoryValueDataError::MissingField {
                     field_name: field_name.clone(),
@@ -410,12 +406,8 @@ where
 /// Compact in-memory batch of projected row values for one schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InMemoryValueData<RowId> {
-    /// Shared schema used to validate and decode every row in this batch.
-    schema: SchemaSource,
-    /// Stable sorted field order for the flat value vector.
-    field_names: Vec<String>,
-    /// Field-name lookup table into `field_names`.
-    field_index_by_name: HashMap<String, usize>,
+    /// Schema and positional view used to validate and lay out every row.
+    schema: OrderedSchemaSource,
     /// Per-row metadata in the same order as the flat value chunks.
     rows: Vec<InMemoryValueRowMeta<RowId>>,
     /// Row-major projected field values laid out as `row_offset + field_index`.
@@ -426,21 +418,8 @@ impl<RowId> InMemoryValueData<RowId> {
     /// Create an empty projected-value batch for `schema`.
     #[must_use]
     pub fn new(schema: impl Into<SchemaSource>) -> Self {
-        let schema = schema.into();
-        let schema_ref = schema.as_schema();
-        let mut field_names = Vec::with_capacity(schema_ref.columns.len());
-        let mut field_index_by_name = HashMap::with_capacity(schema_ref.columns.len());
-
-        field_names.extend(schema_ref.columns.keys().cloned());
-        field_names.sort();
-        for (index, field_name) in field_names.iter().enumerate() {
-            field_index_by_name.insert(field_name.clone(), index);
-        }
-
         Self {
-            schema,
-            field_names,
-            field_index_by_name,
+            schema: OrderedSchemaSource::new(schema.into()),
             rows: Vec::new(),
             values: Vec::new(),
         }
@@ -458,13 +437,13 @@ impl<RowId> InMemoryValueData<RowId> {
     /// Return the schema shared by every row in the batch.
     #[must_use]
     pub fn schema(&self) -> &Schema {
-        self.schema.as_schema()
+        self.schema.schema()
     }
 
     /// Reserve storage for at least `additional_rows` more rows.
     pub fn reserve_rows(&mut self, additional_rows: usize) {
         self.rows.reserve(additional_rows);
-        let additional_values = additional_rows.saturating_mul(self.field_names.len());
+        let additional_values = additional_rows.saturating_mul(self.schema.ordered_schema().len());
         self.values.reserve(additional_values);
     }
 
@@ -513,21 +492,15 @@ impl<RowId> InMemoryValueData<RowId> {
         tombstoned: bool,
         row: &impl RowValueRead,
     ) -> Result<(), InMemoryValueDataError> {
-        let mut row_values = Vec::with_capacity(self.field_names.len());
-        for field_name in &self.field_names {
+        let mut row_values = Vec::with_capacity(self.schema.ordered_schema().len());
+        for field in self.schema.ordered_schema().fields() {
+            let field_name = &field.name;
             let value = row
                 .get_value(field_name)
                 .ok_or_else(|| InMemoryValueDataError::MissingField {
                     field_name: field_name.clone(),
                 })?
                 .into_owned();
-            let field = self
-                .schema()
-                .columns
-                .get(field_name.as_str())
-                .ok_or_else(|| InMemoryValueDataError::UnknownField {
-                    field_name: field_name.clone(),
-                })?;
             field.can_initial(&value).context(InvalidFieldValueSnafu {
                 field_name: field_name.clone(),
             })?;
@@ -536,7 +509,10 @@ impl<RowId> InMemoryValueData<RowId> {
         let row_index = self.rows.len();
         self.rows.push(InMemoryValueRowMeta { row_id, tombstoned });
         self.values.extend(row_values);
-        debug_assert_eq!(self.values.len(), (row_index + 1) * self.field_names.len());
+        debug_assert_eq!(
+            self.values.len(),
+            (row_index + 1) * self.schema.ordered_schema().len()
+        );
         Ok(())
     }
 
@@ -546,7 +522,7 @@ impl<RowId> InMemoryValueData<RowId> {
         if row_index >= self.rows.len() {
             return None;
         }
-        let row_value_offset = row_index.checked_mul(self.field_names.len())?;
+        let row_value_offset = row_index.checked_mul(self.schema.ordered_schema().len())?;
         Some(InMemoryValueDataRowRef {
             data: self,
             row_index,
@@ -593,8 +569,8 @@ impl<'a, RowId> InMemoryValueDataRowRef<'a, RowId> {
 
 impl<RowId> RowValueRead for InMemoryValueDataRowRef<'_, RowId> {
     fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
-        let field_index = self.data.field_index_by_name.get(field_name)?;
-        let value_index = self.row_value_offset.checked_add(*field_index)?;
+        let field_index = self.data.schema.ordered_schema().field_index(field_name)?;
+        let value_index = self.row_value_offset.checked_add(field_index)?;
         self.data
             .values
             .get(value_index)
@@ -628,6 +604,40 @@ fn field_does_not_exist(field_name: &str) -> DecodeValueError {
     }
 }
 
+/// Validate a complete value row against one positional schema view.
+fn validate_complete_value_row_ordered(
+    schema: &OrderedSchema<'_>,
+    fields: &HashMap<String, NullableBasicValue>,
+) -> Result<(), InMemoryValueDataError> {
+    if fields.len() != schema.len() {
+        return Err(InMemoryValueDataError::FieldCountMismatch {
+            expected: schema.len(),
+            actual: fields.len(),
+        });
+    }
+
+    for field_name in fields.keys() {
+        if schema.field(field_name).is_none() {
+            return Err(InMemoryValueDataError::UnknownField {
+                field_name: field_name.clone(),
+            });
+        }
+    }
+
+    for field in schema.fields() {
+        let field_name = &field.name;
+        let Some(value) = fields.get(field_name.as_str()) else {
+            return Err(InMemoryValueDataError::MissingField {
+                field_name: field_name.clone(),
+            });
+        };
+        field.can_initial(value).context(InvalidFieldValueSnafu {
+            field_name: field_name.clone(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Validate that `fields` is a complete row for `schema`.
 ///
 /// This checks three invariants: the row has exactly the same number of fields
@@ -652,7 +662,8 @@ fn validate_complete_value_row(
         }
     }
 
-    for (field_name, field) in &schema.columns {
+    for field in &schema.columns {
+        let field_name = &field.name;
         let Some(value) = fields.get(field_name.as_str()) else {
             return Err(InMemoryValueDataError::MissingField {
                 field_name: field_name.clone(),
@@ -668,6 +679,19 @@ fn validate_complete_value_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_schema_reuses_value_data_source_fields() {
+        let data = InMemoryValueData::<u64>::new(Schema::from_fields([
+            crate::schema::Field::linear_string("title"),
+            crate::schema::Field::monotonic_counter("count"),
+        ]));
+
+        let source_field = data.schema().field("title").unwrap();
+        let ordered_field = data.schema.ordered_schema().field("title").unwrap();
+
+        assert!(std::ptr::eq(source_field, ordered_field));
+    }
 
     #[test]
     fn differing_field_names_reports_fields_with_different_values() {

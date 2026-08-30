@@ -1,11 +1,10 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowStateBatch,
+        DatasetRowScanPage,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
-        DatasetRowStateTransition,
-        DatasetRowStateTransitionBatch,
+        DatasetRowStateTransitionPage,
         DatasetRowStateWrite,
         DatasetSchema,
         DatasetUpdateRecord,
@@ -28,8 +27,10 @@ use crate::{
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
-        ReplicationRowStateRecord,
+        ReplicationRowMetadata,
         ReplicationRowStateSnapshot,
+        ReplicationStateRowBatch,
+        ReplicationStateRowTransitionBatch,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -75,9 +76,10 @@ use flotsync_core::{
 };
 use flotsync_messages::{
     buffa::Message as _,
-    codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
+    codecs::datamodel::encode_row_snapshot,
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
+    snapshots::datamodel::ProtoSchemaSnapshotDecoder,
 };
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
@@ -699,15 +701,11 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
         async move {
-            scan_dataset_row_batch(
-                self.assert_open_connection(),
-                dataset,
-                after,
-                limit,
-            )
-            .await
+            scan_dataset_row_batch(self.assert_open_connection(), dataset, after, limit, output)
+                .await
         }
         .boxed()
     }
@@ -718,7 +716,8 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         current_group: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowTransitionBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
         async move {
             scan_dataset_row_transition_batch(
                 self.assert_open_connection(),
@@ -726,6 +725,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
                 current_group,
                 after,
                 limit,
+                output,
             )
             .await
         }

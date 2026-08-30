@@ -1,23 +1,66 @@
 //! The flotsync data model is based around strict [[Schema]]s which specify both
 //! the underlying storage type and value domain as well as the resolution semantics under
 //! concurrent modification.
+use flotsync_utils::{KeyProjection, ProjectedHashMap};
+use snafu::{ResultExt as _, Snafu};
 use std::{borrow::Cow, collections::HashMap, fmt, ops::Index};
 
 use crate::{FieldStateReadExt, FieldValueReadExt};
 
 pub mod datamodel;
+mod ordered;
 mod public_api;
 pub mod values;
+pub use ordered::{OrderedSchema, OrderedSchemaFields};
 pub use public_api::*;
 pub use values::{NULL, OrderedValue, OrderedValueError};
 
-/// A schema a collection of named, and typed columns.
+/// Fields indexed by their names without storing names separately as map keys.
+pub type SchemaFields = ProjectedHashMap<Field, FieldNameProjection>;
+
+/// Projects [`Field::name`] for schema field lookup.
+pub struct FieldNameProjection;
+
+impl KeyProjection<Field> for FieldNameProjection {
+    type Key = str;
+
+    fn key(field: &Field) -> &Self::Key {
+        &field.name
+    }
+}
+
+impl<'field> KeyProjection<&'field Field> for FieldNameProjection {
+    type Key = str;
+
+    fn key<'value>(field: &'value &'field Field) -> &'value Self::Key {
+        &field.name
+    }
+}
+
+/// A set of fields could not be assembled into a valid schema.
+#[derive(Debug, Snafu)]
+pub enum SchemaBuildError {
+    /// A field default does not belong to the field's value domain.
+    #[snafu(display("Invalid default value: {source}"))]
+    InvalidDefaultValue {
+        /// Value-domain validation failure.
+        source: FieldValueBuildError,
+    },
+    /// Two fields share a name.
+    #[snafu(display("Duplicate field name: {field_name}"))]
+    DuplicateFieldName {
+        /// Repeated field name.
+        field_name: String,
+    },
+}
+
+/// A schema is a collection of named, and typed columns.
 ///
 /// The data model is position-independent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
-    /// Columns by name.
-    pub columns: HashMap<String, Field>,
+    /// Fields indexed by name.
+    pub columns: SchemaFields,
     /// A map containing information about this schema.
     pub metadata: HashMap<String, String>,
 }
@@ -26,9 +69,39 @@ impl Schema {
     #[must_use]
     pub fn empty() -> Self {
         Schema {
-            columns: HashMap::new(),
+            columns: SchemaFields::new(),
             metadata: HashMap::new(),
         }
+    }
+
+    /// Try to create a schema from `fields` without metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaBuildError`] if a default value is invalid or a field
+    /// name occurs more than once.
+    pub fn try_from_fields(
+        fields: impl IntoIterator<Item = Field>,
+    ) -> Result<Self, SchemaBuildError> {
+        let fields = fields.into_iter();
+        let mut columns = SchemaFields::with_capacity(fields.size_hint().0);
+        for field in fields {
+            if let Some(default_value) = &field.default_value {
+                field
+                    .can_initial(default_value)
+                    .context(InvalidDefaultValueSnafu)?;
+            }
+
+            if let Err(error) = columns.insert_unique(field) {
+                return Err(SchemaBuildError::DuplicateFieldName {
+                    field_name: error.into_value().name,
+                });
+            }
+        }
+        Ok(Schema {
+            columns,
+            metadata: HashMap::new(),
+        })
     }
 
     /// Creates a schema from `fields`.
@@ -39,21 +112,7 @@ impl Schema {
     /// Panics if any field has an invalid default value or if two fields share the same name.
     #[must_use]
     pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
-        let mut columns = HashMap::with_capacity(N);
-        for field in fields {
-            if let Some(default_value) = field.default_value.clone()
-                && let Err(source) = field.initial(default_value)
-            {
-                panic!("Invalid default value for field '{}': {source}", field.name);
-            }
-            if let Some(existing_field) = columns.insert(field.name.clone(), field) {
-                panic!("Duplicate field name: {}", existing_field.name);
-            }
-        }
-        Schema {
-            columns,
-            metadata: HashMap::new(),
-        }
+        Self::try_from_fields(fields).unwrap_or_else(|error| panic!("{error}"))
     }
 
     #[must_use]
@@ -78,7 +137,7 @@ impl Index<&str> for Schema {
 
 impl fmt::Display for Schema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut fields = self.columns.values().collect::<Vec<_>>();
+        let mut fields = self.columns.iter().collect::<Vec<_>>();
         fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 
         if f.alternate() {
@@ -750,7 +809,60 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid default value for field 'priority'")]
+    fn schema_try_from_fields_rejects_duplicate_names() {
+        let error = Schema::try_from_fields([
+            Field::linear_string("duplicate"),
+            Field::monotonic_counter("duplicate"),
+        ])
+        .expect_err("duplicate field names should be rejected");
+
+        assert!(matches!(
+            error,
+            SchemaBuildError::DuplicateFieldName { field_name }
+                if field_name == "duplicate"
+        ));
+    }
+
+    #[test]
+    fn schema_fields_support_guarded_non_key_mutation() {
+        let mut schema = Schema::from_fields([Field::linear_string("title")]);
+
+        schema
+            .columns
+            .get_mut("title")
+            .unwrap()
+            .metadata
+            .insert("display".to_owned(), "Title".to_owned());
+
+        assert_eq!(
+            schema
+                .field("title")
+                .unwrap()
+                .metadata
+                .get("display")
+                .map(String::as_str),
+            Some("Title")
+        );
+    }
+
+    #[test]
+    fn schema_try_from_fields_rejects_invalid_defaults() {
+        let mut field =
+            Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending);
+        field.default_value = Some("wrong-type".into());
+        let error = Schema::try_from_fields([field])
+            .expect_err("invalid field defaults should be rejected");
+
+        assert!(matches!(
+            error,
+            SchemaBuildError::InvalidDefaultValue {
+                source: FieldValueBuildError::TypeMismatch { field_name, .. },
+            } if field_name == "priority"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid default value: Field 'priority'")]
     fn schema_from_fields_rejects_invalid_defaults() {
         let mut field =
             Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending);

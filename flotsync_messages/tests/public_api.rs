@@ -10,6 +10,7 @@ use flotsync_data_types::{
         BasicDataType,
         Direction,
         Field,
+        FieldValueBuildError,
         NullableBasicDataType,
         PrimitiveType,
         Schema,
@@ -35,7 +36,7 @@ use flotsync_messages::{
     buffa::Message,
     codecs::{
         datamodel::{decode_schema_operation, encode_schema_operation},
-        schema::{decode_schema_definition, encode_schema_definition},
+        schema::{SchemaCodecError, decode_schema_definition, encode_schema_definition},
     },
     datamodel as proto,
     snapshots::datamodel::{ProtoDataSnapshotDecoder, ProtoDataSnapshotEncoder},
@@ -185,6 +186,44 @@ fn public_schema_transport_roundtrips_field_defaults() {
     let decoded = decode_schema_definition(encoded).unwrap();
 
     assert_eq!(decoded, schema);
+}
+
+#[test]
+fn public_schema_transport_rejects_the_first_duplicate_field() {
+    let schema = Schema::from_fields([Field::linear_string("title")]);
+    let mut encoded = encode_schema_definition(&schema).unwrap();
+    let duplicate = encoded.fields[0].clone();
+    encoded.fields.push(duplicate);
+    encoded.fields.push(proto::FieldDefinition::default());
+
+    let error = decode_schema_definition(encoded)
+        .expect_err("duplicate fields should be rejected before later malformed fields");
+
+    assert!(matches!(
+        error,
+        SchemaCodecError::DuplicateFieldName { field_name } if field_name == "title"
+    ));
+}
+
+#[test]
+fn public_schema_transport_rejects_invalid_field_defaults() {
+    let schema = Schema::from_fields([Field::linear_string("title")]);
+    let default_source = Schema::from_fields([Field::monotonic_counter("counter")
+        .with_default(7u64)
+        .unwrap()]);
+    let mut encoded = encode_schema_definition(&schema).unwrap();
+    let mut encoded_default_source = encode_schema_definition(&default_source).unwrap();
+    encoded.fields[0].default_value = encoded_default_source.fields[0].default_value.take().into();
+
+    let error = decode_schema_definition(encoded)
+        .expect_err("defaults incompatible with their field type should be rejected");
+
+    assert!(matches!(
+        error,
+        SchemaCodecError::InvalidFieldDefault {
+            source: FieldValueBuildError::TypeMismatch { field_name, .. },
+        } if field_name == "title"
+    ));
 }
 
 #[test]

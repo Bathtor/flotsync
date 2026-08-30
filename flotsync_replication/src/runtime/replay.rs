@@ -222,10 +222,13 @@ pub(super) fn replay_datasets_at_versions(
 }
 
 fn row_slice_needs_replay(slice: &DatasetRowStateSlice, read_versions: &VersionVector) -> bool {
-    slice.rows.values().any(|row| match row {
-        Some(row) if row.last_changed_versions <= *read_versions => false,
-        Some(_) => true,
-        None => false,
+    slice.state_rows.rows().any(|row| {
+        matches!(
+            row.metadata()
+                .last_changed_versions
+                .partial_cmp(read_versions),
+            Some(cmp::Ordering::Greater) | None
+        )
     })
 }
 
@@ -323,7 +326,13 @@ fn replay_one_update(
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowStateWrite, DatasetUpdateRecord, ReplicationRowStateRecord, SchemaSource},
+        api::{
+            DatasetRowStateWrite,
+            DatasetUpdateRecord,
+            ReplicationRowMetadata,
+            ReplicationStateRowBatch,
+            SchemaSource,
+        },
         row_values,
     };
     use flotsync_core::{MemberIdentity, versions::PureVersionVector};
@@ -403,13 +412,14 @@ mod tests {
             .to_string()
     }
 
-    fn row_record_with_last_changed(
+    fn row_slice_with_last_changed(
         group_id: GroupId,
         dataset_id: &DatasetId,
         row_key: RowKey,
         last_changed_versions: VersionVector,
-    ) -> ReplicationRowStateRecord {
-        let mut dataset = LocalDataset::new(title_schema());
+    ) -> DatasetRowStateSlice {
+        let schema = title_schema();
+        let mut dataset = LocalDataset::new(schema.clone());
         let applied = apply_local_upsert(
             &mut dataset,
             &row_id(group_id, dataset_id, row_key),
@@ -421,12 +431,32 @@ mod tests {
         let DatasetRowStateWrite::UpsertActive { snapshot, .. } = applied.row_write else {
             panic!("test upsert should produce an active row write");
         };
-        ReplicationRowStateRecord {
-            row_id: row_key,
-            snapshot,
-            tombstoned: false,
-            created_by: Some(update_id(1)),
-            last_changed_versions,
+        let encoded = flotsync_messages::codecs::datamodel::encode_row_snapshot(
+            &snapshot,
+            schema.as_schema(),
+        )
+        .expect("test row snapshot should encode");
+        let mut decoder =
+            flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
+                .expect("test row snapshot should create a decoder");
+        let mut state_rows = ReplicationStateRowBatch::new(schema.as_schema());
+        state_rows
+            .push_decoded_row(
+                ReplicationRowMetadata {
+                    row_key,
+                    tombstoned: false,
+                    created_by: Some(update_id(1)),
+                    last_changed_versions,
+                },
+                &mut decoder,
+            )
+            .expect("test row snapshot should decode into the batch");
+        DatasetRowStateSlice {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            dataset_exists: true,
+            state_rows,
+            missing_row_keys: HashSet::new(),
         }
     }
 
@@ -565,20 +595,8 @@ mod tests {
             } else {
                 60_000
             });
-            let slice = DatasetRowStateSlice {
-                group_id,
-                dataset_id: dataset_id.clone(),
-                dataset_exists: true,
-                rows: HashMap::from([(
-                    row_key,
-                    Some(row_record_with_last_changed(
-                        group_id,
-                        &dataset_id,
-                        row_key,
-                        last_changed_versions,
-                    )),
-                )]),
-            };
+            let slice =
+                row_slice_with_last_changed(group_id, &dataset_id, row_key, last_changed_versions);
 
             assert_eq!(
                 row_slice_needs_replay(&slice, &read_versions),

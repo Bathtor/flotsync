@@ -41,7 +41,7 @@ use flotsync_data_types::{
     RowValues,
     Schema,
     TableOperations,
-    schema::datamodel::{RowOperation, RowRecord},
+    schema::datamodel::RowOperation,
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use flotsync_utils::option_when;
@@ -286,15 +286,10 @@ impl LocalDataset {
 
     /// Rebuild one ephemeral in-memory dataset slice from store-loaded rows.
     pub(super) fn from_row_slice(schema: SchemaSource, slice: DatasetRowStateSlice) -> Self {
-        let data = flotsync_messages::InMemoryStateData::from_row_snapshots_with_tombstones(
+        let data = flotsync_messages::InMemoryStateData::from_row_batch(
             schema,
-            slice.rows.into_values().filter_map(|row| {
-                row.map(|row| RowRecord {
-                    row_id: row.row_id.0,
-                    snapshot: row.snapshot,
-                    tombstoned: row.tombstoned,
-                })
-            }),
+            slice.state_rows,
+            |metadata| (metadata.row_key.0, metadata.tombstoned),
         )
         .expect("store-loaded dataset slice must not contain duplicate row keys");
         Self { data }

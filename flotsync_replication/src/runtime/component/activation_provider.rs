@@ -3,16 +3,21 @@
 use super::*;
 use crate::api::{
     AcceptedCutRelation,
+    InMemoryStateRowView,
     PreviousRow,
     PreviousRowCreator,
     PreviousRowEvidence,
-    ReplicationRowStateRecord,
+    ReplicationRowMetadata,
+    ReplicationStateRowBatch,
+    ReplicationStateRowTransitionBatch,
+    ReplicationStateRowTransitionView,
     RowChangeBatch,
     RowChangeKind,
     RowFieldDifference,
     RowValues,
     SchemaSource,
 };
+use flotsync_data_types::schema::Schema;
 use flotsync_utils::coerce_infallible;
 use std::{borrow::Cow, cmp::Ordering, convert::Infallible};
 
@@ -28,6 +33,10 @@ pub(super) struct StoreActivationRowProvider {
     dataset_index: usize,
     /// Exclusive lower row-key bound within the current dataset.
     after_row_key: Option<RowKey>,
+    /// Reusable storage for ordinary row scans.
+    state_rows: ReplicationStateRowBatch,
+    /// Reusable storage for old-to-new row transition scans.
+    transition_rows: ReplicationStateRowTransitionBatch,
 }
 
 impl StoreActivationRowProvider {
@@ -43,6 +52,11 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         }
     }
 
@@ -66,6 +80,11 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         }
     }
 
@@ -84,6 +103,11 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         }
     }
 }
@@ -136,6 +160,7 @@ impl StoreActivationRowProvider {
                         *group_id,
                         dataset_schema,
                         after,
+                        &mut self.state_rows,
                     )
                     .await?
                 }
@@ -150,11 +175,14 @@ impl StoreActivationRowProvider {
                     fill_hosted_replacement_dataset(
                         transaction.as_mut(),
                         output,
-                        *migration_id,
-                        dataset_schema,
-                        *local_member_index,
-                        final_versions,
-                        after,
+                        HostedReplacementDatasetScan {
+                            migration_id: *migration_id,
+                            dataset_schema,
+                            local_member_index: *local_member_index,
+                            final_versions,
+                            after,
+                        },
+                        &mut self.transition_rows,
                     )
                     .await?
                 }
@@ -168,6 +196,7 @@ impl StoreActivationRowProvider {
                         migration_id.new_group_id,
                         dataset_schema,
                         after,
+                        &mut self.state_rows,
                     )
                     .await?
                 }
@@ -220,18 +249,19 @@ async fn fill_creation_dataset(
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
     after: Option<RowKey>,
+    state_rows: &mut ReplicationStateRowBatch,
 ) -> Result<Option<RowKey>, RowProviderError> {
     let dataset = GroupDatasetSchemaRef {
         group_id: &group_id,
         dataset_id: &dataset_schema.dataset_id,
         schema: dataset_schema.schema.as_schema(),
     };
-    let batch = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+    let page = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
         .boxed()
         .context(ProviderExternalSnafu)?;
-    for current in batch.rows {
+    for current in state_rows.rows() {
         append_creation_row(
             output,
             group_id,
@@ -240,19 +270,37 @@ async fn fill_creation_dataset(
             &current,
         )?;
     }
-    Ok(batch.next_after)
+    Ok(page.next_after)
+}
+
+/// Inputs which identify one page of a hosted old-to-new dataset comparison.
+struct HostedReplacementDatasetScan<'a> {
+    /// Explicit old-to-new group relationship.
+    migration_id: MigrationId,
+    /// Dataset and schema shared by the current activation projection.
+    dataset_schema: &'a crate::api::DatasetSchema,
+    /// Local member position in the previous group.
+    local_member_index: MemberIndex,
+    /// Accepted previous-group frontier.
+    final_versions: &'a VersionVector,
+    /// Exclusive lower row-key bound for this page.
+    after: Option<RowKey>,
 }
 
 /// Load one committed replacement page with a locally hosted predecessor.
 async fn fill_hosted_replacement_dataset(
     transaction: &mut dyn ReplicationStoreReadTransaction,
     output: &mut RowChangeBatch,
-    migration_id: MigrationId,
-    dataset_schema: &crate::api::DatasetSchema,
-    local_member_index: MemberIndex,
-    final_versions: &VersionVector,
-    after: Option<RowKey>,
+    scan: HostedReplacementDatasetScan<'_>,
+    transition_rows: &mut ReplicationStateRowTransitionBatch,
 ) -> Result<Option<RowKey>, RowProviderError> {
+    let HostedReplacementDatasetScan {
+        migration_id,
+        dataset_schema,
+        local_member_index,
+        final_versions,
+        after,
+    } = scan;
     let schema = dataset_schema.schema.as_schema();
     let previous_group = GroupDatasetSchemaRef {
         group_id: &migration_id.old_group_id,
@@ -270,11 +318,12 @@ async fn fill_hosted_replacement_dataset(
             current_group,
             after,
             ACTIVATION_ROWS_PER_BATCH,
+            transition_rows,
         )
         .await
         .boxed()
         .context(ProviderExternalSnafu)?;
-    for transition in batch.rows {
+    for transition in transition_rows.rows() {
         append_hosted_transition(
             output,
             migration_id,
@@ -295,6 +344,7 @@ async fn fill_unavailable_replacement_dataset(
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
     after: Option<RowKey>,
+    state_rows: &mut ReplicationStateRowBatch,
 ) -> Result<Option<RowKey>, RowProviderError> {
     let schema = dataset_schema.schema.as_schema();
     let dataset = GroupDatasetSchemaRef {
@@ -302,12 +352,12 @@ async fn fill_unavailable_replacement_dataset(
         dataset_id: &dataset_schema.dataset_id,
         schema,
     };
-    let batch = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+    let page = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
         .boxed()
         .context(ProviderExternalSnafu)?;
-    for current in batch.rows {
+    for current in state_rows.rows() {
         append_unavailable_current(
             output,
             group_id,
@@ -316,7 +366,7 @@ async fn fill_unavailable_replacement_dataset(
             &current,
         )?;
     }
-    Ok(batch.next_after)
+    Ok(page.next_after)
 }
 
 /// Translate one raw hosted row transition into an application-visible operation.
@@ -327,16 +377,14 @@ fn append_hosted_transition(
     schema_source: &SchemaSource,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
-    transition: crate::api::DatasetRowStateTransition,
+    transition: ReplicationStateRowTransitionView<'_>,
 ) -> Result<(), RowProviderError> {
     let previous_visible = transition
-        .previous
-        .as_ref()
-        .is_some_and(|row| !row.tombstoned);
+        .previous()
+        .is_some_and(|row| !row.metadata().tombstoned);
     let current_visible = transition
-        .current
-        .as_ref()
-        .is_some_and(|row| !row.tombstoned);
+        .current()
+        .is_some_and(|row| !row.metadata().tombstoned);
 
     match (previous_visible, current_visible) {
         (true, true) => append_changed_row(
@@ -378,30 +426,30 @@ fn append_changed_row(
     schema_source: &SchemaSource,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
-    transition: crate::api::DatasetRowStateTransition,
+    transition: ReplicationStateRowTransitionView<'_>,
 ) -> Result<(), RowProviderError> {
     let previous = transition
-        .previous
+        .previous()
         .expect("visible predecessor must contain a stored record");
     let current = transition
-        .current
+        .current()
         .expect("visible successor must contain a stored record");
     let previous_row_id = RowId::new(
         migration_id.old_group_id,
         dataset_id.clone(),
-        transition.row_key,
+        transition.row_key(),
     );
     let current_row_id = RowId::new(
         migration_id.new_group_id,
         dataset_id.clone(),
-        transition.row_key,
+        transition.row_key(),
     );
-    let evidence = previous_row_evidence(&previous, local_member_index, final_versions);
+    let evidence = previous_row_evidence(previous.metadata(), local_member_index, final_versions);
     let schema = schema_source.as_schema();
-    let previous_values = RowValues::from_row(schema, &previous.snapshot)
+    let previous_values = RowValues::from_row(schema, &previous)
         .boxed()
         .context(ProviderExternalSnafu)?;
-    let current_values = RowValues::from_row(schema, &current.snapshot)
+    let current_values = RowValues::from_row(schema, &current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     let differences = changed_value_fields(schema_source, &previous_values, &current_values);
@@ -430,13 +478,13 @@ fn append_removed_row(
     dataset_id: &DatasetId,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
-    transition: crate::api::DatasetRowStateTransition,
+    transition: ReplicationStateRowTransitionView<'_>,
 ) -> Result<(), Infallible> {
     let previous = transition
-        .previous
+        .previous()
         .expect("visible predecessor must contain a stored record");
-    let previous_row_id = RowId::new(previous_group_id, dataset_id.clone(), transition.row_key);
-    let evidence = previous_row_evidence(&previous, local_member_index, final_versions);
+    let previous_row_id = RowId::new(previous_group_id, dataset_id.clone(), transition.row_key());
+    let evidence = previous_row_evidence(previous.metadata(), local_member_index, final_versions);
     output.push(RowChange {
         previous: PreviousRow::Present {
             row_id: previous_row_id.clone(),
@@ -457,25 +505,25 @@ fn append_new_row(
     schema: &flotsync_data_types::schema::Schema,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
-    transition: crate::api::DatasetRowStateTransition,
+    transition: ReplicationStateRowTransitionView<'_>,
 ) -> Result<(), RowProviderError> {
     let previous = previous_absence(
         migration_id.old_group_id,
         dataset_id,
-        transition.row_key,
-        transition.previous,
+        transition.row_key(),
+        transition.previous(),
         local_member_index,
         final_versions,
     );
     let current = transition
-        .current
+        .current()
         .expect("visible successor must contain a stored record");
     let current_row_id = RowId::new(
         migration_id.new_group_id,
         dataset_id.clone(),
-        transition.row_key,
+        transition.row_key(),
     );
-    let current_values = RowValues::from_row(schema, &current.snapshot)
+    let current_values = RowValues::from_row(schema, &current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     output.push(RowChange {
@@ -495,13 +543,14 @@ fn append_creation_row(
     group_id: GroupId,
     dataset_id: &DatasetId,
     schema: &flotsync_data_types::schema::Schema,
-    current: &ReplicationRowStateRecord,
+    current: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
 ) -> Result<(), RowProviderError> {
-    if current.tombstoned {
+    let metadata = current.metadata();
+    if metadata.tombstoned {
         return Ok(());
     }
-    let row_id = RowId::new(group_id, dataset_id.clone(), current.row_id);
-    let row = RowValues::from_row(schema, &current.snapshot)
+    let row_id = RowId::new(group_id, dataset_id.clone(), metadata.row_key);
+    let row = RowValues::from_row(schema, current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     output.push(RowChange::ordinary_upsert(row_id, Arc::new(row)));
@@ -514,13 +563,14 @@ fn append_unavailable_current(
     current_group_id: GroupId,
     dataset_id: &DatasetId,
     schema: &flotsync_data_types::schema::Schema,
-    current: &ReplicationRowStateRecord,
+    current: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
 ) -> Result<(), RowProviderError> {
-    if current.tombstoned {
+    let metadata = current.metadata();
+    if metadata.tombstoned {
         return Ok(());
     }
-    let current_row_id = RowId::new(current_group_id, dataset_id.clone(), current.row_id);
-    let current_values = RowValues::from_row(schema, &current.snapshot)
+    let current_row_id = RowId::new(current_group_id, dataset_id.clone(), metadata.row_key);
+    let current_values = RowValues::from_row(schema, current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     output.push(RowChange {
@@ -539,21 +589,22 @@ fn previous_absence(
     previous_group_id: GroupId,
     dataset_id: &DatasetId,
     row_key: RowKey,
-    previous: Option<ReplicationRowStateRecord>,
+    previous: Option<InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>>,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
 ) -> PreviousRow {
     previous.map_or(PreviousRow::NOT_STORED, |previous| {
-        debug_assert!(previous.tombstoned);
+        debug_assert!(previous.metadata().tombstoned);
         let row_id = RowId::new(previous_group_id, dataset_id.clone(), row_key);
-        let evidence = previous_row_evidence(&previous, local_member_index, final_versions);
+        let evidence =
+            previous_row_evidence(previous.metadata(), local_member_index, final_versions);
         PreviousRow::tombstoned(row_id, evidence)
     })
 }
 
 /// Derive the strongest conservative provenance retained for one predecessor record.
 fn previous_row_evidence(
-    previous: &ReplicationRowStateRecord,
+    previous: &ReplicationRowMetadata,
     local_member_index: MemberIndex,
     final_versions: &VersionVector,
 ) -> PreviousRowEvidence {
@@ -621,7 +672,7 @@ fn changed_value_fields(
                         .columns
                         .get_key_value(field_name)
                         .expect("row field must exist in its static schema");
-                    Cow::Borrowed(field_name.as_str())
+                    Cow::Borrowed(field_name)
                 }
                 SchemaSource::Shared(_) => Cow::Owned(field_name.to_owned()),
             };
@@ -662,15 +713,21 @@ enum ReplacementPredecessor {
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowStateBatch, PreviousRowAbsence, SchemaSource, StoreErrorClassification},
+        api::{DatasetRowScanPage, PreviousRowAbsence, SchemaSource, StoreErrorClassification},
         runtime::{
             in_memory::LocalDataset,
-            tests::{ProviderTestScanRequest, provider_test_read_transaction},
+            tests::{
+                DatasetRowStateTransitionFixture,
+                ProviderTestRowScanResult,
+                ProviderTestScanRequest,
+                ReplicationRowStateFixture,
+                provider_test_read_transaction,
+            },
         },
         test_support::wait_for_test_future,
     };
     use flotsync_core::versions::PureVersionVector;
-    use flotsync_data_types::{Field, Schema};
+    use flotsync_data_types::Field;
     use std::sync::LazyLock;
     use uuid::Uuid;
 
@@ -691,7 +748,7 @@ mod tests {
         tombstoned: bool,
         created_by: Option<UpdateId>,
         last_changed_versions: VersionVector,
-    ) -> ReplicationRowStateRecord {
+    ) -> ReplicationRowStateFixture {
         let row_values = RowValues::try_from_fields(
             &TITLE_SCHEMA,
             HashMap::from([("title".to_owned(), title.into())]),
@@ -707,12 +764,22 @@ mod tests {
         let snapshot = LocalDataset { data }
             .snapshot_row(row_key)
             .expect("embedded test row must be snapshotable");
-        ReplicationRowStateRecord {
+        ReplicationRowStateFixture {
             row_id: row_key,
             snapshot,
             tombstoned,
             created_by,
             last_changed_versions,
+        }
+    }
+
+    /// Copy the provenance columns from one owned row fixture.
+    fn stored_row_metadata(row: &ReplicationRowStateFixture) -> ReplicationRowMetadata {
+        ReplicationRowMetadata {
+            row_key: row.row_id,
+            tombstoned: row.tombstoned,
+            created_by: row.created_by,
+            last_changed_versions: row.last_changed_versions.clone(),
         }
     }
 
@@ -734,17 +801,88 @@ mod tests {
     /// Build one unavailable-predecessor scan result.
     fn row_batch(
         dataset_id: &'static str,
-        rows: Vec<ReplicationRowStateRecord>,
+        rows: Vec<ReplicationRowStateFixture>,
         next_after: Option<RowKey>,
-    ) -> DatasetRowStateBatch {
-        DatasetRowStateBatch {
-            group_id: TEST_MIGRATION_ID.new_group_id,
-            dataset_id: DatasetId::try_from_static(dataset_id)
-                .expect("test dataset id must be valid"),
-            dataset_exists: true,
+    ) -> ProviderTestRowScanResult {
+        ProviderTestRowScanResult {
+            page: DatasetRowScanPage {
+                group_id: TEST_MIGRATION_ID.new_group_id,
+                dataset_id: DatasetId::try_from_static(dataset_id)
+                    .expect("test dataset id must be valid"),
+                dataset_exists: true,
+                next_after,
+            },
             rows,
-            next_after,
         }
+    }
+
+    /// Decode stored-row fixtures into the same state batch used by ordinary scans.
+    fn decoded_state_rows(rows: Vec<ReplicationRowStateFixture>) -> ReplicationStateRowBatch {
+        let mut state_rows = ReplicationStateRowBatch::new(&TITLE_SCHEMA);
+        state_rows.reserve_rows(rows.len());
+        for row in rows {
+            push_decoded_state_row(&mut state_rows, row);
+        }
+        state_rows
+    }
+
+    /// Decode one owned fixture and return its index in `state_rows`.
+    fn push_decoded_state_row(
+        state_rows: &mut ReplicationStateRowBatch,
+        row: ReplicationRowStateFixture,
+    ) -> usize {
+        let encoded =
+            flotsync_messages::codecs::datamodel::encode_row_snapshot(&row.snapshot, &TITLE_SCHEMA)
+                .expect("test row must encode against the title schema");
+        let mut decoder =
+            flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
+                .expect("test row must create a snapshot decoder");
+        let row_index = state_rows.len();
+        state_rows
+            .push_decoded_row(
+                ReplicationRowMetadata {
+                    row_key: row.row_id,
+                    tombstoned: row.tombstoned,
+                    created_by: row.created_by,
+                    last_changed_versions: row.last_changed_versions,
+                },
+                &mut decoder,
+            )
+            .expect("test row must decode into the state batch");
+        row_index
+    }
+
+    /// Convert one owned transition fixture before exercising translation.
+    fn append_test_hosted_transition(
+        output: &mut RowChangeBatch,
+        migration_id: MigrationId,
+        dataset_id: &DatasetId,
+        schema_source: &SchemaSource,
+        local_member_index: MemberIndex,
+        final_versions: &VersionVector,
+        transition: DatasetRowStateTransitionFixture,
+    ) -> Result<(), RowProviderError> {
+        let mut transition_rows =
+            ReplicationStateRowTransitionBatch::new(&TITLE_SCHEMA, &TITLE_SCHEMA);
+        let previous_index = transition
+            .previous
+            .map(|row| push_decoded_state_row(transition_rows.previous_rows_mut(), row));
+        let current_index = transition
+            .current
+            .map(|row| push_decoded_state_row(transition_rows.current_rows_mut(), row));
+        transition_rows.push_alignment(previous_index, current_index);
+        let transition = transition_rows
+            .row(0)
+            .expect("test transition must be present");
+        append_hosted_transition(
+            output,
+            migration_id,
+            dataset_id,
+            schema_source,
+            local_member_index,
+            final_versions,
+            transition,
+        )
     }
 
     /// Build one test store error for provider propagation checks.
@@ -806,6 +944,11 @@ mod tests {
             datasets: group_schema(["beta", "alpha"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         };
 
         let first = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()))
@@ -866,6 +1009,11 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -895,6 +1043,11 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         };
 
         let _batch = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -917,6 +1070,11 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -944,6 +1102,11 @@ mod tests {
             datasets: Vec::new(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            transition_rows: ReplicationStateRowTransitionBatch::new(
+                &Schema::empty(),
+                &Schema::empty(),
+            ),
         };
 
         assert!(
@@ -983,14 +1146,14 @@ mod tests {
         );
         let mut output = RowChangeBatch::new();
 
-        append_hosted_transition(
+        append_test_hosted_transition(
             &mut output,
             TEST_MIGRATION_ID,
             &dataset_id,
             &SchemaSource::Static(&TITLE_SCHEMA),
             MemberIndex::new(0),
             &VersionVector::Full(PureVersionVector::from([1, 0])),
-            crate::api::DatasetRowStateTransition {
+            DatasetRowStateTransitionFixture {
                 row_key: previous.row_id,
                 previous: Some(previous),
                 current: Some(current),
@@ -1038,14 +1201,14 @@ mod tests {
         let current = previous.clone();
         let mut output = RowChangeBatch::new();
 
-        append_hosted_transition(
+        append_test_hosted_transition(
             &mut output,
             TEST_MIGRATION_ID,
             &dataset_id,
             &SchemaSource::Static(&TITLE_SCHEMA),
             MemberIndex::new(0),
             &VersionVector::Full(PureVersionVector::from([1, 0])),
-            crate::api::DatasetRowStateTransition {
+            DatasetRowStateTransitionFixture {
                 row_key: previous.row_id,
                 previous: Some(previous),
                 current: Some(current),
@@ -1079,14 +1242,14 @@ mod tests {
         let row_key = previous.row_id;
         let mut output = RowChangeBatch::new();
 
-        append_hosted_transition(
+        append_test_hosted_transition(
             &mut output,
             TEST_MIGRATION_ID,
             &dataset_id,
             &SchemaSource::Static(&TITLE_SCHEMA),
             MemberIndex::new(0),
             &VersionVector::Full(PureVersionVector::from([1, 0])),
-            crate::api::DatasetRowStateTransition {
+            DatasetRowStateTransitionFixture {
                 row_key,
                 previous: Some(previous),
                 current: None,
@@ -1136,14 +1299,14 @@ mod tests {
         );
         let mut output = RowChangeBatch::new();
 
-        append_hosted_transition(
+        append_test_hosted_transition(
             &mut output,
             TEST_MIGRATION_ID,
             &dataset_id,
             &SchemaSource::Static(&TITLE_SCHEMA),
             MemberIndex::new(0),
             &VersionVector::Full(PureVersionVector::from([1, 1])),
-            crate::api::DatasetRowStateTransition {
+            DatasetRowStateTransitionFixture {
                 row_key: previous.row_id,
                 previous: Some(previous),
                 current: Some(current),
@@ -1184,14 +1347,14 @@ mod tests {
         );
         let mut output = RowChangeBatch::new();
 
-        append_hosted_transition(
+        append_test_hosted_transition(
             &mut output,
             TEST_MIGRATION_ID,
             &dataset_id,
             &SchemaSource::Static(&TITLE_SCHEMA),
             MemberIndex::new(0),
             &VersionVector::Full(PureVersionVector::from([1, 0])),
-            crate::api::DatasetRowStateTransition {
+            DatasetRowStateTransitionFixture {
                 row_key: current.row_id,
                 previous: None,
                 current: Some(current),
@@ -1218,7 +1381,7 @@ mod tests {
 
         assert_eq!(
             previous_row_evidence(
-                &previous,
+                &stored_row_metadata(&previous),
                 MemberIndex::new(0),
                 &VersionVector::Full(PureVersionVector::from([1, 0])),
             ),
@@ -1242,7 +1405,7 @@ mod tests {
 
         assert_eq!(
             previous_row_evidence(
-                &previous,
+                &stored_row_metadata(&previous),
                 MemberIndex::new(0),
                 &VersionVector::Full(PureVersionVector::from([1, 0])),
             ),
@@ -1304,6 +1467,10 @@ mod tests {
             Some(UpdateId::INITIAL_STATE_ORIGIN),
             VersionVector::initial(NonZeroUsize::new(2).expect("test group has members")),
         );
+        let state_rows = decoded_state_rows(vec![current]);
+        let current = state_rows
+            .row(0)
+            .expect("test state batch must contain one row");
         let mut output = RowChangeBatch::new();
 
         append_unavailable_current(

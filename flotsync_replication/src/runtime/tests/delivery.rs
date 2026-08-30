@@ -951,16 +951,13 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             }],
         }
     );
-    let deleted_row =
-        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key])
-            .rows
-            .get(&row_id.row_key)
-            .cloned()
-            .flatten()
-            .expect("deleted row should persist as a tombstone");
-    assert!(deleted_row.tombstoned);
+    let deleted_rows =
+        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key]);
+    let deleted_row = loaded_state_row(&deleted_rows, &row_id.row_key)
+        .expect("deleted row should persist as a tombstone");
+    assert!(deleted_row.metadata().tombstoned);
     assert_eq!(
-        deleted_row.created_by,
+        deleted_row.metadata().created_by,
         Some(UpdateId {
             version: 1,
             node_index: 0,
@@ -993,16 +990,13 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
         .expect("concurrent edit after local delete should apply to the tombstone");
     assert!(restarted_listener.captured_data_changes().is_empty());
 
-    let edited_tombstone =
-        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key])
-            .rows
-            .get(&row_id.row_key)
-            .cloned()
-            .flatten()
-            .expect("edited tombstone should persist");
-    assert!(edited_tombstone.tombstoned);
+    let edited_tombstones =
+        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key]);
+    let edited_tombstone = loaded_state_row(&edited_tombstones, &row_id.row_key)
+        .expect("edited tombstone should persist");
+    assert!(edited_tombstone.metadata().tombstoned);
     assert_eq!(
-        edited_tombstone.created_by,
+        edited_tombstone.metadata().created_by,
         Some(UpdateId {
             version: 1,
             node_index: 0,
@@ -1013,8 +1007,8 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             schema,
             [flotsync_data_types::schema::datamodel::RowRecord {
                 row_id: row_id.row_key.0,
-                snapshot: edited_tombstone.snapshot,
-                tombstoned: edited_tombstone.tombstoned,
+                snapshot: edited_tombstone.snapshot(),
+                tombstoned: edited_tombstone.metadata().tombstoned,
             }],
         )
         .expect("tombstone should rehydrate");
@@ -1411,7 +1405,7 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
         [row_id.row_key],
     );
     assert!(!row_slice.dataset_exists);
-    assert_eq!(row_slice.rows.get(&row_id.row_key), Some(&None));
+    assert!(row_slice.missing_row_keys.contains(&row_id.row_key));
     assert_eq!(
         load_persisted_group(sqlite_store.as_ref(), group_id)
             .version_vector

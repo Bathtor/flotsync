@@ -134,8 +134,8 @@ pub struct RowStateSnapshot<'a, ChangeId> {
 #[derive(Clone, Debug, PartialEq)]
 enum RowStateSnapshotRepr<'a, ChangeId> {
     BorrowedInMemory {
-        field_names: &'a [String],
-        row: &'a InMemoryStateRow<ChangeId>,
+        ordered_schema: &'a OrderedSchema<'a>,
+        fields: &'a [InMemoryFieldState<ChangeId>],
     },
     Owned {
         fields: Vec<(String, InMemoryFieldState<ChangeId>)>,
@@ -144,11 +144,27 @@ enum RowStateSnapshotRepr<'a, ChangeId> {
 
 impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
     pub(crate) fn borrowed_in_memory(
-        field_names: &'a [String],
+        ordered_schema: &'a OrderedSchema<'a>,
         row: &'a InMemoryStateRow<ChangeId>,
     ) -> Self {
+        Self::borrowed_fields(ordered_schema, &row.fields)
+    }
+
+    /// Borrow a complete positional field-state slice using `ordered_schema` as its layout.
+    pub(crate) fn borrowed_fields(
+        ordered_schema: &'a OrderedSchema<'a>,
+        fields: &'a [InMemoryFieldState<ChangeId>],
+    ) -> Self {
+        assert_eq!(
+            ordered_schema.len(),
+            fields.len(),
+            "borrowed row snapshot field count must match its ordered schema"
+        );
         Self {
-            repr: RowStateSnapshotRepr::BorrowedInMemory { field_names, row },
+            repr: RowStateSnapshotRepr::BorrowedInMemory {
+                ordered_schema,
+                fields,
+            },
         }
     }
 
@@ -175,10 +191,13 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         ChangeId: Clone,
     {
         match self.repr {
-            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
-                .iter()
-                .cloned()
-                .zip(row.fields.iter().cloned())
+            RowStateSnapshotRepr::BorrowedInMemory {
+                ordered_schema,
+                fields,
+            } => ordered_schema
+                .fields()
+                .map(|field| field.name.clone())
+                .zip(fields.iter().cloned())
                 .collect(),
             RowStateSnapshotRepr::Owned { fields } => fields,
         }
@@ -207,10 +226,6 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
     ///
     /// See `RowStateSnapshotDecodeError<D::Error>` for failure conditions.
     ///
-    /// # Panics
-    ///
-    /// Panics if a field name yielded by `schema.columns.keys()` cannot be resolved back to a
-    /// schema field from the same map.
     pub fn decode_snapshot<D>(
         schema: &Schema,
         decoder: &mut D,
@@ -222,17 +237,11 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         decoder.begin(schema.columns.len()).context(DecoderSnafu)?;
 
         let mut fields = Vec::with_capacity(schema.columns.len());
-        for field_name in schema.columns.keys() {
-            let schema_field = schema
-                .columns
-                .get(field_name.as_str())
-                .expect("field names and schema are in sync");
-            let field_value = InMemoryFieldState::decode_snapshot_field(
-                field_name.as_str(),
-                schema_field,
-                decoder,
-            )
-            .context(InMemoryFieldStateSnafu)?;
+        for schema_field in &schema.columns {
+            let field_name = &schema_field.name;
+            let field_value =
+                InMemoryFieldState::decode_snapshot_field(field_name, schema_field, decoder)
+                    .context(InMemoryFieldStateSnafu)?;
             fields.push((field_name.clone(), field_value));
         }
 
@@ -249,8 +258,15 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         V: SchemaSnapshotEncoder<ChangeId>,
     {
         match &self.repr {
-            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => {
-                row.encode_snapshot_fields(field_names, writer)
+            RowStateSnapshotRepr::BorrowedInMemory {
+                ordered_schema,
+                fields,
+            } => {
+                debug_assert_eq!(ordered_schema.len(), fields.len());
+                for (field, field_value) in ordered_schema.fields().zip(fields.iter()) {
+                    field_value.encode_snapshot_field(&field.name, writer)?;
+                }
+                Ok(())
             }
             RowStateSnapshotRepr::Owned { fields } => {
                 for (field_name, field_value) in fields {
@@ -268,10 +284,12 @@ where
 {
     fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
         match &self.repr {
-            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
-                .iter()
-                .position(|name| name == field_name)
-                .and_then(|field_index| row.fields.get(field_index))
+            RowStateSnapshotRepr::BorrowedInMemory {
+                ordered_schema,
+                fields,
+            } => ordered_schema
+                .field_index(field_name)
+                .and_then(|field_index| fields.get(field_index))
                 .map(InMemoryFieldState::project_value),
             RowStateSnapshotRepr::Owned { fields } => fields
                 .iter()
@@ -324,20 +342,23 @@ fn validate_schema_snapshot<ChangeId>(
     snapshot: &RowStateSnapshot<'_, ChangeId>,
 ) -> Result<(), SchemaValueError> {
     let mut seen_fields = HashSet::<String>::new();
-    let mut missing_fields = schema.columns.keys().cloned().collect::<HashSet<_>>();
+    let mut missing_fields = schema
+        .columns
+        .keys()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
 
     match &snapshot.repr {
-        RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => {
-            for (field_name, field_value) in field_names
-                .iter()
-                .map(String::as_str)
-                .zip(row.fields.iter())
-            {
+        RowStateSnapshotRepr::BorrowedInMemory {
+            ordered_schema,
+            fields,
+        } => {
+            for (field, field_value) in ordered_schema.fields().zip(fields.iter()) {
                 validate_snapshot_field(
                     schema,
                     &mut seen_fields,
                     &mut missing_fields,
-                    field_name,
+                    &field.name,
                     field_value,
                 )?;
             }
@@ -490,22 +511,26 @@ mod tests {
     use std::{assert_matches, collections::HashMap};
 
     fn schema_with_field(field_name: &str, data_type: ReplicatedDataType) -> Schema {
-        Schema {
-            columns: HashMap::from([(
-                field_name.to_owned(),
-                Field {
-                    name: field_name.to_owned(),
-                    data_type,
-                    default_value: None,
-                    metadata: HashMap::new(),
-                },
-            )]),
+        Schema::from_fields([Field {
+            name: field_name.to_owned(),
+            data_type,
+            default_value: None,
             metadata: HashMap::new(),
-        }
+        }])
     }
 
     fn indexed(id: u32, index: u32) -> IdWithIndex<u32> {
         IdWithIndex { id, index }
+    }
+
+    #[test]
+    #[should_panic(expected = "borrowed row snapshot field count must match its ordered schema")]
+    fn borrowed_snapshot_rejects_mismatched_field_count() {
+        let schema = Schema::from_fields([Field::monotonic_counter("count")]);
+        let ordered_schema = OrderedSchema::from_schema(&schema);
+        let fields = Vec::<InMemoryFieldState<u32>>::new();
+
+        let _snapshot = RowStateSnapshot::borrowed_fields(&ordered_schema, &fields);
     }
 
     #[test]
@@ -567,32 +592,23 @@ mod tests {
 
     #[test]
     fn insert_snapshot_requires_all_fields() {
-        let schema = Schema {
-            columns: HashMap::from([
-                (
-                    "name".to_owned(),
-                    Field {
-                        name: "name".to_owned(),
-                        data_type: ReplicatedDataType::LinearString,
-                        default_value: None,
-                        metadata: HashMap::new(),
-                    },
-                ),
-                (
-                    "priority".to_owned(),
-                    Field {
-                        name: "priority".to_owned(),
-                        data_type: ReplicatedDataType::TotalOrderRegister {
-                            value_type: PrimitiveType::UInt,
-                            direction: Direction::Ascending,
-                        },
-                        default_value: None,
-                        metadata: HashMap::new(),
-                    },
-                ),
-            ]),
-            metadata: HashMap::new(),
-        };
+        let schema = Schema::from_fields([
+            Field {
+                name: "name".to_owned(),
+                data_type: ReplicatedDataType::LinearString,
+                default_value: None,
+                metadata: HashMap::new(),
+            },
+            Field {
+                name: "priority".to_owned(),
+                data_type: ReplicatedDataType::TotalOrderRegister {
+                    value_type: PrimitiveType::UInt,
+                    direction: Direction::Ascending,
+                },
+                default_value: None,
+                metadata: HashMap::new(),
+            },
+        ]);
 
         let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "name".to_owned(),
@@ -611,30 +627,17 @@ mod tests {
 
     #[test]
     fn insert_snapshot_allows_missing_fields_with_defaults() {
-        let schema = Schema {
-            columns: HashMap::from([
-                (
-                    "name".to_owned(),
-                    Field {
-                        name: "name".to_owned(),
-                        data_type: ReplicatedDataType::LinearString,
-                        default_value: None,
-                        metadata: HashMap::new(),
-                    },
-                ),
-                (
-                    "priority".to_owned(),
-                    Field::total_order_register(
-                        "priority",
-                        PrimitiveType::UInt,
-                        Direction::Ascending,
-                    )
-                    .with_default(7u64)
-                    .unwrap(),
-                ),
-            ]),
-            metadata: HashMap::new(),
-        };
+        let schema = Schema::from_fields([
+            Field {
+                name: "name".to_owned(),
+                data_type: ReplicatedDataType::LinearString,
+                default_value: None,
+                metadata: HashMap::new(),
+            },
+            Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending)
+                .with_default(7u64)
+                .unwrap(),
+        ]);
 
         let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "name".to_owned(),
