@@ -465,8 +465,20 @@ impl Drop for DeliveryRuntimeHost {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+/// Create the Kompact system without retaining its thread-local config state in this future.
 async fn build_runtime_system(
+    runtime_config_toml: Option<&str>,
+) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
+    let runtime_config_toml = runtime_config_toml.map(str::to_owned);
+    // KompactConfig contains Rc-backed builders and build() returns a local future. Keep both
+    // entirely on the reusable blocking pool until Kompact provides a Send-compatible path:
+    // https://github.com/kompics/kompact/issues/232
+    blocking::unblock(move || build_runtime_system_blocking(runtime_config_toml.as_deref())).await
+}
+
+/// Build the test-support system synchronously on a blocking-pool worker.
+#[cfg(any(test, feature = "test-support"))]
+fn build_runtime_system_blocking(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let local_endpoint_lease =
@@ -488,15 +500,16 @@ async fn build_runtime_system(
         &discovery_config_keys::PEER_ANNOUNCEMENT_BIND_ADDR,
         peer_announcement_bind_addr,
     );
-    let system = config.build().await.context(BuildSystemSnafu)?;
+    let system = config.build().wait().context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem {
         system,
         local_endpoint_lease,
     })
 }
 
+/// Build the production system synchronously on a blocking-pool worker.
 #[cfg(not(any(test, feature = "test-support")))]
-async fn build_runtime_system(
+fn build_runtime_system_blocking(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let mut config = KompactConfig::default();
@@ -504,7 +517,7 @@ async fn build_runtime_system(
     if let Some(runtime_config_toml) = runtime_config_toml {
         config.load_config_str(runtime_config_toml);
     }
-    let system = config.build().await.context(BuildSystemSnafu)?;
+    let system = config.build().wait().context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem { system })
 }
 

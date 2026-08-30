@@ -76,6 +76,21 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create one concrete replication runtime for the given application identity.
 ///
+/// This asynchronous entry point returns a `Send` future which may move between
+/// executor threads.
+///
+/// Clones of the returned handle share one internal runtime and lifecycle.
+///
+/// Listener callbacks run from the internally owned runtime rather than the
+/// caller's executor. A listener which needs thread-affine application state
+/// should hand the event to its application executor or event bus and resolve
+/// its callback future when that hand-off has completed.
+///
+/// Before closing a caller-owned store or exiting the process, call
+/// [`ReplicationApi::shutdown`] and await its completion. Applications should
+/// also finish or drop any outstanding snapshot and event row providers before
+/// closing the store.
+///
 /// `application_id` scopes the loaded runtime instance for diagnostics and future
 /// multi-application hosting.
 /// `application_schemas` provides the process-static application schema for each
@@ -112,6 +127,9 @@ pub async fn load_replication_runtime(
 
 /// Create one concrete replication runtime with an additional in-memory TOML
 /// config fragment merged into the internal Kompact runtime config.
+///
+/// This function has the same executor, ownership, listener, and shutdown
+/// contract as [`load_replication_runtime`].
 ///
 /// The TOML string only needs to live until this function returns; Kompact
 /// copies it into its config builder before the runtime system is built.

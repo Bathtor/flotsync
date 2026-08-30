@@ -1655,6 +1655,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "base64",
+ "blocking",
  "borrowize",
  "bytes",
  "chrono",

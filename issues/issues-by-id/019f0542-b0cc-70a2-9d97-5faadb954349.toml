@@ -4,28 +4,83 @@ title = "Rethink replication component public API boundary"
 body = """
 Goal
 
-Establish a stable application-facing replication API boundary suitable for MaintainRS, whose Tauri application runtime uses Tokio and must not own or address FlotSync Kompact components directly.
+Provide a stable, executor-independent application-facing replication API boundary suitable for MaintainRS without requiring it to own or address FlotSync Kompact components directly.
 
-Context
+Current findings
 
-C01. ReplicationApi currently exposes the intended application capabilities through a runtime handle, but public asks still enter ReplicationRuntimeComponent and some are forwarded to capability-specific components such as SummaryRequestManager.
-C02. The Kompact-owned embedding alternative is tracked separately by flotsync-3ht and is not the MaintainRS direction.
-C03. Important API ownership and lifecycle choices should settle before MaintainRS accumulates application code that depends on temporary component routing.
+C01. ReplicationApi is Send + Sync and its object-safe operation futures are Send. Arc<dyn ReplicationApi> owns the internal runtime host and is suitable for application state.
+C02. ReplicationEventListener is Send + Sync and returns Send futures, allowing an application-owned listener to bridge events without exposing Kompact values.
+C03. Runtime shutdown takes live ownership exactly once, stops the internal topology and Kompact system, is idempotent, and makes later API calls report RuntimeUnavailable.
+C04. KompactConfig retains Rc-backed factories and KompactConfig::build returns a boxed-local future. Directly awaiting build would therefore make the complete runtime-load future non-Send.
+C05. Runtime system creation now owns the optional TOML text and isolates complete KompactConfig construction plus config.build().wait() inside the existing process-global blocking::unblock pool. Store, listener, topology-start, and remaining async work stay on the caller executor.
+C06. ReplicationRuntimeComponent currently receives application-facing asks and delegates remote summary requests to SummaryRequestManager. This is current internal routing, not a selected long-term single-gateway architecture.
+C07. The upstream limitation is reported as kompics/kompact#232, requesting a Send-compatible asynchronous creation path.
+
+Architecture constraints and deferrals
+
+A01. Preserve the public ReplicationRuntimeComponent and ReplicationRuntimeMessage exports because a direct Kompact integration interface remains planned.
+A02. The direct Kompact integration path remains tracked by flotsync-3ht and is not required for MaintainRS.
+A03. Do not select or document a single gateway component as the long-term architecture. Future multiple components and multiple concern-scoped API interfaces remain open.
+A04. Do not refactor the present summary-manager delegation in this slice. Any future API/component decomposition needs its own design work.
+A05. Keep application store, listener, topology-start, and other Send async work on the caller executor. Isolate only Kompact system configuration and creation on the blocking pool.
 
 Plan
 
-P01. Audit the current ReplicationApi and runtime loading/shutdown surface against MaintainRS needs: Tokio-compatible futures, Send/Sync boundaries, event delivery, startup errors, runtime ownership, and orderly shutdown.
-P02. Keep Kompact topology and capability components internal. Decide whether the existing handle is the stable facade or should delegate to narrower internal capability handles.
-P03. Remove temporary public-to-component forwarding where a stable facade can route directly without exposing actor details.
-P04. Preserve one coherent application API for publishing, snapshots, summaries, group lifecycle operations, security feedback, and listener events.
-P05. Add focused API/lifecycle tests for the selected boundary and document the supported Tokio/Tauri integration pattern.
+P01. Completed: file the upstream Kompact issue requesting a Send-compatible creation path.
+P02. Completed: manage blocking from the workspace dependency table and consume it through workspace inheritance in discovery and replication.
+P03. Completed: own optional runtime TOML and construct, configure, and synchronously build KompactConfig entirely inside blocking::unblock.
+P04. Completed: await only the Send blocking task while preserving startup error context, test socket reservations, and cleanup behaviour.
+P05. Completed: document the workaround in source and link kompics/kompact#232.
+P06. Completed: keep public Rustdoc concise and framework-neutral, covering caller-visible executor compatibility, shared internal runtime and lifecycle, listener hand-off expectations, and shutdown ordering without naming hidden topology.
+P07. Completed: consolidate all compile-time application-boundary checks in application_runtime_boundary.rs: trait-object Send + Sync, normal load-future Send, and representative API-operation future Send. Runtime host tests remain behavioural.
+P08. Completed: preserve public Kompact exports, component topology, current request routing, and future multiple-component/API choices.
+P09. Completed: rustfmt, focused serial runtime host/lifecycle tests, the normal downstream boundary integration test, and pedantic Clippy for affected crates all pass.
 
 Estimate
 
-Approximately 250-600 LOC depending on how much existing forwarding can remain internal, below 1000 LOC."""
-status = "open"
+The review correction required approximately 25 changed LOC. The complete task remains within the original 110-220 LOC estimate and below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-05-03T14:08:55Z"
-updated_at = "2026-08-25T16:36:31.69986Z"
+updated_at = "2026-08-30T15:23:56.748778Z"
+closed_at = "2026-08-30T15:23:56.748778Z"
+
+[[comments]]
+id = "01a0530e-88ac-7cd3-a88e-cc67bf4c8633"
+author = "codex"
+body = "Plan narrowed after MaintainRS/API-boundary review: preserve the public Kompact component/message exports for the future direct Kompact interface; do not select a single-gateway architecture or refactor summary-manager routing here. This slice now only documents the existing Tokio/Tauri-compatible facade and adds compile-time Send/Sync/future assertions."
+created_at = "2026-08-30T14:24:16.556971Z"
+
+[[comments]]
+id = "01a05313-90f7-7070-afe1-e1ddb539a5d1"
+author = "codex"
+body = "Implementation discovery: both the in-crate test build and a separate normal downstream build prove that load_replication_runtime currently returns a non-Send future. KompactConfig uses Rc-backed factories and KompactConfig::build returns a boxed_local future, so config.build().await makes the whole load future non-Send. ReplicationApi operation futures remain Send. The documentation now records the current limitation; changing construction requires renewed plan alignment."
+created_at = "2026-08-30T14:29:46.359781Z"
+
+[[comments]]
+id = "01a05325-de61-7511-b327-9d5dc65b1f58"
+author = "codex"
+body = "Implemented the agreed Send-compatible runtime-load workaround and filed https://github.com/kompics/kompact/issues/232 upstream. The optional TOML is owned before blocking::unblock; all KompactConfig construction and build().wait() stay inside that worker, while topology startup and other async work remain on the caller executor. Added Tokio/Tauri Rustdoc plus test-build and normal-downstream Send assertions. Formatting, 19 serial runtime-host tests, the downstream boundary integration test, and pedantic Clippy pass. Public Kompact exports, topology, and summary-manager routing are unchanged."
+created_at = "2026-08-30T14:49:45.825632Z"
+
+[[comments]]
+id = "01a05340-d402-73a1-877f-5f0d6e88edbd"
+author = "lkroll"
+body = "Review delta agreed: keep application-facing Rustdoc concise and framework-neutral, without naming hidden topology; consolidate every Send/Sync boundary assertion in the downstream integration test and leave host tests behavioural; and manage blocking from the workspace dependency table for both discovery and replication."
+created_at = "2026-08-30T15:19:12.642734Z"
+
+[[comments]]
+id = "01a05343-309a-7273-87ac-734d19c210b7"
+author = "lkroll"
+body = "Addressed all review feedback: public Rustdoc is concise and framework-neutral, application_runtime_boundary.rs is now the sole home for trait and future Send/Sync checks, runtime host tests are behavioural only, and blocking is inherited from the workspace in both consumers. Formatting, the downstream boundary test, 18 serial host tests, and pedantic Clippy for replication and discovery pass."
+created_at = "2026-08-30T15:21:47.418889Z"
+
+[[comments]]
+id = "01a05345-29cc-7b22-a50a-e512aa62135a"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-30T15:23:56.748778Z"

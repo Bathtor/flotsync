@@ -870,11 +870,26 @@ pub enum RejectionReason {
 }
 
 /// Application listener callback interface.
+///
+/// Callbacks originate from the internally owned replication runtime, not
+/// necessarily from the executor which loaded it. Implementations must not
+/// assume a particular invocation thread or executor. They can bridge events
+/// to an application task, channel, or event bus through the returned
+/// [`BoxFuture`].
+///
+/// The producing runtime component awaits the returned future, so listener
+/// implementations should keep the hand-off bounded and avoid blocking work.
+/// Returning an error reports that the application did not accept the event.
 pub trait ReplicationEventListener: Send + Sync {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>>;
 }
 
 /// Application-facing replication control surface.
+///
+/// This executor-independent trait may be retained as an
+/// `Arc<dyn ReplicationApi>` in application state. All clones share one
+/// internal runtime and lifecycle. A graceful application exit must await
+/// [`Self::shutdown`] before closing the caller-owned replication store.
 pub trait ReplicationApi: Send + Sync {
     /// Return a separate read-only diagnostics API for this runtime.
     ///
@@ -899,7 +914,9 @@ pub trait ReplicationApi: Send + Sync {
     /// then shuts down the underlying runtime system. After shutdown starts,
     /// other API calls on any clone of this runtime handle report
     /// [`ApiError::RuntimeUnavailable`]. Calling shutdown again after a
-    /// previous shutdown completed is a no-op.
+    /// previous shutdown completed is a no-op. Once this future completes, the
+    /// application may close its replication store, provided it has also
+    /// finished or dropped outstanding providers which may retain store reads.
     fn shutdown(&self) -> BoxFuture<'_, Result<(), ApiError>>;
 
     /// Return the local member's shareable identity-free public key bundle.
