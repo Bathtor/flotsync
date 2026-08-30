@@ -912,10 +912,12 @@ where
 }
 
 mod field_state;
+mod row_batch;
 mod snapshots;
 
 pub use field_state::{InMemoryFieldState, LinearLatestValueWinsState, LinearListState};
 pub(crate) use field_state::{InMemoryStateRow, validate_in_memory_field_value};
+pub use row_batch::{InMemoryStateRowBatch, InMemoryStateRowView};
 
 #[allow(
     clippy::wildcard_imports,

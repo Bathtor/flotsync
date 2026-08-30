@@ -40,17 +40,15 @@ pub struct DatasetRowStateSlice {
     pub rows: HashMap<RowKey, Option<ReplicationRowStateRecord>>,
 }
 
-/// Storage-extension result for one ordered batch of rows scanned from a dataset.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowStateBatch {
-    /// Replication group that owns this batch.
+/// Page metadata for one ordered dataset-row scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatasetRowScanPage {
+    /// Replication group that owns the rows written to the scan output.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
     pub dataset_id: DatasetId,
     /// Whether this dataset already exists for `group_id`.
     pub dataset_exists: bool,
-    /// Row records ordered by row key.
-    pub rows: Vec<ReplicationRowStateRecord>,
     /// Row key to use as the exclusive lower bound for the next batch.
     ///
     /// `None` means the scan is exhausted. `Some` means callers should issue a
@@ -59,11 +57,12 @@ pub struct DatasetRowStateBatch {
     pub next_after: Option<RowKey>,
 }
 
-impl DatasetRowStateBatch {
+impl DatasetRowScanPage {
     /// Build row transitions from two ordered pages for the same dataset reference.
     ///
-    /// `self` is the previous-group page and `current_batch` is the
-    /// current-group page. Both pages must reference the same dataset.
+    /// `self` and `previous_rows` describe the previous group;
+    /// `current_page` and `current_rows` describe the current group. Both pages
+    /// must reference the same dataset.
     ///
     /// The result contains at most `limit` transitions in ascending row-key order.
     /// Each key present in either input page is represented once, with the
@@ -80,18 +79,26 @@ impl DatasetRowStateBatch {
     #[must_use]
     pub fn transition_with_limit(
         self,
-        current_batch: Self,
+        previous_rows: &ReplicationStateRowBatch,
+        current_page: &Self,
+        current_rows: &ReplicationStateRowBatch,
         limit: NonZeroUsize,
     ) -> DatasetRowStateTransitionBatch {
         assert_eq!(
-            self.dataset_id, current_batch.dataset_id,
+            self.dataset_id, current_page.dataset_id,
             "row-state transition batches must reference the same dataset"
         );
 
         let previous_may_continue = self.next_after.is_some();
-        let current_may_continue = current_batch.next_after.is_some();
-        let mut previous_rows = self.rows.into_iter().peekable();
-        let mut current_rows = current_batch.rows.into_iter().peekable();
+        let current_may_continue = current_page.next_after.is_some();
+        let mut previous_rows = previous_rows
+            .rows()
+            .map(|row| replication_row_state_record(&row))
+            .peekable();
+        let mut current_rows = current_rows
+            .rows()
+            .map(|row| replication_row_state_record(&row))
+            .peekable();
         let mut rows = Vec::with_capacity(limit.get());
 
         while rows.len() < limit.get() {
@@ -139,10 +146,10 @@ impl DatasetRowStateBatch {
 
         DatasetRowStateTransitionBatch {
             previous_group_id: self.group_id,
-            current_group_id: current_batch.group_id,
+            current_group_id: current_page.group_id,
             dataset_id: self.dataset_id,
             previous_dataset_exists: self.dataset_exists,
-            current_dataset_exists: current_batch.dataset_exists,
+            current_dataset_exists: current_page.dataset_exists,
             rows,
             next_after,
         }
@@ -187,6 +194,36 @@ pub struct DatasetRowStateTransitionBatch {
 
 /// Complete row state snapshot used by replication storage.
 pub type ReplicationRowStateSnapshot = RowStateSnapshot<'static, UpdateId>;
+
+/// Metadata stored beside one positional replication row state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicationRowMetadata {
+    /// Stable row key in the dataset that owns this record.
+    pub row_key: RowKey,
+    /// Whether the row is deleted but retained for causal updates.
+    pub tombstoned: bool,
+    /// Update which first introduced this row key, when known.
+    pub created_by: Option<UpdateId>,
+    /// Causal version of the last update that changed this row image.
+    pub last_changed_versions: VersionVector,
+}
+
+/// Reusable positional state rows returned by ordinary replication-store scans.
+pub type ReplicationStateRowBatch = InMemoryStateRowBatch<ReplicationRowMetadata, UpdateId>;
+
+/// Materialise one positional row view at a named-record compatibility boundary.
+fn replication_row_state_record(
+    row: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
+) -> ReplicationRowStateRecord {
+    let metadata = row.metadata();
+    ReplicationRowStateRecord {
+        row_id: metadata.row_key,
+        snapshot: row.snapshot().into_owned(),
+        tombstoned: metadata.tombstoned,
+        created_by: metadata.created_by,
+        last_changed_versions: metadata.last_changed_versions.clone(),
+    }
+}
 
 /// Stored progress for one writable replication group.
 ///
@@ -386,16 +423,17 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// must not clone them into retained store state.
     ///
     /// `after` is an exclusive lower bound over row keys. `None` starts before
-    /// the first row. Implementations must return at most `limit` rows ordered
-    /// by row key. `next_after` is the last emitted row key when another scan
-    /// may be needed, and `None` when this dataset scan is known to be
-    /// exhausted.
+    /// the first row. Implementations must reset `output`, prepare it for
+    /// `dataset.schema`, and append at most `limit` rows ordered by row key.
+    /// `next_after` is the last emitted row key when another scan may be needed,
+    /// and `None` when this dataset scan is known to be exhausted.
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
         dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>>;
+        output: &'a mut ReplicationStateRowBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>>;
 
     /// Scan one ordered transition batch of a dataset across two replication groups.
     ///
@@ -427,13 +465,20 @@ pub trait ReplicationStoreReadTransaction: Send {
         async move {
             ensure_matching_transition_dataset_references(previous_group, current_group)
                 .map_err(StoreError::from_classification_source)?;
+            let mut previous_rows = ReplicationStateRowBatch::new(previous_group.schema);
             let previous_batch = self
-                .scan_dataset_row_batch(previous_group, after, limit)
+                .scan_dataset_row_batch(previous_group, after, limit, &mut previous_rows)
                 .await?;
+            let mut current_rows = ReplicationStateRowBatch::new(current_group.schema);
             let current_batch = self
-                .scan_dataset_row_batch(current_group, after, limit)
+                .scan_dataset_row_batch(current_group, after, limit, &mut current_rows)
                 .await?;
-            Ok(previous_batch.transition_with_limit(current_batch, limit))
+            Ok(previous_batch.transition_with_limit(
+                &previous_rows,
+                &current_batch,
+                &current_rows,
+                limit,
+            ))
         }
         .boxed()
     }
@@ -775,22 +820,48 @@ mod tests {
         dataset_id: &'static str,
         rows: impl IntoIterator<Item = u128>,
         next_after: Option<u128>,
-    ) -> DatasetRowStateBatch {
-        DatasetRowStateBatch {
+    ) -> (DatasetRowScanPage, ReplicationStateRowBatch) {
+        let schema = Schema::empty();
+        let mut state_rows = ReplicationStateRowBatch::new(&schema);
+        for row in rows.into_iter().map(row) {
+            let encoded =
+                flotsync_messages::codecs::datamodel::encode_row_snapshot(&row.snapshot, &schema)
+                    .expect("test row must encode against the empty schema");
+            let mut decoder =
+                flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
+                    .expect("test row must create a snapshot decoder");
+            state_rows
+                .push_decoded_row(
+                    ReplicationRowMetadata {
+                        row_key: row.row_id,
+                        tombstoned: row.tombstoned,
+                        created_by: row.created_by,
+                        last_changed_versions: row.last_changed_versions,
+                    },
+                    &mut decoder,
+                )
+                .expect("test row must decode into the state batch");
+        }
+        let page = DatasetRowScanPage {
             group_id: GroupId(Uuid::from_u128(group_id)),
             dataset_id: DatasetId::try_from_static(dataset_id).expect("test dataset id is valid"),
             dataset_exists: true,
-            rows: rows.into_iter().map(row).collect(),
             next_after: next_after.map(|row_key| RowKey(Uuid::from_u128(row_key))),
-        }
+        };
+        (page, state_rows)
     }
 
     #[test]
     fn transition_batch_aligns_the_row_key_union() {
-        let previous_batch = batch(1, "shared", [1, 3], None);
-        let current_batch = batch(2, "shared", [2, 3], None);
+        let (previous_page, previous_rows) = batch(1, "shared", [1, 3], None);
+        let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
         let limit = NonZeroUsize::new(4).expect("test limit is non-zero");
-        let merged = previous_batch.transition_with_limit(current_batch, limit);
+        let merged = previous_page.transition_with_limit(
+            &previous_rows,
+            &current_page,
+            &current_rows,
+            limit,
+        );
 
         let row_presence = merged
             .rows
@@ -813,10 +884,15 @@ mod tests {
 
     #[test]
     fn transition_batch_pages_the_union_without_losing_buffered_keys() {
-        let previous_batch = batch(1, "shared", [1, 4], None);
-        let current_batch = batch(2, "shared", [2, 3], None);
+        let (previous_page, previous_rows) = batch(1, "shared", [1, 4], None);
+        let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
         let limit = NonZeroUsize::new(2).expect("test limit is non-zero");
-        let merged = previous_batch.transition_with_limit(current_batch, limit);
+        let merged = previous_page.transition_with_limit(
+            &previous_rows,
+            &current_page,
+            &current_rows,
+            limit,
+        );
 
         let row_keys = merged
             .rows
@@ -830,10 +906,15 @@ mod tests {
 
     #[test]
     fn transition_batch_preserves_underlying_exact_limit_continuation() {
-        let previous_batch = batch(1, "shared", [1], Some(1));
-        let current_batch = batch(2, "shared", [1], Some(1));
+        let (previous_page, previous_rows) = batch(1, "shared", [1], Some(1));
+        let (current_page, current_rows) = batch(2, "shared", [1], Some(1));
         let limit = NonZeroUsize::new(1).expect("test limit is non-zero");
-        let merged = previous_batch.transition_with_limit(current_batch, limit);
+        let merged = previous_page.transition_with_limit(
+            &previous_rows,
+            &current_page,
+            &current_rows,
+            limit,
+        );
 
         assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(1))));
     }

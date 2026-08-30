@@ -1,6 +1,8 @@
 //! Store-backed snapshot row streaming for the runtime component.
 
 use super::*;
+use crate::api::ReplicationStateRowBatch;
+use flotsync_data_types::schema::Schema;
 
 /// Snapshot provider backed by one store read transaction.
 ///
@@ -23,6 +25,8 @@ pub(super) struct StoreSnapshotRowProvider {
     max_rows_per_batch: NonZeroUsize,
     /// Whether retained tombstones should be included as tombstoned value rows.
     include_tombstones: bool,
+    /// Reusable decoded state rows for the current store page.
+    state_rows: ReplicationStateRowBatch,
 }
 
 impl StoreSnapshotRowProvider {
@@ -44,6 +48,7 @@ impl StoreSnapshotRowProvider {
             after_row_key: None,
             max_rows_per_batch,
             include_tombstones,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         }
     }
 
@@ -106,28 +111,34 @@ impl BatchProvider for StoreSnapshotRowProvider {
                 let Some(transaction) = self.transaction.as_mut() else {
                     return Ok(None);
                 };
-                let batch = transaction
-                    .scan_dataset_row_batch(dataset, after, max_rows_per_batch)
+                let page = transaction
+                    .scan_dataset_row_batch(
+                        dataset,
+                        after,
+                        max_rows_per_batch,
+                        &mut self.state_rows,
+                    )
                     .await
                     .boxed()
                     .context(ProviderExternalSnafu)?;
 
                 let rows = reuse.prepare(schema.clone(), self.max_rows_per_batch.get());
-                for record in batch.rows {
-                    if record.tombstoned && !self.include_tombstones {
+                for record in self.state_rows.rows() {
+                    let metadata = record.metadata();
+                    if metadata.tombstoned && !self.include_tombstones {
                         continue;
                     }
                     let row_id = RowId {
                         group_id: self.group_id,
                         dataset_id: dataset_id.clone(),
-                        row_key: record.row_id,
+                        row_key: metadata.row_key,
                     };
-                    rows.push_row_read(row_id, record.tombstoned, &record.snapshot)
+                    rows.push_row_read(row_id, metadata.tombstoned, &record)
                         .boxed()
                         .context(ProviderExternalSnafu)?;
                 }
 
-                if let Some(next_after) = batch.next_after {
+                if let Some(next_after) = page.next_after {
                     self.after_row_key = Some(next_after);
                 } else {
                     self.finish_current_dataset();

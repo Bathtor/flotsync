@@ -101,16 +101,17 @@ pub(super) async fn scan_dataset_row_batch(
     dataset: GroupDatasetSchemaRef<'_>,
     after: Option<RowKey>,
     limit: NonZeroUsize,
-) -> Result<DatasetRowStateBatch, StoreError> {
+    output: &mut ReplicationStateRowBatch,
+) -> Result<DatasetRowScanPage, StoreError> {
     let group_id = dataset.group_id;
     let dataset_id = dataset.dataset_id;
+    output.reuse_for_schema(dataset.schema);
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     if !dataset_exists {
-        return Ok(DatasetRowStateBatch {
+        return Ok(DatasetRowScanPage {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
-            rows: Vec::new(),
             next_after: None,
         });
     }
@@ -142,11 +143,11 @@ WHERE group_id = ",
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-    let mut rows = Vec::with_capacity(stored_rows.len());
+    output.reserve_rows(stored_rows.len());
     for row in stored_rows {
         let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let row_snapshot =
-            decode_dataset_row_snapshot(dataset.schema, &row.get::<Vec<u8>, _>("row_snapshot"))?;
+        let mut row_decoder =
+            decode_dataset_row_snapshot_decoder(&row.get::<Vec<u8>, _>("row_snapshot"))?;
         let created_by = decode_dataset_row_created_by(
             &row,
             row_key,
@@ -155,24 +156,25 @@ WHERE group_id = ",
             member_count,
         )?;
         let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
-        rows.push(ReplicationRowStateRecord {
-            row_id: row_key,
-            snapshot: row_snapshot,
+        let metadata = ReplicationRowMetadata {
+            row_key,
             tombstoned: row.get::<bool, _>("row_tombstoned"),
             created_by,
             last_changed_versions,
-        });
+        };
+        output
+            .push_decoded_row(metadata, &mut row_decoder)
+            .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
     }
-    let next_after = if rows.len() == limit.get() {
-        rows.last().map(|row| row.row_id)
+    let next_after = if output.len() == limit.get() {
+        output.rows().next_back().map(|row| row.metadata().row_key)
     } else {
         None
     };
-    Ok(DatasetRowStateBatch {
+    Ok(DatasetRowScanPage {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
-        rows,
         next_after,
     })
 }

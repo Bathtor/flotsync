@@ -135,7 +135,7 @@ pub struct RowStateSnapshot<'a, ChangeId> {
 enum RowStateSnapshotRepr<'a, ChangeId> {
     BorrowedInMemory {
         ordered_schema: &'a OrderedSchema<'a>,
-        row: &'a InMemoryStateRow<ChangeId>,
+        fields: &'a [InMemoryFieldState<ChangeId>],
     },
     Owned {
         fields: Vec<(String, InMemoryFieldState<ChangeId>)>,
@@ -147,10 +147,23 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         ordered_schema: &'a OrderedSchema<'a>,
         row: &'a InMemoryStateRow<ChangeId>,
     ) -> Self {
+        Self::borrowed_fields(ordered_schema, &row.fields)
+    }
+
+    /// Borrow a complete positional field-state slice using `ordered_schema` as its layout.
+    pub(crate) fn borrowed_fields(
+        ordered_schema: &'a OrderedSchema<'a>,
+        fields: &'a [InMemoryFieldState<ChangeId>],
+    ) -> Self {
+        assert_eq!(
+            ordered_schema.len(),
+            fields.len(),
+            "borrowed row snapshot field count must match its ordered schema"
+        );
         Self {
             repr: RowStateSnapshotRepr::BorrowedInMemory {
                 ordered_schema,
-                row,
+                fields,
             },
         }
     }
@@ -180,11 +193,11 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         match self.repr {
             RowStateSnapshotRepr::BorrowedInMemory {
                 ordered_schema,
-                row,
+                fields,
             } => ordered_schema
                 .fields()
                 .map(|field| field.name.clone())
-                .zip(row.fields.iter().cloned())
+                .zip(fields.iter().cloned())
                 .collect(),
             RowStateSnapshotRepr::Owned { fields } => fields,
         }
@@ -247,8 +260,14 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
         match &self.repr {
             RowStateSnapshotRepr::BorrowedInMemory {
                 ordered_schema,
-                row,
-            } => row.encode_snapshot_fields(ordered_schema, writer),
+                fields,
+            } => {
+                debug_assert_eq!(ordered_schema.len(), fields.len());
+                for (field, field_value) in ordered_schema.fields().zip(fields.iter()) {
+                    field_value.encode_snapshot_field(&field.name, writer)?;
+                }
+                Ok(())
+            }
             RowStateSnapshotRepr::Owned { fields } => {
                 for (field_name, field_value) in fields {
                     field_value.encode_snapshot_field(field_name, writer)?;
@@ -267,10 +286,10 @@ where
         match &self.repr {
             RowStateSnapshotRepr::BorrowedInMemory {
                 ordered_schema,
-                row,
+                fields,
             } => ordered_schema
                 .field_index(field_name)
-                .and_then(|field_index| row.fields.get(field_index))
+                .and_then(|field_index| fields.get(field_index))
                 .map(InMemoryFieldState::project_value),
             RowStateSnapshotRepr::Owned { fields } => fields
                 .iter()
@@ -332,9 +351,9 @@ fn validate_schema_snapshot<ChangeId>(
     match &snapshot.repr {
         RowStateSnapshotRepr::BorrowedInMemory {
             ordered_schema,
-            row,
+            fields,
         } => {
-            for (field, field_value) in ordered_schema.fields().zip(row.fields.iter()) {
+            for (field, field_value) in ordered_schema.fields().zip(fields.iter()) {
                 validate_snapshot_field(
                     schema,
                     &mut seen_fields,
@@ -502,6 +521,16 @@ mod tests {
 
     fn indexed(id: u32, index: u32) -> IdWithIndex<u32> {
         IdWithIndex { id, index }
+    }
+
+    #[test]
+    #[should_panic(expected = "borrowed row snapshot field count must match its ordered schema")]
+    fn borrowed_snapshot_rejects_mismatched_field_count() {
+        let schema = Schema::from_fields([Field::monotonic_counter("count")]);
+        let ordered_schema = OrderedSchema::from_schema(&schema);
+        let fields = Vec::<InMemoryFieldState<u32>>::new();
+
+        let _snapshot = RowStateSnapshot::borrowed_fields(&ordered_schema, &fields);
     }
 
     #[test]

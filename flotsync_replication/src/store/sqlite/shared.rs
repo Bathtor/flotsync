@@ -190,6 +190,20 @@ pub(super) fn decode_dataset_row_snapshot(
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))
 }
 
+/// Decode stored protobuf bytes into the streaming schema snapshot adapter.
+pub(super) fn decode_dataset_row_snapshot_decoder(
+    bytes: &[u8],
+) -> Result<ProtoSchemaSnapshotDecoder, StoreError> {
+    let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
+        SqliteStoreError::DecodeStoredProto {
+            object: "dataset row snapshot",
+            source,
+        }
+    })?;
+    ProtoSchemaSnapshotDecoder::new(row)
+        .map_err(|source| invalid_stored_object("dataset row snapshot", source))
+}
+
 pub(super) fn decode_dataset_row_last_changed_versions(
     row: &sqlx::sqlite::SqliteRow,
     member_count: NonZeroUsize,

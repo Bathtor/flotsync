@@ -1,7 +1,7 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowStateBatch,
+        DatasetRowScanPage,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
         DatasetRowStateTransition,
@@ -28,8 +28,10 @@ use crate::{
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
+        ReplicationRowMetadata,
         ReplicationRowStateRecord,
         ReplicationRowStateSnapshot,
+        ReplicationStateRowBatch,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -78,6 +80,7 @@ use flotsync_messages::{
     codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
+    snapshots::datamodel::ProtoSchemaSnapshotDecoder,
 };
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
@@ -699,15 +702,11 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
         async move {
-            scan_dataset_row_batch(
-                self.assert_open_connection(),
-                dataset,
-                after,
-                limit,
-            )
-            .await
+            scan_dataset_row_batch(self.assert_open_connection(), dataset, after, limit, output)
+                .await
         }
         .boxed()
     }

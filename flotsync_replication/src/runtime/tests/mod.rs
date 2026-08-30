@@ -42,7 +42,7 @@ use crate::{
         CreateGroupRequest,
         DataChangeLineage,
         DatasetId,
-        DatasetRowStateBatch,
+        DatasetRowScanPage,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
         DatasetRowStateTransitionBatch,
@@ -95,7 +95,10 @@ use crate::{
         ReplicationGroupRecord,
         ReplicationGroupSnapshot,
         ReplicationGroupView,
+        ReplicationRowMetadata,
+        ReplicationRowStateRecord,
         ReplicationSecuritySecrets,
+        ReplicationStateRowBatch,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -619,7 +622,8 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         dataset: GroupDatasetSchemaRef<'a>,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
+        output: &'a mut ReplicationStateRowBatch,
+    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
         if let Some(provider_scan) = self.provider_scan.as_mut() {
             provider_scan
                 .state
@@ -635,12 +639,40 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
                 .row_results
                 .pop_front()
                 .expect("provider test must supply one result per ordinary scan");
+            let result = result.map(|result| {
+                output.reuse_for_schema(dataset.schema);
+                output.reserve_rows(result.rows.len());
+                for row in result.rows {
+                    let encoded = flotsync_messages::codecs::datamodel::encode_row_snapshot(
+                        &row.snapshot,
+                        dataset.schema,
+                    )
+                    .expect("provider test row must encode against its dataset schema");
+                    let mut decoder =
+                        flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(
+                            encoded,
+                        )
+                        .expect("provider test row must create a snapshot decoder");
+                    output
+                        .push_decoded_row(
+                            ReplicationRowMetadata {
+                                row_key: row.row_id,
+                                tombstoned: row.tombstoned,
+                                created_by: row.created_by,
+                                last_changed_versions: row.last_changed_versions,
+                            },
+                            &mut decoder,
+                        )
+                        .expect("provider test row must decode into the reusable batch");
+                }
+                result.page
+            });
             return futures_util::future::ready(result).boxed();
         }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .scan_dataset_row_batch(dataset, after, limit)
+            .scan_dataset_row_batch(dataset, after, limit, output)
     }
 
     fn scan_dataset_row_transition_batch<'a>(
@@ -1308,9 +1340,17 @@ struct ProviderTestScanBehaviour {
     /// Observations retained after the transaction is consumed.
     state: Arc<Mutex<ProviderTestTransactionState>>,
     /// Results returned by ordinary current-group scans.
-    row_results: VecDeque<Result<DatasetRowStateBatch, StoreError>>,
+    row_results: VecDeque<Result<ProviderTestRowScanResult, StoreError>>,
     /// Results returned by hosted transition scans.
     transition_results: VecDeque<Result<DatasetRowStateTransitionBatch, StoreError>>,
+}
+
+/// One deterministic ordinary scan page and the records decoded into its output batch.
+pub(in crate::runtime) struct ProviderTestRowScanResult {
+    /// Page metadata returned by the test transaction.
+    pub(in crate::runtime) page: DatasetRowScanPage,
+    /// Stored records decoded into the caller-owned state batch.
+    pub(in crate::runtime) rows: Vec<ReplicationRowStateRecord>,
 }
 
 impl Drop for ProviderTestScanBehaviour {
@@ -1324,7 +1364,7 @@ impl Drop for ProviderTestScanBehaviour {
 
 /// Build the existing store transaction wrapper with deterministic provider scans.
 pub(in crate::runtime) fn provider_test_read_transaction(
-    row_results: impl IntoIterator<Item = Result<DatasetRowStateBatch, StoreError>>,
+    row_results: impl IntoIterator<Item = Result<ProviderTestRowScanResult, StoreError>>,
     transition_results: impl IntoIterator<Item = Result<DatasetRowStateTransitionBatch, StoreError>>,
 ) -> (
     Box<dyn ReplicationStoreReadTransaction>,

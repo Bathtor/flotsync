@@ -2,44 +2,90 @@ id = "01a04cec-91ea-7080-b62a-4526ffb32621"
 ref = "flotsync-nk9.2"
 title = "Add schema-bound state row batches"
 body = """
-Replace per-row named replication snapshots with a reusable schema-bound positional state-row batch, building on OrderedSchema from flotsync-nk9.1.
+Implement a reusable schema-bound positional state-row batch and use it for ordinary replication-store scans, building on OrderedSchema from flotsync-nk9.1.
 
 Scope:
-- Add InMemoryStateRowBatch that owns an OrderedSchema wrapper, row metadata, and flat row-major field-state storage.
-- Use ReplicationRowMetadata as the replication-store row metadata: row key, tombstone state, creator version, and last-changed version.
-- Add append-oriented push_decoded_row. The caller constructs row metadata and a snapshot decoder; metadata becomes visible only after the complete row decodes successfully, and partial field-state appends are rolled back on error.
-- Add reset_rows to clear logical contents while retaining allocations under the current ordered schema.
-- Add reuse_for_schema to clear rows, retain reusable vectors, and replace the owned OrderedSchema wrapper only when positional OrderedSchema equality says the layout differs.
-- Implement row views and RowValueRead/field-state access through the ordered schema index, avoiding repeated field names and quadratic name scans.
-- Change the replication store scan API and SQLite implementation to fill or return this batch rather than Vec<ReplicationRowStateRecord> with owned named snapshots.
-- Adapt snapshot-provider, unavailable-dataset activation, inline initial snapshot, and transition scan consumers.
-- Keep transition-specific two-schema concerns out of this child unless required for correctness; record follow-up work if a general multi-schema batch is discovered.
+- Add generic InMemoryStateRowBatch<Metadata, OperationId> in flotsync_data_types.
+- Store an owned OrderedSchema, per-row metadata, and flat row-major InMemoryFieldState values without repeated field names.
+- Provide new, reserve_rows, capacity, len, is_empty, schema, row, rows, reset_rows, reuse_for_schema, and push_decoded_row.
+- Decode directly into flat storage. Roll back all field states appended for a failed row and publish metadata only after the complete decoder succeeds.
+- Add InMemoryStateRowView with metadata, positional access, expected-constant field-name lookup, RowStateRead, RowValueRead, and owned snapshot materialisation.
+- Generalise borrowed RowStateSnapshot storage to a field-state slice so existing InMemoryStateData and the new batch share the same snapshot path.
+- Add ReplicationRowMetadata for row key, tombstone state, creator update, and last-changed versions, plus a replication state-batch alias.
+- Change ordinary replication-store scans to fill a caller-owned reusable state batch and return page metadata for group, dataset, dataset existence, and continuation.
+- Decode SQLite protobuf snapshots directly through ProtoSchemaSnapshotDecoder into the batch.
+- Retain one raw state batch in snapshot and activation providers, and use row views for SnapshotValueRowBatch, RowChangeBatch, and inline initial snapshot projection.
+- Keep ReplicationRowStateRecord for point loads, replay, writes, and transition results in this child.
+- Keep the specialised SQLite two-schema transition scan unchanged. Let the default transition implementation materialise compatibility records from temporary positional batches.
+- Track a general schema-bound transition and point-load redesign as a separate child of flotsync-nk9, blocked by this task.
 
 Concrete API direction:
-- InMemoryStateRowBatch::new, push_decoded_row, rows, row, reset_rows, reuse_for_schema, schema, len, is_empty, and capacity.
-- InMemoryStateRowView borrows its batch and exposes metadata plus positional/name-based state access.
-- Store scan accepts the relevant Schema or OrderedSchema context explicitly enough for SQLite decoding without constructing generic metadata internally.
+- InMemoryStateRowBatch owns its positional schema and reusable vectors.
+- InMemoryStateRowView exposes metadata(), field_at(), snapshot(), RowStateRead, and RowValueRead.
+- ReplicationStoreReadTransaction::scan_dataset_row_batch receives a mutable ReplicationStateRowBatch output and returns DatasetRowScanPage metadata.
+- Store implementations call reuse_for_schema before filling output.
+
+Agreed review adjustments:
+- Enforce the complete borrowed-snapshot invariant with an unconditional ordered-schema/field-slice length assertion and focused mismatch coverage.
+- Make reuse_for_schema compare against the unordered Schema before constructing a replacement OrderedSchema, avoiding a schema-index allocation on unchanged scans and retaining the existing positional layout for semantically equal schemas.
+- Document that append_decoded_snapshot_fields may leave partially appended fields on error and that callers must roll back or discard the vector.
 
 Validation:
-- Data-types unit tests cover successful append, failed-decode rollback, row bounds, name lookup, reset allocation reuse, same-order reuse, and different-order schema replacement.
-- SQLite/store tests cover batch limits, continuation, metadata fidelity, tombstones, and malformed snapshots.
-- Snapshot-provider and activation tests cover projection into SnapshotValueRowBatch without per-row names.
-- Existing transition tests remain green.
+- Data-types tests cover successful append, decoder rollback, row bounds, positional and named lookup, snapshot materialisation, capacity retention, reset, same-schema reuse without replacing the ordered schema, different-schema replacement, and borrowed snapshot length mismatch rejection.
+- SQLite tests cover limits, continuation, dataset existence, metadata fidelity, tombstones, malformed snapshots, and batch reuse.
+- Snapshot-provider, activation-provider, and inline-initial-snapshot tests cover direct projection from positional row views.
+- Existing point-load, replay, write, and transition tests remain green.
+- Run formatting, focused crate tests, workspace all-target checking, pedantic Clippy, and diff whitespace checks serially.
 
 Estimated size:
-- Generic state-row batch and views: 260-360 LOC.
-- Replication metadata and store API integration: 170-250 LOC.
-- SQLite/provider/activation adapters: 160-230 LOC.
-- Tests: 180-260 LOC.
-- Total: approximately 770-1,100 LOC; if transition adaptation pushes the child materially beyond this range, split that adapter into a follow-up child before implementation."""
-status = "open"
+- Generic batch and views: 280-380 LOC.
+- Replication API and SQLite integration: 160-240 LOC.
+- Ordinary scan consumers: 120-180 LOC.
+- Tests and adapters: 200-280 LOC.
+- Review adjustments: 15-30 LOC.
+- Total: approximately 775-1,110 LOC. Transition and point-load redesign remains outside this child to keep this task focused."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 labels = [
     "area:replication",
     "area:store",
 ]
+assignee = "codex"
 blocked_by = ["01a04cec-591e-7a31-a545-d82a3d62a9c8"]
+blocks = ["01a05265-e37a-7d93-911a-d4db04183368"]
 parent = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
 created_at = "2026-08-29T09:49:27.40294Z"
-updated_at = "2026-08-29T09:49:32.170887Z"
+updated_at = "2026-08-30T12:29:34.806389Z"
+closed_at = "2026-08-30T12:29:34.806389Z"
+
+[[comments]]
+id = "01a05266-15b6-7870-8160-202fd545f284"
+author = "lkroll"
+body = "Plan agreed: implement the generic flat state-row batch, direct decode rollback, reusable ordinary store scans, SQLite integration, and direct snapshot/activation projection. Keep named point-load and transition records as compatibility boundaries in this child. Follow-up flotsync-pcj tracks the general transition and point-load redesign under parent flotsync-nk9."
+created_at = "2026-08-30T11:20:17.078162Z"
+
+[[comments]]
+id = "01a0527d-1e67-7800-83c2-76ee30988d48"
+author = "codex"
+body = "Implemented the schema-bound flat state-row batch, direct decoder rollback, reusable ordinary store scan output, SQLite streaming decode, and direct positional projection in snapshot, activation, and inline-snapshot consumers. Added data-type and SQLite coverage for row access, snapshot materialisation, rollback, reuse, metadata, tombstones, missing datasets, malformed snapshots, pagination, and allocation retention. The general transition/point-load redesign remains tracked in child flotsync-pcj."
+created_at = "2026-08-30T11:45:26.631416Z"
+
+[[comments]]
+id = "01a05286-6d12-7c80-ae74-329696f74255"
+author = "codex"
+body = "Review delta agreed: enforce borrowed snapshot field-count equality, avoid constructing an OrderedSchema when reusing a semantically equal Schema, and document the append helper's partial-write error contract. Focused tests will cover mismatch rejection and retained ordered-schema storage."
+created_at = "2026-08-30T11:55:36.594761Z"
+
+[[comments]]
+id = "01a05289-7d92-76f3-b2f7-0e33b6954506"
+author = "codex"
+body = "Resolved review CR01-CR03: borrowed snapshots now assert exact field-count equality, same-schema batch reuse compares before constructing a new ordered layout and retains field storage, and the decode append helper documents its partial-write contract. Data-types and replication test suites, workspace all-target checking, pedantic Clippy, formatting, and diff checks pass."
+created_at = "2026-08-30T11:58:57.426406Z"
+
+[[comments]]
+id = "01a052a5-86d6-7f42-9c17-c920be7f7d49"
+author = "lkroll"
+body = "completed"
+created_at = "2026-08-30T12:29:34.806389Z"

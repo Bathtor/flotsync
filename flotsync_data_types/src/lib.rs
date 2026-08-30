@@ -43,7 +43,13 @@ pub use schema::{
     Schema,
     SchemaBuildError,
     SchemaFields,
-    datamodel::{InMemoryFieldState, NullableBasicValue, SchemaOperation},
+    datamodel::{
+        InMemoryFieldState,
+        InMemoryStateRowBatch,
+        InMemoryStateRowView,
+        NullableBasicValue,
+        SchemaOperation,
+    },
 };
 
 #[derive(Debug, Snafu)]

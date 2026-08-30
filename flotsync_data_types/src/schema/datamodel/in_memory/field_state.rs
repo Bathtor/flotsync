@@ -58,9 +58,30 @@ impl<OperationId> InMemoryStateRow<OperationId> {
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: SchemaSnapshotDecoder<OperationId>,
     {
+        let mut fields = Vec::with_capacity(ordered_schema.len());
+        Self::append_decoded_snapshot_fields(ordered_schema, &mut fields, decoder)?;
+
+        Ok(Self {
+            deleted: false,
+            fields,
+        })
+    }
+
+    /// Append one decoded row to `fields` in schema order.
+    ///
+    /// An error may leave part of the row appended. Callers must truncate
+    /// `fields` to its original length or discard the vector after an error.
+    pub(super) fn append_decoded_snapshot_fields<D>(
+        ordered_schema: &OrderedSchema<'_>,
+        fields: &mut Vec<InMemoryFieldState<OperationId>>,
+        decoder: &mut D,
+    ) -> Result<(), InMemoryStateDataSnapshotDecodeError<D::Error>>
+    where
+        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        D: SchemaSnapshotDecoder<OperationId>,
+    {
         decoder.begin(ordered_schema.len()).context(DecoderSnafu)?;
 
-        let mut fields = Vec::with_capacity(ordered_schema.len());
         for schema_field in ordered_schema.fields() {
             let field_name = &schema_field.name;
             let field_value =
@@ -69,10 +90,7 @@ impl<OperationId> InMemoryStateRow<OperationId> {
         }
 
         decoder.end().context(DecoderSnafu)?;
-        Ok(Self {
-            deleted: false,
-            fields,
-        })
+        Ok(())
     }
 }
 

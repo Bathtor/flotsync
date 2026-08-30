@@ -1,0 +1,25 @@
+id = "01a05265-e37a-7d93-911a-d4db04183368"
+ref = "flotsync-pcj"
+title = "Add schema-bound transition row batches"
+body = """
+Extend the positional state-row batch design from flotsync-nk9.2 across the remaining named-record boundaries.
+
+Scope:
+- Design a schema-bound representation for row transitions spanning previous and current group schemas.
+- Replace transition scan materialisation through ReplicationRowStateRecord where positional layouts can remain explicit.
+- Reassess point-load row slices and replay consumers for the same positional representation without weakening two-schema correctness.
+- Preserve row provenance, tombstones, pagination, and dataset-existence semantics.
+- Keep writes record-oriented unless a batch representation materially improves their API.
+
+This task is intentionally deferred until flotsync-nk9.2 establishes the single-schema state batch and ordinary scan contract."""
+status = "open"
+type = "task"
+priority = 3
+labels = [
+    "area:replication",
+    "area:store",
+]
+blocked_by = ["01a04cec-91ea-7080-b62a-4526ffb32621"]
+parent = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
+created_at = "2026-08-30T11:20:04.218163Z"
+updated_at = "2026-08-30T11:20:11.455686Z"

@@ -14,10 +14,12 @@ use crate::api::{
     InitialGroupValueRows,
     InitialSnapshot,
     InitialValueRow,
-    ReplicationRowStateRecord,
+    ReplicationStateRowBatch,
     ReplicationStoreReadTransaction,
     ReplicationStoreTransaction,
     RowId,
+    RowKey,
+    RowValueRead,
     RowValues,
 };
 use flotsync_core::{
@@ -28,19 +30,19 @@ use snafu::prelude::*;
 use std::num::NonZeroUsize;
 
 /// Convert one visible stored row record into new-group initial value state.
-fn initial_row_state_from_record(
+fn initial_row_state_from_view(
     old_group_id: GroupId,
     dataset_id: &DatasetId,
     schema: &flotsync_data_types::schema::datamodel::SchemaSource,
-    record: &ReplicationRowStateRecord,
+    row_key: RowKey,
+    row: &impl RowValueRead,
 ) -> Result<InitialValueRow, ChangeGroupMembershipError> {
-    let row_key = record.row_id;
     let row_id = RowId {
         group_id: old_group_id,
         dataset_id: dataset_id.clone(),
         row_key,
     };
-    let row = RowValues::from_row(schema.as_schema(), &record.snapshot)
+    let row = RowValues::from_row(schema.as_schema(), row)
         .context(change_membership::SnapshotRowValueSnafu { row_id })?;
     Ok(InitialValueRow { row_key, row })
 }
@@ -64,27 +66,28 @@ pub(super) async fn build_inline_initial_snapshot(
             dataset_id: &dataset_schema.dataset_id,
             schema: dataset_schema.schema.as_schema(),
         };
-        let batch = transaction
-            .scan_dataset_row_batch(dataset, None, row_limit)
+        let mut state_rows = ReplicationStateRowBatch::new(dataset.schema);
+        let page = transaction
+            .scan_dataset_row_batch(dataset, None, row_limit, &mut state_rows)
             .await
             .context(change_membership::StoreAccessSnafu)?;
         ensure!(
-            batch.next_after.is_none(),
+            page.next_after.is_none(),
             change_membership::IncompleteInitialSnapshotScanSnafu {
                 group_id,
                 dataset_id: dataset_schema.dataset_id.clone(),
             }
         );
 
-        let rows = batch
-            .rows
-            .into_iter()
-            .filter(|row| !row.tombstoned)
+        let rows = state_rows
+            .rows()
+            .filter(|row| !row.metadata().tombstoned)
             .map(|row| {
-                initial_row_state_from_record(
+                initial_row_state_from_view(
                     group_id,
                     &dataset_schema.dataset_id,
                     &dataset_schema.schema,
+                    row.metadata().row_key,
                     &row,
                 )
             })

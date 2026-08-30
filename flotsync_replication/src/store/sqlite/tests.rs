@@ -119,6 +119,35 @@ WHERE group_id = ?3 AND dataset_id = ?4 AND row_key = ?5
     .expect("raw row creator should update");
 }
 
+/// Replace one persisted row snapshot with arbitrary bytes for corruption tests.
+fn replace_raw_row_snapshot(
+    store: &SqliteReplicationStore,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    row_key: RowKey,
+    snapshot: Vec<u8>,
+) {
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await.context(SqlxSnafu)?;
+        sqlx::query(
+            "
+UPDATE dataset_rows
+SET row_snapshot = ?1
+WHERE group_id = ?2 AND dataset_id = ?3 AND row_key = ?4
+",
+        )
+        .bind(snapshot)
+        .bind(group_id.to_string())
+        .bind(dataset_id.as_str())
+        .bind(row_key.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+        Ok::<_, StoreError>(())
+    })
+    .expect("raw row snapshot should update");
+}
+
 type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
 
 fn in_memory_store(local_member: MemberIdentity) -> TestSqliteStore {
@@ -2195,7 +2224,7 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
             group_id,
             dataset_id: dataset_id.clone(),
             actions: vec![
-                DatasetRowStateWrite::UpsertActive {
+                DatasetRowStateWrite::UpsertTombstone {
                     row_key: second_row_key,
                     snapshot: title_snapshot(&schema, second_row_key, "second"),
                 },
@@ -2213,6 +2242,7 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let mut state_rows = ReplicationStateRowBatch::new(&schema);
     let first_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
         GroupDatasetSchemaRef {
             group_id: &group_id,
@@ -2221,8 +2251,15 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
         },
         None,
         NonZeroUsize::new(1).expect("limit should be non-zero"),
+        &mut state_rows,
     ))
     .expect("first batch should scan");
+    let first_scanned_metadata = state_rows
+        .row(0)
+        .expect("first scan should return one row")
+        .metadata()
+        .clone();
+    let retained_capacity = state_rows.capacity();
     let second_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
         GroupDatasetSchemaRef {
             group_id: &group_id,
@@ -2231,14 +2268,149 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
         },
         first_batch.next_after,
         NonZeroUsize::new(1).expect("limit should be non-zero"),
+        &mut state_rows,
     ))
     .expect("second batch should scan");
+    let second_scanned_metadata = state_rows
+        .row(0)
+        .expect("second scan should return one row")
+        .metadata()
+        .clone();
     wait_for_store_future(transaction.release()).expect("read should release");
 
-    assert_eq!(first_batch.rows[0].row_id, first_row_key);
+    assert!(first_batch.dataset_exists);
+    assert_eq!(first_scanned_metadata.row_key, first_row_key);
+    assert!(!first_scanned_metadata.tombstoned);
+    assert_eq!(first_scanned_metadata.created_by, Some(sample_change_id()));
+    assert_eq!(
+        first_scanned_metadata.last_changed_versions,
+        sample_last_changed_versions()
+    );
     assert_eq!(first_batch.next_after, Some(first_row_key));
-    assert_eq!(second_batch.rows[0].row_id, second_row_key);
+    assert_eq!(second_scanned_metadata.row_key, second_row_key);
+    assert!(second_scanned_metadata.tombstoned);
+    assert_eq!(second_scanned_metadata.created_by, None);
+    assert_eq!(
+        second_scanned_metadata.last_changed_versions,
+        sample_last_changed_versions()
+    );
     assert_eq!(second_batch.next_after, Some(second_row_key));
+    assert_eq!(state_rows.capacity(), retained_capacity);
+}
+
+#[test]
+fn sqlite_store_scan_clears_reused_rows_for_missing_dataset() {
+    let dataset_id = docs_dataset_id();
+    let missing_dataset_id =
+        DatasetId::try_from_static("missing").expect("test dataset id should be valid");
+    let schema = title_schema();
+    let store = in_memory_store(local_member());
+    let group_id = GroupId(Uuid::from_u128(1_106));
+    let row_key = RowKey(Uuid::from_u128(1_206));
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+        .expect("group should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &schema,
+        DatasetRowStatePatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowStateWrite::UpsertActive {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, "present"),
+            }],
+            change_id: sample_change_id(),
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("row should store");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let mut state_rows = ReplicationStateRowBatch::new(&schema);
+    let limit = NonZeroUsize::new(8).expect("limit should be non-zero");
+    wait_for_store_future(transaction.scan_dataset_row_batch(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        None,
+        limit,
+        &mut state_rows,
+    ))
+    .expect("existing dataset should scan");
+    assert_eq!(state_rows.len(), 1);
+
+    let page = wait_for_store_future(transaction.scan_dataset_row_batch(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &missing_dataset_id,
+            schema: &schema,
+        },
+        None,
+        limit,
+        &mut state_rows,
+    ))
+    .expect("missing dataset should return an empty page");
+    wait_for_store_future(transaction.release()).expect("read should release");
+
+    assert!(!page.dataset_exists);
+    assert!(page.next_after.is_none());
+    assert!(state_rows.is_empty());
+}
+
+#[test]
+fn sqlite_store_scan_rejects_malformed_row_snapshot_without_publishing_metadata() {
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = in_memory_store(local_member());
+    let group_id = GroupId(Uuid::from_u128(2_106));
+    let row_key = RowKey(Uuid::from_u128(2_206));
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+        .expect("group should store");
+    wait_for_store_future(apply_row_patch(
+        transaction.as_mut(),
+        &schema,
+        DatasetRowStatePatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowStateWrite::UpsertActive {
+                row_key,
+                snapshot: title_snapshot(&schema, row_key, "corrupt me"),
+            }],
+            change_id: sample_change_id(),
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ))
+    .expect("row should store");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+    replace_raw_row_snapshot(&store, group_id, &dataset_id, row_key, vec![0xff]);
+
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+    let mut state_rows = ReplicationStateRowBatch::new(&schema);
+    let result = wait_for_store_future(transaction.scan_dataset_row_batch(
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        None,
+        NonZeroUsize::new(1).expect("limit should be non-zero"),
+        &mut state_rows,
+    ));
+    wait_for_store_future(transaction.release()).expect("read should release");
+
+    assert!(result.is_err());
+    assert!(state_rows.is_empty());
 }
 
 #[test]

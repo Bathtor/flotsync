@@ -3,16 +3,20 @@
 use super::*;
 use crate::api::{
     AcceptedCutRelation,
+    InMemoryStateRowView,
     PreviousRow,
     PreviousRowCreator,
     PreviousRowEvidence,
+    ReplicationRowMetadata,
     ReplicationRowStateRecord,
+    ReplicationStateRowBatch,
     RowChangeBatch,
     RowChangeKind,
     RowFieldDifference,
     RowValues,
     SchemaSource,
 };
+use flotsync_data_types::schema::Schema;
 use flotsync_utils::coerce_infallible;
 use std::{borrow::Cow, cmp::Ordering, convert::Infallible};
 
@@ -28,6 +32,8 @@ pub(super) struct StoreActivationRowProvider {
     dataset_index: usize,
     /// Exclusive lower row-key bound within the current dataset.
     after_row_key: Option<RowKey>,
+    /// Reusable storage for ordinary row scans.
+    state_rows: ReplicationStateRowBatch,
 }
 
 impl StoreActivationRowProvider {
@@ -43,6 +49,7 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         }
     }
 
@@ -66,6 +73,7 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         }
     }
 
@@ -84,6 +92,7 @@ impl StoreActivationRowProvider {
             datasets: group_schema.datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         }
     }
 }
@@ -136,6 +145,7 @@ impl StoreActivationRowProvider {
                         *group_id,
                         dataset_schema,
                         after,
+                        &mut self.state_rows,
                     )
                     .await?
                 }
@@ -168,6 +178,7 @@ impl StoreActivationRowProvider {
                         migration_id.new_group_id,
                         dataset_schema,
                         after,
+                        &mut self.state_rows,
                     )
                     .await?
                 }
@@ -220,18 +231,19 @@ async fn fill_creation_dataset(
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
     after: Option<RowKey>,
+    state_rows: &mut ReplicationStateRowBatch,
 ) -> Result<Option<RowKey>, RowProviderError> {
     let dataset = GroupDatasetSchemaRef {
         group_id: &group_id,
         dataset_id: &dataset_schema.dataset_id,
         schema: dataset_schema.schema.as_schema(),
     };
-    let batch = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+    let page = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
         .boxed()
         .context(ProviderExternalSnafu)?;
-    for current in batch.rows {
+    for current in state_rows.rows() {
         append_creation_row(
             output,
             group_id,
@@ -240,7 +252,7 @@ async fn fill_creation_dataset(
             &current,
         )?;
     }
-    Ok(batch.next_after)
+    Ok(page.next_after)
 }
 
 /// Load one committed replacement page with a locally hosted predecessor.
@@ -295,6 +307,7 @@ async fn fill_unavailable_replacement_dataset(
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
     after: Option<RowKey>,
+    state_rows: &mut ReplicationStateRowBatch,
 ) -> Result<Option<RowKey>, RowProviderError> {
     let schema = dataset_schema.schema.as_schema();
     let dataset = GroupDatasetSchemaRef {
@@ -302,12 +315,12 @@ async fn fill_unavailable_replacement_dataset(
         dataset_id: &dataset_schema.dataset_id,
         schema,
     };
-    let batch = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH)
+    let page = transaction
+        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
         .boxed()
         .context(ProviderExternalSnafu)?;
-    for current in batch.rows {
+    for current in state_rows.rows() {
         append_unavailable_current(
             output,
             group_id,
@@ -316,7 +329,7 @@ async fn fill_unavailable_replacement_dataset(
             &current,
         )?;
     }
-    Ok(batch.next_after)
+    Ok(page.next_after)
 }
 
 /// Translate one raw hosted row transition into an application-visible operation.
@@ -495,13 +508,14 @@ fn append_creation_row(
     group_id: GroupId,
     dataset_id: &DatasetId,
     schema: &flotsync_data_types::schema::Schema,
-    current: &ReplicationRowStateRecord,
+    current: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
 ) -> Result<(), RowProviderError> {
-    if current.tombstoned {
+    let metadata = current.metadata();
+    if metadata.tombstoned {
         return Ok(());
     }
-    let row_id = RowId::new(group_id, dataset_id.clone(), current.row_id);
-    let row = RowValues::from_row(schema, &current.snapshot)
+    let row_id = RowId::new(group_id, dataset_id.clone(), metadata.row_key);
+    let row = RowValues::from_row(schema, current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     output.push(RowChange::ordinary_upsert(row_id, Arc::new(row)));
@@ -514,13 +528,14 @@ fn append_unavailable_current(
     current_group_id: GroupId,
     dataset_id: &DatasetId,
     schema: &flotsync_data_types::schema::Schema,
-    current: &ReplicationRowStateRecord,
+    current: &InMemoryStateRowView<'_, ReplicationRowMetadata, UpdateId>,
 ) -> Result<(), RowProviderError> {
-    if current.tombstoned {
+    let metadata = current.metadata();
+    if metadata.tombstoned {
         return Ok(());
     }
-    let current_row_id = RowId::new(current_group_id, dataset_id.clone(), current.row_id);
-    let current_values = RowValues::from_row(schema, &current.snapshot)
+    let current_row_id = RowId::new(current_group_id, dataset_id.clone(), metadata.row_key);
+    let current_values = RowValues::from_row(schema, current)
         .boxed()
         .context(ProviderExternalSnafu)?;
     output.push(RowChange {
@@ -662,15 +677,19 @@ enum ReplacementPredecessor {
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowStateBatch, PreviousRowAbsence, SchemaSource, StoreErrorClassification},
+        api::{DatasetRowScanPage, PreviousRowAbsence, SchemaSource, StoreErrorClassification},
         runtime::{
             in_memory::LocalDataset,
-            tests::{ProviderTestScanRequest, provider_test_read_transaction},
+            tests::{
+                ProviderTestRowScanResult,
+                ProviderTestScanRequest,
+                provider_test_read_transaction,
+            },
         },
         test_support::wait_for_test_future,
     };
     use flotsync_core::versions::PureVersionVector;
-    use flotsync_data_types::{Field, Schema};
+    use flotsync_data_types::Field;
     use std::sync::LazyLock;
     use uuid::Uuid;
 
@@ -736,15 +755,45 @@ mod tests {
         dataset_id: &'static str,
         rows: Vec<ReplicationRowStateRecord>,
         next_after: Option<RowKey>,
-    ) -> DatasetRowStateBatch {
-        DatasetRowStateBatch {
-            group_id: TEST_MIGRATION_ID.new_group_id,
-            dataset_id: DatasetId::try_from_static(dataset_id)
-                .expect("test dataset id must be valid"),
-            dataset_exists: true,
+    ) -> ProviderTestRowScanResult {
+        ProviderTestRowScanResult {
+            page: DatasetRowScanPage {
+                group_id: TEST_MIGRATION_ID.new_group_id,
+                dataset_id: DatasetId::try_from_static(dataset_id)
+                    .expect("test dataset id must be valid"),
+                dataset_exists: true,
+                next_after,
+            },
             rows,
-            next_after,
         }
+    }
+
+    /// Decode stored-record fixtures into the same state batch used by ordinary scans.
+    fn decoded_state_rows(rows: Vec<ReplicationRowStateRecord>) -> ReplicationStateRowBatch {
+        let mut state_rows = ReplicationStateRowBatch::new(&TITLE_SCHEMA);
+        state_rows.reserve_rows(rows.len());
+        for row in rows {
+            let encoded = flotsync_messages::codecs::datamodel::encode_row_snapshot(
+                &row.snapshot,
+                &TITLE_SCHEMA,
+            )
+            .expect("test row must encode against the title schema");
+            let mut decoder =
+                flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(encoded)
+                    .expect("test row must create a snapshot decoder");
+            state_rows
+                .push_decoded_row(
+                    ReplicationRowMetadata {
+                        row_key: row.row_id,
+                        tombstoned: row.tombstoned,
+                        created_by: row.created_by,
+                        last_changed_versions: row.last_changed_versions,
+                    },
+                    &mut decoder,
+                )
+                .expect("test row must decode into the state batch");
+        }
+        state_rows
     }
 
     /// Build one test store error for provider propagation checks.
@@ -806,6 +855,7 @@ mod tests {
             datasets: group_schema(["beta", "alpha"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         };
 
         let first = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()))
@@ -866,6 +916,7 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -895,6 +946,7 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         };
 
         let _batch = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -917,6 +969,7 @@ mod tests {
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
@@ -944,6 +997,7 @@ mod tests {
             datasets: Vec::new(),
             dataset_index: 0,
             after_row_key: None,
+            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
         };
 
         assert!(
@@ -1304,6 +1358,10 @@ mod tests {
             Some(UpdateId::INITIAL_STATE_ORIGIN),
             VersionVector::initial(NonZeroUsize::new(2).expect("test group has members")),
         );
+        let state_rows = decoded_state_rows(vec![current]);
+        let current = state_rows
+            .row(0)
+            .expect("test state batch must contain one row");
         let mut output = RowChangeBatch::new();
 
         append_unavailable_current(
