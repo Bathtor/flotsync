@@ -10,7 +10,7 @@ use super::{
         RuntimeSecurityContext,
     },
     group_state::SharedGroupState,
-    summary_request_manager::{SummaryRequestManagerComponent, SummaryRequestManagerSlot},
+    summary_request_manager::SummaryRequestManagerComponent,
 };
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};

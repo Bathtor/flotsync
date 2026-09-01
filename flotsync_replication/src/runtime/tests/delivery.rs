@@ -358,62 +358,6 @@ fn request_summary_returns_remote_current_version_vector() {
 }
 
 #[test]
-fn recovered_summary_manager_reconnects_routes_delivery_and_actor_requests() {
-    let _runtime_endpoint_leases =
-        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
-    let alice_member = alice_fixture.local_member.clone();
-    let bob_member = bob_fixture.local_member.clone();
-    let alice_runtime = &alice_fixture.runtime;
-    let bob_runtime = &bob_fixture.runtime;
-    let group_id = GroupId(Uuid::from_u128(50_951));
-    let members = GroupMembers::from_ordered_members([alice_member.clone(), bob_member.clone()])
-        .expect("group members should build");
-    alice_runtime
-        .install_group_for_test(group_id, members.clone())
-        .expect("alice group should install");
-    bob_runtime
-        .install_group_for_test(group_id, members)
-        .expect("bob group should install");
-
-    let interrupted_request = alice_runtime.request_summary(SummaryRequest {
-        group_id,
-        target: bob_member.clone(),
-    });
-    alice_runtime.wait_for_pending_summary_request_for_test(group_id, &bob_member);
-    alice_runtime.recover_summary_request_manager_for_test();
-    assert!(matches!(
-        wait_for_test_reply(interrupted_request),
-        Err(ApiError::RuntimeUnavailable)
-    ));
-    alice_runtime.publish_direct_peer_route_for_test(
-        MemberIdentity::from_array(["manual", "probe"]),
-        bob_runtime.advertised_loopback_udp_addr_for_test(),
-    );
-    alice_runtime.recover_summary_request_manager_for_test();
-    alice_runtime.publish_route_establishment_peer_route_for_test(
-        bob_member.clone(),
-        bob_runtime.advertised_loopback_udp_addr_for_test(),
-    );
-    bob_runtime.publish_direct_peer_route_for_test(
-        alice_member,
-        alice_runtime.advertised_loopback_udp_addr_for_test(),
-    );
-    let summary = wait_for_test_reply(alice_runtime.request_summary(SummaryRequest {
-        group_id,
-        target: bob_member.clone(),
-    }))
-    .expect("recovered summary manager should complete an application request");
-
-    assert_eq!(summary.group_id, group_id);
-    assert_eq!(summary.responder, bob_member);
-    assert_eq!(
-        summary.has_versions,
-        VersionVector::initial(NonZeroUsize::new(2).expect("two members"))
-    );
-}
-
-#[test]
 fn group_invitation_persists_group_schema() {
     let _runtime_endpoint_leases =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);

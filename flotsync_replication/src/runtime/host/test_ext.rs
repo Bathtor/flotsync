@@ -5,10 +5,6 @@
     reason = "The private host helper shares its parent's local implementation vocabulary."
 )]
 use super::*;
-#[cfg(test)]
-use crate::runtime::summary_request_manager::SummaryRequestManagerMessage;
-#[cfg(test)]
-use flotsync_core::GroupId;
 
 pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Return the address peers should use when this host bound an unspecified interface.
@@ -18,9 +14,6 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Withdraw every direct route for one peer and wait until every route consumer observes it.
     #[cfg(test)]
     fn withdraw_direct_peer_routes(&self, peer: MemberIdentity);
-    /// Publish a direct route through the production route-establishment provider.
-    #[cfg(test)]
-    fn publish_route_establishment_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
     /// Replace route-establishment watches with test-selected routes.
     #[cfg(test)]
     fn replace_route_establishment_watches(
@@ -39,12 +32,6 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Wait until the runtime component accepts one mailbox turn.
     #[cfg(test)]
     fn wait_for_runtime_startup(&self);
-    /// Wait until one application summary request is owned by the current manager.
-    #[cfg(test)]
-    fn wait_for_pending_summary_request(&self, group_id: GroupId, target: &MemberIdentity);
-    /// Trigger a recoverable summary-manager invariant failure and wait for replacement.
-    #[cfg(test)]
-    fn recover_summary_request_manager(&self);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -66,19 +53,6 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             routes: Vec::new(),
         });
         wait_for_no_direct_peer_route(self.topology(), &peer);
-    }
-
-    #[cfg(test)]
-    /// Publish a direct route through the production route-establishment provider.
-    fn publish_route_establishment_peer_route(
-        &self,
-        peer: MemberIdentity,
-        remote_addr: SocketAddr,
-    ) {
-        let update = direct_peer_route_update(self.external_udp_addr, peer.clone(), remote_addr);
-        self.route_establishment_component()
-            .on_definition(|component| component.publish_route_update_for_test(update));
-        wait_for_direct_peer_route(self.topology(), &peer);
     }
 
     #[cfg(test)]
@@ -140,50 +114,6 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
                 "replication runtime component became unavailable during test startup barrier: {error:?}"
             ),
         }
-    }
-
-    #[cfg(test)]
-    fn wait_for_pending_summary_request(&self, group_id: GroupId, target: &MemberIdentity) {
-        use flotsync_io::test_support::eventually_component_state;
-
-        let manager = self.topology().runtime.summary_request_manager();
-        let target = target.clone();
-        eventually_component_state(
-            TEST_DIRECT_PEER_ROUTE_TIMEOUT,
-            &manager,
-            |component| component.has_pending_summary(group_id, &target),
-            format_args!(
-                "timed out waiting for pending summary request for group={group_id}, target={target}"
-            ),
-        );
-    }
-
-    #[cfg(test)]
-    fn recover_summary_request_manager(&self) {
-        use flotsync_io::test_support::eventually;
-
-        let original = self.topology().runtime.summary_request_manager();
-        let original_id = original.id();
-        original.actor_ref().tell(
-            SummaryRequestManagerMessage::TriggerMissingInternalRetryForTest {
-                group_id: flotsync_core::GroupId(uuid::Uuid::from_u128(50_901)),
-                peer: MemberIdentity::from_array(["recovery", "probe"]),
-                operation_id: uuid::Uuid::from_u128(50_902),
-            },
-        );
-        eventually(
-            TEST_DIRECT_PEER_ROUTE_TIMEOUT,
-            || original.is_faulty(),
-            "original summary request manager should become faulty",
-        );
-        eventually(
-            TEST_DIRECT_PEER_ROUTE_TIMEOUT,
-            || {
-                let replacement = self.topology().runtime.summary_request_manager();
-                replacement.id() != original_id && replacement.is_active()
-            },
-            "summary request manager should recover into an active replacement",
-        );
     }
 }
 
@@ -250,10 +180,9 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
     );
 
     let summary_peer = peer.clone();
-    let summary_request_manager = topology.runtime.summary_request_manager();
     eventually_component_state(
         TEST_DIRECT_PEER_ROUTE_TIMEOUT,
-        &summary_request_manager,
+        topology.runtime.summary_request_manager(),
         |component| component.knows_direct_route(&summary_peer),
         format_args!("timed out waiting for summary-manager route publication for peer={peer}"),
     );
@@ -280,10 +209,9 @@ fn wait_for_no_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdenti
     );
 
     let summary_peer = peer.clone();
-    let summary_request_manager = topology.runtime.summary_request_manager();
     eventually_component_state(
         TEST_DIRECT_PEER_ROUTE_TIMEOUT,
-        &summary_request_manager,
+        topology.runtime.summary_request_manager(),
         |component| !component.knows_direct_route(&summary_peer),
         format_args!("timed out waiting for summary-manager route withdrawal for peer={peer}"),
     );

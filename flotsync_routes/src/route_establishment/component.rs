@@ -255,15 +255,6 @@ impl RouteEstablishmentComponent {
         self.route_endpoint_lifecycle_port.share()
     }
 
-    /// Publish one discovery indication through the production provider in topology tests.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn publish_route_update_for_test(
-        &mut self,
-        update: crate::DiscoveryRouteUpdate<TransportRouteKey>,
-    ) {
-        self.discovery_port.trigger(update);
-    }
-
     /// Load route-establishment timing from Kompact config.
     ///
     /// # Errors

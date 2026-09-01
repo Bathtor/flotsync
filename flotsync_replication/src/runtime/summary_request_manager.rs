@@ -24,7 +24,6 @@ use crate::{
         shared::{MessageId, PlaintextPayload, ReliableMessageScope},
     },
 };
-use arc_swap::ArcSwap;
 use flotsync_core::{GroupId, MemberIdentity, member::TrieSet, membership::SharedGroupMemberships};
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_routes::{DiscoveryRouteUpdate, RouteDiscoveryPort, TransportRouteKey};
@@ -44,68 +43,6 @@ use uuid::Uuid;
 pub(super) enum SummaryRequestManagerMessage {
     /// Ask one group member for its current group version vector.
     RequestSummary(Ask<SummaryRequest, Result<Summary, ApiError>>),
-    /// Exercise recoverable retry-invariant handling through normal actor dispatch.
-    #[cfg(test)]
-    TriggerMissingInternalRetryForTest {
-        /// Group identifier for the deliberately absent internal request.
-        group_id: GroupId,
-        /// Peer identity for the deliberately absent internal request.
-        peer: MemberIdentity,
-        /// Operation identifier for the deliberately absent internal request.
-        operation_id: Uuid,
-    },
-}
-
-/// One atomically published summary-manager component and its matching actor destination.
-struct SummaryRequestManagerInstance {
-    /// Component used by topology lifecycle and diagnostic operations.
-    component: Arc<Component<SummaryRequestManagerComponent>>,
-    /// Strong actor reference used by application-facing runtime dispatch.
-    actor_ref: ActorRefStrong<SummaryRequestManagerMessage>,
-}
-
-/// Stable topology and actor destination whose manager instance may be replaced after recovery.
-pub(super) struct SummaryRequestManagerSlot {
-    /// Component and actor reference that must change as one published unit.
-    current: ArcSwap<SummaryRequestManagerInstance>,
-}
-
-impl SummaryRequestManagerSlot {
-    /// Create one stable slot around the initial manager component.
-    pub(super) fn new(component: Arc<Component<SummaryRequestManagerComponent>>) -> Self {
-        Self {
-            current: ArcSwap::from_pointee(Self::instance(component)),
-        }
-    }
-
-    /// Load the manager component current at this instant.
-    pub(super) fn component(&self) -> Arc<Component<SummaryRequestManagerComponent>> {
-        self.current.load().component.clone()
-    }
-
-    /// Send one message to the manager current at this instant.
-    pub(super) fn tell(&self, message: SummaryRequestManagerMessage) {
-        self.current.load().actor_ref.tell(message);
-    }
-
-    /// Publish a connected replacement component and its matching actor destination atomically.
-    pub(super) fn replace(&self, replacement: Arc<Component<SummaryRequestManagerComponent>>) {
-        self.current.store(Arc::new(Self::instance(replacement)));
-    }
-
-    /// Pair one live component with the strong actor reference used to address it.
-    fn instance(
-        component: Arc<Component<SummaryRequestManagerComponent>>,
-    ) -> SummaryRequestManagerInstance {
-        let actor_ref = component
-            .actor_ref()
-            .hold()
-            .expect("summary request manager must expose a strong actor ref");
-        SummaryRequestManagerInstance {
-            component,
-            actor_ref,
-        }
-    }
 }
 
 /// Route-triggered summary operations indexed by semantic target and operation UUID.
@@ -212,10 +149,7 @@ impl SummaryInboundFailure {
 /// Besides application requests, the component observes direct-route transitions
 /// and starts summary-based synchronisation for shared hosted groups. It tracks
 /// those internal operations independently of current route availability so route
-/// flapping cannot accumulate duplicate reliable-delivery work. Recoverable faults
-/// replace the component with fresh transient state; dropping the faulted instance
-/// closes outstanding application promises, which the public runtime maps to
-/// [`ApiError::RuntimeUnavailable`].
+/// flapping cannot accumulate duplicate reliable-delivery work.
 #[derive(ComponentDefinition)]
 pub(super) struct SummaryRequestManagerComponent {
     ctx: ComponentContext<Self>,
@@ -254,14 +188,6 @@ impl SummaryRequestManagerComponent {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
         self.available_direct_peers.contains(peer)
-    }
-
-    /// Return whether one application request is waiting for the identified peer and group.
-    #[cfg(test)]
-    pub(crate) fn has_pending_summary(&self, group_id: GroupId, target: &MemberIdentity) -> bool {
-        self.pending_summaries
-            .values()
-            .any(|pending| pending.group_id == group_id && &pending.target == target)
     }
 
     fn reply_api<T>(
@@ -363,7 +289,7 @@ impl SummaryRequestManagerComponent {
             Ok(())
         } else {
             self.cancel_timer(timeout_timer);
-            None.whatever_recoverable(format!(
+            None.whatever_unrecoverable(format!(
                 "new internal summary operation unexpectedly conflicts for group {} and peer {}",
                 target.group_id, target.peer
             ))
@@ -379,7 +305,7 @@ impl SummaryRequestManagerComponent {
         let timeout_timer = self.schedule_internal_summary_timeout(operation_id);
         let Some(mut request) = self.internal_summaries.get1_mut(target) else {
             self.cancel_timer(timeout_timer);
-            return None.whatever_recoverable(format!(
+            return None.whatever_unrecoverable(format!(
                 "checked internal summary operation disappeared for group {} and peer {}",
                 target.group_id, target.peer
             ));
@@ -492,7 +418,7 @@ impl SummaryRequestManagerComponent {
                 let request = self
                     .internal_summaries
                     .remove2(&correlation_id)
-                    .whatever_recoverable(
+                    .whatever_unrecoverable(
                         "validated internal summary operation must remain indexed",
                     )?;
                 if let Some(timeout_timer) = request.timeout_timer {
@@ -680,16 +606,6 @@ impl Actor for SummaryRequestManagerComponent {
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             SummaryRequestManagerMessage::RequestSummary(ask) => self.handle_request_summary(ask),
-            #[cfg(test)]
-            SummaryRequestManagerMessage::TriggerMissingInternalRetryForTest {
-                group_id,
-                peer,
-                operation_id,
-            } => {
-                let target = InternalSummaryTarget { group_id, peer };
-                self.retry_internal_summary_request(&target, operation_id)?;
-                Handled::OK
-            }
         }
     }
 }
@@ -1122,6 +1038,25 @@ mod tests {
         assert_eq!(second.group_id, group_id);
         assert_eq!(first.correlation_id, second.correlation_id);
         assert_eq!(first.message_id, second.message_id);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn missing_internal_summary_retry_is_unrecoverable() {
+        let harness = SummaryRequestManagerHarness::new(
+            member("alice"),
+            TestGroupMemberships::default().shared(),
+        );
+        let missing_target = InternalSummaryTarget {
+            group_id: GroupId(Uuid::from_u128(7)),
+            peer: member("bob"),
+        };
+
+        let handled = harness.manager.on_definition(|component| {
+            component.retry_internal_summary_request(&missing_target, Uuid::from_u128(8))
+        });
+
+        assert!(matches!(handled, Err(HandlerError::Unrecoverable(_))));
         harness.shutdown();
     }
 }

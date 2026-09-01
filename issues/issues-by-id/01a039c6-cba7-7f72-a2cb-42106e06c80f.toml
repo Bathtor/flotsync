@@ -18,9 +18,9 @@ C07. RouteDiscoveryPort is indication-only. In test builds the production and ma
 C08. Reliable delivery retains unacknowledged outbound work across route withdrawal and deduplicates submissions only by MessageId.
 C09. A diagnostic test confirmed that two otherwise equivalent submissions with different MessageId values are both retained concurrently. Internal timeout continuations must retain their operation identity; reliable delivery owns transport retries.
 C10. iddqd::BiHashMap atomically maintains unique semantic-target and operation-UUID indexes over one internal request record.
-C11. Kompact marks a component faulty after a recoverable handler error and invokes its configured recovery function. Its default recovery function only ignores the fault; useful recovery therefore requires an explicit production replacement function.
-C12. A fresh SummaryRequestManagerComponent reconstructs non-application state from membership and subsequent complete route snapshots. It intentionally does not replay route snapshots that predate recovery; a later route change or reachability refresh restores that view.
-C13. Outstanding application promises cannot be transferred and must fail with the faulted instance.
+C11. Kompact recovery replaces rather than restarts a component in place. The current host does not provide general machinery for refreshing escaped component references, actor references, and port ownership.
+C12. Summary-manager indexed-state invariant failures are therefore unrecoverable in this task. General replacement recovery is tracked separately by flotsync-sae.
+C13. Commit 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d preserves the removed replacement proof of concept and its tests.
 
 Plan
 
@@ -31,45 +31,41 @@ P04. Remove the core-only membership test implementation. Test the production Ru
 P05. On an empty-to-non-empty peer-route transition, take one membership snapshot and directly iterate over locally hosted groups containing that peer. Ignore the local member and relay updates, with explanations for intentional no-op paths.
 P06. Keep one iddqd::BiHashMap record indexed uniquely by semantic group/peer target and operation UUID.
 P07. Generate one operation UUID for each new summary request and use it as both the wire correlation and wrapped reliable-delivery MessageId. Retain internal work across route withdrawal; after timeout, a later reconnect resubmits the same operation UUID.
-P08. Refactor retry lookup into direct success and missing branches. Update and explicitly release the mutable indexed-map guard before submission; on invariant loss, cancel the newly scheduled timer, return a recoverable handler error, and never submit untracked work.
-P09. Install a production recovery function for SummaryRequestManagerComponent. On recoverable fault, create a fresh manager with the same stable dependencies and settings, reconnect its reliable-delivery and discovery ports, publish the replacement actor reference to every consumer that addresses the manager, and start the replacement.
-P10. Keep application-facing promises and timeout behaviour separate from internal synchronisation state. Document and enforce how outstanding application requests are failed or abandoned when the faulted manager is replaced.
+P08. Update and explicitly release the mutable indexed-map guard before submission. On indexed-state invariant loss, cancel any newly scheduled timer, return an unrecoverable handler error, and never submit untracked work.
+P09. Keep SummaryRequestManagerComponent as an ordinary directly owned topology component and pass its strong actor reference directly to ReplicationRuntimeComponent.
+P10. Remove the replacement slot, recovery dependency factory, supervisor callback, recovery-time port reconnection, and recovery-only host controls.
 P11. Keep both the production discovery connection and the test/test-support manual connection. Place the indication-only multiple-provider caveat directly above the conditional manual connection.
-P12. Replace the syntactically empty final route branch with an end-of-chain else comment explaining that an already-available peer creates no transition.
-P13. Preserve the corrected full-topology diagram, component documentation, and standing AGENTS.md rule for comments on intentionally empty control-flow branches.
+P12. Keep explanations on every intentional no-op control-flow path.
+P13. Preserve the corrected full-topology diagram, component and module documentation, and standing AGENTS.md rules.
 P14. Validate internal replies through the correlation index, then remove the matching owned record atomically without eagerly cloning the target.
-P15. Update topology ownership so recovery can replace the manager without leaving stale actor references or port connections. Keep the recovery factory and rewiring responsibility in the runtime host topology rather than embedding topology knowledge in the component.
-P16. Accept eventual route-state restoration after recovery. Do not add immediate snapshot replay to route establishment for this edge case.
-P17. Add concise module documentation to every touched Rust module identified by the instruction audit.
-P18. Replace the route-discovery test sidecar with a shared required-port reference and KompactSystem::trigger_i; retain the reliable-delivery tester used for request observation.
-P19. Keep SummaryRequestManagerInstance private because only the stable slot names it.
-P20. Verify that an outstanding application summary request fails as RuntimeUnavailable when recovery drops the faulted manager, then verify a later request succeeds through the replacement.
+P15. Keep direct KompactSystem::trigger_i route injection in summary-manager component tests.
+P16. Track reusable replacement recovery, route snapshot restoration, lifecycle coordination, and outstanding-promise policy in flotsync-sae, linked to this issue and commit 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d.
 
 Tests
 
 T01. Existing TrieSet tests cover successful removal, absent removal, and structural cleanup without affecting siblings.
 T02. A production RuntimeGroupStateSnapshot test covers groups_with_member filtering; the existing route-claim and summary-manager tests cover the established route and replication test implementations.
-T03. Component tests continue to cover initial route availability, filtering to shared hosted groups, non-empty replacement, relay updates, route flapping, completion, and identity-stable timeout retry.
-T04. The supervision test triggers the exact invariant failure through normal component dispatch, verifies the original becomes faulty, waits for the configured replacement to become active, and proves the replacement handles later work.
-T05. Topology-level coverage proves the replacement manager is connected to both production and test discovery inputs where applicable, to reliable delivery, and to actor consumers through the refreshed reference.
+T03. Component tests cover initial route availability, filtering to shared hosted groups, non-empty replacement, relay updates, route flapping, completion, and identity-stable timeout retry.
+T04. A focused component test proves missing indexed retry state is classified as unrecoverable and does not submit work.
+T05. Host tests continue to cover both production and manual discovery-provider connections without replacement machinery.
 T06. Keep the runtime reconnection integration test proving automatic repair without a later edit or application summary request.
-T07. Recovery coverage proves an outstanding application request fails with RuntimeUnavailable and a subsequent request succeeds.
-T08. Run formatting, focused serial tests, affected crate suites with one test thread, the project-specific Rust instruction audit, and pedantic Clippy for affected crates.
+T07. Run formatting, focused serial tests, affected crate suites with one test thread, the project-specific Rust instruction audit, and pedantic Clippy for affected crates.
 
 Estimate
 
-E01. The complete worktree is approximately 1500 changed lines across the original task and four review rounds.
-E02. The accepted round-four follow-up is approximately 80–140 changed lines.
-E03. The complete task exceeds 1000 changed lines, but recovery remains local to RuntimeLogicTopology, the stable summary-manager slot, and focused test support; no generic recovery infrastructure or child issue is needed.
-E04. Implementation and validation are complete; the task is ready for review."""
-status = "in-progress"
-status_reason = "in review"
+E01. The replacement proof of concept is preserved in commit 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d.
+E02. The simplification removes approximately 250–400 lines and changes fewer than 50 additional lines.
+E03. The remaining task stays within the existing issue; general host recovery is split into flotsync-sae at priority 3.
+E04. The unrecoverable simplification is implemented and validated; the result is ready for review."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
 assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-08-25T16:35:24.711927Z"
-updated_at = "2026-09-01T16:24:17.219019Z"
+updated_at = "2026-09-01T16:42:26.699695Z"
+closed_at = "2026-09-01T16:42:26.699695Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-610d188b70a0"
@@ -128,3 +124,15 @@ id = "01a05dc9-2043-7432-926e-1794f631b17b"
 author = "codex"
 body = "Resolved accepted review round 4 items W1O-R21 through W1O-R24. Added module documentation to every touched Rust module identified by the audit, replaced the route-discovery sidecar with direct KompactSystem::trigger_i injection, made SummaryRequestManagerInstance private, and extended recovery coverage to prove an outstanding application request becomes RuntimeUnavailable before a later request succeeds through the replacement. W1O-R20 remains intentionally deferred: route state is restored on a later change or reachability refresh. Validation passed: focused recovery and manager tests, full serial core/routes/replication suites, rustfmt, diff checks, all-target pedantic Clippy, and the Rust instruction audit."
 created_at = "2026-09-01T16:24:17.219019Z"
+
+[[comments]]
+id = "01a05dd7-a00f-7aa3-881e-7cb07158dd68"
+author = "lkroll"
+body = "Checkpointed the replacement recovery proof of concept as 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d and created linked P3 follow-up flotsync-sae. The current worktree now uses the agreed simpler design: SummaryRequestManagerComponent is directly owned by the topology, ReplicationRuntimeComponent holds its direct strong actor reference, replacement/reconnection machinery and recovery-only test controls are removed, and indexed-state invariant loss is unrecoverable. Validation passed: focused classification and route-reestablishment tests, full serial flotsync_replication (361 unit tests plus boundary/doc tests) and flotsync_routes (66 unit tests plus doc tests) suites, test-support compilation, formatting, diff checks, all-target pedantic Clippy, and the Rust instruction audit."
+created_at = "2026-09-01T16:40:07.439947Z"
+
+[[comments]]
+id = "01a05dd9-c00b-78b3-a6bb-c7172dd49eca"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-01T16:42:26.699695Z"

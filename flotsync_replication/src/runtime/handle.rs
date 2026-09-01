@@ -546,18 +546,6 @@ impl ReplicationRuntime {
         self.with_host_for_test(|host| host.withdraw_direct_peer_routes(peer));
     }
 
-    /// Publish a direct route through the production route-establishment provider.
-    #[cfg(test)]
-    pub(crate) fn publish_route_establishment_peer_route_for_test(
-        &self,
-        peer: MemberIdentity,
-        remote_addr: std::net::SocketAddr,
-    ) {
-        self.with_host_for_test(|host| {
-            host.publish_route_establishment_peer_route(peer, remote_addr);
-        });
-    }
-
     #[cfg(test)]
     pub(crate) fn replace_route_establishment_watches_for_test(
         &self,
@@ -576,21 +564,6 @@ impl ReplicationRuntime {
     #[cfg(test)]
     pub(crate) fn wait_for_direct_peer_route_for_test(&self, peer: &MemberIdentity) {
         self.with_host_for_test(|host| host.wait_for_direct_peer_route(peer));
-    }
-
-    /// Wait until the current summary manager owns one application request.
-    #[cfg(test)]
-    pub(crate) fn wait_for_pending_summary_request_for_test(
-        &self,
-        group_id: GroupId,
-        target: &MemberIdentity,
-    ) {
-        self.with_host_for_test(|host| host.wait_for_pending_summary_request(group_id, target));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn recover_summary_request_manager_for_test(&self) {
-        self.with_host_for_test(DeliveryRuntimeHostTestExt::recover_summary_request_manager);
     }
 
     pub(crate) fn install_group_for_test(
