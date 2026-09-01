@@ -32,6 +32,7 @@
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical. Use `-W clippy::pedantic` before a change is considered ready for review.
 - Prefer readable control flow over chained iterator side effects.
+- Always comment intentionally empty control-flow branches to explain why doing nothing is correct.
 - Prefer `for` and `while`/`while let` over `loop` where possible; seeing the termination condition up front is usually clearer, even when the condition contains a fallible expression such as `while let Some(item) = next_item()?`.
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.

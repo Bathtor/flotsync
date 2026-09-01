@@ -29,6 +29,35 @@ fn runtime_group_state_projection_rejects_duplicate_group_ids() {
 }
 
 #[test]
+fn runtime_group_state_filters_groups_by_member() {
+    let local_member = alice_member();
+    let bob = bob_member();
+    let bob_group_id = GroupId(Uuid::from_u128(34));
+    let other_group_id = GroupId(Uuid::from_u128(35));
+    let bob_group = inactive_group_record(
+        bob_group_id,
+        vec![local_member.clone(), bob.clone()],
+        GroupSchema::default(),
+    );
+    let other_group = inactive_group_record(
+        other_group_id,
+        vec![local_member.clone(), MemberIdentity::from_array(["carol"])],
+        GroupSchema::default(),
+    );
+    let snapshot = RuntimeGroupStateSnapshot::from_records(
+        &local_member,
+        ApplicationSchemas::EMPTY,
+        [bob_group, other_group],
+    )
+    .expect("runtime group state should build");
+
+    let groups = flotsync_core::membership::GroupMemberships::groups_with_member(&snapshot, &bob)
+        .collect::<Vec<_>>();
+
+    assert_eq!(groups, vec![bob_group_id]);
+}
+
+#[test]
 fn runtime_group_state_reuses_matching_process_static_schema() {
     let local_member = alice_member();
     let group_id = GroupId(Uuid::from_u128(31));

@@ -98,6 +98,58 @@ fn pending_apply_need_retries_after_route_appears() {
 }
 
 #[test]
+fn route_reestablishment_repairs_update_missed_while_disconnected() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let dataset_id = docs_dataset_id();
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust();
+    let alice_member = alice_fixture.local_member.clone();
+    let bob_member = bob_fixture.local_member.clone();
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
+
+    publish_direct_peer_routes(alice_runtime, &alice_member, bob_runtime, &bob_member);
+    let group_id = GroupId(Uuid::from_u128(50_251));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    alice_runtime
+        .install_group_for_test(group_id, members.clone())
+        .expect("alice group should install");
+    bob_runtime
+        .install_group_for_test(group_id, members)
+        .expect("bob group should install");
+
+    alice_runtime.withdraw_direct_peer_routes_for_test(bob_member.clone());
+    bob_runtime.withdraw_direct_peer_routes_for_test(alice_member.clone());
+    let row_id = test_row_id(group_id, dataset_id.clone(), 50_252);
+    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id);
+    publish_changes(
+        alice_runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "repaired after reconnect",
+            },
+        }],
+    );
+    assert!(bob_fixture.listener.captured_data_changes().is_empty());
+
+    publish_direct_peer_routes(alice_runtime, &alice_member, bob_runtime, &bob_member);
+    bob_fixture.listener.wait_for_data_change_count(1);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id,
+                title: "repaired after reconnect".to_owned(),
+            }],
+        }]
+    );
+}
+
+#[test]
 fn partial_update_batch_retry_narrows_remaining_need() {
     let _runtime_endpoint_leases =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);

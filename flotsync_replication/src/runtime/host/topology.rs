@@ -646,6 +646,9 @@ impl ComponentTopology for DiscoveryTopology {
 ///                             ^
 ///                             |
 /// ReliableDeliveryComponent --+--> SummaryRequestManagerComponent
+///                                     ^
+///                                     |
+/// RouteDiscoveryPort -----------------+
 /// ```
 pub(in crate::runtime::host) struct RuntimeLogicTopology {
     catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
@@ -705,6 +708,13 @@ impl RuntimeLogicTopology {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::runtime::host) fn summary_request_manager(
+        &self,
+    ) -> &Arc<Component<SummaryRequestManagerComponent>> {
+        &self.summary_request_manager
+    }
+
     fn connect_delivery(&self, delivery: &DeliveryTopology) -> Result<(), RuntimeHostError> {
         connect_components::<GroupBroadcastPort, _, _>(
             delivery.group_broadcast_provider(),
@@ -727,6 +737,24 @@ impl RuntimeLogicTopology {
             "reliable delivery -> summary request manager",
         )
     }
+
+    fn connect_discovery(&self, discovery: &DiscoveryTopology) -> Result<(), RuntimeHostError> {
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.route_discovery_provider(),
+            &self.summary_request_manager,
+            "route establishment -> summary request manager",
+        )?;
+        // RouteDiscoveryPort carries indications only, so test builds may safely merge manual
+        // updates with production route establishment at one consumer. Do not generalise this to
+        // request-bearing ports: multiple providers would make request ownership ambiguous.
+        #[cfg(any(test, feature = "test-support"))]
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.manual_route_discovery_provider(),
+            &self.summary_request_manager,
+            "manual route discovery -> summary request manager",
+        )?;
+        Ok(())
+    }
 }
 
 impl ComponentTopology for RuntimeLogicTopology {
@@ -748,8 +776,9 @@ impl ComponentTopology for RuntimeLogicTopology {
 ///                       |                         |                 |
 ///                       v                         |                 v
 ///                DiscoveryTopology --routes-------+----------> DeliveryTopology --semantic events--> RuntimeLogicTopology
-///                       ^                         |
-///                       +----inbound payloads-----+
+///                       | ^                       |                                                   ^
+///                       | +----inbound payloads---+                                                   |
+///                       +-------------------------------routes----------------------------------------+
 /// ```
 pub(in crate::runtime::host) struct RuntimeTopology {
     pub(in crate::runtime::host) io: IoTopology,
@@ -843,7 +872,8 @@ impl RuntimeTopology {
         self.delivery.connect_internal_routes()?;
         self.discovery.connect_internal_routes()?;
         self.delivery.connect_discovery(&self.discovery)?;
-        self.runtime.connect_delivery(&self.delivery)
+        self.runtime.connect_delivery(&self.delivery)?;
+        self.runtime.connect_discovery(&self.discovery)
     }
 
     pub(in crate::runtime::host) async fn start_all(

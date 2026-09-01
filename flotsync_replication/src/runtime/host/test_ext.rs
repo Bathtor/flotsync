@@ -9,8 +9,11 @@ use super::*;
 pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Return the address peers should use when this host bound an unspecified interface.
     fn advertised_loopback_udp_addr(&self) -> SocketAddr;
-    /// Publish a direct unicast peer route and wait until delivery components observe it.
+    /// Publish a direct unicast peer route and wait until every route consumer observes it.
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
+    /// Withdraw every direct route for one peer and wait until every route consumer observes it.
+    #[cfg(test)]
+    fn withdraw_direct_peer_routes(&self, peer: MemberIdentity);
     /// Replace route-establishment watches with test-selected routes.
     #[cfg(test)]
     fn replace_route_establishment_watches(
@@ -20,10 +23,10 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Publish configured static routes after a test has explicitly requested them.
     #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self);
-    /// Return whether both direct-delivery components currently know a peer route.
+    /// Return whether every direct-route consumer currently knows a peer route.
     #[cfg(test)]
     fn knows_direct_peer_route(&self, peer: &MemberIdentity) -> bool;
-    /// Wait until both direct-delivery components have observed a peer route.
+    /// Wait until every direct-route consumer has observed a peer route.
     #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity);
     /// Wait until the runtime component accepts one mailbox turn.
@@ -38,28 +41,18 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use flotsync_routes::{
-            DatagramRouteScope,
-            RoutePreferenceRank,
-            RouteSharingKind,
-            SendRouteCandidate,
-            UdpRouteKey,
-        };
+        let update = direct_peer_route_update(self.external_udp_addr, peer.clone(), remote_addr);
+        self.publish_route_update(update);
+        wait_for_direct_peer_route(self.topology(), &peer);
+    }
 
-        let route = SendRouteCandidate {
-            coverage_key: TransportRouteKey::Udp(UdpRouteKey {
-                remote_addr,
-                scope: DatagramRouteScope::Unicast,
-                local_bind: Some(self.external_udp_addr),
-            }),
-            sharing: RouteSharingKind::Exclusive,
-            preference_rank: RoutePreferenceRank::new(1),
-        };
+    #[cfg(test)]
+    fn withdraw_direct_peer_routes(&self, peer: MemberIdentity) {
         self.publish_route_update(flotsync_routes::DiscoveryRouteUpdate::PeerRoutes {
             peer: peer.clone(),
-            routes: vec![route],
+            routes: Vec::new(),
         });
-        wait_for_direct_peer_route(self.topology(), &peer);
+        wait_for_no_direct_peer_route(self.topology(), &peer);
     }
 
     #[cfg(test)]
@@ -93,7 +86,13 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             .delivery
             .reliable_delivery
             .on_definition(|component| component.knows_direct_route(&reliable_peer));
-        broadcast_knows && reliable_knows
+        let summary_peer = peer.clone();
+        let summary_knows = self
+            .topology()
+            .runtime
+            .summary_request_manager()
+            .on_definition(|component| component.knows_direct_route(&summary_peer));
+        broadcast_knows && reliable_knows && summary_knows
     }
 
     #[cfg(test)]
@@ -108,11 +107,43 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             .actor_ref()
             .ask_with(ReplicationRuntimeMessage::test_ping);
         match wait_for_test_reply(future) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Receiving the barrier reply is the complete success condition.
+            }
             Err(error) => panic!(
                 "replication runtime component became unavailable during test startup barrier: {error:?}"
             ),
         }
+    }
+}
+
+/// Build the direct-route indication shared by manual and production-provider tests.
+#[cfg(any(test, feature = "test-support"))]
+fn direct_peer_route_update(
+    local_addr: SocketAddr,
+    peer: MemberIdentity,
+    remote_addr: SocketAddr,
+) -> flotsync_routes::DiscoveryRouteUpdate<TransportRouteKey> {
+    use flotsync_routes::{
+        DatagramRouteScope,
+        RoutePreferenceRank,
+        RouteSharingKind,
+        SendRouteCandidate,
+        UdpRouteKey,
+    };
+
+    let route = SendRouteCandidate {
+        coverage_key: TransportRouteKey::Udp(UdpRouteKey {
+            remote_addr,
+            scope: DatagramRouteScope::Unicast,
+            local_bind: Some(local_addr),
+        }),
+        sharing: RouteSharingKind::Exclusive,
+        preference_rank: RoutePreferenceRank::new(1),
+    };
+    flotsync_routes::DiscoveryRouteUpdate::PeerRoutes {
+        peer,
+        routes: vec![route],
     }
 }
 
@@ -146,5 +177,42 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
         &topology.delivery.reliable_delivery,
         |component| component.knows_direct_route(&reliable_peer),
         format_args!("timed out waiting for reliable-delivery route publication for peer={peer}"),
+    );
+
+    let summary_peer = peer.clone();
+    eventually_component_state(
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
+        topology.runtime.summary_request_manager(),
+        |component| component.knows_direct_route(&summary_peer),
+        format_args!("timed out waiting for summary-manager route publication for peer={peer}"),
+    );
+}
+
+#[cfg(test)]
+fn wait_for_no_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity) {
+    use flotsync_io::test_support::eventually_component_state;
+
+    let broadcast_peer = peer.clone();
+    eventually_component_state(
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
+        &topology.delivery.group_broadcast,
+        |component| !component.knows_direct_route(&broadcast_peer),
+        format_args!("timed out waiting for group-broadcast route withdrawal for peer={peer}"),
+    );
+
+    let reliable_peer = peer.clone();
+    eventually_component_state(
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
+        &topology.delivery.reliable_delivery,
+        |component| !component.knows_direct_route(&reliable_peer),
+        format_args!("timed out waiting for reliable-delivery route withdrawal for peer={peer}"),
+    );
+
+    let summary_peer = peer.clone();
+    eventually_component_state(
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
+        topology.runtime.summary_request_manager(),
+        |component| !component.knows_direct_route(&summary_peer),
+        format_args!("timed out waiting for summary-manager route withdrawal for peer={peer}"),
     );
 }

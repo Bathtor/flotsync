@@ -1,0 +1,32 @@
+id = "01a05dcf-c64f-7ab2-9477-90d7fffc12e6"
+ref = "flotsync-sae"
+title = "Revisit Kompact component recovery"
+body = """
+Goal
+
+Design reusable host machinery for replacing faulted Kompact components whose component and actor references have escaped into the runtime topology.
+
+Context
+
+Commit 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d contains an initial SummaryRequestManagerComponent replacement implementation using an atomic component/actor slot, recovery-time port reconnection, and recursive recovery installation. The implementation was removed from the active flotsync-w1o work because Kompact recovery creates a new component rather than restarting in place, and the host does not yet have a general reference-replacement lifecycle.
+
+Scope
+
+R01. Define ownership and replacement semantics for component references, actor references, and port connections.
+R02. Coordinate replacement with startup, graceful shutdown, and concurrent API dispatch.
+R03. Decide how replacement components acquire current upstream indication state, including routes published before recovery.
+R04. Define what happens to outstanding promises and transient protocol state.
+R05. Provide reusable supervision tests covering repeated recovery and reference refresh.
+
+Reference implementation
+
+Inspect commit 4c92e7a9d33172f05a6a75d86ca0c4baecbdde4d for the removed proof of concept and its recovery tests."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-09-01T16:31:32.943737Z"
+updated_at = "2026-09-01T16:31:37.769279Z"
+
+[[links]]
+target = "01a039c6-cba7-7f72-a2cb-42106e06c80f"
+label = "discovered from"

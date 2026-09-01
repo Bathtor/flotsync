@@ -1,3 +1,5 @@
+//! Main replication runtime component and its group, update, and API workflows.
+
 use super::{
     DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
     catch_up_manager::{

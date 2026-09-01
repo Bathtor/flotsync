@@ -1,3 +1,5 @@
+//! Shared replication test stores, memberships, listeners, and runtime fixtures.
+
 use crate::{
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
@@ -140,6 +142,18 @@ impl GroupMemberships for TestGroupMemberships {
             self.groups
                 .iter()
                 .map(|(group_id, members)| (*group_id, members)),
+        )
+    }
+
+    fn groups_with_member<'a>(
+        &'a self,
+        member: &'a MemberIdentity,
+    ) -> Box<dyn Iterator<Item = GroupId> + 'a> {
+        Box::new(
+            self.groups
+                .iter()
+                .filter(move |(_, members)| members.contains(member))
+                .map(|(group_id, _)| *group_id),
         )
     }
 }
@@ -601,7 +615,9 @@ impl ReplicationEventListener for TestEventListener {
                         .expect("listener event channel must remain open while tests are running");
                 }
                 ReplicationEvent::GroupInvitation { .. }
-                | ReplicationEvent::MigrationProposals { .. } => {}
+                | ReplicationEvent::MigrationProposals { .. } => {
+                    // This listener captures data changes only; group workflow has separate probes.
+                }
             }
             Ok(())
         }

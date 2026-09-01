@@ -39,6 +39,18 @@ impl GroupMemberships for TestGroupMemberships {
                 .map(|(group_id, members)| (*group_id, members)),
         )
     }
+
+    fn groups_with_member<'a>(
+        &'a self,
+        member: &'a MemberIdentity,
+    ) -> Box<dyn Iterator<Item = GroupId> + 'a> {
+        Box::new(
+            self.groups
+                .iter()
+                .filter(move |(_, members)| members.contains(member))
+                .map(|(group_id, _)| *group_id),
+        )
+    }
 }
 
 /// Shared source retaining one fixed route-test snapshot.
@@ -675,7 +687,9 @@ impl RouteEstablishmentHarness {
             .recv_timeout(Duration::from_millis(100))
         {
             Ok(submit) => panic!("{reason}: unexpected submit {submit:?}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The complete success condition is observing no transport submission.
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("{reason}: route transport recorder disconnected");
             }

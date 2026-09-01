@@ -1309,10 +1309,7 @@ pub(super) fn local_claim_group_ids(
     local_member: &MemberIdentity,
 ) -> Vec<GroupId> {
     let memberships = group_memberships.snapshot();
-    memberships
-        .groups()
-        .filter_map(|(group_id, members)| option_when!(members.contains(local_member), group_id))
-        .collect()
+    memberships.groups_with_member(local_member).collect()
 }
 
 /// Return whether every locally known claimed group contains `member`.

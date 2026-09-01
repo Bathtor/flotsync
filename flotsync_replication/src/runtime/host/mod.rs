@@ -409,11 +409,10 @@ impl DeliveryRuntimeHost {
         Ok(())
     }
 
-    /// Publish one route-discovery update into both semantic delivery owners.
+    /// Publish one route-discovery update into every runtime route consumer.
     ///
-    /// This is temporary until the replication runtime is wired to the real
-    /// discovery mechanism. Today it exists so tests and bring-up tooling can
-    /// inject direct routes explicitly.
+    /// The manual provider lets tests and bring-up tooling inject direct routes
+    /// explicitly alongside the production route-establishment provider.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish_route_update(
         &self,

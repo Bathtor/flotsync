@@ -1,3 +1,5 @@
+//! Public replication runtime handle, lifecycle ownership, and test-only controls.
+
 #[cfg(any(test, feature = "test-support"))]
 use super::host::DeliveryRuntimeHostTestExt;
 use super::{
@@ -537,6 +539,11 @@ impl ReplicationRuntime {
         remote_addr: std::net::SocketAddr,
     ) {
         self.with_host_for_test(|host| host.publish_direct_peer_route(peer, remote_addr));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn withdraw_direct_peer_routes_for_test(&self, peer: MemberIdentity) {
+        self.with_host_for_test(|host| host.withdraw_direct_peer_routes(peer));
     }
 
     #[cfg(test)]
