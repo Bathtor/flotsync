@@ -1669,6 +1669,7 @@ dependencies = [
  "flotsync_security",
  "flotsync_utils",
  "futures-util",
+ "iddqd",
  "indoc",
  "intervallum",
  "itertools 0.14.0",

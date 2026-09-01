@@ -1,3 +1,5 @@
+//! Main replication runtime component and its group, update, and API workflows.
+
 use super::{
     DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
     catch_up_manager::{
@@ -55,7 +57,7 @@ use super::{
     },
     pending_group,
     replay,
-    summary_request_manager::SummaryRequestManagerMessage,
+    summary_request_manager::{SummaryRequestManagerMessage, SummaryRequestManagerSlot},
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::api::MemberKeyId;
@@ -418,7 +420,7 @@ pub struct ReplicationRuntimeComponent {
     config: ReplicationConfig,
     security: DeliverySecurity,
     group_memberships: Arc<SharedGroupState>,
-    summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+    summary_request_manager: Arc<SummaryRequestManagerSlot>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
     max_inline_bootstrap_public_key_bundles: usize,
@@ -447,7 +449,7 @@ pub(super) struct RuntimeSecurityContext {
 
 /// Actor dependencies created by the runtime logic topology.
 pub(super) struct RuntimeComponentActors {
-    pub(super) summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+    pub(super) summary_request_manager: Arc<SummaryRequestManagerSlot>,
     pub(super) catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
 }
 

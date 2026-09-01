@@ -336,6 +336,11 @@ impl TrieSet {
         self.0.insert(key, ()).is_none()
     }
 
+    /// Remove `key` and return whether it was present.
+    pub fn remove<I: IdentifierLike>(&mut self, key: &I) -> bool {
+        self.0.remove(key).is_some()
+    }
+
     #[must_use]
     pub fn contains<I: IdentifierLike>(&self, key: &I) -> bool {
         self.0.get(key).is_some()
@@ -622,5 +627,28 @@ mod tests {
         assert_eq!(trie_map.get(&a), Some(&1));
         assert_eq!(trie_map.remove(&a), Some(1));
         assert!(trie_map.is_empty());
+    }
+
+    #[test]
+    fn test_set_remove_reports_presence_and_preserves_siblings() {
+        let mut trie_set = TrieSet::new();
+        let a = id(["a"]);
+        let ab = id(["a", "b"]);
+        let ac = id(["a", "c"]);
+
+        trie_set.insert(a.clone());
+        trie_set.insert(ab.clone());
+        trie_set.insert(ac.clone());
+
+        assert!(trie_set.remove(&ab));
+        assert!(!trie_set.contains(&ab));
+        assert!(trie_set.contains(&a));
+        assert!(trie_set.contains(&ac));
+        assert!(!trie_set.remove(&ab));
+
+        assert!(trie_set.remove(&a));
+        assert!(trie_set.contains(&ac));
+        assert!(trie_set.remove(&ac));
+        assert!(trie_set.is_empty());
     }
 }

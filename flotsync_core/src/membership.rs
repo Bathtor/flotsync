@@ -1,3 +1,5 @@
+//! Read-only group-membership snapshots and canonical ordered member sets.
+
 use crate::{GroupId, MemberIdentity, MemberIndex, member::TrieMap};
 use snafu::prelude::*;
 use std::sync::Arc;
@@ -9,6 +11,12 @@ pub trait GroupMemberships: Send + Sync {
 
     /// Iterate locally hosted groups in an unspecified order.
     fn groups(&self) -> Box<dyn Iterator<Item = (GroupId, &GroupMembers)> + '_>;
+
+    /// Iterate locally hosted group identifiers whose membership includes `member`.
+    fn groups_with_member<'a>(
+        &'a self,
+        member: &'a MemberIdentity,
+    ) -> Box<dyn Iterator<Item = GroupId> + 'a>;
 
     /// Return whether `group_id` currently exists in this membership snapshot.
     fn contains_group(&self, group_id: &GroupId) -> bool {
@@ -162,6 +170,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
     fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
         MemberIdentity::from_array(segments)
     }

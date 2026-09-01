@@ -255,6 +255,15 @@ impl RouteEstablishmentComponent {
         self.route_endpoint_lifecycle_port.share()
     }
 
+    /// Publish one discovery indication through the production provider in topology tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_route_update_for_test(
+        &mut self,
+        update: crate::DiscoveryRouteUpdate<TransportRouteKey>,
+    ) {
+        self.discovery_port.trigger(update);
+    }
+
     /// Load route-establishment timing from Kompact config.
     ///
     /// # Errors
@@ -1309,10 +1318,7 @@ pub(super) fn local_claim_group_ids(
     local_member: &MemberIdentity,
 ) -> Vec<GroupId> {
     let memberships = group_memberships.snapshot();
-    memberships
-        .groups()
-        .filter_map(|(group_id, members)| option_when!(members.contains(local_member), group_id))
-        .collect()
+    memberships.groups_with_member(local_member).collect()
 }
 
 /// Return whether every locally known claimed group contains `member`.

@@ -26,6 +26,7 @@ flotsync_security = { path = "../flotsync_security", default-features = false }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 futures-util = { workspace = true }
+iddqd = { workspace = true }
 interval = { package = "intervallum", version = "1" }
 itertools = { workspace = true }
 kompact = { workspace = true }

@@ -96,6 +96,18 @@ impl GroupMemberships for RuntimeGroupStateSnapshot {
                 .map(|group| (group.group_id, &group.members)),
         )
     }
+
+    fn groups_with_member<'a>(
+        &'a self,
+        member: &'a MemberIdentity,
+    ) -> Box<dyn Iterator<Item = GroupId> + 'a> {
+        Box::new(
+            self.groups
+                .values()
+                .filter(move |group| group.members.contains(member))
+                .map(|group| group.group_id),
+        )
+    }
 }
 
 #[sealed]

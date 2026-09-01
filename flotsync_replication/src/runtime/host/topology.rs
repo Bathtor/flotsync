@@ -1,6 +1,9 @@
 //! Component topology construction for the delivery runtime host.
 
 use super::*;
+use kompact::component::ContextSystemHandle;
+use std::sync::Weak;
+use uuid::Uuid;
 
 trait RuntimeLifecycleComponent: Send + Sync {
     fn start<'a>(
@@ -71,6 +74,27 @@ where
     Ok(())
 }
 
+/// Reconnect one replacement component without holding both component locks together.
+///
+/// Recovery runs on Kompact's supervisor, where a transient dual-lock failure cannot be returned
+/// to a caller for retry. Acquiring and updating the two port sides separately avoids that
+/// transient failure mode while preserving the same bidirectional connection.
+fn connect_replacement_component<P, C1, C2>(
+    source: &Arc<Component<C1>>,
+    target: &Arc<Component<C2>>,
+) where
+    P: Port + 'static,
+    C1: ComponentDefinition + Sized + 'static + Provide<P> + ProvideRef<P>,
+    C2: ComponentDefinition + Sized + 'static + Require<P> + RequireRef<P>,
+{
+    let provided_ref = LockingProvideRef::<P, C1>::provided_ref(source);
+    let required_ref = LockingRequireRef::<P, C2>::required_ref(target);
+    let _provider_connection =
+        LockingProvideRef::<P, C1>::connect_to_required(source, required_ref);
+    let _requirer_connection =
+        LockingRequireRef::<P, C2>::connect_to_provided(target, provided_ref);
+}
+
 fn describe_component_connect_error(error: &TryDualLockError) -> &'static str {
     match error {
         TryDualLockError::LeftWouldBlock => "provider component lock would block",
@@ -99,6 +123,32 @@ where
             component: C::type_name(),
             message: error.to_string(),
         })
+}
+
+impl RuntimeLifecycleComponent for SummaryRequestManagerSlot {
+    fn start<'a>(
+        &'a self,
+        system: &'a KompactSystem,
+        control_timeout: Duration,
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
+        async move {
+            let component = self.component();
+            component.start(system, control_timeout).await
+        }
+        .boxed()
+    }
+
+    fn stop<'a>(
+        &'a self,
+        system: &'a KompactSystem,
+        control_timeout: Duration,
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
+        async move {
+            let component = self.component();
+            component.stop(system, control_timeout).await
+        }
+        .boxed()
+    }
 }
 
 impl<C> RuntimeLifecycleComponent for Arc<Component<C>>
@@ -646,16 +696,95 @@ impl ComponentTopology for DiscoveryTopology {
 ///                             ^
 ///                             |
 /// ReliableDeliveryComponent --+--> SummaryRequestManagerComponent
+///                                     ^
+///                                     |
+/// RouteDiscoveryPort -----------------+
 /// ```
 pub(in crate::runtime::host) struct RuntimeLogicTopology {
     catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
-    summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
+    summary_request_manager: Arc<SummaryRequestManagerSlot>,
+    summary_request_manager_dependencies: SummaryRequestManagerDependencies,
     pub(in crate::runtime::host) runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
+
+/// Port wiring applied to every recovered summary-manager instance.
+type SummaryRequestManagerConnector =
+    dyn Fn(&Arc<Component<SummaryRequestManagerComponent>>) + Send + Sync;
 
 /// Runtime-logic knobs that are not application or identity dependencies.
 struct RuntimeLogicSettings {
     summary_request_timeout: Duration,
+}
+
+/// Stable constructor inputs retained for summary-manager recovery.
+#[derive(Clone)]
+struct SummaryRequestManagerDependencies {
+    /// Local sender identity used by every replacement instance.
+    local_member: MemberIdentity,
+    /// Shared membership source consulted by every replacement instance.
+    group_memberships: Arc<dyn SharedGroupMemberships>,
+    /// Response timeout configured for every replacement instance.
+    request_timeout: Duration,
+}
+
+impl SummaryRequestManagerDependencies {
+    /// Construct a fresh summary manager with empty transient protocol state.
+    fn create_component(&self) -> SummaryRequestManagerComponent {
+        SummaryRequestManagerComponent::new(
+            self.local_member.clone(),
+            self.group_memberships.clone(),
+            self.request_timeout,
+        )
+    }
+}
+
+/// Recovery factory that replaces a faulted summary manager and republishes its destinations.
+struct SummaryRequestManagerRecovery {
+    /// Stable constructor inputs for fresh manager state.
+    dependencies: SummaryRequestManagerDependencies,
+    /// Current topology slot, held weakly to avoid a component/recovery cycle.
+    component_slot: Weak<SummaryRequestManagerSlot>,
+    /// Provider connections required before a replacement may become current.
+    connect: Arc<SummaryRequestManagerConnector>,
+}
+
+impl SummaryRequestManagerRecovery {
+    /// Install this reusable factory as the one-shot recovery function of `component`.
+    fn install(self: &Arc<Self>, component: &Arc<Component<SummaryRequestManagerComponent>>) {
+        let recovery = self.clone();
+        component.set_recovery_function(move |fault| {
+            fault.recover_with(move |context, system, log| {
+                recovery.replace_faulted_component(context.component_id, &system, log);
+            })
+        });
+    }
+
+    /// Construct, connect, publish, and start one fresh replacement component.
+    fn replace_faulted_component(
+        self: &Arc<Self>,
+        faulted_component_id: Uuid,
+        system: &ContextSystemHandle,
+        log: &KompactLogger,
+    ) {
+        let Some(component_slot) = self.component_slot.upgrade() else {
+            warn!(
+                log,
+                "not recovering summary request manager {faulted_component_id}: runtime topology was dropped"
+            );
+            return;
+        };
+        let dependencies = self.dependencies.clone();
+        let replacement = system.create(move || dependencies.create_component());
+        (self.connect)(&replacement);
+        self.install(&replacement);
+        component_slot.replace(replacement.clone());
+        system.start(&replacement);
+        info!(
+            log,
+            "replaced faulted summary request manager {faulted_component_id} with {}",
+            replacement.id()
+        );
+    }
 }
 
 /// Grouped inputs for the runtime logic topology.
@@ -678,22 +807,22 @@ impl RuntimeLogicTopology {
             .actor_ref()
             .hold()
             .expect("catch-up manager must expose a strong actor ref");
-        let summary_request_manager = SummaryRequestManagerComponent::new(
-            input.identity.local_member.clone(),
-            input.identity.group_memberships.clone(),
-            input.settings.summary_request_timeout,
-        );
-        let summary_request_manager = system.create(move || summary_request_manager);
-        let summary_request_manager_ref = summary_request_manager
-            .actor_ref()
-            .hold()
-            .expect("summary request manager must expose a strong actor ref");
+        let summary_request_manager_dependencies = SummaryRequestManagerDependencies {
+            local_member: input.identity.local_member.clone(),
+            group_memberships: input.identity.group_memberships.clone(),
+            request_timeout: input.settings.summary_request_timeout,
+        };
+        let initial_dependencies = summary_request_manager_dependencies.clone();
+        let summary_request_manager =
+            system.create(move || initial_dependencies.create_component());
+        let summary_request_manager =
+            Arc::new(SummaryRequestManagerSlot::new(summary_request_manager));
         let runtime_component = ReplicationRuntimeComponent::new(
             input.identity,
             input.services,
             input.security,
             RuntimeComponentActors {
-                summary_request_manager: summary_request_manager_ref,
+                summary_request_manager: summary_request_manager.clone(),
                 catch_up_manager: catch_up_manager_ref,
             },
         );
@@ -701,8 +830,16 @@ impl RuntimeLogicTopology {
         Self {
             catch_up_manager,
             summary_request_manager,
+            summary_request_manager_dependencies,
             runtime_component,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::runtime::host) fn summary_request_manager(
+        &self,
+    ) -> Arc<Component<SummaryRequestManagerComponent>> {
+        self.summary_request_manager.component()
     }
 
     fn connect_delivery(&self, delivery: &DeliveryTopology) -> Result<(), RuntimeHostError> {
@@ -721,11 +858,66 @@ impl RuntimeLogicTopology {
             &self.runtime_component,
             "reliable delivery -> replication runtime",
         )?;
+        let summary_request_manager = self.summary_request_manager.component();
         connect_components::<ReliableDeliveryPort, _, _>(
             delivery.reliable_delivery_provider(),
-            &self.summary_request_manager,
+            &summary_request_manager,
             "reliable delivery -> summary request manager",
         )
+    }
+
+    fn connect_discovery(&self, discovery: &DiscoveryTopology) -> Result<(), RuntimeHostError> {
+        let summary_request_manager = self.summary_request_manager.component();
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.route_discovery_provider(),
+            &summary_request_manager,
+            "route establishment -> summary request manager",
+        )?;
+        // RouteDiscoveryPort carries indications only, so test builds may safely merge manual
+        // updates with production route establishment at one consumer. Do not generalise this to
+        // request-bearing ports: multiple providers would make request ownership ambiguous.
+        #[cfg(any(test, feature = "test-support"))]
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.manual_route_discovery_provider(),
+            &summary_request_manager,
+            "manual route discovery -> summary request manager",
+        )?;
+        Ok(())
+    }
+
+    /// Install production recovery after every provider needed by replacements is available.
+    fn install_summary_request_manager_recovery(
+        &self,
+        delivery: &DeliveryTopology,
+        discovery: &DiscoveryTopology,
+    ) {
+        let reliable_delivery = delivery.reliable_delivery_provider().clone();
+        let route_discovery = discovery.route_discovery_provider().clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let manual_route_discovery = discovery.manual_route_discovery_provider().clone();
+        let connect = Arc::new(
+            move |manager: &Arc<Component<SummaryRequestManagerComponent>>| {
+                connect_replacement_component::<ReliableDeliveryPort, _, _>(
+                    &reliable_delivery,
+                    manager,
+                );
+                connect_replacement_component::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+                    &route_discovery,
+                    manager,
+                );
+                #[cfg(any(test, feature = "test-support"))]
+                connect_replacement_component::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+                    &manual_route_discovery,
+                    manager,
+                );
+            },
+        );
+        let recovery = Arc::new(SummaryRequestManagerRecovery {
+            dependencies: self.summary_request_manager_dependencies.clone(),
+            component_slot: Arc::downgrade(&self.summary_request_manager),
+            connect,
+        });
+        recovery.install(&self.summary_request_manager.component());
     }
 }
 
@@ -733,7 +925,7 @@ impl ComponentTopology for RuntimeLogicTopology {
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
         std::iter::once(&self.catch_up_manager as &dyn RuntimeLifecycleComponent)
             .chain(std::iter::once(
-                &self.summary_request_manager as &dyn RuntimeLifecycleComponent,
+                self.summary_request_manager.as_ref() as &dyn RuntimeLifecycleComponent
             ))
             .chain(std::iter::once(
                 &self.runtime_component as &dyn RuntimeLifecycleComponent,
@@ -748,8 +940,9 @@ impl ComponentTopology for RuntimeLogicTopology {
 ///                       |                         |                 |
 ///                       v                         |                 v
 ///                DiscoveryTopology --routes-------+----------> DeliveryTopology --semantic events--> RuntimeLogicTopology
-///                       ^                         |
-///                       +----inbound payloads-----+
+///                       | ^                       |                                                   ^
+///                       | +----inbound payloads---+                                                   |
+///                       +-------------------------------routes----------------------------------------+
 /// ```
 pub(in crate::runtime::host) struct RuntimeTopology {
     pub(in crate::runtime::host) io: IoTopology,
@@ -843,7 +1036,11 @@ impl RuntimeTopology {
         self.delivery.connect_internal_routes()?;
         self.discovery.connect_internal_routes()?;
         self.delivery.connect_discovery(&self.discovery)?;
-        self.runtime.connect_delivery(&self.delivery)
+        self.runtime.connect_delivery(&self.delivery)?;
+        self.runtime.connect_discovery(&self.discovery)?;
+        self.runtime
+            .install_summary_request_manager_recovery(&self.delivery, &self.discovery);
+        Ok(())
     }
 
     pub(in crate::runtime::host) async fn start_all(

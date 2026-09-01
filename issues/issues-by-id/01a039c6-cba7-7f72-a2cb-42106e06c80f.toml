@@ -4,35 +4,127 @@ title = "Trigger replication synchronisation when peer routes become available"
 body = """
 Goal
 
-Automatically start Summary-based replication catch-up when a direct route to a peer transitions from unavailable to available. This repairs updates missed while peers were disconnected even when no later update exposes a causal gap and MaintainRS does not manually request a summary.
+Automatically start summary-based replication catch-up when a direct route to a peer transitions from unavailable to available. This repairs updates missed while peers were disconnected even when no later update exposes a causal gap and MaintainRS does not manually request a summary.
+
+Current code alignment
+
+C01. SummaryRequestManagerComponent owns outbound summary correlation identifiers, application promises, application request timeouts, and route-triggered summary state.
+C02. ReplicationRuntimeComponent independently observes every inbound Summary, compares it with stored local progress, and notifies CatchUpManagerComponent of available and needed ranges.
+C03. Summary replies without a pending application request are accepted by SummaryRequestManagerComponent and still complete reliable-delivery processing.
+C04. CatchUpManagerComponent already deduplicates needed versions, retries NeedRange broadcasts, and consumes UpdateBatch replies.
+C05. SharedGroupMemberships snapshots expose exactly the locally hosted groups and their members.
+C06. RouteDiscoveryPort updates are complete replacement snapshots: an empty peer route list withdraws availability, while relay updates are separate.
+C07. RouteDiscoveryPort is indication-only. In test builds the production and manual discovery providers may both feed a consumer safely; this topology must not be generalised to request-bearing ports because provider ownership would be ambiguous.
+C08. Reliable delivery retains unacknowledged outbound work across route withdrawal and deduplicates submissions only by MessageId.
+C09. A diagnostic test confirmed that two otherwise equivalent submissions with different MessageId values are both retained concurrently. Internal timeout continuations must retain their operation identity; reliable delivery owns transport retries.
+C10. iddqd::BiHashMap atomically maintains unique semantic-target and operation-UUID indexes over one internal request record.
+C11. Kompact marks a component faulty after a recoverable handler error and invokes its configured recovery function. Its default recovery function only ignores the fault; useful recovery therefore requires an explicit production replacement function.
+C12. A fresh SummaryRequestManagerComponent reconstructs non-application state from membership and subsequent complete route snapshots. It intentionally does not replay route snapshots that predate recovery; a later route change or reachability refresh restores that view.
+C13. Outstanding application promises cannot be transferred and must fail with the faulted instance.
 
 Plan
 
-S01. Let the replication summary-request owner consume the same complete per-peer route snapshots already published to semantic delivery.
-S02. Track peer availability and trigger only on an empty-to-non-empty route transition. Replacing one usable route set with another must not create duplicate synchronisation work; a withdrawal followed by renewed availability must permit a new synchronisation.
-S03. For every locally hosted group shared with the available peer, submit an internal SummaryRequest through reliable delivery. Exclude groups that do not contain the peer and never target the local member.
-S04. Reuse the existing inbound Summary observation, NeedRange calculation, retrying catch-up manager, and UpdateBatch response path rather than creating a parallel reconciliation mechanism.
-S05. Track or deduplicate outstanding peer/group summary work so repeated route notifications and symmetric link establishment remain benign. Internal requests must not require an application promise, and replies must not be reported as unknown application correlations.
-S06. Keep the trigger independent of relay support. Direct route establishment is sufficient for this slice.
+P01. Keep RouteDiscoveryPort<TransportRouteKey> consumption in SummaryRequestManagerComponent and retain the TrieSet of peers whose latest complete direct-route snapshot is non-empty.
+P02. Keep the new TrieSet::remove operation and its focused structural tests.
+P03. Make GroupMemberships::groups_with_member a required query and implement it directly against every concrete snapshot storage, avoiding a boxed iterator layered over groups().
+P04. Remove the core-only membership test implementation. Test the production RuntimeGroupStateSnapshot directly and retain the route-claim and summary-manager scenarios that exercise the two established test implementations.
+P05. On an empty-to-non-empty peer-route transition, take one membership snapshot and directly iterate over locally hosted groups containing that peer. Ignore the local member and relay updates, with explanations for intentional no-op paths.
+P06. Keep one iddqd::BiHashMap record indexed uniquely by semantic group/peer target and operation UUID.
+P07. Generate one operation UUID for each new summary request and use it as both the wire correlation and wrapped reliable-delivery MessageId. Retain internal work across route withdrawal; after timeout, a later reconnect resubmits the same operation UUID.
+P08. Refactor retry lookup into direct success and missing branches. Update and explicitly release the mutable indexed-map guard before submission; on invariant loss, cancel the newly scheduled timer, return a recoverable handler error, and never submit untracked work.
+P09. Install a production recovery function for SummaryRequestManagerComponent. On recoverable fault, create a fresh manager with the same stable dependencies and settings, reconnect its reliable-delivery and discovery ports, publish the replacement actor reference to every consumer that addresses the manager, and start the replacement.
+P10. Keep application-facing promises and timeout behaviour separate from internal synchronisation state. Document and enforce how outstanding application requests are failed or abandoned when the faulted manager is replaced.
+P11. Keep both the production discovery connection and the test/test-support manual connection. Place the indication-only multiple-provider caveat directly above the conditional manual connection.
+P12. Replace the syntactically empty final route branch with an end-of-chain else comment explaining that an already-available peer creates no transition.
+P13. Preserve the corrected full-topology diagram, component documentation, and standing AGENTS.md rule for comments on intentionally empty control-flow branches.
+P14. Validate internal replies through the correlation index, then remove the matching owned record atomically without eagerly cloning the target.
+P15. Update topology ownership so recovery can replace the manager without leaving stale actor references or port connections. Keep the recovery factory and rewiring responsibility in the runtime host topology rather than embedding topology knowledge in the component.
+P16. Accept eventual route-state restoration after recovery. Do not add immediate snapshot replay to route establishment for this edge case.
+P17. Add concise module documentation to every touched Rust module identified by the instruction audit.
+P18. Replace the route-discovery test sidecar with a shared required-port reference and KompactSystem::trigger_i; retain the reliable-delivery tester used for request observation.
+P19. Keep SummaryRequestManagerInstance private because only the stable slot names it.
+P20. Verify that an outstanding application summary request fails as RuntimeUnavailable when recovery drops the faulted manager, then verify a later request succeeds through the replacement.
 
 Tests
 
-T01. Initial non-empty peer routes trigger one summary request for every shared hosted group.
-T02. Non-empty route replacement does not retrigger synchronisation.
-T03. Route withdrawal followed by renewed availability triggers synchronisation again.
-T04. Non-members and the local member are excluded.
-T05. An integration test demonstrates that an update missed while disconnected is repaired after route re-establishment without a later edit or an explicit application summary request.
+T01. Existing TrieSet tests cover successful removal, absent removal, and structural cleanup without affecting siblings.
+T02. A production RuntimeGroupStateSnapshot test covers groups_with_member filtering; the existing route-claim and summary-manager tests cover the established route and replication test implementations.
+T03. Component tests continue to cover initial route availability, filtering to shared hosted groups, non-empty replacement, relay updates, route flapping, completion, and identity-stable timeout retry.
+T04. The supervision test triggers the exact invariant failure through normal component dispatch, verifies the original becomes faulty, waits for the configured replacement to become active, and proves the replacement handles later work.
+T05. Topology-level coverage proves the replacement manager is connected to both production and test discovery inputs where applicable, to reliable delivery, and to actor consumers through the refreshed reference.
+T06. Keep the runtime reconnection integration test proving automatic repair without a later edit or application summary request.
+T07. Recovery coverage proves an outstanding application request fails with RuntimeUnavailable and a subsequent request succeeds.
+T08. Run formatting, focused serial tests, affected crate suites with one test thread, the project-specific Rust instruction audit, and pedantic Clippy for affected crates.
 
 Estimate
 
-Approximately 180-350 LOC including topology wiring and focused tests, below 1000 LOC."""
-status = "open"
+E01. The complete worktree is approximately 1500 changed lines across the original task and four review rounds.
+E02. The accepted round-four follow-up is approximately 80–140 changed lines.
+E03. The complete task exceeds 1000 changed lines, but recovery remains local to RuntimeLogicTopology, the stable summary-manager slot, and focused test support; no generic recovery infrastructure or child issue is needed.
+E04. Implementation and validation are complete; the task is ready for review."""
+status = "in-progress"
+status_reason = "in review"
 type = "task"
 priority = 2
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
 created_at = "2026-08-25T16:35:24.711927Z"
-updated_at = "2026-08-25T16:36:51.015332Z"
+updated_at = "2026-09-01T16:24:17.219019Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-610d188b70a0"
 label = "supersedes"
+
+[[comments]]
+id = "01a05365-2307-7490-932d-900bb5e10e68"
+author = "codex"
+body = "Implemented the agreed route-triggered synchronisation plan. SummaryRequestManagerComponent now consumes complete direct-route snapshots, tracks unavailable-to-available transitions, and submits internal per-group SummaryRequest messages for shared hosted groups. Production and manual route providers are wired into the manager; test route barriers include all three route consumers. Added component coverage for filtering and transition behaviour plus an integration test proving a disconnected update is repaired after reconnection without an application summary request. Formatting passes, all 357 flotsync_replication library tests pass serially, and all-target pedantic Clippy is clean."
+created_at = "2026-08-30T15:58:52.167028Z"
+
+[[comments]]
+id = "01a0536f-46d1-7cf1-a06e-5d85fc4d6eba"
+author = "codex"
+body = "Review delta W1O-R01 through W1O-R03 accepted. The plan now accounts for reliable delivery retaining withdrawn work: internal requests are tracked per group and peer, outstanding reconnects are suppressed, and timeout retries retain the same correlation and message identity. The review fix also removes the temporary group allocation and corrects topology and component documentation. Added focused coverage is planned for outstanding flaps, completion followed by reconnect, and identity-stable retry after timeout."
+created_at = "2026-08-30T16:09:56.689592Z"
+
+[[comments]]
+id = "01a05376-36af-7921-a224-a9c2d004f0fb"
+author = "codex"
+body = "Resolved review findings W1O-R01 through W1O-R03. Internal route-triggered summaries now retain per-group/peer state across withdrawal, suppress reconnect duplication while pending, and reuse correlation and reliable message identity when a timed-out operation becomes retryable. Matching replies clear the tracked operation. The manager now iterates hosted groups directly, and topology plus component documentation describe the direct discovery path and outstanding state. Four focused manager tests, the reconnection integration test, all 359 library tests, formatting, the Rust instruction audit, and all-target pedantic Clippy pass."
+created_at = "2026-08-30T16:17:31.311433Z"
+
+[[comments]]
+id = "01a05be7-5579-7d83-ad4a-6c805d0c69e2"
+author = "codex"
+body = "Review round 2 plan agreed. The delta restores both discovery providers with an indication-only safety note, adopts TrieSet and iddqd::BiHashMap, centralises membership queries, shares one UUID across summary correlation and reliable identity, treats retry-state invariant loss as recoverable, removes eager cloning, and documents intentional no-op branches. A temporary diagnostic confirmed that distinct MessageId values create concurrently retained reliable work; the diagnostic was removed after the run."
+created_at = "2026-09-01T07:38:02.489358Z"
+
+[[comments]]
+id = "01a05bf7-a969-7eb2-802a-356eacc2aac0"
+author = "codex"
+body = "Resolved review round 2 findings W1O-R04 through W1O-R13. Restored both discovery providers with the indication-only safety caveat; moved available peers to TrieSet; centralised group-membership queries; replaced dual maps with iddqd::BiHashMap; shared one UUID across summary correlation and reliable MessageId; made retry/completion invariant loss recoverable; removed eager cloning; and documented intentional no-op branches plus the standing AGENTS.md rule. Validation passed: 61 core, 360 replication, and 66 routes library tests serially; both focused discovery-provider tests; the route-reestablishment integration test; test-support feature check; formatting; all-target pedantic Clippy; and the Rust instruction audit."
+created_at = "2026-09-01T07:55:52.553175Z"
+
+[[comments]]
+id = "01a05c16-7f75-7ea3-ad09-39da8a5a908c"
+author = "codex"
+body = "Review round 3 plan aligned for W1O-R14 through W1O-R19. In addition to the membership, topology-comment, retry-control-flow, and test clean-ups, the production runtime must now install a real recovery function for SummaryRequestManagerComponent. Recovery will create fresh manager state, reconnect delivery and discovery ports, refresh actor consumers, and start the replacement; tests will exercise the actual recoverable dispatch and prove the replacement resumes route-triggered summary work. Implementation is intentionally deferred."
+created_at = "2026-09-01T08:29:33.429913Z"
+
+[[comments]]
+id = "01a05d85-f8ce-7f13-8aeb-6002a50c1ef4"
+author = "codex"
+body = "Implemented review round 3 (W1O-R14 through W1O-R19). The membership query now has direct concrete implementations and production-snapshot coverage; topology and control-flow comments are scoped as reviewed; retry mutation no longer uses an extra boolean; and recoverable summary-manager failures now replace the production component with fresh state, atomically update its actor/component slot, reconnect reliable delivery plus production/manual route discovery, and reinstall recovery recursively. The recovery integration test exercises two successive replacements, verifies both discovery providers, and completes an application summary request over reliable delivery. Validation passed: full serial flotsync_core (60), flotsync_routes (66), and flotsync_replication (361 plus integration/doc tests) suites; all-target pedantic Clippy for all affected crates; test-support check; rustfmt; and diff checks. The Rust instruction audit found no unresolved exceptions."
+created_at = "2026-09-01T15:10:56.206292Z"
+
+[[comments]]
+id = "01a05dc3-a4bd-7772-8e5f-d24e58403c57"
+author = "codex"
+body = "Review round 4 aligned. Immediate route-snapshot replay after summary-manager recovery is intentionally deferred: the accepted trade-off is eventual restoration on the next route change or reachability refresh. The agreed follow-up adds required module documentation, replaces the simple route-indication sidecar with KompactSystem::trigger_i, tests the outstanding application-request failure contract across recovery, and narrows the replacement-instance visibility."
+created_at = "2026-09-01T16:18:17.917977Z"
+
+[[comments]]
+id = "01a05dc9-2043-7432-926e-1794f631b17b"
+author = "codex"
+body = "Resolved accepted review round 4 items W1O-R21 through W1O-R24. Added module documentation to every touched Rust module identified by the audit, replaced the route-discovery sidecar with direct KompactSystem::trigger_i injection, made SummaryRequestManagerInstance private, and extended recovery coverage to prove an outstanding application request becomes RuntimeUnavailable before a later request succeeds through the replacement. W1O-R20 remains intentionally deferred: route state is restored on a later change or reachability refresh. Validation passed: focused recovery and manager tests, full serial core/routes/replication suites, rustfmt, diff checks, all-target pedantic Clippy, and the Rust instruction audit."
+created_at = "2026-09-01T16:24:17.219019Z"
