@@ -23,7 +23,7 @@ pub struct SnapshotRowsRequest {
 /// Projected row-value snapshot stream returned by [`ReplicationApi::snapshot_rows`].
 pub struct SnapshotValueRows {
     pub group_id: GroupId,
-    pub read_token: ReadToken,
+    pub read_token: GroupReadToken,
     pub rows: Box<SnapshotValueRowProvider>,
 }
 

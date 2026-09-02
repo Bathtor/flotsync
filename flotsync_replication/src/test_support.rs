@@ -6,10 +6,12 @@ use crate::{
     api::{
         ApplicationSchemas,
         DataChangeLineage,
+        DataChangeReadPosition,
         DatasetId,
         DatasetSchema,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupReadToken,
         GroupSchema,
         ListenerError,
         ListenerExternalSnafu,
@@ -22,7 +24,6 @@ use crate::{
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
-        ReadToken,
         ReplicationApi,
         ReplicationConfig,
         ReplicationEvent,
@@ -104,6 +105,19 @@ pub fn replication_group_snapshot(
 ) -> Arc<dyn ReplicationGroupSnapshot> {
     application_snapshot_from_records(local_member, ApplicationSchemas::EMPTY, records)
         .expect("test group records should pass production runtime projection")
+}
+
+/// Bind listener lineage to a group read token for an externally constructed test event.
+///
+/// # Panics
+///
+/// Panics if replacement lineage names a successor other than the token's group.
+#[must_use]
+pub fn data_change_read_position(
+    lineage: DataChangeLineage,
+    read_token: GroupReadToken,
+) -> DataChangeReadPosition {
+    DataChangeReadPosition::new(lineage, read_token)
 }
 
 /// Fixed membership snapshot used by delivery, codec, and runtime unit tests.
@@ -343,7 +357,7 @@ impl<T> Drop for SqliteStoreTestOwner<T> {
 /// within the test timeout.
 pub fn publish_changes(
     runtime: &dyn ReplicationApi,
-    read_token: ReadToken,
+    read_token: GroupReadToken,
     changes: Vec<RowMutation>,
 ) -> PublishReceipt {
     wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
@@ -363,7 +377,7 @@ pub fn snapshot_read_token(
     runtime: &dyn ReplicationApi,
     group_id: GroupId,
     dataset_id: DatasetId,
-) -> ReadToken {
+) -> GroupReadToken {
     let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
         group_id,
         datasets: HashSet::from([dataset_id]),
@@ -460,7 +474,7 @@ pub struct CapturedDataChange {
 pub struct TestEventListener {
     data_changes: Mutex<Vec<CapturedDataChange>>,
     data_change_lineages: Mutex<Vec<DataChangeLineage>>,
-    data_change_read_tokens: Mutex<Vec<ReadToken>>,
+    data_change_read_tokens: Mutex<Vec<GroupReadToken>>,
     buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
     buffered_event_tx: mpsc::Sender<CapturedDataChange>,
 }
@@ -555,7 +569,7 @@ impl TestEventListener {
     ///
     /// Panics if the listener state mutex is poisoned.
     #[must_use]
-    pub fn captured_data_change_read_tokens(&self) -> Vec<ReadToken> {
+    pub fn captured_data_change_read_tokens(&self) -> Vec<GroupReadToken> {
         self.drain_buffered_events();
         self.data_change_read_tokens
             .lock()
@@ -582,11 +596,9 @@ impl ReplicationEventListener for TestEventListener {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
         async move {
             match event {
-                ReplicationEvent::DataChanged {
-                    lineage,
-                    read_token,
-                    mut rows,
-                } => {
+                ReplicationEvent::DataChanged { position, mut rows } => {
+                    let lineage = position.lineage();
+                    let read_token = position.group_read_token().clone();
                     let mut captured_rows = Vec::new();
                     process_batches::<RowChangeBatch>(rows.as_mut(), |batch| {
                         for change in batch.drain(..) {

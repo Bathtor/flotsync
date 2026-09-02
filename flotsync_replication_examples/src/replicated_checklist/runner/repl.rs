@@ -127,10 +127,8 @@ pub struct ChecklistListener {
 
 /// One complete listener-delivered data event and its resulting read position.
 pub struct ChecklistListenerEvent {
-    /// Framework lineage needed to interpret predecessor metadata.
-    pub lineage: DataChangeLineage,
-    /// Read position to merge only after the complete event is applied.
-    pub read_token: ReadToken,
+    /// Lineage-bound position to apply only after the complete event is applied.
+    pub read_position: DataChangeReadPosition,
     /// Every row change collected from the event's provider pages.
     pub changes: Vec<RowChange>,
 }
@@ -187,8 +185,8 @@ pub enum ChecklistGroupSyncOutcome {
     Failed {
         /// Group whose publication failed.
         group_id: GroupId,
-        /// Concrete replication API failure returned for this group.
-        error: ApiError,
+        /// Failure obtaining the group read position or publishing its mutations.
+        error: ChecklistGroupSyncError,
     },
 }
 
@@ -198,6 +196,18 @@ impl ChecklistGroupSyncOutcome {
     pub const fn is_success(&self) -> bool {
         matches!(self, Self::Published { .. })
     }
+}
+
+/// Failure affecting one group while an all-group checklist sync continues.
+#[derive(Debug, Snafu)]
+#[snafu(module(group_sync_error))]
+pub enum ChecklistGroupSyncError {
+    /// The application working set lacks the group's current read position.
+    #[snafu(display("{source}"))]
+    WorkingSet { source: ChecklistWorkingSetError },
+    /// The replication runtime rejected or could not complete publication.
+    #[snafu(display("{source}"))]
+    Replication { source: ApiError },
 }
 
 /// Structured result of one all-group checklist synchronisation pass.
@@ -245,11 +255,7 @@ impl ReplicationEventListener for ChecklistListener {
         let event_sender = self.event_sender.clone();
         async move {
             match event {
-                ReplicationEvent::DataChanged {
-                    lineage,
-                    read_token,
-                    mut rows,
-                } => {
+                ReplicationEvent::DataChanged { position, mut rows } => {
                     let mut changes = Vec::new();
                     while let Some(batch) = rows.next_batch().await.boxed()? {
                         changes.extend(batch);
@@ -258,8 +264,7 @@ impl ReplicationEventListener for ChecklistListener {
                     // makes the new group usable by the application.
                     event_sender
                         .send(ChecklistListenerEvent {
-                            lineage,
-                            read_token,
+                            read_position: position,
                             changes,
                         })
                         .map_err(|_| ListenerError::Rejected {
@@ -683,27 +688,32 @@ impl ChecklistRepl {
                 .expect("dirty group must produce a non-empty sync plan");
             let mutation_count = plan.mutations.len();
             let changes = std::mem::take(&mut plan.mutations);
-            let read_token = self
+            let read_token_result = self
                 .session
                 .working_set
-                .read_token()
-                .context(repl_error::WorkingSetSnafu)?;
-            let publish_result = self
-                .replication
-                .publish_changes(PublishChangesRequest {
-                    read_token,
-                    changes,
-                })
-                .await;
+                .group_read_token(&group_id)
+                .context(group_sync_error::WorkingSetSnafu);
+            let publish_result = match read_token_result {
+                Ok(read_token) => self
+                    .replication
+                    .publish_changes(PublishChangesRequest {
+                        read_token,
+                        changes,
+                    })
+                    .await
+                    .context(group_sync_error::ReplicationSnafu),
+                Err(error) => Err(error),
+            };
             match publish_result {
                 Ok(receipt) => {
                     // The working set already reflects this local write, but its read token
                     // does not until we retain the receipt or receive the listener echo.
                     // Retain the receipt immediately so a completed sync cannot leave the
-                    // token behind the local state. Carrying it into later requests merely
-                    // accumulates independent group positions; it creates no cross-group
-                    // causal dependency.
-                    self.session.working_set.set_read_token(receipt.read_token);
+                    // token behind the local state. The application aggregate merges this
+                    // group's new position without creating a cross-group causal dependency.
+                    self.session
+                        .working_set
+                        .merge_read_token(receipt.read_token);
                     self.session
                         .working_set
                         .finish_successful_group_sync(Some(plan));
@@ -821,16 +831,17 @@ impl ChecklistRepl {
         let groups = self.group_state()?;
         let mut report = ChecklistListenerDrainReport::default();
         while let Some(event) = self.receive_listener_event()? {
-            ChecklistSession::validate_listener_changes(
-                groups.as_ref(),
-                event.lineage,
-                &event.changes,
-            )?;
-            match event.lineage {
+            let ChecklistListenerEvent {
+                read_position,
+                changes,
+            } = event;
+            let lineage = read_position.lineage();
+            ChecklistSession::validate_listener_changes(groups.as_ref(), lineage, &changes)?;
+            match lineage {
                 DataChangeLineage::Update => {
                     self.session
                         .working_set
-                        .enqueue_row_changes(event.changes)
+                        .enqueue_row_changes(changes)
                         .context(repl_error::WorkingSetSnafu)?;
                     report.applied_event_count += self.session.working_set.drain_queued_events();
                 }
@@ -838,7 +849,7 @@ impl ChecklistRepl {
                     let mut plan = self
                         .session
                         .working_set
-                        .prepare_group_replacement(migration_id, event.changes)
+                        .prepare_group_replacement(migration_id, changes)
                         .context(repl_error::WorkingSetSnafu)?;
                     Self::resolve_group_replacement(dialog, &mut plan)?;
                     let outcome = plan.commit(&mut self.session.working_set);
@@ -851,7 +862,9 @@ impl ChecklistRepl {
                     }
                 }
             }
-            self.session.working_set.merge_read_token(event.read_token);
+            self.session
+                .working_set
+                .apply_data_change_read_position(&read_position);
             report.event_count += 1;
         }
         Ok(report)
@@ -1421,7 +1434,7 @@ mod tests {
         RowMutation,
         RowValues,
         providers::VecRowProvider,
-        test_support::{publish_changes, snapshot_read_token},
+        test_support::{data_change_read_position, publish_changes, snapshot_read_token},
     };
     use flotsync_security::{LocalStoreSecretError, install_local_store_secret_test_store};
     use futures_util::{
@@ -1564,13 +1577,15 @@ mod tests {
         let read_token =
             snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
         block_on(listener.on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::GroupReplacement {
-                migration_id: MigrationId {
-                    old_group_id,
-                    new_group_id,
+            position: data_change_read_position(
+                DataChangeLineage::GroupReplacement {
+                    migration_id: MigrationId {
+                        old_group_id,
+                        new_group_id,
+                    },
                 },
-            },
-            read_token,
+                read_token,
+            ),
             rows: Box::new(VecRowProvider::new(vec![replacement_collision_change(
                 new_group_id,
                 row_key,
@@ -1614,7 +1629,7 @@ mod tests {
         );
         assert!(matches!(
             repl.session.working_set.read_token(),
-            Err(ChecklistWorkingSetError::MissingReadToken)
+            Err(ChecklistWorkingSetError::MissingApplicationReadToken)
         ));
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");
@@ -1631,13 +1646,15 @@ mod tests {
         let read_token =
             snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
         block_on(listener.on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::GroupReplacement {
-                migration_id: MigrationId {
-                    old_group_id,
-                    new_group_id,
+            position: data_change_read_position(
+                DataChangeLineage::GroupReplacement {
+                    migration_id: MigrationId {
+                        old_group_id,
+                        new_group_id,
+                    },
                 },
-            },
-            read_token: read_token.clone(),
+                read_token.clone(),
+            ),
             rows: Box::new(VecRowProvider::new(vec![replacement_collision_change(
                 new_group_id,
                 row_key,
@@ -1670,7 +1687,7 @@ mod tests {
                 .working_set
                 .read_token()
                 .expect("committed replacement should merge its read token"),
-            read_token
+            read_token.into()
         );
         let output = String::from_utf8(output).expect("dialog output should be UTF-8");
         assert!(output.contains("1 reconciliation change(s) were retained"));
@@ -1926,8 +1943,7 @@ mod tests {
         let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
 
         block_on(listener.on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::Update,
-            read_token: read_token.clone(),
+            position: data_change_read_position(DataChangeLineage::Update, read_token.clone()),
             rows: Box::new(VecRowProvider::new(Vec::new())),
         }))
         .expect("empty data event should reach the listener");
@@ -1936,7 +1952,7 @@ mod tests {
             .events
             .try_recv()
             .expect("empty event should retain one token-only event");
-        assert_eq!(event.read_token, read_token);
+        assert_eq!(event.read_position.group_read_token(), &read_token);
         assert!(event.changes.is_empty());
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");
@@ -1965,8 +1981,7 @@ mod tests {
             .collect();
 
         block_on(listener.on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::Update,
-            read_token: read_token.clone(),
+            position: data_change_read_position(DataChangeLineage::Update, read_token.clone()),
             rows: Box::new(PagedRowProvider { pages }),
         }))
         .expect("paged data event should reach the listener");
@@ -1975,8 +1990,8 @@ mod tests {
             .events
             .try_recv()
             .expect("all pages should produce one listener event");
-        assert_eq!(event.lineage, DataChangeLineage::Update);
-        assert_eq!(event.read_token, read_token);
+        assert_eq!(event.read_position.lineage(), DataChangeLineage::Update);
+        assert_eq!(event.read_position.group_read_token(), &read_token);
         assert_eq!(
             event
                 .changes
@@ -2015,9 +2030,11 @@ mod tests {
                 row: ChecklistItem::new("first snapshot").to_row_values_patch(),
             }],
         );
+        let second_token =
+            snapshot_read_token(runtime.as_ref(), second_group, checklist_dataset_id());
         publish_changes(
             runtime.as_ref(),
-            first_receipt.read_token,
+            second_token,
             vec![RowMutation::Upsert {
                 row_id: RowId {
                     group_id: second_group,
@@ -2027,6 +2044,7 @@ mod tests {
                 row: ChecklistItem::new("second snapshot").to_row_values_patch(),
             }],
         );
+        assert_eq!(first_receipt.read_token.group_id(), first_group);
 
         let mut working_set = ChecklistWorkingSet::new();
         block_on(load_group_snapshot(
@@ -2063,7 +2081,7 @@ mod tests {
                     .read_token()
                     .expect("workspace token should load")
             ),
-            "ReadToken { group_count: 2, .. }"
+            "ApplicationReadToken { group_count: 2, .. }"
         );
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");
@@ -2079,13 +2097,15 @@ mod tests {
             load_test_runtime_with_groups(&member, [new_group]);
         let read_token = snapshot_read_token(runtime.as_ref(), new_group, checklist_dataset_id());
         block_on(listener.on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::GroupReplacement {
-                migration_id: MigrationId {
-                    old_group_id: old_group,
-                    new_group_id: new_group,
+            position: data_change_read_position(
+                DataChangeLineage::GroupReplacement {
+                    migration_id: MigrationId {
+                        old_group_id: old_group,
+                        new_group_id: new_group,
+                    },
                 },
-            },
-            read_token,
+                read_token,
+            ),
             rows: Box::new(VecRowProvider::new(Vec::new())),
         }))
         .expect("replacement should reach the listener before sync");
@@ -2478,13 +2498,19 @@ mod tests {
             [
                 ChecklistGroupSyncOutcome::Failed {
                     group_id: actual_unknown,
-                    error: ApiError::ApiExternal { .. },
+                    error: ChecklistGroupSyncError::WorkingSet {
+                        source: ChecklistWorkingSetError::MissingGroupReadToken {
+                            group_id: missing_group,
+                        },
+                    },
                 },
                 ChecklistGroupSyncOutcome::Published {
                     group_id: actual_known,
                     mutation_count: 1,
                 },
-            ] if *actual_unknown == unknown_group && *actual_known == known_group
+            ] if *actual_unknown == unknown_group
+                && *missing_group == unknown_group
+                && *actual_known == known_group
         ));
         assert!(report.listener_drain_deferred);
         assert_eq!(report.listener_event_count, 0);
@@ -2498,7 +2524,9 @@ mod tests {
         let failed_report = ChecklistSyncReport {
             group_outcomes: vec![ChecklistGroupSyncOutcome::Failed {
                 group_id: known_group,
-                error: ApiError::RuntimeUnavailable,
+                error: ChecklistGroupSyncError::Replication {
+                    source: ApiError::RuntimeUnavailable,
+                },
             }],
             listener_drain_deferred: true,
             listener_event_count: 0,

@@ -19,7 +19,7 @@ use flotsync_replication::{
     RowKey,
     SnapshotRef,
     security::{KnownMemberKeyReport, KnownMemberReport, MemberKeyTrustReport},
-    test_support::{replication_group_snapshot, snapshot_read_token},
+    test_support::{data_change_read_position, replication_group_snapshot, snapshot_read_token},
 };
 use indoc::indoc;
 use std::{io::Cursor, sync::Mutex};
@@ -399,9 +399,8 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
         respond: Box::new(RecordingInvitationResponder {
             decisions: decisions.clone(),
             accepted_event: Some(AcceptedListenerEvent {
-                lineage: DataChangeLineage::Update,
+                read_position: data_change_read_position(DataChangeLineage::Update, read_token),
                 listener: listener.clone(),
-                read_token,
                 changes: vec![RowChange {
                     previous: PreviousRow::NotCompared,
                     change: RowChangeKind::Upsert {
@@ -477,9 +476,11 @@ fn migration_invitation_acceptance_applies_the_delivered_replacement_before_retu
         respond: Box::new(RecordingInvitationResponder {
             decisions: decisions.clone(),
             accepted_event: Some(AcceptedListenerEvent {
-                lineage: DataChangeLineage::GroupReplacement { migration_id },
+                read_position: data_change_read_position(
+                    DataChangeLineage::GroupReplacement { migration_id },
+                    read_token,
+                ),
                 listener: listener.clone(),
-                read_token,
                 changes: vec![RowChange {
                     previous: PreviousRow::Unavailable,
                     change: RowChangeKind::Upsert {
@@ -593,7 +594,7 @@ fn created_group_is_visible_to_the_runtime_registry_and_listener() {
         .expect("created group should deliver its read position through the listener");
     assert!(listener_event.changes.is_empty());
     let mut working_set = ChecklistWorkingSet::new();
-    working_set.merge_read_token(listener_event.read_token);
+    working_set.apply_data_change_read_position(&listener_event.read_position);
     assert!(working_set.listed_items().is_empty());
     assert!(working_set.read_token().is_ok());
 

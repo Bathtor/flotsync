@@ -181,6 +181,18 @@ where
         }
     }
 
+    /// Remove and return the value stored for `key`, when present.
+    pub fn remove(&mut self, key: &O::LookupKey) -> Option<V> {
+        let removal = self
+            .entries
+            .binary_search_by(|(candidate, _)| O::compare(candidate.borrow(), key));
+        if let Ok(index) = removal {
+            Some(self.entries.remove(index).1)
+        } else {
+            None
+        }
+    }
+
     /// Compare two owned keys through their borrowed lookup representation.
     fn compare_keys(left: &K, right: &K) -> Ordering {
         O::compare(left.borrow(), right.borrow())
@@ -318,6 +330,26 @@ mod tests {
             vec![(10, "ten"), (20, "TWENTY"), (30, "THIRTY")]
         );
         assert_eq!(map.get_mut(&40), None);
+    }
+
+    #[test]
+    fn remove_returns_the_value_and_preserves_sorted_order() {
+        let mut map = SortedArrayMap::<&'static str, u32, LengthThenLexical>::try_from_entries([
+            ("long", 4),
+            ("b", 2),
+            ("aa", 3),
+            ("a", 1),
+        ])
+        .expect("unique strings should build");
+
+        assert_eq!(map.remove("aa"), Some(3));
+        assert_eq!(map.remove("missing"), None);
+        assert_eq!(
+            map.iter()
+                .map(|(key, value)| (*key, *value))
+                .collect::<Vec<_>>(),
+            vec![("a", 1), ("b", 2), ("long", 4)]
+        );
     }
 
     #[test]

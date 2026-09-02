@@ -291,7 +291,7 @@ impl Default for ChangeGroupMembershipRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishReceipt {
     pub update_id: UpdateId,
-    pub read_token: ReadToken,
+    pub read_token: GroupReadToken,
 }
 
 /// Source that explains why a group invitation was received.
@@ -765,19 +765,19 @@ pub enum ReplicationEvent {
     ///
     /// [`DataChangeLineage::GroupReplacement`] represents one atomic old-to-new
     /// application-view transition across the complete row provider. Applications
-    /// should consume and record every row before merging `read_token`; dropping
-    /// the provider abandons the remainder of that transition.
+    /// must apply complete `DataChanged` transitions in listener delivery order:
+    /// consume and record every row, then pass `position` to
+    /// [`ApplicationReadToken::apply_data_change`]. The runtime awaits each
+    /// listener callback and does not emit the next transition until the current
+    /// callback completes. Dropping the provider abandons the remainder of that
+    /// transition.
+    ///
+    /// Only independent group positions obtained from snapshots, publish
+    /// receipts, or other compatible group-local progress may be merged out of
+    /// listener order with [`ApplicationReadToken::merge_applied`].
     DataChanged {
-        /// Context required to interpret row-level predecessor metadata.
-        lineage: DataChangeLineage,
-        /// Read position reached by the row changes in this event.
-        ///
-        /// Applications that keep local mutable state should merge this into
-        /// their stored [`ReadToken`] after applying all rows from the event.
-        /// This avoids replacing newer local publish progress with an older
-        /// listener token when local and inbound events are consumed out of
-        /// order.
-        read_token: ReadToken,
+        /// Lineage-bound read position reached by this complete transition.
+        position: DataChangeReadPosition,
         /// Batched row operations which comprise this event.
         rows: Box<RowProvider>,
     },
@@ -956,7 +956,7 @@ pub trait ReplicationApi: Send + Sync {
         request: security::RecordPublicKeyBundleFeedbackRequest,
     ) -> BoxFuture<'_, Result<(), ApiError>>;
 
-    /// Publish one local set of row mutations from a known read token.
+    /// Publish one local set of row mutations from a known group read token.
     ///
     /// The request token is the read position of the application state used to
     /// decide the mutation list. Mutations are interpreted as sparse field
@@ -1019,9 +1019,9 @@ pub trait ReplicationApi: Send + Sync {
     /// dataset contents through ordinary [`Self::publish_changes`] updates.
     /// Before returning successfully, the runtime delivers an empty
     /// [`ReplicationEvent::DataChanged`] event containing the new group's read
-    /// position through [`ReplicationEventListener`]. Applications should merge
-    /// that event into their stored [`ReadToken`] before publishing the first
-    /// dataset changes for the group.
+    /// position through [`ReplicationEventListener`]. Applications should apply
+    /// that event's bound position to their stored [`ApplicationReadToken`]
+    /// before publishing the first dataset changes for the group.
     /// Locally supplied names are trimmed and rejected if the result is empty;
     /// invitation messages are carried verbatim, may be empty, and are discarded after
     /// activation.

@@ -503,8 +503,13 @@ pub(crate) enum PublishChangesError {
     UnknownGroup { group_id: GroupId },
     #[snafu(display("Group {group_id} no longer accepts local updates."))]
     GroupNotWritable { group_id: GroupId },
-    #[snafu(display("Read token does not contain group {group_id}."))]
-    ReadTokenMissingGroup { group_id: GroupId },
+    #[snafu(display(
+        "Read token targets group {read_token_group_id}, but the published rows target group {group_id}."
+    ))]
+    ReadTokenGroupMismatch {
+        group_id: GroupId,
+        read_token_group_id: GroupId,
+    },
     #[snafu(display(
         "Read token for group {group_id} has {read_token_member_count} members, but the persisted group has {persisted_member_count} members.",
     ))]
@@ -579,7 +584,7 @@ impl StoreErrorClassificationSource for PublishChangesError {
             | Self::MixedGroups { .. }
             | Self::UnknownGroup { .. }
             | Self::GroupNotWritable { .. }
-            | Self::ReadTokenMissingGroup { .. }
+            | Self::ReadTokenGroupMismatch { .. }
             | Self::ReadTokenMemberCountMismatch { .. }
             | Self::ReadTokenAheadOfLocalState { .. }
             | Self::Replay { .. }

@@ -25,8 +25,10 @@ use flotsync_data_types::{
     schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
 use flotsync_replication::{
+    ApplicationReadToken,
+    DataChangeReadPosition,
     DatasetId,
-    ReadToken,
+    GroupReadToken,
     RowChange,
     RowChangeKind,
     RowId,
@@ -849,8 +851,12 @@ pub enum ChecklistWorkingSetError {
         "Group replacement successor item {item_id:?} already has unsynchronised local state."
     ))]
     DirtyReplacementSuccessor { item_id: ChecklistItemId },
-    #[snafu(display("Checklist working set does not have a replication read token."))]
-    MissingReadToken,
+    #[snafu(display("Checklist working set does not have an application read token."))]
+    MissingApplicationReadToken,
+    #[snafu(display(
+        "Checklist working set does not have a replication read token for group {group_id}."
+    ))]
+    MissingGroupReadToken { group_id: GroupId },
 }
 
 /// In-memory REPL view of checklist rows between explicit `sync` commands.
@@ -866,7 +872,7 @@ pub struct ChecklistWorkingSet {
     dirty_rows: HashMap<ChecklistItemId, DirtyRowKind>,
     queued_events: VecDeque<ChecklistEvent>,
     event_history: Vec<ChecklistEvent>,
-    read_token: Option<ReadToken>,
+    read_token: Option<ApplicationReadToken>,
 }
 
 impl ChecklistWorkingSet {
@@ -964,21 +970,53 @@ impl ChecklistWorkingSet {
     /// # Errors
     ///
     /// See `ChecklistWorkingSetError` for failure conditions.
-    pub fn read_token(&self) -> Result<ReadToken, ChecklistWorkingSetError> {
+    pub fn read_token(&self) -> Result<ApplicationReadToken, ChecklistWorkingSetError> {
         self.read_token
             .clone()
-            .ok_or(ChecklistWorkingSetError::MissingReadToken)
+            .ok_or(ChecklistWorkingSetError::MissingApplicationReadToken)
     }
 
-    pub fn set_read_token(&mut self, read_token: ReadToken) {
+    pub fn set_read_token(&mut self, read_token: ApplicationReadToken) {
         self.read_token = Some(read_token);
     }
 
-    pub fn merge_read_token(&mut self, read_token: ReadToken) {
+    /// Return the position used to publish changes to `group_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChecklistWorkingSetError::MissingApplicationReadToken`] if no
+    /// application position has been ingested, or
+    /// [`ChecklistWorkingSetError::MissingGroupReadToken`] if that position
+    /// does not contain the requested group.
+    pub fn group_read_token(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<GroupReadToken, ChecklistWorkingSetError> {
+        let read_token = self
+            .read_token
+            .as_ref()
+            .ok_or(ChecklistWorkingSetError::MissingApplicationReadToken)?;
+        read_token.group_read_token(group_id).ok_or(
+            ChecklistWorkingSetError::MissingGroupReadToken {
+                group_id: *group_id,
+            },
+        )
+    }
+
+    pub fn merge_read_token(&mut self, read_token: GroupReadToken) {
         if let Some(existing_token) = &mut self.read_token {
             existing_token.merge_applied(&read_token);
         } else {
-            self.read_token = Some(read_token);
+            self.read_token = Some(read_token.into());
+        }
+    }
+
+    /// Apply the position change represented by one completely ingested listener event.
+    pub fn apply_data_change_read_position(&mut self, position: &DataChangeReadPosition) {
+        if let Some(existing_token) = &mut self.read_token {
+            existing_token.apply_data_change(position);
+        } else {
+            self.read_token = Some(position.group_read_token().clone().into());
         }
     }
 
@@ -2179,7 +2217,7 @@ mod tests {
         assert!(checklist.item(clean_item_id).is_none());
         assert!(matches!(
             checklist.read_token(),
-            Err(ChecklistWorkingSetError::MissingReadToken)
+            Err(ChecklistWorkingSetError::MissingApplicationReadToken)
         ));
         assert_eq!(
             checklist.item(item_id).expect("row should exist").text,

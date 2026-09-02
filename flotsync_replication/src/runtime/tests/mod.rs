@@ -55,6 +55,7 @@ use crate::{
         GroupInvitationSource,
         GroupMemberKeys,
         GroupNameUpdate,
+        GroupReadToken,
         GroupSchema,
         InMemoryStateRowView,
         InitialDatasetValueRows,
@@ -85,7 +86,6 @@ use crate::{
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
-        ReadToken,
         RejectionReason,
         ReplicationApi,
         ReplicationConfig,
@@ -1189,7 +1189,7 @@ struct ListenerStubState {
     data_changes: Vec<CapturedDataChange>,
     data_change_batch_sizes: Vec<Vec<usize>>,
     data_change_lineages: Vec<DataChangeLineage>,
-    data_change_read_tokens: Vec<ReadToken>,
+    data_change_read_tokens: Vec<GroupReadToken>,
     pending_group_events: Vec<CapturedPendingGroupEvent>,
     migration_proposal_event_sizes: Vec<usize>,
     reject_pending_group_events: bool,
@@ -1258,7 +1258,7 @@ impl ListenerStub {
             .clone()
     }
 
-    fn captured_data_change_read_tokens(&self) -> Vec<ReadToken> {
+    fn captured_data_change_read_tokens(&self) -> Vec<GroupReadToken> {
         self.drain_buffered_events();
         self.state
             .lock()
@@ -1337,11 +1337,9 @@ impl ReplicationEventListener for ListenerStub {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
         async move {
             match event {
-                ReplicationEvent::DataChanged {
-                    lineage,
-                    read_token,
-                    mut rows,
-                } => {
+                ReplicationEvent::DataChanged { position, mut rows } => {
+                    let lineage = position.lineage();
+                    let read_token = position.group_read_token().clone();
                     let mut captured_rows = Vec::new();
                     let mut batch_sizes = Vec::new();
                     process_batches::<RowChangeBatch>(rows.as_mut(), |batch| {

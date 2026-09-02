@@ -50,6 +50,56 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
 }
 
 #[test]
+fn publish_changes_rejects_a_read_token_for_another_group() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        &TITLE_APPLICATION_SCHEMAS,
+    );
+    let first_group = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("first group creation should succeed");
+    let second_group = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("second group creation should succeed");
+    let first_token =
+        snapshot_read_token(fixture.runtime.as_ref(), first_group, dataset_id.clone());
+
+    let error = wait_for_test_reply(fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: first_token,
+        changes: vec![RowMutation::Upsert {
+            row_id: test_row_id(second_group, dataset_id, 35_001),
+            row: crate::row_values! {
+                "title" => "wrong token",
+            },
+        }],
+    }))
+    .expect_err("a group token must not authorise publication to another group");
+
+    match error {
+        ApiError::ApiExternal { source } => match source.downcast_ref::<PublishChangesError>() {
+            Some(PublishChangesError::ReadTokenGroupMismatch {
+                group_id,
+                read_token_group_id,
+            }) => {
+                assert_eq!(*group_id, second_group);
+                assert_eq!(*read_token_group_id, first_group);
+            }
+            other => panic!("unexpected publish error source: {other:?}"),
+        },
+        error => panic!("unexpected API error: {error:?}"),
+    }
+}
+
+#[test]
 fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_id() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -356,12 +406,8 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
         .last()
         .cloned()
         .expect("migration listener event should carry a read token");
-    assert!(migration_read_token.group_version(&old_group_id).is_none());
-    assert!(
-        migration_read_token
-            .group_version(&migration_id.new_group_id)
-            .is_some()
-    );
+    assert_eq!(migration_read_token.group_id(), migration_id.new_group_id);
+    assert_eq!(migration_read_token.version(), &new_group.version_vector);
     assert!(
         wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
             group_id: old_group_id,
@@ -499,7 +545,8 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
         include_tombstones: false,
     }))
     .expect("read-only group should remain snapshot-readable");
-    assert!(snapshot.read_token.group_version(&group_id).is_none());
+    assert_eq!(snapshot.read_token.group_id(), group_id);
+    assert_eq!(snapshot.read_token.version(), &versions);
     drop(snapshot);
     wait_for_test_reply(runtime.request_summary(SummaryRequest {
         group_id,
@@ -508,7 +555,7 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
     .expect("read-only group should permit application summaries");
     assert!(
         wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
-            read_token: ReadToken::from_group_versions(HashMap::from([(group_id, versions)])),
+            read_token: GroupReadToken::from_group_version(group_id, versions),
             changes: vec![RowMutation::Upsert {
                 row_id: test_row_id(group_id, dataset_id, 50_603),
                 row: crate::row_values! { "title" => "rejected" },
@@ -755,7 +802,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
     let row_id = test_row_id(group_id, dataset_id, 40_102);
-    let read_token = ReadToken::from_group_versions(HashMap::from([(group_id, version_vector)]));
+    let read_token = GroupReadToken::from_group_version(group_id, version_vector);
 
     let error = wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
         read_token,

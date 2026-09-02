@@ -51,10 +51,13 @@ old-to-new application-view transition. The row provider may return multiple
 batches, but all batches belong to that one transition. An empty transition is
 still emitted.
 
-Applications should consume and record the complete provider before merging
-the event's `ReadToken`. Dropping the provider abandons the remaining portion
-of the transition. The token describes the active successor view after the
-activation commit; it does not preserve the predecessor as an active group.
+Applications should consume and record the complete provider before passing the
+event's bound `DataChangeReadPosition` to
+`ApplicationReadToken::apply_data_change`. Listener transitions must be applied
+in delivery order. Dropping the provider abandons the remaining portion of the
+transition. The bound group token describes the active successor view after the
+activation commit; applying the position retires the predecessor position and
+advances the successor.
 
 ## Row Operations
 

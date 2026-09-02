@@ -581,11 +581,14 @@ fn migrated_group_updates_follow_read_only_and_closed_application_visibility() {
         .apply_update_for_test(alice_member.clone(), read_only_update)
         .expect("in-cut update should apply");
     fixture.listener.wait_for_data_change_count(1);
-    assert!(
-        fixture.listener.captured_data_change_read_tokens()[0]
-            .group_version(&group_id)
-            .is_none()
-    );
+    let read_token = &fixture.listener.captured_data_change_read_tokens()[0];
+    let expected_read_versions =
+        VersionVector::initial(member_count).with_update_applied(UpdateId {
+            version: 1,
+            node_index: 0,
+        });
+    assert_eq!(read_token.group_id(), group_id);
+    assert_eq!(read_token.version(), &expected_read_versions);
 
     persist_group_lifecycle(
         fixture.store.as_ref(),
@@ -811,7 +814,7 @@ fn update_batch_failure_after_first_update_keeps_first_notifications() {
 }
 
 #[test]
-fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
+fn inbound_listener_read_token_is_scoped_to_the_updated_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
@@ -884,16 +887,8 @@ fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
         .expect("inbound event should have a read token");
     let mut expected_inbound_versions = VersionVector::initial(member_count);
     expected_inbound_versions.increment_at(0);
-    let mut expected_unrelated_versions = VersionVector::initial(member_count);
-    expected_unrelated_versions.increment_at(1);
-    assert_eq!(
-        inbound_read_token.group_version(&inbound_group_id),
-        Some(&expected_inbound_versions)
-    );
-    assert_eq!(
-        inbound_read_token.group_version(&unrelated_group_id),
-        Some(&expected_unrelated_versions)
-    );
+    assert_eq!(inbound_read_token.group_id(), inbound_group_id);
+    assert_eq!(inbound_read_token.version(), &expected_inbound_versions);
 }
 
 #[test]

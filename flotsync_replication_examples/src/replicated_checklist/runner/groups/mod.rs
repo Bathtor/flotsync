@@ -874,12 +874,10 @@ pub mod test_support {
 
     /// Listener event delivered before a successful test acceptance returns.
     pub struct AcceptedListenerEvent {
-        /// Lineage carried by the accepted activation event.
-        pub lineage: DataChangeLineage,
+        /// Lineage-bound position carried by the accepted activation event.
+        pub read_position: DataChangeReadPosition,
         /// Listener receiving the activation event before acceptance completes.
         pub listener: Arc<ChecklistListener>,
-        /// Read position carried by the activation event.
-        pub read_token: ReadToken,
         /// Complete activation changes carried by the test event.
         pub changes: Vec<RowChange>,
     }
@@ -893,8 +891,7 @@ pub mod test_support {
                     event
                         .listener
                         .on_event(ReplicationEvent::DataChanged {
-                            lineage: event.lineage,
-                            read_token: event.read_token,
+                            position: event.read_position,
                             rows: Box::new(VecRowProvider::new(event.changes)),
                         })
                         .await

@@ -1005,7 +1005,7 @@ pub(super) fn snapshot_read_token(
     runtime: &dyn ReplicationApi,
     group_id: GroupId,
     dataset_id: DatasetId,
-) -> ReadToken {
+) -> GroupReadToken {
     let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
         group_id,
         datasets: HashSet::from([dataset_id]),
@@ -1022,7 +1022,7 @@ pub(super) fn snapshot_read_token(
 
 pub(super) fn publish_changes(
     runtime: &dyn ReplicationApi,
-    read_token: ReadToken,
+    read_token: GroupReadToken,
     changes: Vec<RowMutation>,
 ) -> PublishReceipt {
     wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {

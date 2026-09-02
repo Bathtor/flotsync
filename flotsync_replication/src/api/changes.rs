@@ -1,14 +1,16 @@
 //! Change publication requests and provider contracts.
 
 use super::*;
-use crate::codecs::ReadTokenProtoCodec;
+use crate::codecs::{ApplicationReadTokenProtoCodec, GroupReadTokenProtoCodec};
 use base64::engine::general_purpose::STANDARD;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use flotsync_core::SortedArrayMap;
 use flotsync_messages::proto::{DecodeProto, EncodeProto};
 
-/// Outer format discriminator for a protobuf read-token payload.
-const READ_TOKEN_PROTOBUF_FORMAT_V1: u8 = 1;
+/// Format discriminator for an application-token protobuf payload.
+pub(super) const APPLICATION_READ_TOKEN_PROTOBUF_FORMAT_V1: u8 = 1;
+/// Format discriminator for a group-token protobuf payload.
+pub(super) const GROUP_READ_TOKEN_PROTOBUF_FORMAT_V1: u8 = 2;
 
 /// Write-only row payload submitted by applications.
 ///
@@ -46,19 +48,152 @@ impl RowMutation {
     }
 }
 
-/// Opaque read-position token returned by the replication runtime.
+/// Opaque read position for one replication group.
 ///
-/// Applications should store this value alongside their application
-/// state and pass it back to [`ReplicationApi::publish_changes`] and other APIs.
+/// Applications receive this token with group-local rows, listener events, and
+/// publish receipts. The group identity is visible so applications can organise
+/// state by group, while the remainder of the position stays private.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ReadToken {
-    // Developer note: the token intentionally hides its group-scoped version
-    // vectors from applications. Runtime internals remain responsible for
-    // validating group compatibility and advancing the right producer position.
-    versions: Arc<ReadTokenVersions>,
+pub struct GroupReadToken {
+    /// Application-visible group whose private replication position is represented.
+    group_id: GroupId,
+    /// Shared because tokens are routinely cloned into listener events and receipts.
+    version: Arc<VersionVector>,
 }
 
-impl ReadToken {
+impl GroupReadToken {
+    pub(crate) fn from_group_version(group_id: GroupId, version: VersionVector) -> Self {
+        Self {
+            group_id,
+            version: Arc::new(version),
+        }
+    }
+
+    /// Return the group whose read position this token represents.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    /// Encode this token as canonical opaque bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Bytes {
+        let mut output = BytesMut::with_capacity(65);
+        output.put_u8(GROUP_READ_TOKEN_PROTOBUF_FORMAT_V1);
+        GroupReadTokenProtoCodec::new(self.group_id, self.version.as_ref())
+            .encode_proto_into(&mut output);
+        output.freeze()
+    }
+
+    /// Decode an opaque group token previously returned by the replication runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadTokenDecodeError`] when `input` is not a structurally valid
+    /// single-group read-token encoding supported by this runtime.
+    pub fn from_bytes(input: &[u8]) -> Result<Self, ReadTokenDecodeError> {
+        let (group_id, version) = decode_group_read_token(input)
+            .boxed()
+            .context(ReadTokenDecodeSnafu)?;
+        Ok(Self::from_group_version(group_id, version))
+    }
+
+    pub(crate) fn version(&self) -> &VersionVector {
+        self.version.as_ref()
+    }
+
+    pub(crate) fn with_update_applied(&self, update_id: UpdateId) -> Self {
+        Self::from_group_version(
+            self.group_id,
+            self.version.as_ref().with_update_applied(update_id),
+        )
+    }
+}
+
+impl std::fmt::Debug for GroupReadToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let alternate = f.alternate();
+        let mut debug = f.debug_struct("GroupReadToken");
+        debug.field("group_id", &self.group_id);
+        if alternate {
+            debug.field("version", &self.version);
+            debug.finish()
+        } else {
+            debug.finish_non_exhaustive()
+        }
+    }
+}
+
+impl std::fmt::Display for GroupReadToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&STANDARD.encode(self.to_bytes()))
+    }
+}
+
+impl FromStr for GroupReadToken {
+    type Err = ParseReadTokenError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let bytes = STANDARD.decode(input).context(InvalidBase64Snafu)?;
+        ensure!(STANDARD.encode(&bytes) == input, NonCanonicalSnafu);
+        Self::from_bytes(&bytes).context(InvalidTokenSnafu)
+    }
+}
+
+/// Bound listener position for one complete data-change transition.
+///
+/// Applications apply the event's rows first and then pass this position to
+/// [`ApplicationReadToken::apply_data_change`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataChangeReadPosition {
+    /// Batch-level relationship between this transition and the preceding view.
+    lineage: DataChangeLineage,
+    /// Group position reached after the complete transition is applied.
+    read_token: GroupReadToken,
+}
+
+impl DataChangeReadPosition {
+    pub(crate) fn new(lineage: DataChangeLineage, read_token: GroupReadToken) -> Self {
+        if let DataChangeLineage::GroupReplacement { migration_id } = lineage {
+            assert_eq!(
+                read_token.group_id, migration_id.new_group_id,
+                "replacement read position for migration {migration_id:?} targeted group {:?}",
+                read_token.group_id,
+            );
+        }
+        Self {
+            lineage,
+            read_token,
+        }
+    }
+
+    /// Return the relationship between this transition and the preceding view.
+    #[must_use]
+    pub const fn lineage(&self) -> DataChangeLineage {
+        self.lineage
+    }
+
+    /// Return the successor group position reached by this transition.
+    #[must_use]
+    pub const fn group_read_token(&self) -> &GroupReadToken {
+        &self.read_token
+    }
+}
+
+/// Aggregate application position across application-visible replication groups.
+///
+/// Applications may persist this aggregate atomically with their complete
+/// materialised state. Applications that store state per group may instead
+/// persist each [`GroupReadToken`] separately and rebuild the startup position
+/// with [`Self::from_group_tokens`].
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ApplicationReadToken {
+    /// Canonically ordered private group positions included in the application state.
+    versions: Arc<ApplicationReadTokenVersions>,
+}
+
+impl ApplicationReadToken {
+    #[cfg(test)]
     pub(crate) fn from_group_versions(groups: HashMap<GroupId, VersionVector>) -> Self {
         let groups =
             SortedArrayMap::try_from_entries(groups).expect("hash map has no duplicate keys");
@@ -69,18 +204,37 @@ impl ReadToken {
         groups: SortedArrayMap<GroupId, VersionVector>,
     ) -> Self {
         Self {
-            versions: Arc::new(ReadTokenVersions { groups }),
+            versions: Arc::new(ApplicationReadTokenVersions { groups }),
+        }
+    }
+
+    /// Build an application position from separately stored group positions.
+    ///
+    /// Compatible duplicate group positions are combined at their furthest
+    /// known position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if duplicate positions for one group have incompatible member
+    /// counts.
+    #[must_use]
+    pub fn from_group_tokens(tokens: impl IntoIterator<Item = GroupReadToken>) -> Self {
+        let mut versions = ApplicationReadTokenVersions::default();
+        for token in tokens {
+            let GroupReadToken { group_id, version } = token;
+            versions.merge_group_position(group_id, Arc::unwrap_or_clone(version));
+        }
+        Self {
+            versions: Arc::new(versions),
         }
     }
 
     /// Encode this token as canonical opaque bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Bytes {
-        // 65 bytes is enough to hold the version plus a small 2 group token with a few members
-        // per group without reallocating.
         let mut output = BytesMut::with_capacity(65);
-        output.put_u8(READ_TOKEN_PROTOBUF_FORMAT_V1);
-        ReadTokenProtoCodec::from(&self.versions.groups).encode_proto_into(&mut output);
+        output.put_u8(APPLICATION_READ_TOKEN_PROTOBUF_FORMAT_V1);
+        ApplicationReadTokenProtoCodec::from(&self.versions.groups).encode_proto_into(&mut output);
         output.freeze()
     }
 
@@ -91,7 +245,7 @@ impl ReadToken {
     /// Returns [`ReadTokenDecodeError`] when `input` is not a structurally valid
     /// read-token encoding supported by this runtime.
     pub fn from_bytes(input: &[u8]) -> Result<Self, ReadTokenDecodeError> {
-        let groups = Self::decode_group_versions(input)
+        let groups = decode_application_read_token(input)
             .boxed()
             .context(ReadTokenDecodeSnafu)?;
         Ok(Self::from_sorted_group_versions(groups))
@@ -101,98 +255,100 @@ impl ReadToken {
         self.versions.groups.get(group_id)
     }
 
-    pub(crate) fn group_count(&self) -> usize {
+    /// Return whether this application position contains no groups.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.versions.groups.is_empty()
+    }
+
+    /// Return the number of group positions represented in this application state.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
         self.versions.groups.len()
     }
 
-    pub(crate) fn with_group_version(
-        &self,
-        group_id: GroupId,
-        version_vector: VersionVector,
-    ) -> Self {
-        let mut groups = self.versions.groups.clone();
-        groups.insert(group_id, version_vector);
-        Self::from_sorted_group_versions(groups)
+    /// Return the stored position for `group_id`, when the application contains that group.
+    #[must_use]
+    pub fn group_read_token(&self, group_id: &GroupId) -> Option<GroupReadToken> {
+        self.group_version(group_id)
+            .cloned()
+            .map(|version| GroupReadToken::from_group_version(*group_id, version))
     }
 
-    pub(crate) fn with_update_applied(&self, group_id: GroupId, update_id: UpdateId) -> Self {
-        let Some(group_versions) = self.group_version(&group_id) else {
-            return self.clone();
-        };
-        self.with_group_version(group_id, group_versions.with_update_applied(update_id))
-    }
-
-    /// Merge an event or snapshot token into this application read position.
+    /// Merge one snapshot, publish receipt, or compatible group-local token
+    /// into this application position.
     ///
-    /// This is safe for applications that publish locally while listener
-    /// events are still queued: the merge keeps the furthest-known version for
-    /// every group instead of replacing newer local progress with an older
-    /// event token.
+    /// This is safe for independent progress within a compatible group: the
+    /// merge keeps the furthest-known position instead of replacing newer local
+    /// progress with an older token. Listener data-change positions must use
+    /// [`Self::apply_data_change`] in listener delivery order instead.
     ///
     /// # Panics
     ///
     /// Panics if both tokens contain the same group with incompatible member
     /// counts.
-    pub fn merge_applied(&mut self, applied: &ReadToken) {
+    pub fn merge_applied(&mut self, applied: &GroupReadToken) {
         let versions = Arc::make_mut(&mut self.versions);
-        for (group_id, applied_versions) in applied.versions.groups.iter() {
-            if let Some(existing_versions) = versions.groups.get_mut(group_id) {
-                *existing_versions = existing_versions.least_upper_bound(applied_versions);
-            } else {
-                // Group membership changes are rare, so most merges update an
-                // existing entry in place and avoid this sorted-vector insertion.
-                versions.groups.insert(*group_id, applied_versions.clone());
-            }
-        }
+        versions.merge_group_position(applied.group_id, applied.version.as_ref().clone());
     }
 
-    /// Decode the outer format discriminator and its selected payload.
-    fn decode_group_versions(
-        input: &[u8],
-    ) -> Result<SortedArrayMap<GroupId, VersionVector>, ReadTokenBytesDecodeError> {
-        let Some((&format, payload)) = input.split_first() else {
-            return MissingFormatSnafu.fail();
-        };
-        ensure!(
-            format == READ_TOKEN_PROTOBUF_FORMAT_V1,
-            UnsupportedFormatSnafu {
-                actual: format,
-                supported: READ_TOKEN_PROTOBUF_FORMAT_V1,
-            }
+    /// Apply one listener data-change position, including group replacement semantics.
+    ///
+    /// Ordinary updates advance or insert the supplied group. Replacements also
+    /// retire the predecessor group before advancing the successor, so callers
+    /// do not need to implement token lifecycle rules themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the existing and applied positions for the affected group
+    /// have incompatible member counts.
+    pub fn apply_data_change(&mut self, position: &DataChangeReadPosition) {
+        let versions = Arc::make_mut(&mut self.versions);
+        if let DataChangeLineage::GroupReplacement { migration_id } = position.lineage {
+            versions.groups.remove(&migration_id.old_group_id);
+        }
+        versions.merge_group_position(
+            position.read_token.group_id,
+            position.read_token.version.as_ref().clone(),
         );
-        let groups = ReadTokenProtoCodec::decode_proto_from_slice(payload)
-            .context(InvalidPayloadSnafu)?
-            .into_groups();
-        Ok(groups)
     }
 }
 
-impl std::fmt::Debug for ReadToken {
+impl From<GroupReadToken> for ApplicationReadToken {
+    fn from(token: GroupReadToken) -> Self {
+        let GroupReadToken { group_id, version } = token;
+        Self::from_sorted_group_versions(SortedArrayMap::from_entry(
+            group_id,
+            Arc::unwrap_or_clone(version),
+        ))
+    }
+}
+
+impl std::fmt::Debug for ApplicationReadToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if f.alternate() {
-            return f
-                .debug_struct("ReadToken")
+            f.debug_struct("ApplicationReadToken")
                 .field("groups", &self.versions.groups)
-                .finish();
+                .finish()
+        } else {
+            f.debug_struct("ApplicationReadToken")
+                .field("group_count", &self.group_count())
+                .finish_non_exhaustive()
         }
-        f.debug_struct("ReadToken")
-            .field("group_count", &self.group_count())
-            .finish_non_exhaustive()
     }
 }
 
-impl std::fmt::Display for ReadToken {
+impl std::fmt::Display for ApplicationReadToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&STANDARD.encode(self.to_bytes()))
     }
 }
 
-impl FromStr for ReadToken {
+impl FromStr for ApplicationReadToken {
     type Err = ParseReadTokenError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let bytes = STANDARD.decode(input).context(InvalidBase64Snafu)?;
-        // Only check for base64 canonicity. Protobuf is more lenient in encoding between versions.
         ensure!(STANDARD.encode(&bytes) == input, NonCanonicalSnafu);
         Self::from_bytes(&bytes).context(InvalidTokenSnafu)
     }
@@ -220,11 +376,58 @@ pub enum ParseReadTokenError {
     NonCanonical,
 }
 
+/// Decode one application-token format discriminator and payload.
+fn decode_application_read_token(
+    input: &[u8],
+) -> Result<SortedArrayMap<GroupId, VersionVector>, ReadTokenBytesDecodeError> {
+    let (&format, payload) = input.split_first().context(MissingFormatSnafu)?;
+    ensure!(
+        format == APPLICATION_READ_TOKEN_PROTOBUF_FORMAT_V1,
+        UnsupportedFormatSnafu {
+            actual: format,
+            supported: APPLICATION_READ_TOKEN_PROTOBUF_FORMAT_V1,
+        }
+    );
+    let groups = ApplicationReadTokenProtoCodec::decode_proto_from_slice(payload)
+        .context(InvalidPayloadSnafu)?
+        .into_groups();
+    Ok(groups)
+}
+
+/// Decode one group-token format discriminator and payload.
+fn decode_group_read_token(
+    input: &[u8],
+) -> Result<(GroupId, VersionVector), ReadTokenBytesDecodeError> {
+    let (&format, payload) = input.split_first().context(MissingFormatSnafu)?;
+    ensure!(
+        format == GROUP_READ_TOKEN_PROTOBUF_FORMAT_V1,
+        UnsupportedFormatSnafu {
+            actual: format,
+            supported: GROUP_READ_TOKEN_PROTOBUF_FORMAT_V1,
+        }
+    );
+    let group = GroupReadTokenProtoCodec::decode_proto_from_slice(payload)
+        .context(InvalidPayloadSnafu)?
+        .into_group();
+    Ok(group)
+}
+
 /// Group-scoped positions hidden behind the public opaque token.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReadTokenVersions {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ApplicationReadTokenVersions {
     /// Canonically ordered group vectors used by codecs and runtime operations.
     groups: SortedArrayMap<GroupId, VersionVector>,
+}
+
+impl ApplicationReadTokenVersions {
+    /// Merge an owned group position into this aggregate backing state.
+    fn merge_group_position(&mut self, group_id: GroupId, applied: VersionVector) {
+        if let Some(existing) = self.groups.get_mut(&group_id) {
+            *existing = existing.least_upper_bound(&applied);
+        } else {
+            self.groups.insert(group_id, applied);
+        }
+    }
 }
 
 /// Failure while decoding the outer read-token byte format.
@@ -238,7 +441,7 @@ enum ReadTokenBytesDecodeError {
         "Read token used unsupported format {actual}; supported format is {supported}."
     ))]
     UnsupportedFormat { actual: u8, supported: u8 },
-    /// The version-selected payload was structurally invalid.
+    /// The selected payload was structurally invalid.
     #[snafu(display("Read-token payload was invalid: {source}"))]
     InvalidPayload {
         source: crate::codecs::ReadTokenCodecError,
@@ -248,8 +451,8 @@ enum ReadTokenBytesDecodeError {
 /// Request to publish one local set of row mutations from a known read token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishChangesRequest {
-    /// Opaque read position for the application state this change was based on.
-    pub read_token: ReadToken,
+    /// Opaque group position for the application state this change was based on.
+    pub read_token: GroupReadToken,
     /// Row mutations to publish.
     pub changes: Vec<RowMutation>,
 }

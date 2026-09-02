@@ -7,7 +7,7 @@ pub(super) type ListenerDataChangeBatches = SmallVec<[ListenerDataChanges; 1]>;
 
 /// One listener notification batch paired with the read token reached by that batch.
 pub(super) struct ListenerDataChanges {
-    pub(super) read_token: ReadToken,
+    pub(super) read_token: GroupReadToken,
     pub(super) row_changes: Vec<RowChange>,
 }
 
@@ -42,8 +42,10 @@ pub(super) async fn notify_listener_data_change(
 ) -> Result<(), ListenerError> {
     listener
         .on_event(ReplicationEvent::DataChanged {
-            lineage: DataChangeLineage::Update,
-            read_token: event_batch.read_token,
+            position: DataChangeReadPosition::new(
+                DataChangeLineage::Update,
+                event_batch.read_token,
+            ),
             rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
         })
         .await
@@ -56,8 +58,7 @@ pub(super) async fn notify_pending_activation_data_changes(
 ) -> Result<(), ListenerError> {
     listener
         .on_event(ReplicationEvent::DataChanged {
-            lineage: outcome.lineage,
-            read_token: outcome.read_token,
+            position: outcome.read_position,
             rows: outcome.rows,
         })
         .await

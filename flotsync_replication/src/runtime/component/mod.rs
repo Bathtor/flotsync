@@ -71,6 +71,7 @@ use crate::{
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DataChangeLineage,
+        DataChangeReadPosition,
         DatasetId,
         DatasetRowStatePatch,
         DatasetRowStateWrite,
@@ -82,6 +83,7 @@ use crate::{
         GroupMemberKeys,
         GroupMigrationPolicy,
         GroupNameUpdate,
+        GroupReadToken,
         GroupSchema,
         InitialSnapshot,
         ListenerError,
@@ -96,7 +98,6 @@ use crate::{
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
-        ReadToken,
         RejectionReason,
         ReplicationConfig,
         ReplicationEvent,
@@ -121,7 +122,6 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
-        WritableReplicationGroupVersionRecord,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
         security::{
@@ -239,7 +239,7 @@ use snapshot_provider::StoreSnapshotRowProvider;
 struct PreparedLocalPublish {
     group_id: GroupId,
     update_id: UpdateId,
-    read_token: ReadToken,
+    read_token: GroupReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
 }
@@ -587,11 +587,15 @@ impl ReplicationRuntimeComponent {
             .begin_read_transaction()
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        let group_versions = transaction
-            .load_writable_replication_group_versions()
+        let persisted_group = transaction
+            .load_replication_group(&request.group_id)
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        let read_token = Self::read_token_from_group_versions(group_versions);
+        let persisted_group = persisted_group.context(snapshot::UnknownGroupSnafu {
+            group_id: request.group_id,
+        })?;
+        let read_token =
+            GroupReadToken::from_group_version(request.group_id, persisted_group.version_vector);
 
         let group_schema = self
             .group_memberships
@@ -689,27 +693,16 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Build one opaque application read token from currently stored group progress.
-    fn read_token_from_groups(
+    /// Build one opaque group read token from currently stored group progress.
+    fn group_read_token_from_groups(
         groups: impl IntoIterator<Item = ReplicationGroupRecord>,
-    ) -> ReadToken {
-        let group_versions = groups
+        group_id: GroupId,
+    ) -> GroupReadToken {
+        let group = groups
             .into_iter()
-            .filter(|group| group.lifecycle.is_writable())
-            .map(|group| (group.group_id, group.version_vector))
-            .collect();
-        ReadToken::from_group_versions(group_versions)
-    }
-
-    /// Build one opaque application read token from narrow writable-group progress records.
-    fn read_token_from_group_versions(
-        groups: impl IntoIterator<Item = WritableReplicationGroupVersionRecord>,
-    ) -> ReadToken {
-        let group_versions = groups
-            .into_iter()
-            .map(|group| (group.group_id, group.version_vector))
-            .collect();
-        ReadToken::from_group_versions(group_versions)
+            .find(|group| group.group_id == group_id)
+            .expect("installed group progress must include the activated group");
+        GroupReadToken::from_group_version(group_id, group.version_vector)
     }
 
     /// Return catch-up ranges required before an inbound update can apply.
@@ -2069,7 +2062,7 @@ impl ReplicationRuntimeComponent {
                 active_groups.iter().cloned(),
             )
             .context(activation::InstallGroupSnafu { group_id })?;
-        let read_token = Self::read_token_from_groups(active_groups);
+        let read_token = Self::group_read_token_from_groups(active_groups, group_id);
         transaction
             .commit()
             .await
@@ -2091,7 +2084,7 @@ impl ReplicationRuntimeComponent {
         key: PendingGroupWorkKey,
         group_schema: &GroupSchema,
         hosted_predecessor: Option<(MemberIndex, VersionVector)>,
-        read_token: ReadToken,
+        read_token: GroupReadToken,
     ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
         let group_id = key.group_id();
         let read_transaction = self
@@ -2099,12 +2092,12 @@ impl ReplicationRuntimeComponent {
             .begin_read_transaction()
             .await
             .context(activation::PostCommitStoreAccessSnafu { group_id })?;
-        let (lineage, rows): (DataChangeLineage, Box<RowProvider>) = match key {
+        let (read_position, rows): (DataChangeReadPosition, Box<RowProvider>) = match key {
             PendingGroupWorkKey::GroupInvitation {
                 group_id,
                 source: crate::api::GroupInvitationSource::Creation,
             } => (
-                DataChangeLineage::Update,
+                DataChangeReadPosition::new(DataChangeLineage::Update, read_token),
                 Box::new(StoreActivationRowProvider::for_creation(
                     read_transaction,
                     group_id,
@@ -2115,7 +2108,10 @@ impl ReplicationRuntimeComponent {
                 source: crate::api::GroupInvitationSource::Migration { migration_id },
                 ..
             } => (
-                DataChangeLineage::GroupReplacement { migration_id },
+                DataChangeReadPosition::new(
+                    DataChangeLineage::GroupReplacement { migration_id },
+                    read_token,
+                ),
                 Box::new(StoreActivationRowProvider::unavailable_replacement(
                     read_transaction,
                     migration_id,
@@ -2126,7 +2122,10 @@ impl ReplicationRuntimeComponent {
                 let (local_member_index, final_versions) = hosted_predecessor
                     .expect("migration proposal activation must close its hosted predecessor");
                 (
-                    DataChangeLineage::GroupReplacement { migration_id },
+                    DataChangeReadPosition::new(
+                        DataChangeLineage::GroupReplacement { migration_id },
+                        read_token,
+                    ),
                     Box::new(StoreActivationRowProvider::hosted_replacement(
                         read_transaction,
                         migration_id,
@@ -2138,8 +2137,7 @@ impl ReplicationRuntimeComponent {
             }
         };
         Ok(PendingGroupActivationOutcome {
-            read_token,
-            lineage,
+            read_position,
             rows,
         })
     }
@@ -2307,10 +2305,14 @@ impl ReplicationRuntimeComponent {
         let mut local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
                 .context(publish::InvalidPersistedGroupSnafu { group_id })?;
-        let read_versions = read_token
-            .group_version(&group_id)
-            .cloned()
-            .context(publish::ReadTokenMissingGroupSnafu { group_id })?;
+        ensure!(
+            read_token.group_id() == group_id,
+            publish::ReadTokenGroupMismatchSnafu {
+                group_id,
+                read_token_group_id: read_token.group_id(),
+            }
+        );
+        let read_versions = read_token.version().clone();
         ensure!(
             read_versions.num_members() == local_group.member_count(),
             publish::ReadTokenMemberCountMismatchSnafu {
@@ -2366,7 +2368,7 @@ impl ReplicationRuntimeComponent {
             .update_replication_group_version_vector(&group_id, local_group.version_vector)
             .await
             .context(publish::StoreAccessSnafu)?;
-        let read_token = read_token.with_update_applied(group_id, update_id);
+        let read_token = read_token.with_update_applied(update_id);
         transaction
             .commit()
             .await
@@ -3192,26 +3194,17 @@ impl ReplicationRuntimeComponent {
         .context(inbound::StoreAccessSnafu)?;
         let mut working_datasets =
             replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
-        let writable_group_versions = transaction
-            .load_writable_replication_group_versions()
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let mut listener_read_token = Self::read_token_from_group_versions(writable_group_versions);
-        if lifecycle.is_writable() && listener_read_token.group_version(&group_id).is_none() {
-            listener_read_token = listener_read_token
-                .with_group_version(group_id, local_group.version_vector.clone());
-        }
         let mut event_batches = ListenerDataChangeBatches::new();
         for ready_update in &apply_plan.ready_chain {
             let applied_batch =
                 apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
-            if lifecycle.is_writable() {
-                listener_read_token = listener_read_token
-                    .with_group_version(group_id, local_group.version_vector.clone());
-            }
             if lifecycle.emits_data_changes() && !applied_batch.row_changes.is_empty() {
+                let read_token = GroupReadToken::from_group_version(
+                    group_id,
+                    local_group.version_vector.clone(),
+                );
                 event_batches.push(ListenerDataChanges {
-                    read_token: listener_read_token.clone(),
+                    read_token,
                     row_changes: applied_batch.row_changes,
                 });
             }
@@ -3616,7 +3609,8 @@ impl ReplicationRuntimeComponent {
             .store_new_replication_group(record)
             .await
             .map_err(ApiError::from_store_classification_source)?;
-        let read_token = Self::read_token_from_groups(std::iter::once(persisted_group.clone()));
+        let read_token =
+            GroupReadToken::from_group_version(group_id, persisted_group.version_vector.clone());
         notify_listener_data_change(
             self.listener.clone(),
             ListenerDataChanges {
