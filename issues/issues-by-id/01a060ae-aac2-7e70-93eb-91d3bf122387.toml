@@ -1,0 +1,39 @@
+id = "01a060ae-aac2-7e70-93eb-91d3bf122387"
+ref = "flotsync-5ou.1"
+title = "Introduce group-scoped read tokens"
+body = """
+Goal
+
+Make replication progress group-scoped for ordinary application work while retaining one serialisable aggregate position for application startup.
+
+Scope
+
+T01. Introduce GroupReadToken as the opaque position for one visible GroupId. Keep the underlying replication/version data private to the framework.
+T02. Introduce ApplicationReadToken as the serialisable aggregate of per-group positions used at the application startup boundary.
+T03. Convert DataChanged and publish request/receipt paths from the current cross-group ReadToken to GroupReadToken.
+T04. Ensure group lifecycle and position events expose enough information for applications to maintain an ApplicationReadToken as groups advance, appear, retire, or are replaced.
+T05. Update codecs, public re-exports, test helpers, examples, and affected callers while preserving token validation at the appropriate group boundary.
+T06. Remove the per-update construction of an all-writable-groups token.
+
+Validation
+
+V01. Codec round trips preserve opaque group positions and the aggregate application token.
+V02. Ordinary data events and publish APIs carry only the affected group position.
+V03. Aggregate-token tests cover adding, advancing, retiring, and replacing group positions.
+V04. Existing publication and listener behaviour remains unchanged apart from token scope.
+
+Deferrals
+
+D01. Do not implement startup replay, synchronisation classification, or staged component startup in this task.
+D02. Do not reorganise ReplicationRuntimeComponent beyond changes directly required by the token conversion.
+
+Sizing
+
+Approximately 350-550 production LOC plus 250-400 test and call-site LOC."""
+status = "open"
+type = "task"
+priority = 1
+blocks = ["01a060af-0325-7591-9353-b025a5a27b68"]
+parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+created_at = "2026-09-02T05:54:14.850373Z"
+updated_at = "2026-09-02T05:54:37.47735Z"

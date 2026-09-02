@@ -1,0 +1,50 @@
+id = "01a060af-0325-7591-9353-b025a5a27b68"
+ref = "flotsync-5ou.2"
+title = "Replay full state during startup"
+body = """
+Goal
+
+Replace explicit live row snapshots with a staged application-startup load that is correct before incremental optimisation: return a live runtime immediately when there is no readable state, otherwise provide a full replay and start listener delivery only after application acknowledgement.
+
+Scope
+
+F01. Preload persisted groups, resolve schemas, and populate SharedGroupState in the async harness before starting the Kompact system.
+F02. Introduce ReplicationRuntimeLoad with Ready and Synchronising results. Accept Option<ApplicationReadToken> and the real listener at initial load, but deliberately use full replay for every non-empty readable state in this slice.
+F03. Build/connect ReplicationRuntimeComponent with a configurable log-only or panic-on-event placeholder listener and keep it inactive while starting IO, transport, delivery, and discovery.
+F04. Stream bounded full per-group sections containing current full rows, target GroupReadTokens, and the final ApplicationReadToken. Full sections emit neither inferred removals nor partial field upserts.
+F05. Let ApplicationSynchronisation completion install the retained real listener through on_definition, start the runtime component with notification, await successful on_start, and return ReplicationApi.
+F06. Keep pending decision and accepted-activation replay in on_start after listener replacement and before queued live work is handled.
+F07. Define orderly abort, drop/shutdown, completion-failure, and retry behaviour for the partly started host.
+F08. Remove snapshot_rows from the live ReplicationApi and convert examples, test helpers, and callers to the startup replay or narrower store fixtures.
+F09. Preserve the inactive Kompact mailbox as the only live-work buffer; do not add a gateway or token-based duplicate filtering.
+
+Correctness boundary
+
+C01. No readable groups returns Ready directly.
+C02. Any readable group returns Synchronising and a full replay, regardless of whether the optional supplied ApplicationReadToken might already be current. The later incremental child adds that optimisation.
+C03. The application ingests and atomically stores the full result plus final token before calling complete.
+C04. The runtime component is the only component that applies semantic replication updates and remains inactive throughout replay, so queued live work cannot overlap the replay cut.
+
+Validation
+
+V01. Cover empty Ready and non-empty full replay across one and multiple groups.
+V02. Cover bounded batches, full-section semantics, listener substitution, queued inbound work, pending recovery event ordering, and absence of replay/live duplication.
+V03. Cover application abort/retry, placeholder log/panic behaviour, start failure, and shutdown from both Ready and Synchronising states.
+V04. Confirm no live snapshot_rows API or caller remains.
+
+Deferrals
+
+D01. Do not classify supplied tokens, return exact-token Ready for non-empty state, emit incremental sections, coalesce update history, or select fallback per group in this task.
+D02. Do not reorganise the general runtime FSM; flotsync-zop tracks that work.
+
+Sizing
+
+Approximately 600-1,000 production and call-site LOC plus 650-1,100 test LOC."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a060ae-aac2-7e70-93eb-91d3bf122387"]
+blocks = ["01a060af-43d8-7250-8bb6-f7eb9ae61700"]
+parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+created_at = "2026-09-02T05:54:37.47735Z"
+updated_at = "2026-09-02T05:54:54.040853Z"

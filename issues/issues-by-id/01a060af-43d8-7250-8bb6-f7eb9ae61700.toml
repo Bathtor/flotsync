@@ -1,0 +1,44 @@
+id = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+ref = "flotsync-5ou.3"
+title = "Optimise startup synchronisation incrementally"
+body = """
+Goal
+
+Optimise the established full-replay startup contract so applications normally resume from a supplied ApplicationReadToken using only the coalesced changes required to reach current local state.
+
+Scope
+
+I01. Classify each supplied group position against current readable group state as current, incrementally recoverable, or requiring full fallback.
+I02. Return Ready for an exact current ApplicationReadToken even when readable state exists. Keep None as an explicit request for full replay.
+I03. For recoverable behind positions, inspect applied update history to discover affected row identities, then emit each row once as its current full value or as an explicit deletion.
+I04. Avoid replaying historical intermediate values, redundant upserts, or unchanged rows.
+I05. Fall back to a full section only for groups whose position is missing, incompatible, ahead, pruned, or ambiguous; preserve incremental sections for unaffected groups.
+I06. Emit explicit application/group position reconciliation when no row changes are required but the final ApplicationReadToken advances.
+I07. Handle groups that appear, retire, or are replaced without asking applications to infer lifecycle changes from absent rows.
+I08. Preserve bounded/streamed row providers and the startup/listener ordering established by flotsync-5ou.2.
+
+Validation
+
+V01. Cover exact-token Ready and ordinary restart deltas.
+V02. Cover repeated changes to one row coalescing to one current row, creation followed by deletion, explicit deletion, and position-only advancement.
+V03. Cover unknown, missing, ahead, pruned, and ambiguous group positions.
+V04. Cover mixed incremental and full sections without degrading compatible groups.
+V05. Cover offline peer progress and retained group-replacement paths that can be proven from current store evidence.
+V06. Prove that no update represented by the synchronisation cut is delivered again as a live DataChanged event.
+
+Deferrals
+
+D01. Do not retain completed group-replacement lineage solely to avoid fallback. Use full-group replay when current persisted evidence is insufficient.
+D02. Do not add an application gateway or conditional live-listener filtering.
+D03. Do not redesign the general runtime FSM; flotsync-zop remains separate.
+
+Sizing
+
+Approximately 550-850 production LOC plus 450-900 test LOC."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a060af-0325-7591-9353-b025a5a27b68"]
+parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+created_at = "2026-09-02T05:54:54.040853Z"
+updated_at = "2026-09-02T05:54:59.59804Z"

@@ -4,37 +4,102 @@ title = "Resume persisted application state incrementally"
 body = """
 Goal
 
-Let disk-backed applications such as MaintainRS resume from their atomically stored application state and ReadToken, normally receiving only changes since that position instead of rebuilding every group from fresh snapshots.
+Let disk-backed applications resume from atomically stored application state and an application-wide read position. Startup should normally provide one coalesced diff from that position to current local state, fall back to full current rows only for groups that cannot be reconstructed incrementally, and establish a strict boundary before unconditional live listener delivery.
 
-Context
+Agreed semantics
 
-C01. The replicated checklist rebuilds an in-memory working set by reading current snapshots on every start.
-C02. MaintainRS owns a more complex application database and should usually preserve that state across restarts.
-C03. A decoded ReadToken may legitimately describe older group versions and lifecycle state.
-C04. Publish already validates the target group position at write time; application synchronisation needs its own validation and fallback rules.
-C05. Current runtime startup replays unresolved group decisions and accepted activations, but not ordinary application data changes.
-C06. Completed activation lineage is not always reconstructable from current group records, especially for a member added through migration, so correct restart replay may require retained delivery metadata or an acknowledgement boundary.
+S01. The framework owns the synchronisation/live-delivery boundary. Applications consume startup synchronisation, atomically persist the resulting state and ApplicationReadToken, mark synchronisation complete, and then consume ordinary listener events without duplicate filtering or conditional logic.
+S02. None requests a full startup synchronisation across every currently readable group. Some(token) requests incremental synchronisation from that application position.
+S03. An exact current token returns a live runtime directly. None against a new store with no readable groups also returns a live runtime directly.
+S04. A behind token normally produces a small coalesced diff. Discover rows affected after the supplied per-group position, then emit each current full row at most once or an explicit deletion. Do not replay redundant or intermediate historical states.
+S05. A full group section contains current full-row snapshots only: no inferred row removals and no partial field upserts. Applications decide how full state interacts with retained or dirty local state.
+S06. Missing, incompatible, ahead, pruned, or ambiguous group positions use explicit full-group fallback where incremental reconstruction is unsafe. Keep compatible groups incremental.
+S07. A synchronisation that only advances group/application position still requires application acknowledgement so the newer ApplicationReadToken can be persisted.
+S08. Do not retain completed group-replacement lineage solely for this feature. Use selective full-group fallback when the retained store cannot prove an incremental path.
 
-Investigation and implementation direction
+Application-visible groups and tokens
 
-P01. Define how an application supplies its latest atomically stored ReadToken before live listener delivery begins.
-P02. Define a completion or acknowledgement boundary so application state and token advancement remain crash-consistent.
-P03. Support the common case of replaying ordinary applied updates after a valid stored group position without sending complete snapshots.
-P04. Preserve and replay creation and group-replacement lineage when sufficient retained evidence exists.
-P05. Detect unsupported, missing, ahead, pruned, or ambiguous positions and explicitly fall back to bounded fresh snapshots for only the affected groups where practical.
-P06. Keep unaffected groups incremental when another group requires snapshot fallback.
-P07. Specify ordering between startup replay, pending decisions and activations, catch-up, and later live listener events.
-P08. Cover ordinary restart deltas, offline peer progress, creation, migration chains, added-member lineage, mixed incremental/fallback recovery, listener failure, and crashes around application acknowledgement.
+G01. Treat a group as the unit of ordinary replication progress and selective re-synchronisation. This formalises existing application-visible identity: RowId, group-state inspection, group creation and membership operations, lifecycle events, summaries, and current snapshots already expose GroupId.
+G02. Replace the current always-cross-group ReadToken role with an opaque GroupReadToken for group-local operations and events. Group identity is visible; the underlying version position remains private.
+G03. Introduce a serialisable ApplicationReadToken as the aggregate startup boundary over per-group positions.
+G04. DataChanged and publish request/receipt paths use GroupReadToken. Avoid rebuilding a cross-group token for every ordinary update.
+G05. Group lifecycle/position events provide enough information for an application to maintain its aggregate startup token when groups advance, appear, retire, or are replaced.
+G06. Remove snapshot_rows as a separately callable live ReplicationApi operation. Startup synchronisation supersedes it; passing None requests the full load.
+
+Synchronisation result
+
+Y01. The prepared result is organised into explicit per-group sections, each identified as incremental or full and carrying the target GroupReadToken.
+Y02. Incremental sections contain coalesced current full rows and explicit deletions for rows changed since the supplied group position.
+Y03. Full sections stream all current rows for the group and deliberately make no statement that locally retained rows absent from the section must be removed.
+Y04. The result also carries the final ApplicationReadToken that represents the complete local synchronisation cut.
+Y05. Group sections and row batches remain bounded/streamed so a full application load need not materialise every row in memory at once.
+Y06. Position and lifecycle changes needed to reconcile the supplied aggregate with current readable groups are explicit in the synchronisation contract rather than inferred by applications from absent rows.
+
+Staged runtime startup
+
+L01. Preload persisted groups, resolve their schemas, and populate SharedGroupState in the async loading harness before the Kompact system is started. Remove this hydration responsibility from ReplicationRuntimeComponent::on_start.
+L02. Build and connect the normal ReplicationRuntimeComponent with a non-optional placeholder Arc<dyn ReplicationEventListener>, but leave that component inactive while starting the IO, transport, delivery, and discovery topology.
+L03. The inactive runtime component is the startup queue boundary. Kompact queues addressed messages/events until it starts; no additional gateway component, manual live-update buffer, or token-based duplicate suppression is introduced.
+L04. The placeholder listener has configurable log-only and panic-on-event behaviour. This supports production diagnostics and strict testing without a separate listener-installed boolean.
+L05. The initial load accepts Option<ApplicationReadToken> and the real listener, then returns ReplicationRuntimeLoad::Ready(Arc<dyn ReplicationApi>) or ReplicationRuntimeLoad::Synchronising(ApplicationSynchronisation).
+L06. Ready means the real listener is installed and the runtime component has successfully started. Synchronising retains the real listener, the prepared synchronisation result, and ownership needed to complete or shut down the partly started host.
+L07. Completion consumes ApplicationSynchronisation, installs the retained listener through on_definition while the runtime component is still inactive, starts that component with lifecycle notification, waits for successful on_start, and returns the normal live ReplicationApi.
+L08. ReplicationRuntimeComponent::on_start replays pending decisions and accepted activations only after the real listener is installed. Queued live messages are handled afterwards.
+L09. No reload/verification of preloaded SharedGroupState is required immediately before start. Only the inactive runtime component writes the replication group registry, and concurrent external writes to the store are unsupported.
+L10. If application state creation or synchronisation ingestion fails, do not start the runtime component. The intermediate handle supports orderly host shutdown/drop so the caller can retry the entire load.
+L11. Transport/discovery traffic may proceed during application ingestion, but semantic replication processing destined for the inactive runtime component waits in its mailbox. The potentially unbounded queue is accepted for this low-throughput async facade.
+
+Ordering and failure invariants
+
+O01. The store-derived synchronisation cut is prepared while the sole component that can apply replication updates is inactive.
+O02. The application finishes ingesting all synchronisation sections and atomically stores their final ApplicationReadToken before calling complete.
+O03. Starting the runtime component is the single transition from startup synchronisation to listener delivery; update events do not overlap the synchronisation cut.
+O04. If complete cannot install the listener or start the runtime component, return an observable load/completion error and shut down or retain sufficient ownership for explicit cleanup. Never expose a nominally live API.
+O05. Placeholder-listener invocation is always observable according to its configured log or panic policy.
+O06. Pending recovery events and queued network work preserve mailbox order after successful on_start; tests must pin the intended ordering where Kompact lifecycle semantics matter.
+
+Validation
+
+T01. Token codec and API tests cover per-group opacity, aggregate serialisation, ordinary event/publish token scope, and aggregate updates for group lifecycle changes.
+T02. Synchronisation tests cover None/full, empty-store Ready, exact-token Ready, ordinary restart deltas, multiple historical updates coalesced to one current row, deletion, position-only advancement, and bounded row batches.
+T03. Compatibility tests cover unknown, missing, ahead, pruned, and ambiguous positions plus mixed incremental/full fallback without degrading unaffected groups.
+T04. Lifecycle tests prove that support components can run while the runtime component remains inactive, inbound work queues, the listener can be replaced before start, and no queued update is both synchronised and delivered live.
+T05. Failure tests cover placeholder log/panic policies, application abort and retry, completion/start failure, pending decision/activation replay, and orderly shutdown from both Ready and Synchronising states.
+T06. Existing snapshot_rows callers, examples, and test helpers move to the startup synchronisation contract or narrower store-level fixtures as appropriate.
+
+Explicit deferrals
+
+D01. Do not add a separate gateway/buffering component in this slice. Reconsider it only for future first-class Kompact APIs or substantially different throughput needs.
+D02. Do not add completed group-replacement lineage retention in this slice.
+D03. Do not combine this work with decomposition of the roughly 4,300-line ReplicationRuntimeComponent. flotsync-zop tracks the independent priority-1 investigation into explicit FSM phases, block_on usage, module boundaries, and service/topology organisation.
+D04. Do not redesign direct Kompact-only application APIs in this slice.
+
+Agreed implementation sequence
+
+Q01. flotsync-5ou.1 introduces GroupReadToken and ApplicationReadToken and converts ordinary event/publish APIs. It does not change startup.
+Q02. flotsync-5ou.2 establishes the complete staged-startup contract and removes snapshot_rows. It returns Ready only for no readable state and deliberately performs a full replay for every non-empty readable state, regardless of the optional supplied token.
+Q03. flotsync-5ou.3 then optimises the working full-replay path with exact-token Ready, compatibility classification, coalesced incremental sections, position-only reconciliation, and selective full-group fallback.
+Q04. The dependency order is flotsync-5ou.1, then flotsync-5ou.2, then flotsync-5ou.3. Each child must remain correct and reviewable at its boundary; the parent remains the umbrella contract.
 
 Sizing
 
-The complete implementation is likely to exceed 1000 LOC. After the replay and acknowledgement contract is designed, split implementation into self-contained children for the application resume boundary, ordinary update delta replay, and activation/migration lineage plus snapshot fallback."""
-status = "open"
+Z01. flotsync-5ou.1 is approximately 350-550 production LOC plus 250-400 test/call-site LOC.
+Z02. flotsync-5ou.2 is approximately 600-1,000 production/call-site LOC plus 650-1,100 tests.
+Z03. flotsync-5ou.3 is approximately 550-850 production LOC plus 450-900 tests.
+Z04. Total expected change remains roughly 2,850-4,800 LOC including tests and call-site churn. The three-child split is intentionally vertical: the middle child is larger because separating topology staging from replacement of snapshot_rows would leave no useful end-to-end startup contract."""
+status = "in-progress"
+status_reason = "plan agreed"
 type = "task"
 priority = 1
+assignee = "codex"
 parent = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+children = [
+    "01a060ae-aac2-7e70-93eb-91d3bf122387",
+    "01a060af-0325-7591-9353-b025a5a27b68",
+    "01a060af-43d8-7250-8bb6-f7eb9ae61700",
+]
 created_at = "2026-08-27T06:08:37.269924Z"
-updated_at = "2026-08-27T06:08:47.946181Z"
+updated_at = "2026-09-02T05:55:46.194168Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5fb762bcf154"

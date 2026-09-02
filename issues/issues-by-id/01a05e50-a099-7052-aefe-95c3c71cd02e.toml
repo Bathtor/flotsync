@@ -1,0 +1,36 @@
+id = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+ref = "flotsync-zop"
+title = "Decompose replication runtime component"
+body = """
+Goal
+
+Decompose the oversized ReplicationRuntimeComponent and its service/topology setup into maintainable boundaries, making important runtime phases explicit without coupling the work to application startup synchronisation.
+
+Context
+
+C01. ReplicationRuntimeComponent currently combines public API dispatch, update application, group workflows, listener delivery, security operations, startup recovery, and replication-port handling in one module of roughly 4,000 lines.
+C02. Several operations currently use Handled::block_on to prevent interleaving while async work is in progress. Some of these blocking sections may be encoding meaningful implicit runtime states rather than merely awaiting short atomic work.
+C03. flotsync-5ou can use the existing inactive-component lifecycle and therefore does not require this decomposition.
+C04. This remains priority-1 architectural work because adding further behaviour to the current component without clearer state ownership will make ordering and failure handling increasingly difficult to maintain.
+
+Investigation direction
+
+D01. Inventory block_on call sites and distinguish genuinely atomic mailbox turns from implicit lifecycle or protocol phases.
+D02. Where a phase has meaningful entry, accepted inputs, deferred inputs, completion, rollback, or failure semantics, represent it as an explicit FSM state rather than relying on a long blocked handler.
+D03. Keep transition ownership and invariants central while allowing coherent FSM state implementations to live in separate files instead of growing one monolithic component module.
+D04. Evaluate which responsibilities should remain one serialised Kompact component, which should become owned domain state/service objects, and which justify separate components or ports.
+D05. Preserve existing behaviour through incremental, independently reviewable extractions with focused transition and ordering tests.
+D06. Revisit runtime-service and topology inputs so dependencies are grouped by responsibility rather than exposing every service to the whole component.
+
+Planning constraint
+
+Detailed boundaries and implementation sequencing are intentionally deferred until this task is discussed separately. Do not use flotsync-5ou as the vehicle for opportunistic structural refactoring.
+
+Sizing
+
+The complete implementation is likely to exceed 1000 LOC. Once the FSM inventory and ownership boundaries are agreed, split the work into independently reviewable child tasks where practical."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-09-01T18:52:17.43323Z"
+updated_at = "2026-09-02T05:34:45.134068Z"
