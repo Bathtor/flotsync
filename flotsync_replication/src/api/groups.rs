@@ -2,6 +2,10 @@
 
 use super::{load_security_error::LocalStoreSecretSnafu, *};
 
+/// Default maximum number of rows emitted in one startup synchronisation batch.
+pub const DEFAULT_APPLICATION_SYNCHRONISATION_BATCH_SIZE: NonZeroUsize =
+    NonZeroUsize::new(128).expect("the default synchronisation batch size is non-zero");
+
 /// Policy decision for one invitation or migration classification.
 ///
 /// The enum order is the restrictiveness order: automatic acceptance is the
@@ -100,7 +104,7 @@ pub enum GroupClosePolicy {
 }
 
 /// Runtime configuration passed during `load`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicationConfig {
     /// Policy used to derive runtime permissions from stored trust evidence.
     pub trust_policy: TrustPolicy,
@@ -110,6 +114,20 @@ pub struct ReplicationConfig {
     pub group_migration_policy: GroupMigrationPolicy,
     /// Local access policy reserved for the future standalone group-close flow.
     pub group_close_policy: GroupClosePolicy,
+    /// Maximum number of rows emitted in one application startup synchronisation batch.
+    pub application_synchronisation_batch_size: NonZeroUsize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            trust_policy: TrustPolicy::default(),
+            group_invitation_policy: GroupInvitationPolicy::default(),
+            group_migration_policy: GroupMigrationPolicy::default(),
+            group_close_policy: GroupClosePolicy::default(),
+            application_synchronisation_batch_size: DEFAULT_APPLICATION_SYNCHRONISATION_BATCH_SIZE,
+        }
+    }
 }
 
 /// Device-local security input required while loading one replication runtime.
@@ -772,7 +790,7 @@ pub enum ReplicationEvent {
     /// callback completes. Dropping the provider abandons the remainder of that
     /// transition.
     ///
-    /// Only independent group positions obtained from snapshots, publish
+    /// Only independent group positions obtained from startup synchronisation, publish
     /// receipts, or other compatible group-local progress may be merged out of
     /// listener order with [`ApplicationReadToken::merge_applied`].
     DataChanged {
@@ -790,6 +808,27 @@ pub enum ReplicationEvent {
         /// Complete candidate set known when this event was emitted.
         proposals: SmallVec<[MigrationCandidateProposal; 1]>,
     },
+}
+
+impl fmt::Debug for ReplicationEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataChanged { position, .. } => formatter
+                .debug_struct("DataChanged")
+                .field("position", position)
+                .field("rows", &"<row provider>")
+                .finish(),
+            Self::GroupInvitation { invitation, .. } => formatter
+                .debug_struct("GroupInvitation")
+                .field("invitation", invitation)
+                .field("respond", &"<invitation responder>")
+                .finish(),
+            Self::MigrationProposals { proposals } => formatter
+                .debug_struct("MigrationProposals")
+                .field("proposals", proposals)
+                .finish(),
+        }
+    }
 }
 
 /// Batch-level relationship between emitted data changes and a preceding group view.
@@ -810,6 +849,16 @@ pub struct MigrationCandidateProposal {
     pub proposal: MigrationProposal,
     /// One-shot response for this specific candidate.
     pub respond: Box<dyn MigrationProposalResponder>,
+}
+
+impl fmt::Debug for MigrationCandidateProposal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MigrationCandidateProposal")
+            .field("proposal", &self.proposal)
+            .field("respond", &"<migration proposal responder>")
+            .finish()
+    }
 }
 
 /// Callback for applications to accept or reject one group invitation.
@@ -981,30 +1030,6 @@ pub trait ReplicationApi: Send + Sync {
         &self,
         request: PublishChangesRequest,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
-
-    /// Open a batched stream over the latest locally stored projected row values for selected datasets.
-    ///
-    /// The request is scoped to one replication group and an explicit set of
-    /// application datasets. The stream reflects the latest state known to the
-    /// local store when the snapshot is opened; it does not wait for remote peers
-    /// and it does not perform catch-up. When `include_tombstones` is false, the
-    /// provider should emit only application-visible rows. When it is true,
-    /// retained delete tombstones are emitted as [`SnapshotValueRow`] views with
-    /// [`SnapshotValueRow::is_tombstoned`] set.
-    ///
-    /// The returned [`SnapshotValueRows`] provider may hold a store read transaction
-    /// while it is alive, so callers should drain or drop it promptly. Batches
-    /// are bounded by [`SnapshotRowsRequest::max_rows_per_batch`] and are emitted
-    /// through the same [`BatchProvider`] end-of-stream contract as listener row
-    /// providers.
-    ///
-    /// The method returns [`ApiError`] when the group is unknown, the request is
-    /// invalid, the runtime is unavailable, or the store cannot open the
-    /// snapshot.
-    fn snapshot_rows(
-        &self,
-        request: SnapshotRowsRequest,
-    ) -> BoxFuture<'_, Result<SnapshotValueRows, ApiError>>;
 
     /// Ask one group member for its current group version vector.
     fn request_summary(&self, request: SummaryRequest) -> BoxFuture<'_, Result<Summary, ApiError>>;

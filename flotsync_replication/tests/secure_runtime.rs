@@ -34,7 +34,6 @@ use flotsync_replication::{
         provision_test_trusted_public_keys,
         provisioned_sqlite_store,
         publish_changes,
-        snapshot_read_token,
         test_application_id,
         test_public_member_keys,
         wait_for_test_future,
@@ -242,7 +241,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
     );
     let row_id = test_row_id(group_id, dataset_id.clone(), 11);
 
-    let read_token = snapshot_read_token(alice_fixture.api(), group_id, dataset_id.clone());
+    let read_token = alice_fixture.group_read_token(group_id);
     let receipt = publish_changes(
         alice_fixture.api(),
         read_token,
@@ -293,7 +292,7 @@ fn update_gap_triggers_need_range_and_update_batch_catch_up() {
 
     let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_011);
     let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_012);
-    let first_read_token = snapshot_read_token(alice_fixture.api(), group_id, dataset_id.clone());
+    let first_read_token = alice_fixture.group_read_token(group_id);
     let first_receipt = publish_changes(
         alice_fixture.api(),
         first_read_token,
@@ -358,7 +357,7 @@ fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
     bob_fixture.install_group_for_test(group_id, members);
 
     let row_id = test_row_id(group_id, dataset_id.clone(), 50_111);
-    let read_token = snapshot_read_token(alice_fixture.api(), group_id, dataset_id.clone());
+    let read_token = alice_fixture.group_read_token(group_id);
     publish_changes(
         alice_fixture.api(),
         read_token,

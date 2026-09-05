@@ -4,47 +4,239 @@ title = "Replay full state during startup"
 body = """
 Goal
 
-Replace explicit live row snapshots with a staged application-startup load that is correct before incremental optimisation: return a live runtime immediately when there is no readable state, otherwise provide a full replay and start listener delivery only after application acknowledgement.
+Replace the live snapshot_rows API with staged startup loading: return a live runtime immediately when there is no readable application state, otherwise expose one coherent per-group snapshot replay and start live listener delivery only after application acknowledgement.
 
-Scope
+Public contract
 
-F01. Preload persisted groups, resolve schemas, and populate SharedGroupState in the async harness before starting the Kompact system.
-F02. Introduce ReplicationRuntimeLoad with Ready and Synchronising results. Accept Option<ApplicationReadToken> and the real listener at initial load, but deliberately use full replay for every non-empty readable state in this slice.
-F03. Build/connect ReplicationRuntimeComponent with a configurable log-only or panic-on-event placeholder listener and keep it inactive while starting IO, transport, delivery, and discovery.
-F04. Stream bounded full per-group sections containing current full rows, target GroupReadTokens, and the final ApplicationReadToken. Full sections emit neither inferred removals nor partial field upserts.
-F05. Let ApplicationSynchronisation completion install the retained real listener through on_definition, start the runtime component with notification, await successful on_start, and return ReplicationApi.
-F06. Keep pending decision and accepted-activation replay in on_start after listener replacement and before queued live work is handled.
-F07. Define orderly abort, drop/shutdown, completion-failure, and retry behaviour for the partly started host.
-F08. Remove snapshot_rows from the live ReplicationApi and convert examples, test helpers, and callers to the startup replay or narrower store fixtures.
-F09. Preserve the inactive Kompact mailbox as the only live-work buffer; do not add a gateway or token-based duplicate filtering.
+P01. Both public load entry points accept Option<ApplicationReadToken> and return ReplicationRuntimeLoad::Ready or ReplicationRuntimeLoad::Synchronising.
+P02. This child accepts but does not classify the supplied application token. No readable groups returns Ready; any readable group returns Synchronising with snapshot replay. Exact-token and incremental selection remain deferred.
+P03. ApplicationSynchronisation exposes an iterator-shaped next_group API which yields sequential SingleGroupSynchronisation values instead of sections, slices, or group indices.
+P04. Each SingleGroupSynchronisation exposes its GroupId, resulting GroupReadToken, and a row provider restricted to that group. Snapshot batches remain bounded, never cross dataset boundaries, and contain visible full snapshot rows only.
+P05. Restore SnapshotRow, SnapshotRowBatch, and apply_snapshot_rows terminology. Remove batch-level section/group indices and the speculative Full batch enum variant.
+P06. Keep the final aggregate ApplicationReadToken available as an optional convenience. Applications may instead persist each GroupReadToken after ingesting that group; both persistence layouts are valid.
+P07. ReplicationConfig exposes application_synchronisation_batch_size with a non-zero default of 128 rows.
+P08. ApplicationSynchronisation::complete consumes a fully drained replay, installs the retained listener, starts runtime logic, and returns the normal ReplicationApi. Explicit shutdown aborts cleanly.
+
+Preparation and lifecycle
+
+L01. Before creating the Kompact system, open one store read transaction, load and validate groups, resolve schemas, populate SharedGroupState, derive deterministically ordered readable-group synchronisations and their GroupReadTokens, and build the optional aggregate ApplicationReadToken.
+L02. Retain that same read transaction throughout snapshot delivery so rows and target tokens describe one store cut without opening one transaction per group.
+L03. Represent preparation as an explicit Ready or Synchronising state so the latter owns its replay state and provider without correlated Option fields or assertions.
+L04. Internally use one preallocated collection, sized from the loaded group count, whose entries combine application-visible group metadata with dataset scan state. Do not maintain parallel section, token, and scan collections.
+L05. Build and connect the ordinary topology with a non-optional placeholder listener and the preloaded SharedGroupState.
+L06. Start IO, transport, delivery, and discovery while catch-up, summary management, and ReplicationRuntimeComponent remain inactive.
+L07. Completion replaces the listener through on_definition while the runtime component is inactive, then starts catch-up, summary management, and ReplicationRuntimeComponent in that order with lifecycle notification.
+L08. ReplicationRuntimeComponent::on_start no longer hydrates group state. It replays pending decisions and resumes accepted activations after listener replacement; queued live work is handled only after on_start completes.
+L09. The inactive runtime component mailbox remains the only live-work buffer. Add no gateway, manual update buffer, or token-based listener filtering.
+
+Provider and cleanup state
+
+F01. The startup provider distinguishes streaming, successfully exhausted, explicitly aborted/released, and terminally failed lifecycle outcomes as needed; transaction release alone must not imply exhaustion.
+F02. Classify failures at the scope available inside the retained transaction. Terminal store, decode, copy, cursor, or release failures transition to a sticky Failed state. Non-terminal failures which can safely be retried within the existing transaction preserve the transaction and cursor so the current operation can be retried.
+F03. Reword ProviderFailed to describe use after an earlier terminal provider error rather than implying every operation failure poisons the provider.
+F04. Natural exhaustion is established only after every group and dataset scan is consumed and the retained transaction is released successfully.
+F05. Explicit abort releases the retained transaction without pretending the replay was consumed.
+F06. Completion requires natural exhaustion. Premature completion, listener installation failure, or component-start failure shuts down the partly started host and requires a fresh load because incomplete application state cannot safely receive unconditional incremental updates.
+F07. ApplicationSynchronisation::shutdown explicitly releases the retained transaction before orderly host shutdown so release failures remain observable.
+F08. Cleanup attempts all applicable steps. The first operational cleanup failure is returned and secondary failures are logged; premature completion continues to return SynchronisationIncomplete while logging cleanup failures.
+F09. Dropping an unfinished synchronisation uses best-effort asynchronous host shutdown and logs accurate guidance for the synchronisation lifecycle.
+F10. Use one clearly named owning cleanup operation unless separate borrowed and owning operations have genuinely distinct, documented semantics. Use batch consistently rather than page for the same bounded store result.
+F11. If compatibility draining or application snapshot ingestion fails, explicitly await staged synchronisation shutdown before returning the primary error; log any secondary cleanup failure.
+
+Staged host boundary
+
+H01. Move placeholder construction onto StartupEventPolicy::create_listener and pass the created listener into host preparation rather than passing the policy through the host boundary.
+H02. Always debug-log the complete unexpected ReplicationEvent before applying logging-only or panic behaviour.
+H03. Document the unenforced precondition that listener replacement occurs only while ReplicationRuntimeComponent is inactive.
+H04. Remove the test-only host preparation error variant; tests should exercise the same host-startup error shape as production.
+H05. Keep application-state preparation out of immediate-start host test helpers so those helpers retain their original concern.
+H06. Rename the unit-test query to ReadGroupToken, restrict it to unit-test compilation, and handle it with spawn_local rather than blocking the component.
+H07. Feature-level test support reads group tokens through its backing store rather than exposing the unit-test message.
+H08. Observe staged inbound delivery through a forwarding PortTesterComponent<GroupBroadcastPort> rather than a test-only counter on GroupBroadcastComponent.
+H09. The production placeholder policy remains logging-only; strict lifecycle tests use panic-on-event.
+
+Runtime-load simplification
+
+U01. Replace duplicated public and typed load enums with one generic ready/synchronising enum plus public trait-object and crate-internal concrete aliases.
+U02. Move compatibility replay draining onto ApplicationSynchronisation and reuse that single helper from typed test loaders and public test support.
+U03. Destructure PendingReplicationRuntime ownership so application_id, listener, host, and config can move independently without eager clones.
+U04. Match or transform the original activation result directly while still attempting host shutdown after activation failure.
+U05. Keep public documentation entirely in application terms and avoid exposing actor-framework implementation details.
+U06. Defer all loader argument-struct work to the P0 follow-up flotsync-4e8, covering public, typed, security-ready, and test-only loader layers.
+
+Snapshot removal and callers
+
+R01. Remove ReplicationApi::snapshot_rows, ReplicationRuntimeMessage::SnapshotRows, SnapshotRowsRequest, SnapshotValueRows, the component handler, and SnapshotRowsError.
+R02. Refactor the efficient store snapshot provider into the startup synchronisation provider outside ReplicationRuntimeComponent.
+R03. Convert the replicated checklist to construct its working set from startup snapshot rows, persist either each completed GroupReadToken or the optional final aggregate token, complete startup, and only then enter the REPL.
+R04. Replace the checklist runner setup tuple with a named struct.
+R05. Convert generic runtime test loaders to use the shared drain-and-complete helper where startup behaviour is not under test.
+R06. Replace post-start snapshot assertions with startup-replay tests or narrow store-level inspection helpers. Persistence tests reload into a fresh working set rather than inspect already-mutated in-memory state.
+R07. Consolidate compile-time Send assertions into one type-only helper.
+
+Test structure
+
+T01. Add a concise title-upsert helper for repeated RowMutation construction.
+T02. Check each batch dataset while already iterating over its rows, failing on the first mismatched dataset instead of making a separate pass.
+T03. Add a focused single-member readable group-record fixture or builder with sensible module-local defaults.
+T04. Add a staged-startup test fixture for repeated member, store, security, socket, listener, schema, and config setup while keeping the two-peer networking scenario explicit enough to read.
+T05. Keep individual tests focused on their lifecycle or data assertion rather than environment construction.
+T06. Failure-injection wrappers for read transactions must retain the store's actual read-only transaction semantics rather than substituting a write transaction.
 
 Correctness boundary
 
-C01. No readable groups returns Ready directly.
-C02. Any readable group returns Synchronising and a full replay, regardless of whether the optional supplied ApplicationReadToken might already be current. The later incremental child adds that optimisation.
-C03. The application ingests and atomically stores the full result plus final token before calling complete.
-C04. The runtime component is the only component that applies semantic replication updates and remains inactive throughout replay, so queued live work cannot overlap the replay cut.
+C01. The application applies each group snapshot and records the corresponding GroupReadToken before advancing; it may atomically record the optional final ApplicationReadToken after the complete replay.
+C02. Snapshot groups do not imply removals for locally retained rows missing from the snapshot and emit no partial field upserts.
+C03. The sole component that applies semantic replication updates remains inactive throughout the retained store cut.
+C04. Starting ReplicationRuntimeComponent is the single transition to unconditional listener delivery.
+C05. External concurrent writes to the replication store remain unsupported; no redundant pre-start verification reload is added.
+C06. Use “applied group snapshot” for a complete snapshot of one group and “partial application snapshot” only for selected rows spanning selected groups.
 
 Validation
 
-V01. Cover empty Ready and non-empty full replay across one and multiple groups.
-V02. Cover bounded batches, full-section semantics, listener substitution, queued inbound work, pending recovery event ordering, and absence of replay/live duplication.
-V03. Cover application abort/retry, placeholder log/panic behaviour, start failure, and shutdown from both Ready and Synchronising states.
-V04. Confirm no live snapshot_rows API or caller remains.
+V01. Cover Ready for no readable state and snapshot replay for one or multiple readable groups, including empty groups.
+V02. Cover deterministic group ordering, genuinely bounded multi-row batches, dataset boundaries, visible snapshot semantics, tombstone omission, per-group target tokens, and the optional aggregate token.
+V03. Cover listener substitution and placeholder policies. A real two-peer delivery test sends work while the target synchronises, observes no callback before completion, and observes exactly-once delivery afterward under the panic placeholder policy.
+V04. Cover natural exhaustion, explicit abort, premature completion, drop, retryable in-transaction failures, terminal provider failures, transaction-release failure, completion after failure, component-start failure with its exact error, and a fresh retry completed into a live runtime.
+V05. Cover checklist publication by shutting down and rebuilding application state through staged startup, including multiple groups and both viable token-persistence approaches where practical.
+V06. Add compile-time Send coverage for the staged load result and synchronisation handle.
+V07. Confirm no live snapshot_rows API or caller remains.
+V08. Run focused lifecycle and provider tests, the complete replication and example suites, pedantic Clippy, Rustfmt, Rustdoc, diff hygiene, OKF documentation checks, and the repository Rust instruction audit.
+V09. Retryable scan coverage must fail after a successful bounded batch and prove that retrying in the same transaction reuses the unchanged cursor and emits every remaining row exactly once.
+
+Code quality
+
+Q01. Keep public documentation focused on current behaviour; rely on non-exhaustive public types rather than speculative future-design prose.
+Q02. Follow repository visibility and item ordering, comment intentionally empty control flow, and remove stale or misleading helper naming and unused parameters.
+Q03. Keep failure-injection terminology general enough for startup reads rather than activation-specific when the same control serves both paths.
+Q04. Prefer named types and helpers where they remove setup noise or clarify ownership, but avoid abstractions which hide the scenario under test.
+Q05. Do not retain a transaction after a terminal provider error solely to observe a possible later release error; dropping it is an accepted cleanup trade-off.
 
 Deferrals
 
-D01. Do not classify supplied tokens, return exact-token Ready for non-empty state, emit incremental sections, coalesce update history, or select fallback per group in this task.
-D02. Do not reorganise the general runtime FSM; flotsync-zop tracks that work.
+D01. Do not classify supplied tokens, return exact-token Ready for non-empty state, emit incremental synchronisations, coalesce update history, or select per-group fallback. flotsync-5ou.3 owns those optimisations.
+D02. Do not reorganise the general runtime FSM or decompose ReplicationRuntimeComponent beyond moving startup hydration and snapshot responsibilities required here. flotsync-zop owns that work.
+D03. Do not add direct Kompact-only application APIs.
+D04. Do not perform the loader argument-struct refactor here. The linked P0 follow-up flotsync-4e8 owns that cross-cutting work and is blocked by this task.
 
-Sizing
+Execution and sizing
 
-Approximately 600-1,000 production and call-site LOC plus 650-1,100 test LOC."""
-status = "open"
+E01. Implement this plan within flotsync-5ou.2 in three internal stages: synchronisation/provider, staged host/runtime boundary, then callers/tests/examples. Do not split it into separate tasks or add user checkpoints between individual comments.
+E02. Work through the review checklist item by item and keep its status current so every supplied comment has an explicit disposition before returning to review.
+E03. Expected repair churn is approximately 1,000-1,500 lines. Removing the section/index machinery and duplicated compatibility paths should keep net growth lower, but the task is likely to exceed 1,000 touched lines.
+E04. The user resumed implementation; return the accepted review repairs for review only after focused regression coverage and the complete validation set pass.
+
+Fourth review repairs
+G01. Validate each loaded group record before merging its read token or appending its snapshot scan. Duplicate readable records with incompatible member counts must return the structured duplicate-group startup error rather than panic. Add focused regression coverage.
+G02. Mark the new public ReplicationRuntimeLoad enum non-exhaustive and update downstream external matches with an explicit unsupported-state fallback.
+G03. Replace the five-element checklist test-loader tuple with a named fixture and convert its callers to named-field destructuring or access.
+G04. Describe SynchronisationIncomplete in terms of exhausting every prepared group snapshot, including empty groups, rather than consuming row batches.
+G05. Preserve all previously agreed lifecycle, retry, cleanup, snapshot, listener, and token-persistence behaviour. Keep loader argument structs deferred to flotsync-4e8.
+G06. Expected repair churn is approximately 60-100 lines, below the 1,000-line split threshold.
+G07. Re-run focused startup and malformed-store coverage, the replication and checklist suites, pedantic Clippy, Rustfmt, Rustdoc, diff hygiene, and the repository Rust instruction audit before returning to review.
+
+Fifth review repairs
+J01. Rely on each restricted topology struct's visibility as the effective cap and use plain pub only for fields which genuinely need cross-module access; keep all other fields private.
+J02. Replace the always-present unit-test delivery proxy with one wholly cfg(test) RuntimeHostTestSupport structure. It owns the existing route-publication mode and the optional group-broadcast/runtime proxy, materialises requested test components after the Kompact system exists, derives observation handles on demand, and provides the single extension point for future host instrumentation.
+J03. Keep RuntimeHostTestSupport separate from production preparation inputs, RuntimeTopologyBuildInput, DeliveryTopology, and other production payloads. Ordinary preparation wrappers supply its direct/default form internally, while one narrowly named test-only loader opts into the proxy for the staged-startup scenario.
+J04. Use cfg_select! once at the connection boundary to express direct production wiring and test direct-or-proxied wiring. Only opted-in tests start and traverse the proxy; ordinary tests retain production-equivalent topology.
+J05. Centralise the repeated failure-control mutex acquisition in one documented helper shared by the failing store and delegated transaction wrappers.
+J06. Document that ApplicationSynchronisation::next_group returning None means no further group can be claimed, while successful completion still requires natural exhaustion; an incompletely dropped claimed group also yields None but leaves completion ineligible.
+J07. Add the local UnitResult<E> alias for unit-valued error conversion and explain any ownership-driven destructuring retained in PendingReplicationRuntime::start.
+J08. Use value-free assert_send<T: Send + ?Sized>() and assert_sync<T: Sync + ?Sized>() for named owned and trait-object types. Use a separately named and documented assert_inferred_send(&value) only for opaque return types which cannot be named and require value-based inference.
+J09. Retain ChecklistRuntimeFixture values and access their fields directly instead of destructuring stores into deliberately unused bindings.
+J10. Expected fifth-review repair churn is approximately 155-270 lines, below the 1,000-line split threshold. Re-run focused runtime-host and checklist tests, workspace all-target/all-feature pedantic Clippy, Rustfmt, Rustdoc, diff hygiene, and the Rust instruction audit before returning to review.
+
+Sixth review repairs
+
+K01. Keep RuntimeHostTestSupport and the reserved local-endpoint lease as separate fields. Move conditional host fields to the end of DeliveryRuntimeHost and conditional constructor arguments to the end of DeliveryRuntimeHost::new, without adding another support or request type.
+K02. Extend the deferred P0 follow-up flotsync-4e8 to cover prepare_with_runtime_config_toml, prepare_with_test_support, prepare_with_options, and DeliveryRuntimeHost construction, including removal of the associated too-many-arguments allowances.
+K03. Replace the free failure-control lock helper with short associated lock_control functions on FailingStore and FailingStoreTransaction. Use Self::lock_control with either the instance field or a moved control mutex and introduce no wrapper abstraction.
+K04. Preserve all existing host behaviour and failure-injection semantics; this pass is ordering and test-helper cleanup only.
+K05. Expected sixth-review repair churn is approximately 35-70 lines, below the 1,000-line split threshold. Re-run focused runtime-host and replication tests, the example suite, workspace all-target/all-feature pedantic Clippy, Rustfmt, Rustdoc, diff hygiene, and the Rust instruction audit before returning to review."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 blocked_by = ["01a060ae-aac2-7e70-93eb-91d3bf122387"]
-blocks = ["01a060af-43d8-7250-8bb6-f7eb9ae61700"]
+blocks = [
+    "01a060af-43d8-7250-8bb6-f7eb9ae61700",
+    "01a067de-34f3-7510-b84b-edc14564d67a",
+]
 parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
 created_at = "2026-09-02T05:54:37.47735Z"
-updated_at = "2026-09-02T05:54:54.040853Z"
+updated_at = "2026-09-05T08:39:36.103856Z"
+closed_at = "2026-09-05T08:39:36.103856Z"
+
+[[comments]]
+id = "01a06331-45a6-74e3-ada3-d36129336957"
+author = "codex"
+body = "Review follow-up agreed: make provider release failures sticky, explicitly release on abort, exercise real delivery during staged startup, restore checklist reload evidence, strengthen batching/retry/Send coverage, and address documentation, naming, ordering, and empty-loop conformance findings."
+created_at = "2026-09-02T17:36:08.614075Z"
+
+[[comments]]
+id = "01a067ef-ac73-7ef0-a8fc-3a96809bdf97"
+author = "codex"
+body = "Combined review plan agreed on 2026-09-03. The redesign uses sequential per-group snapshot synchronisations with an optional aggregate ApplicationReadToken convenience; persisting each GroupReadToken after its group is also supported. Provider handling will distinguish retryable in-transaction failures from sticky terminal failures and separate natural exhaustion from abort cleanup. The same pass covers the staged listener and test seams, generic load result, shared compatibility draining, snapshot terminology, and test/example setup cleanup. Loader argument structs remain deferred to linked P0 follow-up flotsync-4e8. Implementation is intentionally paused until the user resumes the task."
+created_at = "2026-09-03T15:42:35.635984Z"
+
+[[comments]]
+id = "01a06b4b-0b7d-71f1-ab2e-4c95709a0bac"
+author = "codex"
+body = "Implemented the agreed combined review plan. Startup replay now exposes sequential per-group snapshot synchronisations, supports per-group or aggregate token persistence, separates natural exhaustion from abort, permits operation-scoped retries within the retained transaction, and invalidates the provider on terminal failures. The host/test seams, shared draining, checklist terminology/setup, and Send assertions were simplified as planned. All review items are resolved except the loader argument-struct work intentionally tracked by flotsync-4e8. Replication (374), secure-runtime (6), and example (95) tests pass; workspace pedantic Clippy, test-support pedantic Clippy, Rustdoc, formatting, diff hygiene, OKF validation, and the Rust instruction audit pass."
+created_at = "2026-09-04T07:21:15.38928Z"
+
+[[comments]]
+id = "01a06b62-b48f-7c23-acac-16fc40ce5afb"
+author = "codex"
+body = "Third review delta agreed: explicitly shut down staged synchronisation after compatibility-drain or checklist snapshot-application errors; keep terminal provider transaction-drop behaviour as-is; preserve genuine read-only semantics in the failure-injection store; strengthen operation-scoped retry coverage around a non-empty cursor; and use “applied group snapshot” for a complete group while reserving “partial application snapshot” for selected rows across selected groups."
+created_at = "2026-09-04T07:47:05.99998Z"
+
+[[comments]]
+id = "01a06b6c-406c-73c3-b7af-718a6d90ab87"
+author = "codex"
+body = "Third review repairs completed. Compatibility and checklist replay failures now await explicit synchronisation shutdown while preserving the primary error; the test store wraps genuine read versus write transactions; operation-scoped retry coverage now proves a non-empty cursor is unchanged and remaining rows are emitted once; and GroupReadToken merge documentation uses “applied group snapshot”. CR02 remains unchanged by agreement. Validation: 375 replication unit tests plus boundary test, 6 secure-runtime tests, 95 example tests, both pedantic Clippy runs, Rustdoc with warnings denied, Rustfmt, diff hygiene, and the Rust instruction audit all pass."
+created_at = "2026-09-04T07:57:31.628694Z"
+
+[[comments]]
+id = "01a06bb1-f379-7721-95f8-d90a3e3f178d"
+author = "codex"
+body = "Fourth review delta agreed: validate stored groups before aggregate-token construction so malformed duplicates return structured errors; make the new public load enum non-exhaustive; replace the checklist test-loader tuple with a named fixture; and correct SynchronisationIncomplete documentation to describe group-snapshot exhaustion."
+created_at = "2026-09-04T09:13:39.449616Z"
+
+[[comments]]
+id = "01a06bbc-2ef8-7b71-9903-0b1e02745aaf"
+author = "lkroll"
+body = "Fourth review repairs completed. Stored groups are validated before token/snapshot publication, with incompatible duplicate records covered by a structured-error regression; ReplicationRuntimeLoad is non-exhaustive with an explicit checklist fallback; checklist test loaders now return a named fixture while retaining the SQLite owner for each test lifetime; and SynchronisationIncomplete documentation now refers to group snapshots. Validation: 376 replication unit tests plus boundary test, 6 all-feature secure-runtime tests, 95 checklist tests, workspace all-target/all-feature pedantic Clippy, Rustfmt, diff hygiene, OKF validation, documentation build, and the Rust instruction audit pass. Documentation emitted only existing unrelated broken-link warnings."
+created_at = "2026-09-04T09:24:50.040515Z"
+
+[[comments]]
+id = "01a06c4f-389a-7da2-adb0-c6bbe6272a65"
+author = "lkroll"
+body = "Fifth review delta agreed: isolate all host instrumentation in one cfg(test) RuntimeHostTestSupport extension point; opt the staged inbound scenario into its delivery proxy while ordinary tests retain direct wiring; simplify topology visibility, failure-control locking, synchronisation documentation and shutdown conversions; document ownership-driven destructuring; separate named-type and inferred opaque-future Send assertions; and retain checklist fixtures for direct field access."
+created_at = "2026-09-04T12:05:26.298808Z"
+
+[[comments]]
+id = "01a06c60-c4d1-7042-94cd-2e92e455b3c3"
+author = "lkroll"
+body = "Fifth review repairs completed. Test-only delivery instrumentation now lives in a separate extensible RuntimeHostTestSupport payload and only the staged inbound scenario opts into proxy wiring; production topology payloads and ordinary tests retain direct connections. Restricted field visibility, failure-control locking, next_group exhaustion documentation, shutdown result conversions, ownership rationale, Send assertions, and checklist fixture retention were simplified as agreed. Validation: 30 focused host tests, 376 replication unit tests plus boundary test, 6 all-feature secure-runtime tests, 95 example tests, workspace all-target/all-feature pedantic Clippy, Rustdoc with warnings denied, Rustfmt, diff hygiene, OKF validation, and the Rust instruction audit all pass."
+created_at = "2026-09-04T12:24:36.305778Z"
+
+[[comments]]
+id = "01a070a9-b09c-7312-87e6-85a3d7e0c5d1"
+author = "lkroll"
+body = "Sixth review delta agreed: keep RuntimeHostTestSupport and the reserved socket lease separate but move conditional host state and constructor arguments to the end; replace the free failure-control lock helper with short associated functions on FailingStore and FailingStoreTransaction; and extend flotsync-4e8 to cover both host preparation boundaries and construction. No new support wrapper or request type will be introduced."
+created_at = "2026-09-05T08:22:44.12402Z"
+
+[[comments]]
+id = "01a070b4-428b-7160-9fa1-6c6f01649eb7"
+author = "lkroll"
+body = "Sixth review repairs completed. DeliveryRuntimeHost keeps the lease and RuntimeHostTestSupport separate but places conditional state and constructor arguments last; the free failure-control lock helper is replaced by the agreed Self::lock_control associated functions; and flotsync-4e8 now covers the host preparation chain. Focused host tests (30), the replication suite (376 plus boundary), examples (95), workspace all-feature pedantic Clippy, warning-denied Rustdoc, Rustfmt, diff hygiene, OKF validation, and the Rust instruction audit pass. Validation exception: the secure-runtime observed-summary scenario consistently timed out while loading its initial fixture, before group setup; this mechanical review delta does not change that startup behaviour, so the failure is recorded rather than reported as a pass."
+created_at = "2026-09-05T08:34:16.843671Z"
+
+[[comments]]
+id = "01a070b9-21a7-7911-8c5c-28d9dcf09c43"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-05T08:39:36.103856Z"

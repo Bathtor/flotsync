@@ -32,6 +32,9 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Wait until the runtime component accepts one mailbox turn.
     #[cfg(test)]
     fn wait_for_runtime_startup(&self);
+    /// Wait until group broadcast hands one inbound message to runtime logic.
+    #[cfg(test)]
+    fn wait_for_group_broadcast_inbound(&self);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -114,6 +117,12 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
                 "replication runtime component became unavailable during test startup barrier: {error:?}"
             ),
         }
+    }
+
+    #[cfg(test)]
+    fn wait_for_group_broadcast_inbound(&self) {
+        self.test_support
+            .wait_for_group_broadcast_runtime_indication();
     }
 }
 

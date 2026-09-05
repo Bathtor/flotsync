@@ -22,5 +22,11 @@ pub use local_identity::{
     ProvisionedLocalIdentity,
     provision_local_identity,
 };
-pub use runtime::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
+pub use runtime::{
+    ApplicationSynchronisation,
+    ReplicationRuntimeLoad,
+    SingleGroupSynchronisation,
+    load_replication_runtime,
+    load_replication_runtime_with_runtime_config_toml,
+};
 pub use store::{SqliteReplicationStore, SqliteReplicationStoreProvisioner};

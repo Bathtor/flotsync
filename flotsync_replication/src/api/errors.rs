@@ -44,6 +44,9 @@ pub enum DatasetIdError {
 pub enum RowProviderError {
     #[snafu(display("Row provider failed: {source}"))]
     ProviderExternal { source: BoxError },
+    /// An earlier terminal provider operation left the provider invalid.
+    #[snafu(display("Row provider is invalid after an earlier terminal error."))]
+    ProviderFailed,
 }
 
 #[derive(Debug, Snafu)]
@@ -278,6 +281,11 @@ pub enum LoadError {
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
     Unavailable { application_id: ApplicationId },
+    /// Startup completion was requested before every prepared group snapshot was exhausted.
+    #[snafu(display(
+        "Application startup synchronisation for '{application_id}' was not fully consumed."
+    ))]
+    SynchronisationIncomplete { application_id: ApplicationId },
 }
 
 impl StoreErrorClassificationSource for LoadError {
@@ -285,7 +293,9 @@ impl StoreErrorClassificationSource for LoadError {
         match self {
             Self::StoreAccess { source, .. } => source.store_error_classification(),
             Self::Security { source, .. } => source.store_error_classification(),
-            Self::Runtime { .. } | Self::Unavailable { .. } => None,
+            Self::Runtime { .. }
+            | Self::Unavailable { .. }
+            | Self::SynchronisationIncomplete { .. } => None,
         }
     }
 }

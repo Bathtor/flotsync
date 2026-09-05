@@ -1,4 +1,5 @@
 use super::{
+    catch_up_manager::CatchUpManagerComponent,
     component::ReplicationRuntimeComponent,
     errors::{
         ChangeGroupMembershipError,
@@ -6,10 +7,14 @@ use super::{
         GroupInstallError,
         InboundDeliveryError,
         PublishChangesError,
+        RuntimeStartupError,
     },
     group_state::{RuntimeGroupStateSnapshot, SharedGroupState},
     handle::{
         ReplicationRuntime,
+        ReplicationRuntimeLoad,
+        TypedReplicationRuntimeLoad,
+        load_replication_runtime_typed_with_observed_startup_for_test,
         load_replication_runtime_typed_with_security_for_test,
         wait_for_test_reply,
     },
@@ -18,6 +23,7 @@ use super::{
         DeliveryRuntimeHostTestExt,
         PreconfiguredPeerRoutesPublishMode,
         RuntimeHostError,
+        StartupEventPolicy,
     },
     in_memory::{
         LocalDataset,
@@ -29,6 +35,7 @@ use super::{
     },
     load_replication_runtime,
     load_replication_runtime_with_runtime_config_toml,
+    synchronisation::prepare_application_state,
 };
 use crate::{
     MAX_VERSION_VALUE,
@@ -36,6 +43,7 @@ use crate::{
     SqliteReplicationStoreProvisioner,
     api::{
         ApiError,
+        ApplicationReadToken,
         ApplicationSchemas,
         AuthorityScope,
         ChangeGroupMembershipRequest,
@@ -113,12 +121,15 @@ use crate::{
         RowKey,
         RowKeyIterator,
         RowMutation,
+        RowProviderError,
         STORE_EXTERNAL_UNCLASSIFIED_SNAFU,
         SchemaSource,
         SnapshotRef,
-        SnapshotRowsRequest,
-        SnapshotValueRow,
         StoreError,
+        StoreErrorClass,
+        StoreErrorClassification,
+        StoreErrorResolution,
+        StoreErrorScope,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
         SummaryRequest,
@@ -159,6 +170,7 @@ use crate::{
         provision_test_identity as provision_shared_test_identity,
         provision_test_security as provision_shared_test_security,
         provisioned_sqlite_store,
+        test_group_key,
         test_public_member_keys,
         test_replication_security_secrets,
         wait_for_test_future,
@@ -220,6 +232,13 @@ static STATIC_TITLE_EDIT_COUNT_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static TITLE_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
     ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_SCHEMA)
         .expect("title application schemas should build")
+});
+static TWO_TITLE_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
+    ApplicationSchemas::try_from_lazy_entries([
+        ("docs", &STATIC_TITLE_SCHEMA),
+        ("notes", &STATIC_TITLE_SCHEMA),
+    ])
+    .expect("two-dataset title application schemas should build")
 });
 static TITLE_NOTE_APPLICATION_SCHEMAS: LazyLock<ApplicationSchemas> = LazyLock::new(|| {
     ApplicationSchemas::try_from_lazy_entry("docs", &STATIC_TITLE_NOTE_SCHEMA)
@@ -301,10 +320,10 @@ impl<S> Drop for RuntimeFixture<S> {
     }
 }
 
-/// State machine for failing the provider read opened after activation commits.
+/// State machine for failing one selected future read transaction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ActivationReadFailure {
-    /// Do not inject an activation-provider read failure.
+enum ReadTransactionFailure {
+    /// Do not inject a read-transaction failure.
     #[default]
     Disabled,
     /// Wait for the next transaction which commits an activation.
@@ -319,7 +338,13 @@ struct FailingStoreControlState {
     fail_next_apply_dataset_row_patch: Option<DatasetId>,
     fail_next_activate_replication_group: bool,
     fail_after_next_pending_group_commit: bool,
-    activation_read_failure: ActivationReadFailure,
+    read_transaction_failure: ReadTransactionFailure,
+    fail_next_read_release: bool,
+    read_release_count: usize,
+    snapshot_scan_failures: VecDeque<StoreErrorClassification>,
+    snapshot_scan_requests: Vec<ProviderTestScanRequest>,
+    /// Optional deterministic replacement for all-groups reads in malformed-store tests.
+    loaded_groups_override: Option<Vec<ReplicationGroupRecord>>,
 }
 
 /// Test-only store wrapper that can fail selected future writes while
@@ -333,6 +358,15 @@ struct FailingStore<S> {
 }
 
 impl<S> FailingStore<S> {
+    /// Acquire shared failure-injection state with the store's poison invariant.
+    fn lock_control(
+        control: &Mutex<FailingStoreControlState>,
+    ) -> std::sync::MutexGuard<'_, FailingStoreControlState> {
+        control
+            .lock()
+            .expect("failing store mutex must not be poisoned")
+    }
+
     fn new(inner: Arc<S>) -> Self {
         Self {
             inner,
@@ -349,32 +383,56 @@ impl<S> FailingStore<S> {
     }
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
-        self.control
-            .lock()
-            .expect("failing store mutex must not be poisoned")
-            .fail_next_apply_dataset_row_patch = Some(dataset_id);
+        Self::lock_control(&self.control).fail_next_apply_dataset_row_patch = Some(dataset_id);
     }
 
     fn fail_after_next_pending_group_commit(&self) {
-        self.control
-            .lock()
-            .expect("failing store mutex must not be poisoned")
-            .fail_after_next_pending_group_commit = true;
+        Self::lock_control(&self.control).fail_after_next_pending_group_commit = true;
     }
 
     fn fail_next_activate_replication_group(&self) {
-        self.control
-            .lock()
-            .expect("failing store mutex must not be poisoned")
-            .fail_next_activate_replication_group = true;
+        Self::lock_control(&self.control).fail_next_activate_replication_group = true;
+    }
+
+    /// Fail the next read transaction opened after this call.
+    fn fail_next_read_transaction(&self) {
+        Self::lock_control(&self.control).read_transaction_failure =
+            ReadTransactionFailure::NextReadTransaction;
     }
 
     /// Fail the provider read transaction opened after the next activation commit.
     fn fail_activation_read_after_next_commit(&self) {
-        self.control
-            .lock()
-            .expect("failing store mutex must not be poisoned")
-            .activation_read_failure = ActivationReadFailure::AfterNextActivationCommit;
+        Self::lock_control(&self.control).read_transaction_failure =
+            ReadTransactionFailure::AfterNextActivationCommit;
+    }
+
+    /// Fail the next explicit read-transaction release.
+    fn fail_next_read_release(&self) {
+        Self::lock_control(&self.control).fail_next_read_release = true;
+    }
+
+    /// Fail the next snapshot scan with the selected store classification.
+    fn fail_next_snapshot_scan(&self, classification: StoreErrorClassification) {
+        Self::lock_control(&self.control)
+            .snapshot_scan_failures
+            .push_back(classification);
+    }
+
+    /// Return every ordinary snapshot scan request observed by this wrapper.
+    fn snapshot_scan_requests(&self) -> Vec<ProviderTestScanRequest> {
+        Self::lock_control(&self.control)
+            .snapshot_scan_requests
+            .clone()
+    }
+
+    /// Return the number of delegated read transactions explicitly released.
+    fn read_release_count(&self) -> usize {
+        Self::lock_control(&self.control).read_release_count
+    }
+
+    /// Return the supplied records from every delegated all-groups read.
+    fn override_loaded_groups(&self, groups: Vec<ReplicationGroupRecord>) {
+        Self::lock_control(&self.control).loaded_groups_override = Some(groups);
     }
 }
 
@@ -395,7 +453,7 @@ where
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
-                inner: Some(inner),
+                inner: Some(FailingStoreTransactionInner::Write(inner)),
                 control,
                 hide_local_private_keys,
                 provider_scan: None,
@@ -410,12 +468,9 @@ where
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
         let should_fail = {
-            let mut failure = self
-                .control
-                .lock()
-                .expect("failing store mutex must not be poisoned");
-            if failure.activation_read_failure == ActivationReadFailure::NextReadTransaction {
-                failure.activation_read_failure = ActivationReadFailure::Disabled;
+            let mut failure = Self::lock_control(&self.control);
+            if failure.read_transaction_failure == ReadTransactionFailure::NextReadTransaction {
+                failure.read_transaction_failure = ReadTransactionFailure::Disabled;
                 true
             } else {
                 false
@@ -423,26 +478,22 @@ where
         };
         if should_fail {
             return async move {
-                let source = std::io::Error::other(
-                    "failing store intentionally failed activation provider read transaction",
-                );
+                let source =
+                    std::io::Error::other("failing store intentionally failed read transaction");
                 Err::<Box<dyn ReplicationStoreReadTransaction>, _>(source)
                     .boxed()
                     .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU)
             }
             .boxed();
         }
-        if !self.hide_local_private_keys {
-            return self.inner.begin_read_transaction();
-        }
-
         let inner = self.inner.clone();
         let control = self.control.clone();
+        let hide_local_private_keys = self.hide_local_private_keys;
         async move {
-            let inner = inner.begin_transaction().await?;
+            let inner = inner.begin_read_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
-                inner: Some(inner),
-                hide_local_private_keys: true,
+                inner: Some(FailingStoreTransactionInner::Read(inner)),
+                hide_local_private_keys,
                 control,
                 provider_scan: None,
                 wrote_pending_group_work: false,
@@ -485,17 +536,100 @@ where
     }
 }
 
+/// Actual store transaction kind retained by the shared failure-injection wrapper.
+enum FailingStoreTransactionInner {
+    /// Read-only transaction returned by `begin_read_transaction`.
+    Read(Box<dyn ReplicationStoreReadTransaction>),
+    /// Read-write transaction returned by `begin_transaction`.
+    Write(Box<dyn ReplicationStoreTransaction>),
+}
+
+impl FailingStoreTransactionInner {
+    /// Return the contained write transaction.
+    fn write_mut(&mut self) -> &mut dyn ReplicationStoreTransaction {
+        match self {
+            Self::Write(transaction) => transaction.as_mut(),
+            Self::Read(_) => panic!("a read-only transaction cannot perform delegated writes"),
+        }
+    }
+
+    /// Consume and return the contained write transaction.
+    fn into_write(self) -> Box<dyn ReplicationStoreTransaction> {
+        match self {
+            Self::Write(transaction) => transaction,
+            Self::Read(_) => panic!("a read-only transaction cannot complete as a write"),
+        }
+    }
+
+    /// Release either transaction kind using its matching terminal operation.
+    fn release(self) -> BoxFuture<'static, Result<(), StoreError>> {
+        match self {
+            Self::Read(transaction) => transaction.release(),
+            Self::Write(transaction) => transaction.rollback(),
+        }
+    }
+}
+
+impl std::ops::Deref for FailingStoreTransactionInner {
+    type Target = dyn ReplicationStoreReadTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Read(transaction) => transaction.as_ref(),
+            Self::Write(transaction) => transaction.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for FailingStoreTransactionInner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Read(transaction) => transaction.as_mut(),
+            Self::Write(transaction) => transaction.as_mut(),
+        }
+    }
+}
+
+/// Read or write transaction wrapper sharing the store's failure controls.
 struct FailingStoreTransaction {
-    inner: Option<Box<dyn ReplicationStoreTransaction>>,
+    /// Actual store transaction, absent only in deterministic provider unit tests.
+    inner: Option<FailingStoreTransactionInner>,
     /// Whether this transaction emulates an absent local-private key record.
     hide_local_private_keys: bool,
     /// Failure injection shared with the wrapping store.
     control: Arc<Mutex<FailingStoreControlState>>,
     /// Optional deterministic scan behaviour for replacement-provider tests.
     provider_scan: Option<ProviderTestScanBehaviour>,
+    /// Whether this transaction wrote pending group work before committing.
     wrote_pending_group_work: bool,
     /// Whether this transaction removed a pending activation before committing.
     removed_pending_group_activation: bool,
+}
+
+impl FailingStoreTransaction {
+    /// Acquire shared failure-injection state with the transaction's poison invariant.
+    fn lock_control(
+        control: &Mutex<FailingStoreControlState>,
+    ) -> std::sync::MutexGuard<'_, FailingStoreControlState> {
+        control
+            .lock()
+            .expect("failing store mutex must not be poisoned")
+    }
+
+    /// Return the delegated write transaction; read wrappers never use this path.
+    fn write_transaction(&mut self) -> &mut dyn ReplicationStoreTransaction {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .write_mut()
+    }
+
+    /// Consume the delegated write transaction; read wrappers never use this path.
+    fn into_write_transaction(self) -> Box<dyn ReplicationStoreTransaction> {
+        self.inner
+            .expect("failing store transaction must remain open until completion")
+            .into_write()
+    }
 }
 
 impl ReplicationStoreReadTransaction for FailingStoreTransaction {
@@ -512,6 +646,12 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
     fn load_replication_groups(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        let groups = Self::lock_control(&self.control)
+            .loaded_groups_override
+            .clone();
+        if let Some(groups) = groups {
+            return futures_util::future::ready(Ok(groups)).boxed();
+        }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -682,6 +822,23 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         limit: NonZeroUsize,
         output: &'a mut ReplicationStateRowBatch,
     ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
+        let injected_failure = {
+            let mut control = Self::lock_control(&self.control);
+            control
+                .snapshot_scan_requests
+                .push(ProviderTestScanRequest {
+                    dataset_id: dataset.dataset_id.clone(),
+                    after,
+                    limit,
+                });
+            control.snapshot_scan_failures.pop_front()
+        };
+        if let Some(classification) = injected_failure {
+            let source =
+                std::io::Error::other("failing store intentionally failed one snapshot scan");
+            return futures_util::future::ready(Err(StoreError::new(classification, source)))
+                .boxed();
+        }
         if let Some(provider_scan) = self.provider_scan.as_mut() {
             provider_scan
                 .state
@@ -843,6 +1000,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
     fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         let Self {
             inner,
+            control,
             provider_scan,
             ..
         } = *self;
@@ -854,9 +1012,23 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
                 .release_count += 1;
             return futures_util::future::ready(Ok(())).boxed();
         }
+        let should_fail = {
+            let mut control = Self::lock_control(&control);
+            control.read_release_count += 1;
+            std::mem::take(&mut control.fail_next_read_release)
+        };
+        if should_fail {
+            let source = std::io::Error::other(
+                "failing store intentionally failed read transaction release",
+            );
+            let result = Err::<(), _>(source)
+                .boxed()
+                .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
+            return futures_util::future::ready(result).boxed();
+        }
         inner
             .expect("failing store transaction must remain open until release")
-            .rollback()
+            .release()
     }
 }
 
@@ -865,19 +1037,14 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .insert_replication_group(group)
+        self.write_transaction().insert_replication_group(group)
     }
 
     fn ensure_replication_group_material(
         &mut self,
         material: ReplicationGroupMaterialRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .ensure_replication_group_material(material)
     }
 
@@ -887,10 +1054,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         version_vector: VersionVector,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let should_fail = {
-            let mut control = self
-                .control
-                .lock()
-                .expect("failing store mutex must not be poisoned");
+            let mut control = Self::lock_control(&self.control);
             std::mem::take(&mut control.fail_next_activate_replication_group)
         };
         if should_fail {
@@ -903,9 +1067,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             }
             .boxed();
         }
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .activate_replication_group(group_id, version_vector)
     }
 
@@ -913,9 +1075,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         record: LocalMemberPrivateKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .ensure_local_member_private_keys(record)
     }
 
@@ -923,19 +1083,14 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         record: MemberPublicKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .ensure_member_public_keys(record)
+        self.write_transaction().ensure_member_public_keys(record)
     }
 
     fn ensure_member_key_trust_evidence(
         &mut self,
         record: MemberKeyTrustEvidenceRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .ensure_member_key_trust_evidence(record)
     }
 
@@ -943,9 +1098,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         fingerprint: KeyFingerprint,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .ensure_blocked_key_fingerprint(fingerprint)
     }
 
@@ -954,9 +1107,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .update_replication_group_version_vector(group_id, version_vector)
     }
 
@@ -965,9 +1116,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         lifecycle: ReplicationGroupLifecycle,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .update_replication_group_lifecycle(group_id, lifecycle)
     }
 
@@ -979,9 +1128,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         let control = self.control.clone();
         async move {
             let should_fail = {
-                let mut control = control
-                    .lock()
-                    .expect("failing store mutex must not be poisoned");
+                let mut control = Self::lock_control(&control);
                 if control.fail_next_apply_dataset_row_patch.as_ref() == Some(&patch.dataset_id) {
                     control.fail_next_apply_dataset_row_patch = None;
                     true
@@ -993,6 +1140,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                 self.inner
                     .take()
                     .expect("failing store transaction must remain open during rollback")
+                    .into_write()
                     .rollback()
                     .await?;
                 let source = std::io::Error::other(format!(
@@ -1003,9 +1151,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                     .boxed()
                     .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
             }
-            self.inner
-                .as_mut()
-                .expect("failing store transaction must remain open during delegated writes")
+            self.write_transaction()
                 .apply_dataset_row_patch(dataset, patch)
                 .await
         }
@@ -1016,10 +1162,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         update: ReplicationUpdateRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .append_replication_update(update)
+        self.write_transaction().append_replication_update(update)
     }
 
     fn mark_replication_update_applied<'a>(
@@ -1027,9 +1170,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .mark_replication_update_applied(group_id, update_id)
     }
 
@@ -1038,9 +1179,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         record: PendingGroupDecisionRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         self.wrote_pending_group_work = true;
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .upsert_pending_group_decision(record)
     }
 
@@ -1048,10 +1187,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         key: PendingGroupWorkKey,
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .remove_pending_group_decision(key)
+        self.write_transaction().remove_pending_group_decision(key)
     }
 
     fn upsert_pending_group_activation(
@@ -1059,9 +1195,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         record: PendingGroupActivationRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         self.wrote_pending_group_work = true;
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .upsert_pending_group_activation(record)
     }
 
@@ -1070,9 +1204,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         key: PendingGroupWorkKey,
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
         self.removed_pending_group_activation = true;
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .remove_pending_group_activation(key)
     }
 
@@ -1080,9 +1212,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &mut self,
         group_id: GroupId,
     ) -> BoxFuture<'_, Result<bool, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
+        self.write_transaction()
             .remove_inactive_replication_group_material(group_id)
     }
 
@@ -1097,17 +1227,16 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         async move {
             inner
                 .expect("failing store transaction must remain open until commit")
+                .into_write()
                 .commit()
                 .await?;
             let should_fail = {
-                let mut control = control
-                    .lock()
-                    .expect("failing store mutex must not be poisoned");
+                let mut control = Self::lock_control(&control);
                 if removed_pending_group_activation
-                    && control.activation_read_failure
-                        == ActivationReadFailure::AfterNextActivationCommit
+                    && control.read_transaction_failure
+                        == ReadTransactionFailure::AfterNextActivationCommit
                 {
-                    control.activation_read_failure = ActivationReadFailure::NextReadTransaction;
+                    control.read_transaction_failure = ReadTransactionFailure::NextReadTransaction;
                 }
                 wrote_pending_group_work
                     && std::mem::take(&mut control.fail_after_next_pending_group_commit)
@@ -1126,10 +1255,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
     }
 
     fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
-        let Self { inner, .. } = *self;
-        inner
-            .expect("failing store transaction must remain open until rollback")
-            .rollback()
+        (*self).into_write_transaction().rollback()
     }
 }
 
@@ -1168,19 +1294,6 @@ impl CapturedRowChange {
             }
             RowChangeKind::Delete { row_id } => Ok(Self::Delete { row_id }),
         }
-    }
-
-    fn capture_snapshot(row: &SnapshotValueRow<'_>) -> Result<Self, ListenerError> {
-        let row_id = row.row_id().clone();
-        if row.is_tombstoned() {
-            return Ok(Self::Delete { row_id });
-        }
-        let title = row
-            .get_field_value::<str>("title")
-            .boxed()
-            .context(ListenerExternalSnafu)?
-            .into_owned();
-        Ok(Self::Upsert { row_id, title })
     }
 }
 
@@ -1499,7 +1612,7 @@ pub(in crate::runtime) fn provider_test_read_transaction(
 }
 
 /// One scan request observed by replacement-provider tests.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::runtime) struct ProviderTestScanRequest {
     /// Dataset requested by the provider.
     pub(in crate::runtime) dataset_id: DatasetId,

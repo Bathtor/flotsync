@@ -25,8 +25,7 @@ fn pending_apply_need_retries_after_route_appears() {
 
     let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_211);
     let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_212);
-    let first_read_token =
-        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let first_read_token = group_read_token(alice_runtime.as_ref(), group_id);
     let first_receipt = publish_changes(
         alice_runtime.as_ref(),
         first_read_token,
@@ -123,7 +122,7 @@ fn route_reestablishment_repairs_update_missed_while_disconnected() {
     alice_runtime.withdraw_direct_peer_routes_for_test(bob_member.clone());
     bob_runtime.withdraw_direct_peer_routes_for_test(alice_member.clone());
     let row_id = test_row_id(group_id, dataset_id.clone(), 50_252);
-    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id);
+    let read_token = group_read_token(alice_runtime.as_ref(), group_id);
     publish_changes(
         alice_runtime.as_ref(),
         read_token,
@@ -190,8 +189,7 @@ fn partial_update_batch_retry_narrows_remaining_need() {
 
     let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_311);
     let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_312);
-    let first_read_token =
-        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let first_read_token = group_read_token(alice_runtime.as_ref(), group_id);
     let first_receipt = publish_changes(
         alice_runtime.as_ref(),
         first_read_token,
@@ -835,8 +833,7 @@ fn inbound_listener_read_token_is_scoped_to_the_updated_group() {
         .expect("unrelated group should install");
 
     let unrelated_row_id = test_row_id(unrelated_group_id, dataset_id.clone(), 23_010);
-    let unrelated_read_token =
-        snapshot_read_token(bob_runtime.as_ref(), unrelated_group_id, dataset_id.clone());
+    let unrelated_read_token = group_read_token(bob_runtime.as_ref(), unrelated_group_id);
     publish_changes(
         bob_runtime.as_ref(),
         unrelated_read_token,
@@ -981,7 +978,7 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
         }]
     );
 
-    let read_token = snapshot_read_token(bob_runtime.as_ref(), group_id, dataset_id.clone());
+    let read_token = group_read_token(bob_runtime.as_ref(), group_id);
     publish_changes(
         bob_runtime.as_ref(),
         read_token,

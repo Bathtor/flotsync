@@ -80,6 +80,7 @@ mod groups;
 mod security_material;
 mod snapshots;
 mod store;
+mod synchronisation;
 #[cfg(test)]
 mod tests;
 
@@ -93,3 +94,4 @@ pub use security_material::*;
 pub use snapshots::*;
 pub use store::*;
 pub use store_error::*;
+pub use synchronisation::*;

@@ -191,6 +191,7 @@ impl SharedGroupState {
     }
 
     /// Return the application schema registry shared by this runtime.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) const fn application_schemas(&self) -> &'static ApplicationSchemas {
         self.application_schemas
     }

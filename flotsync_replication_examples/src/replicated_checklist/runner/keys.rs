@@ -164,7 +164,6 @@ mod tests {
         CreateGroupRequest,
         MigrationId,
         PublishReceipt,
-        SnapshotValueRows,
         Summary,
         security::{KnownMemberKeysReport, PublicKeyBundleSchemeReport},
         test_support::test_public_member_keys,
@@ -251,14 +250,6 @@ mod tests {
             _request: PublishChangesRequest,
         ) -> Pin<Box<dyn Future<Output = Result<PublishReceipt, ApiError>> + Send + '_>> {
             panic!("checklist key tests must not publish changes")
-        }
-
-        fn snapshot_rows(
-            &self,
-            _request: SnapshotRowsRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<SnapshotValueRows, ApiError>> + Send + '_>>
-        {
-            panic!("checklist key tests must not load snapshots")
         }
 
         fn request_summary(

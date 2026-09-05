@@ -117,42 +117,6 @@ impl StoreErrorClassificationSource for CreateGroupError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)), module(snapshot))]
-pub(super) enum SnapshotRowsError {
-    #[snafu(display("snapshot_rows requires at least one dataset."))]
-    EmptyDatasets,
-    #[snafu(display("Group {group_id} is not hosted by this runtime."))]
-    UnknownGroup { group_id: GroupId },
-    #[snafu(display("Group {group_id} is closed to application reads."))]
-    GroupClosed { group_id: GroupId },
-    #[snafu(display(
-        "Dataset {dataset_id} in group {group_id} has no schema available for row snapshots."
-    ))]
-    MissingDatasetSchema {
-        group_id: GroupId,
-        dataset_id: DatasetId,
-    },
-    #[snafu(display("Replication-store access failed at {location}: {source}"))]
-    StoreAccess {
-        source: StoreError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-}
-
-impl StoreErrorClassificationSource for SnapshotRowsError {
-    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
-        match self {
-            Self::StoreAccess { source, .. } => source.store_error_classification(),
-            Self::EmptyDatasets
-            | Self::UnknownGroup { .. }
-            | Self::GroupClosed { .. }
-            | Self::MissingDatasetSchema { .. } => None,
-        }
-    }
-}
-
-#[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(summary))]
 pub(super) enum SummaryError {
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]

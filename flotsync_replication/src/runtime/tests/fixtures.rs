@@ -10,6 +10,10 @@ pub(super) fn docs_dataset_id() -> DatasetId {
     DatasetId::try_from_static("docs").expect("dataset id should be valid")
 }
 
+pub(super) fn notes_dataset_id() -> DatasetId {
+    DatasetId::try_from_static("notes").expect("dataset id should be valid")
+}
+
 pub(super) fn alice_member() -> MemberIdentity {
     MemberIdentity::from_array(ALICE_MEMBER_SEGMENTS)
 }
@@ -175,6 +179,13 @@ where
 
 pub(super) fn docs_group_schema() -> GroupSchema {
     docs_group_schema_from_schema(title_schema_shared())
+}
+
+pub(super) fn two_title_group_schema() -> GroupSchema {
+    GroupSchema::new(HashMap::from([
+        (docs_dataset_id(), title_schema_shared().into()),
+        (notes_dataset_id(), title_schema_shared().into()),
+    ]))
 }
 
 /// Coerce the title-schema `LazyLock` into the process-static reference expected by APIs.
@@ -647,9 +658,10 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHo
     provision_test_security(store.as_ref(), local_member, []);
     let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
+    let group_state = load_group_state_for_test(local_member, ApplicationSchemas::EMPTY, &store);
     let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
         local_member,
-        ApplicationSchemas::EMPTY,
+        group_state,
         store.clone(),
         listener,
         ReplicationConfig::default(),
@@ -659,6 +671,29 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHo
     .expect("host should start");
     host.wait_for_runtime_startup();
     SqliteStoreTestOwner::new(host, store)
+}
+
+/// Load current group metadata for immediate-start host tests without preparing application rows.
+pub(super) fn load_group_state_for_test<S>(
+    local_member: &MemberIdentity,
+    application_schemas: &'static ApplicationSchemas,
+    store: &Arc<S>,
+) -> Arc<SharedGroupState>
+where
+    S: ReplicationStore + 'static,
+{
+    let mut transaction = wait_for_test_reply(store.begin_read_transaction())
+        .expect("runtime test group-state transaction should open");
+    let records = wait_for_test_reply(transaction.load_replication_groups())
+        .expect("runtime test group records should load");
+    wait_for_test_reply(transaction.release())
+        .expect("runtime test group-state transaction should release");
+    let snapshot =
+        RuntimeGroupStateSnapshot::from_records(local_member, application_schemas, records)
+            .expect("runtime test group records should form valid state");
+    let group_state = Arc::new(SharedGroupState::new(application_schemas));
+    group_state.replace(snapshot);
+    group_state
 }
 
 pub(super) fn load_runtime_with_parts<S>(
@@ -982,42 +1017,8 @@ where
     row_slice
 }
 
-pub(super) fn drain_snapshot_rows(
-    runtime: &dyn ReplicationApi,
-    request: SnapshotRowsRequest,
-) -> Vec<CapturedRowChange> {
-    let mut snapshot =
-        wait_for_test_reply(runtime.snapshot_rows(request)).expect("snapshot should start");
-    let mut rows = Vec::new();
-    while let Some(batch) =
-        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
-    {
-        for row in batch.rows() {
-            rows.push(
-                CapturedRowChange::capture_snapshot(&row).expect("snapshot row should decode"),
-            );
-        }
-    }
-    rows
-}
-
-pub(super) fn snapshot_read_token(
-    runtime: &dyn ReplicationApi,
-    group_id: GroupId,
-    dataset_id: DatasetId,
-) -> GroupReadToken {
-    let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
-        group_id,
-        datasets: HashSet::from([dataset_id]),
-        max_rows_per_batch: NonZeroUsize::new(16).unwrap(),
-        include_tombstones: false,
-    }))
-    .expect("snapshot should start");
-    let read_token = snapshot.read_token.clone();
-    while let Some(_batch) =
-        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
-    {}
-    read_token
+pub(super) fn group_read_token(runtime: &ReplicationRuntime, group_id: GroupId) -> GroupReadToken {
+    runtime.group_read_token_for_test(group_id)
 }
 
 pub(super) fn publish_changes(
@@ -1095,41 +1096,32 @@ pub(super) fn title_update_message_for_row(
     }
 }
 
-pub(super) fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
-    rows.sort_by_key(|row| match row {
-        CapturedRowChange::Upsert { row_id, .. } | CapturedRowChange::Delete { row_id } => {
-            row_id.to_string()
-        }
-    });
-}
-
 pub(super) fn snapshot_string_field(
-    runtime: &dyn ReplicationApi,
+    store: &dyn ReplicationStore,
     group_id: GroupId,
-    dataset_id: DatasetId,
+    dataset_id: &DatasetId,
     row_id: &RowId,
     field_name: &str,
 ) -> String {
-    let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
-        group_id,
-        datasets: HashSet::from([dataset_id]),
-        max_rows_per_batch: NonZeroUsize::new(16).unwrap(),
-        include_tombstones: false,
-    }))
-    .expect("snapshot should start");
-    while let Some(batch) =
-        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
-    {
-        for row in batch.rows() {
-            if row.row_id() == row_id {
-                return row
-                    .get_field_value::<str>(field_name)
-                    .expect("snapshot field should decode")
-                    .into_owned();
-            }
-        }
-    }
-    panic!("snapshot row {row_id} should exist");
+    let slice = load_persisted_row_slice(store, group_id, dataset_id, [row_id.row_key]);
+    let stored_row = loaded_state_row(&slice, &row_id.row_key).expect("stored row should exist");
+    let schema = Schema::try_from_fields(slice.state_rows.schema().fields().cloned())
+        .expect("stored row schema should remain valid");
+    let materialised = flotsync_messages::InMemoryStateData::from_row_snapshots_with_tombstones(
+        schema,
+        [flotsync_data_types::schema::datamodel::RowRecord {
+            row_id: row_id.row_key.0,
+            snapshot: stored_row.snapshot(),
+            tombstoned: stored_row.metadata().tombstoned,
+        }],
+    )
+    .expect("stored row should materialise");
+    materialised
+        .get_row(&row_id.row_key.0)
+        .expect("materialised row should exist")
+        .get_field_value::<str>(field_name)
+        .expect("stored field should decode")
+        .into_owned()
 }
 
 pub(super) fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {

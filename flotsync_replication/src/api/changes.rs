@@ -275,8 +275,8 @@ impl ApplicationReadToken {
             .map(|version| GroupReadToken::from_group_version(*group_id, version))
     }
 
-    /// Merge one snapshot, publish receipt, or compatible group-local token
-    /// into this application position.
+    /// Merge one applied group snapshot, publish receipt, or compatible
+    /// group-local token into this application position.
     ///
     /// This is safe for independent progress within a compatible group: the
     /// merge keeps the furthest-known position instead of replacing newer local

@@ -17,7 +17,7 @@ use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
     let config = load_checklist_config(config_path)?;
-    let (config, local_member, listener_receivers, replication, store) = {
+    let loaded = {
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut output = io::stdout();
@@ -29,7 +29,8 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
         };
 
         let (listener, listener_receivers) = ChecklistListener::pair();
-        let replication = match load_checklist_runtime(&setup, listener).await {
+        let mut working_set = ChecklistWorkingSet::new();
+        let replication = match load_checklist_runtime(&setup, listener, &mut working_set).await {
             Ok(replication) => replication,
             Err(source) => {
                 if let Err(error) = setup.store.close().await.context(repl_error::StoreSnafu) {
@@ -37,31 +38,50 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
                         "SQLite store closure also failed after replication runtime loading failed: {error}"
                     );
                 }
-                return Err(source).context(repl_error::LoadRuntimeSnafu);
+                return Err(source);
             }
         };
-        (
-            setup.config,
-            setup.local_member,
+        LoadedChecklistPeer {
+            config: setup.config,
+            local_member: setup.local_member,
             listener_receivers,
             replication,
-            setup.store,
-        )
+            store: setup.store,
+            working_set,
+        }
     };
 
     let run_result = run_loaded_checklist_repl(
-        config,
-        local_member,
-        listener_receivers,
-        replication.clone(),
+        loaded.config,
+        loaded.local_member,
+        loaded.listener_receivers,
+        loaded.replication.clone(),
+        loaded.working_set,
     )
     .await;
-    let shutdown_result = replication
+    let shutdown_result = loaded
+        .replication
         .shutdown()
         .await
         .context(repl_error::ReplicationSnafu);
-    let close_result = store.close().await.context(repl_error::StoreSnafu);
+    let close_result = loaded.store.close().await.context(repl_error::StoreSnafu);
     preserve_primary_shutdown_error(run_result, shutdown_result, close_result)
+}
+
+/// Application-owned resources returned by checklist startup.
+struct LoadedChecklistPeer {
+    /// Parsed peer configuration retained by the interactive session.
+    config: ChecklistAppConfig,
+    /// Local replication identity shown by group commands.
+    local_member: MemberIdentity,
+    /// Listener queues consumed by the interactive session.
+    listener_receivers: ChecklistListenerReceivers,
+    /// Live replication API shut down after the interactive session exits.
+    replication: Arc<dyn ReplicationApi>,
+    /// Backing store closed after replication has shut down.
+    store: Arc<SqliteReplicationStore>,
+    /// Application state reconstructed before listener delivery starts.
+    working_set: ChecklistWorkingSet,
 }
 
 /// Run the interactive checklist after every application-owned resource has loaded.
@@ -70,18 +90,8 @@ async fn run_loaded_checklist_repl(
     local_member: MemberIdentity,
     listener_receivers: ChecklistListenerReceivers,
     replication: Arc<dyn ReplicationApi>,
+    working_set: ChecklistWorkingSet,
 ) -> Result<(), ReplicatedChecklistError> {
-    let mut working_set = ChecklistWorkingSet::new();
-    let group_state = replication
-        .group_state()
-        .context(repl_error::ReplicationSnafu)?;
-    let readable_group_ids = group_state
-        .readable_groups()
-        .map(ReplicationGroupView::group_id)
-        .collect::<Vec<_>>();
-    for group_id in readable_group_ids {
-        load_group_snapshot(replication.as_ref(), &mut working_set, group_id).await?;
-    }
     let session = ChecklistSession::new(working_set);
     let mut repl = ChecklistRepl::new(
         config,
@@ -1217,32 +1227,50 @@ Run `sync` again to publish them.
     }
 }
 
-pub async fn load_group_snapshot(
-    replication: &dyn ReplicationApi,
+pub(super) async fn complete_checklist_runtime_load(
+    load: ReplicationRuntimeLoad,
     working_set: &mut ChecklistWorkingSet,
-    group_id: GroupId,
-) -> Result<(), ReplicatedChecklistError> {
-    let mut snapshot = replication
-        .snapshot_rows(SnapshotRowsRequest {
-            group_id,
-            datasets: HashSet::from([checklist_dataset_id()]),
-            max_rows_per_batch: CHECKLIST_SNAPSHOT_BATCH_SIZE,
-            include_tombstones: false,
-        })
-        .await
-        .context(repl_error::ReplicationSnafu)?;
-    let read_token = snapshot.read_token.clone();
-    while let Some(batch) = snapshot
-        .rows
-        .next_batch()
-        .await
-        .context(repl_error::SnapshotRowsSnafu)?
-    {
-        working_set
-            .apply_snapshot_rows(batch.rows())
-            .context(repl_error::WorkingSetSnafu)?;
+) -> Result<Arc<dyn ReplicationApi>, ReplicatedChecklistError> {
+    match load {
+        ReplicationRuntimeLoad::Ready(runtime) => Ok(runtime),
+        ReplicationRuntimeLoad::Synchronising(mut synchronisation) => {
+            let application_result =
+                apply_checklist_snapshots(&mut synchronisation, working_set).await;
+            if let Err(error) = application_result {
+                if let Err(cleanup_error) = synchronisation.shutdown().await {
+                    log::error!(
+                        "replication synchronisation shutdown also failed after checklist snapshot application failed: {cleanup_error}"
+                    );
+                }
+                return Err(error);
+            }
+            synchronisation
+                .complete()
+                .await
+                .context(repl_error::LoadRuntimeSnafu)
+        }
+        _ => Err(ReplicatedChecklistError::UnsupportedRuntimeLoadState),
     }
-    working_set.merge_read_token(read_token);
+}
+
+/// Apply every prepared group snapshot and retain its resulting read token.
+async fn apply_checklist_snapshots(
+    synchronisation: &mut ApplicationSynchronisation,
+    working_set: &mut ChecklistWorkingSet,
+) -> Result<(), ReplicatedChecklistError> {
+    while let Some(mut group) = synchronisation.next_group() {
+        while let Some(batch) = group
+            .rows()
+            .next_batch()
+            .await
+            .context(repl_error::SynchronisationRowsSnafu)?
+        {
+            working_set
+                .apply_snapshot_rows(batch.rows())
+                .context(repl_error::WorkingSetSnafu)?;
+        }
+        working_set.merge_read_token(group.read_token().clone());
+    }
     Ok(())
 }
 
@@ -1318,17 +1346,21 @@ async fn prepare_checklist_store_setup(
 async fn load_checklist_runtime(
     setup: &ChecklistStoreSetup,
     listener: Arc<ChecklistListener>,
-) -> Result<Arc<dyn ReplicationApi>, LoadError> {
-    load_replication_runtime_with_runtime_config_toml(
+    working_set: &mut ChecklistWorkingSet,
+) -> Result<Arc<dyn ReplicationApi>, ReplicatedChecklistError> {
+    let load = load_replication_runtime_with_runtime_config_toml(
         checklist_application_id(),
         &CHECKLIST_APPLICATION_SCHEMAS,
         setup.store.clone(),
+        None,
         listener,
         ReplicationConfig::default(),
         setup.replication_security.clone(),
         &setup.config.runtime_config_toml,
     )
     .await
+    .context(repl_error::LoadRuntimeSnafu)?;
+    complete_checklist_runtime_load(load, working_set).await
 }
 
 /// Build the confirmation prompt shown before creating any first-run setup state.
@@ -1415,6 +1447,7 @@ mod tests {
         ChecklistRowChange,
         FIELD_TEXT,
         runner::groups::test_support::{
+            TestSqliteStore,
             load_test_runtime_with_group_records,
             load_test_runtime_with_groups,
             named_test_group,
@@ -1431,10 +1464,9 @@ mod tests {
         RowChangeKind,
         RowId,
         RowKey,
-        RowMutation,
         RowValues,
         providers::VecRowProvider,
-        test_support::{data_change_read_position, publish_changes, snapshot_read_token},
+        test_support::{data_change_read_position, test_replication_security_secrets},
     };
     use flotsync_security::{LocalStoreSecretError, install_local_store_secret_test_store};
     use futures_util::{
@@ -1442,6 +1474,29 @@ mod tests {
         future::{self, BoxFuture},
     };
     use std::{borrow::Cow, collections::VecDeque, io::Cursor};
+
+    /// Reload one test store through the application startup boundary into a fresh working set.
+    fn reload_test_working_set(
+        store: &TestSqliteStore,
+    ) -> (Arc<dyn ReplicationApi>, ChecklistWorkingSet) {
+        let (listener, _receivers) = ChecklistListener::pair();
+        let concrete_store = Arc::clone(&**store);
+        let load = block_on(load_replication_runtime_with_runtime_config_toml(
+            checklist_application_id(),
+            &CHECKLIST_APPLICATION_SCHEMAS,
+            concrete_store,
+            None,
+            listener,
+            ReplicationConfig::default(),
+            test_replication_security_secrets(),
+            "",
+        ))
+        .expect("persisted checklist runtime should reload");
+        let mut working_set = ChecklistWorkingSet::new();
+        let runtime = block_on(complete_checklist_runtime_load(load, &mut working_set))
+            .expect("persisted checklist synchronisation should complete");
+        (runtime, working_set)
+    }
 
     /// Deterministic provider which emits one pre-built row-change page per call.
     struct PagedRowProvider {
@@ -1572,11 +1627,12 @@ mod tests {
         let old_group_id = GroupId(Uuid::from_u128(73_001));
         let new_group_id = GroupId(Uuid::from_u128(73_002));
         let row_key = RowKey(Uuid::from_u128(73_003));
-        let (_store, runtime, listener, receivers) =
-            load_test_runtime_with_groups(&member, [new_group_id]);
-        let read_token =
-            snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
-        block_on(listener.on_event(ReplicationEvent::DataChanged {
+        let fixture = load_test_runtime_with_groups(&member, [new_group_id]);
+        let read_token = fixture
+            .working_set
+            .group_read_token(&new_group_id)
+            .expect("replacement group token should load during startup");
+        block_on(fixture.listener.on_event(ReplicationEvent::DataChanged {
             position: data_change_read_position(
                 DataChangeLineage::GroupReplacement {
                     migration_id: MigrationId {
@@ -1598,8 +1654,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             ChecklistSession::new(working_set),
         );
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -1632,7 +1688,7 @@ mod tests {
             Err(ChecklistWorkingSetError::MissingApplicationReadToken)
         ));
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
@@ -1641,11 +1697,12 @@ mod tests {
         let old_group_id = GroupId(Uuid::from_u128(73_004));
         let new_group_id = GroupId(Uuid::from_u128(73_005));
         let row_key = RowKey(Uuid::from_u128(73_006));
-        let (_store, runtime, listener, receivers) =
-            load_test_runtime_with_groups(&member, [new_group_id]);
-        let read_token =
-            snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
-        block_on(listener.on_event(ReplicationEvent::DataChanged {
+        let fixture = load_test_runtime_with_groups(&member, [new_group_id]);
+        let read_token = fixture
+            .working_set
+            .group_read_token(&new_group_id)
+            .expect("replacement group token should load during startup");
+        block_on(fixture.listener.on_event(ReplicationEvent::DataChanged {
             position: data_change_read_position(
                 DataChangeLineage::GroupReplacement {
                     migration_id: MigrationId {
@@ -1667,8 +1724,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             ChecklistSession::new(working_set),
         );
         let mut input = Cursor::new(b"accept local\n");
@@ -1693,7 +1750,7 @@ mod tests {
         assert!(output.contains("1 reconciliation change(s) were retained"));
         assert!(output.contains("Run `sync` again to publish them."));
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
@@ -1938,33 +1995,38 @@ mod tests {
     fn listener_preserves_the_read_token_for_an_empty_data_event() {
         let member = MemberIdentity::from_array(["alice"]);
         let group_id = GroupId::new_random();
-        let (_store, runtime, listener, receivers) =
-            load_test_runtime_with_groups(&member, [group_id]);
-        let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
+        let fixture = load_test_runtime_with_groups(&member, [group_id]);
+        let read_token = fixture
+            .working_set
+            .group_read_token(&group_id)
+            .expect("group token should load during startup");
 
-        block_on(listener.on_event(ReplicationEvent::DataChanged {
+        block_on(fixture.listener.on_event(ReplicationEvent::DataChanged {
             position: data_change_read_position(DataChangeLineage::Update, read_token.clone()),
             rows: Box::new(VecRowProvider::new(Vec::new())),
         }))
         .expect("empty data event should reach the listener");
 
-        let event = receivers
+        let event = fixture
+            .receivers
             .events
             .try_recv()
             .expect("empty event should retain one token-only event");
         assert_eq!(event.read_position.group_read_token(), &read_token);
         assert!(event.changes.is_empty());
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
     fn listener_collects_all_provider_pages_into_one_atomic_event() {
         let member = MemberIdentity::from_array(["alice"]);
         let group_id = GroupId::new_random();
-        let (_store, runtime, listener, receivers) =
-            load_test_runtime_with_groups(&member, [group_id]);
-        let read_token = snapshot_read_token(runtime.as_ref(), group_id, checklist_dataset_id());
+        let fixture = load_test_runtime_with_groups(&member, [group_id]);
+        let read_token = fixture
+            .working_set
+            .group_read_token(&group_id)
+            .expect("group token should load during startup");
         let row_ids = [
             RowId::new(group_id, checklist_dataset_id(), RowKey(Uuid::from_u128(1))),
             RowId::new(group_id, checklist_dataset_id(), RowKey(Uuid::from_u128(2))),
@@ -1980,13 +2042,14 @@ mod tests {
             })
             .collect();
 
-        block_on(listener.on_event(ReplicationEvent::DataChanged {
+        block_on(fixture.listener.on_event(ReplicationEvent::DataChanged {
             position: data_change_read_position(DataChangeLineage::Update, read_token.clone()),
             rows: Box::new(PagedRowProvider { pages }),
         }))
         .expect("paged data event should reach the listener");
 
-        let event = receivers
+        let event = fixture
+            .receivers
             .events
             .try_recv()
             .expect("all pages should produce one listener event");
@@ -2001,90 +2064,11 @@ mod tests {
             row_ids.iter().collect::<Vec<_>>()
         );
         assert!(matches!(
-            receivers.events.try_recv(),
+            fixture.receivers.events.try_recv(),
             Err(TryRecvError::Empty)
         ));
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
-    }
-
-    #[test]
-    fn group_snapshot_loading_combines_rows_and_workspace_read_position() {
-        let member = MemberIdentity::from_array(["alice"]);
-        let first_group = GroupId(Uuid::from_u128(71_011));
-        let second_group = GroupId(Uuid::from_u128(71_012));
-        let (_store, runtime, _listener, _receivers) =
-            load_test_runtime_with_groups(&member, [first_group, second_group]);
-        let first_row = RowKey(Uuid::from_u128(91));
-        let second_row = RowKey(Uuid::from_u128(92));
-        let token = snapshot_read_token(runtime.as_ref(), first_group, checklist_dataset_id());
-        let first_receipt = publish_changes(
-            runtime.as_ref(),
-            token,
-            vec![RowMutation::Upsert {
-                row_id: RowId {
-                    group_id: first_group,
-                    dataset_id: checklist_dataset_id(),
-                    row_key: first_row,
-                },
-                row: ChecklistItem::new("first snapshot").to_row_values_patch(),
-            }],
-        );
-        let second_token =
-            snapshot_read_token(runtime.as_ref(), second_group, checklist_dataset_id());
-        publish_changes(
-            runtime.as_ref(),
-            second_token,
-            vec![RowMutation::Upsert {
-                row_id: RowId {
-                    group_id: second_group,
-                    dataset_id: checklist_dataset_id(),
-                    row_key: second_row,
-                },
-                row: ChecklistItem::new("second snapshot").to_row_values_patch(),
-            }],
-        );
-        assert_eq!(first_receipt.read_token.group_id(), first_group);
-
-        let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            first_group,
-        ))
-        .expect("first snapshot should load");
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            second_group,
-        ))
-        .expect("second snapshot should load");
-
-        assert_eq!(
-            working_set
-                .item(ChecklistItemId::group(first_group, first_row))
-                .expect("first group item should load")
-                .text,
-            "first snapshot"
-        );
-        assert_eq!(
-            working_set
-                .item(ChecklistItemId::group(second_group, second_row))
-                .expect("second group item should load")
-                .text,
-            "second snapshot"
-        );
-        assert_eq!(
-            format!(
-                "{:?}",
-                working_set
-                    .read_token()
-                    .expect("workspace token should load")
-            ),
-            "ApplicationReadToken { group_count: 2, .. }"
-        );
-
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
@@ -2093,10 +2077,12 @@ mod tests {
         let old_group = GroupId(Uuid::from_u128(71_101));
         let new_group = GroupId(Uuid::from_u128(71_102));
         let row_key = RowKey(Uuid::from_u128(71_103));
-        let (_store, runtime, listener, receivers) =
-            load_test_runtime_with_groups(&member, [new_group]);
-        let read_token = snapshot_read_token(runtime.as_ref(), new_group, checklist_dataset_id());
-        block_on(listener.on_event(ReplicationEvent::DataChanged {
+        let fixture = load_test_runtime_with_groups(&member, [new_group]);
+        let read_token = fixture
+            .working_set
+            .group_read_token(&new_group)
+            .expect("replacement group token should load during startup");
+        block_on(fixture.listener.on_event(ReplicationEvent::DataChanged {
             position: data_change_read_position(
                 DataChangeLineage::GroupReplacement {
                     migration_id: MigrationId {
@@ -2115,8 +2101,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             ChecklistSession::new(working_set),
         );
 
@@ -2148,7 +2134,7 @@ mod tests {
         ));
         assert!(second_report.remaining_dirty_groups.is_empty());
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
@@ -2156,26 +2142,14 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let first_group = GroupId(Uuid::from_u128(72_001));
         let second_group = GroupId(Uuid::from_u128(72_002));
-        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+        let fixture = load_test_runtime_with_group_records(
             &member,
             [
                 named_test_group(second_group, &member, "second"),
                 named_test_group(first_group, &member, "first"),
             ],
         );
-        let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            first_group,
-        ))
-        .expect("first group token should load");
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            second_group,
-        ))
-        .expect("second group token should load");
+        let mut working_set = fixture.working_set;
         let first_item = working_set.add_item(
             ChecklistItemAssociation::Group(first_group),
             "first group item",
@@ -2184,13 +2158,13 @@ mod tests {
             ChecklistItemAssociation::Group(second_group),
             "second group item",
         );
-        working_set.add_item(ChecklistItemAssociation::Local, "local item");
+        let local_item = working_set.add_item(ChecklistItemAssociation::Local, "local item");
         let session = ChecklistSession::new(working_set);
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             session,
         );
 
@@ -2220,35 +2194,30 @@ mod tests {
             "sync complete:\n  groups:\n    first: published 1 mutation(s)\n    second: published 1 mutation(s)\n  listener events: 2\n  applied events: 2\n  unsynchronised local items: 1\n  dirty groups: none"
         );
 
-        let mut verified = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut verified,
-            first_group,
-        ))
-        .expect("published first group should reload");
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut verified,
-            second_group,
-        ))
-        .expect("published second group should reload");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
+        let (reloaded_runtime, reloaded) = reload_test_working_set(&fixture.store);
         assert_eq!(
-            verified
+            reloaded
                 .item(first_item)
-                .expect("first published item should exist")
+                .expect("first published item should reload")
                 .text,
             "first group item"
         );
         assert_eq!(
-            verified
+            reloaded
                 .item(second_item)
-                .expect("second published item should exist")
+                .expect("second published item should reload")
                 .text,
             "second group item"
         );
-
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        assert!(reloaded.item(local_item).is_none());
+        let reloaded_token = reloaded
+            .read_token()
+            .expect("aggregate application token should reload");
+        assert_eq!(reloaded_token.group_count(), 2);
+        assert!(reloaded_token.group_read_token(&first_group).is_some());
+        assert!(reloaded_token.group_read_token(&second_group).is_some());
+        block_on(reloaded_runtime.shutdown()).expect("reloaded runtime should shut down");
     }
 
     #[test]
@@ -2256,26 +2225,14 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let source_group = GroupId(Uuid::from_u128(72_003));
         let target_group = GroupId(Uuid::from_u128(72_004));
-        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+        let fixture = load_test_runtime_with_group_records(
             &member,
             [
                 named_test_group(source_group, &member, "source"),
                 named_test_group(target_group, &member, "target"),
             ],
         );
-        let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            source_group,
-        ))
-        .expect("source token should load");
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            target_group,
-        ))
-        .expect("target token should load");
+        let mut working_set = fixture.working_set;
         let copied_source =
             working_set.add_item(ChecklistItemAssociation::Group(source_group), "copy source");
         let moved_source =
@@ -2284,8 +2241,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             session,
         );
         synchronise_test_groups(&mut repl).expect("source setup should publish");
@@ -2323,33 +2280,28 @@ mod tests {
                 },
             ] if *actual_source == source_group && *actual_target == target_group
         ));
-        let mut verified = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut verified,
-            source_group,
-        ))
-        .expect("source snapshot should reload");
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut verified,
-            target_group,
-        ))
-        .expect("target snapshot should reload");
-        assert!(verified.item(copied_source).is_some());
-        assert!(verified.item(moved_source).is_none());
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
+        let (reloaded_runtime, reloaded) = reload_test_working_set(&fixture.store);
+        assert!(reloaded.item(copied_source).is_some());
+        assert!(reloaded.item(moved_source).is_none());
         assert!(
-            verified
+            reloaded
                 .item(ChecklistItemId::group(target_group, copied_source.row_key))
                 .is_some()
         );
         assert!(
-            verified
+            reloaded
                 .item(ChecklistItemId::group(target_group, moved_source.row_key))
                 .is_some()
         );
-
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        assert_eq!(
+            reloaded
+                .read_token()
+                .expect("aggregate application token should reload")
+                .group_count(),
+            2
+        );
+        block_on(reloaded_runtime.shutdown()).expect("reloaded runtime should shut down");
     }
 
     #[test]
@@ -2357,7 +2309,7 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let target_group = GroupId(Uuid::from_u128(72_007));
         let unavailable_source = GroupId(Uuid::from_u128(72_008));
-        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+        let fixture = load_test_runtime_with_group_records(
             &member,
             [
                 named_test_group(target_group, &member, "target"),
@@ -2365,12 +2317,12 @@ mod tests {
             ],
         );
         let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            target_group,
-        ))
-        .expect("target token should load");
+        working_set.merge_read_token(
+            fixture
+                .working_set
+                .group_read_token(&target_group)
+                .expect("target token should load during startup"),
+        );
         let row_key = RowKey(Uuid::from_u128(72_009));
         let source_id = ChecklistItemId::group(unavailable_source, row_key);
         let target_id = ChecklistItemId::group(target_group, row_key);
@@ -2385,8 +2337,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             session,
         );
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
@@ -2449,7 +2401,7 @@ mod tests {
         assert!(repl.session.working_set.item(source_id).is_none());
         assert!(repl.session.working_set.item(target_id).is_some());
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 
     #[test]
@@ -2457,17 +2409,17 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let unknown_group = GroupId(Uuid::from_u128(72_010));
         let known_group = GroupId(Uuid::from_u128(72_011));
-        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+        let fixture = load_test_runtime_with_group_records(
             &member,
             [named_test_group(known_group, &member, "known")],
         );
         let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            known_group,
-        ))
-        .expect("known group token should load");
+        working_set.merge_read_token(
+            fixture
+                .working_set
+                .group_read_token(&known_group)
+                .expect("known group token should load during startup"),
+        );
         working_set.add_item(
             ChecklistItemAssociation::Group(unknown_group),
             "cannot publish",
@@ -2485,8 +2437,8 @@ mod tests {
         let mut repl = ChecklistRepl::new(
             test_app_config(),
             member,
-            runtime.clone(),
-            receivers,
+            fixture.runtime.clone(),
+            fixture.receivers,
             session,
         );
 
@@ -2541,6 +2493,6 @@ mod tests {
             "sync incomplete:\n  groups:\n    known: failed: Replication runtime component became unavailable.\n  listener events: 0 applied before publication; later events deferred because a group publication failed\n  applied events: 0\n  unsynchronised local items: 0\n  dirty groups: known"
         );
 
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
+        block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
     }
 }

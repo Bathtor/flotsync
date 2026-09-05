@@ -1,0 +1,36 @@
+id = "01a067de-34f3-7510-b84b-edc14564d67a"
+ref = "flotsync-4e8"
+title = "Refactor replication runtime load arguments"
+body = """
+Goal
+
+Replace the growing positional replication-runtime loader APIs with one or more named argument structs so call sites are readable, optional inputs can have sensible defaults, and loader evolution does not require repetitive signature churn.
+
+Scope
+
+P01. Redesign the public load entry points around cohesive argument structs while preserving the standard and explicit runtime-config entry points where useful.
+P02. Include the internal typed loader, security-ready loader, test-support loader, and lifecycle-test loader so positional forwarding is removed throughout the complete call chain.
+P03. Define defaults only where they are semantically safe and unsurprising; keep required identity, schema, store, listener, and security inputs explicit.
+P04. Update examples, test support, integration tests, and documentation to use the named inputs.
+P05. Remove obsolete too-many-arguments allowances after the conversion.
+P06. Include the host preparation chain—prepare_with_runtime_config_toml, prepare_with_test_support, prepare_with_options, and DeliveryRuntimeHost construction—so the eventual named inputs remove positional forwarding and the corresponding too-many-arguments allowances at this lower boundary as well. Keep optional test seams isolated from ordinary host preparation inputs.
+
+Context
+
+Discovered during review of flotsync-5ou.2. Keep this refactor separate from the startup-synchronisation correctness and terminology fixes in that issue."""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = ["01a060af-0325-7591-9353-b025a5a27b68"]
+created_at = "2026-09-03T15:23:30.931531Z"
+updated_at = "2026-09-05T08:34:00.661449Z"
+
+[[links]]
+target = "01a060af-0325-7591-9353-b025a5a27b68"
+label = "discovered from"
+
+[[comments]]
+id = "01a070b4-0355-7be1-bc63-c39ee7e1100a"
+author = "lkroll"
+body = "Scope expanded from the sixth flotsync-5ou.2 review: include DeliveryRuntimeHost::prepare_with_runtime_config_toml, prepare_with_test_support, prepare_with_options, and host construction in the named-argument refactor, while keeping optional test seams separate from ordinary preparation inputs."
+created_at = "2026-09-05T08:34:00.661449Z"

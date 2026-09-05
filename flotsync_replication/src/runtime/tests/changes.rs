@@ -19,7 +19,7 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 34);
 
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
     let receipt = publish_changes(
         fixture.runtime.as_ref(),
         read_token,
@@ -70,8 +70,7 @@ fn publish_changes_rejects_a_read_token_for_another_group() {
         ..Default::default()
     }))
     .expect("second group creation should succeed");
-    let first_token =
-        snapshot_read_token(fixture.runtime.as_ref(), first_group, dataset_id.clone());
+    let first_token = group_read_token(fixture.runtime.as_ref(), first_group);
 
     let error = wait_for_test_reply(fixture.runtime.publish_changes(PublishChangesRequest {
         read_token: first_token,
@@ -116,7 +115,7 @@ fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_i
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 121_000);
 
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
     let insert_receipt = publish_changes(
         fixture.runtime.as_ref(),
         read_token,
@@ -142,9 +141,9 @@ fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_i
     assert_eq!(update_receipt.update_id.version, 2);
     assert_eq!(
         snapshot_string_field(
-            fixture.runtime.as_ref(),
+            fixture.store.as_ref(),
             group_id,
-            dataset_id,
+            &dataset_id,
             &row_id,
             "title",
         ),
@@ -167,7 +166,7 @@ fn request_summary_reports_local_versions() {
         ..Default::default()
     }))
     .expect("create_group should succeed");
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
     let receipt = publish_changes(
         fixture.runtime.as_ref(),
         read_token,
@@ -194,95 +193,6 @@ fn request_summary_reports_local_versions() {
 }
 
 #[test]
-fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
-    let alice_member = alice_member();
-    let dataset_id = docs_dataset_id();
-    let fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member.clone(),
-        &TITLE_APPLICATION_SCHEMAS,
-    );
-    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member],
-        group_schema: docs_group_schema(),
-        ..Default::default()
-    }))
-    .expect("create_group should succeed");
-    let active_row_id = test_row_id(group_id, dataset_id.clone(), 35);
-    let deleted_row_id = test_row_id(group_id, dataset_id.clone(), 36);
-
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
-    let receipt = publish_changes(
-        fixture.runtime.as_ref(),
-        read_token,
-        vec![
-            RowMutation::Upsert {
-                row_id: active_row_id.clone(),
-                row: crate::row_values! {
-                    "title" => "still visible",
-                },
-            },
-            RowMutation::Upsert {
-                row_id: deleted_row_id.clone(),
-                row: crate::row_values! {
-                    "title" => "now deleted",
-                },
-            },
-        ],
-    );
-    publish_changes(
-        fixture.runtime.as_ref(),
-        receipt.read_token,
-        vec![RowMutation::Delete {
-            row_id: deleted_row_id.clone(),
-        }],
-    );
-
-    let mut visible_rows = drain_snapshot_rows(
-        fixture.runtime.as_ref(),
-        SnapshotRowsRequest {
-            group_id,
-            datasets: HashSet::from([dataset_id.clone()]),
-            max_rows_per_batch: NonZeroUsize::new(1).expect("batch size should be non-zero"),
-            include_tombstones: false,
-        },
-    );
-    sort_captured_rows(&mut visible_rows);
-
-    assert_eq!(
-        visible_rows,
-        vec![CapturedRowChange::Upsert {
-            row_id: active_row_id.clone(),
-            title: "still visible".to_owned(),
-        }]
-    );
-
-    let mut all_rows = drain_snapshot_rows(
-        fixture.runtime.as_ref(),
-        SnapshotRowsRequest {
-            group_id,
-            datasets: HashSet::from([dataset_id]),
-            max_rows_per_batch: NonZeroUsize::new(1).expect("batch size should be non-zero"),
-            include_tombstones: true,
-        },
-    );
-    sort_captured_rows(&mut all_rows);
-
-    assert_eq!(
-        all_rows,
-        vec![
-            CapturedRowChange::Upsert {
-                row_id: active_row_id,
-                title: "still visible".to_owned(),
-            },
-            CapturedRowChange::Delete {
-                row_id: deleted_row_id,
-            },
-        ]
-    );
-}
-
-#[test]
 fn publish_changes_emits_local_data_changed_event_before_reply() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -303,7 +213,7 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
     );
     let row_id = test_row_id(group_id, dataset_id, 39);
 
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
     publish_changes(
         fixture.runtime.as_ref(),
         read_token,
@@ -346,7 +256,7 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     }))
     .expect("create_group should succeed");
     let old_row_id = test_row_id(old_group_id, dataset_id.clone(), 40);
-    let read_token = snapshot_read_token(runtime.as_ref(), old_group_id, dataset_id.clone());
+    let read_token = group_read_token(runtime.as_ref(), old_group_id);
     publish_changes(
         runtime.as_ref(),
         read_token,
@@ -408,15 +318,6 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
         .expect("migration listener event should carry a read token");
     assert_eq!(migration_read_token.group_id(), migration_id.new_group_id);
     assert_eq!(migration_read_token.version(), &new_group.version_vector);
-    assert!(
-        wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
-            group_id: old_group_id,
-            datasets: HashSet::from([docs_dataset_id()]),
-            max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
-            include_tombstones: false,
-        }))
-        .is_err()
-    );
     assert!(
         wait_for_test_reply(runtime.request_summary(SummaryRequest {
             group_id: old_group_id,
@@ -538,16 +439,9 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
-    let snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
-        group_id,
-        datasets: HashSet::from([dataset_id.clone()]),
-        max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
-        include_tombstones: false,
-    }))
-    .expect("read-only group should remain snapshot-readable");
-    assert_eq!(snapshot.read_token.group_id(), group_id);
-    assert_eq!(snapshot.read_token.version(), &versions);
-    drop(snapshot);
+    let read_token = runtime.group_read_token_for_test(group_id);
+    assert_eq!(read_token.group_id(), group_id);
+    assert_eq!(read_token.version(), &versions);
     wait_for_test_reply(runtime.request_summary(SummaryRequest {
         group_id,
         target: alice_member.clone(),
@@ -665,7 +559,7 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 41);
 
-    let initial_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let initial_token = group_read_token(fixture.runtime.as_ref(), group_id);
     let insert_receipt = publish_changes(
         fixture.runtime.as_ref(),
         initial_token,
@@ -705,9 +599,9 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
 
     assert_eq!(
         snapshot_string_field(
-            fixture.runtime.as_ref(),
+            fixture.store.as_ref(),
             group_id,
-            dataset_id.clone(),
+            &dataset_id,
             &row_id,
             "title",
         ),
@@ -715,9 +609,9 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
     );
     assert_eq!(
         snapshot_string_field(
-            fixture.runtime.as_ref(),
+            fixture.store.as_ref(),
             group_id,
-            dataset_id,
+            &dataset_id,
             &row_id,
             "note"
         ),
@@ -743,7 +637,7 @@ fn publish_changes_error_display_includes_local_operation_source() {
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 40);
 
-    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
     let receipt = publish_changes(
         fixture.runtime.as_ref(),
         read_token,

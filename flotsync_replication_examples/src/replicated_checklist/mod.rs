@@ -35,7 +35,7 @@ use flotsync_replication::{
     RowKey,
     RowMutation,
     RowValuesPatch,
-    SnapshotValueRow,
+    SnapshotRow,
 };
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -828,13 +828,13 @@ pub enum ChecklistWorkingSetError {
     #[snafu(display("Checklist row {row_key} has unsupported status value {value:?}."))]
     InvalidStatus { row_key: RowKey, value: String },
     #[snafu(display(
-        "Checklist snapshot unexpectedly included deleted row {row_id}; startup only requests visible rows."
+        "Snapshot synchronisation unexpectedly included deleted row {row_id}; startup only requests visible rows."
     ))]
     UnexpectedDeletedSnapshotRow { row_id: RowId },
     #[snafu(display("Dirty checklist item {item_id:?} is missing from the working set."))]
     MissingDirtyItem { item_id: ChecklistItemId },
     #[snafu(display(
-        "Incoming replication change conflicts with dirty checklist item {item_id:?}. Restart the checklist to reload current snapshots before continuing."
+        "Incoming replication change conflicts with dirty checklist item {item_id:?}. Restart the checklist to reload current state before continuing."
     ))]
     IncomingChangeForDirtyItem { item_id: ChecklistItemId },
     #[snafu(display(
@@ -1281,7 +1281,7 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn apply_snapshot_rows<'a, I>(&mut self, rows: I) -> Result<(), ChecklistWorkingSetError>
     where
-        I: IntoIterator<Item = SnapshotValueRow<'a>>,
+        I: IntoIterator<Item = SnapshotRow<'a>>,
     {
         for row in rows {
             let change = self.checklist_change_from_snapshot_row(&row)?;
@@ -1424,7 +1424,7 @@ impl ChecklistWorkingSet {
 
     fn checklist_change_from_snapshot_row(
         &self,
-        row: &SnapshotValueRow<'_>,
+        row: &SnapshotRow<'_>,
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         let row_id = row.row_id().clone();
         if row.is_tombstoned() {
@@ -1948,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reload_rejects_unrequested_deleted_rows() {
+    fn snapshot_synchronisation_rejects_unrequested_deleted_rows() {
         let mut checklist = test_working_set();
         let row_id = test_row_id(RowKey(Uuid::from_u128(61)));
         let row_values = RowValues::try_from_fields(

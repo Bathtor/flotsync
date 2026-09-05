@@ -1,10 +1,7 @@
 //! Tests for checklist group registry and invitation behaviour.
 
 use super::{test_support::*, *};
-use crate::replicated_checklist::{
-    ChecklistItem,
-    runner::repl::{ChecklistListener, load_group_snapshot},
-};
+use crate::replicated_checklist::{ChecklistItem, runner::repl::ChecklistListener};
 use flotsync_core::versions::VersionVector;
 use flotsync_data_types::RowValues;
 use flotsync_replication::{
@@ -19,7 +16,7 @@ use flotsync_replication::{
     RowKey,
     SnapshotRef,
     security::{KnownMemberKeyReport, KnownMemberReport, MemberKeyTrustReport},
-    test_support::{data_change_read_position, replication_group_snapshot, snapshot_read_token},
+    test_support::{data_change_read_position, replication_group_snapshot},
 };
 use indoc::indoc;
 use std::{io::Cursor, sync::Mutex};
@@ -318,14 +315,13 @@ fn listener_queues_group_invitations_without_deciding_them() {
 #[test]
 fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_clear() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (_store, runtime, _listener, receivers) =
-        load_test_runtime_with_groups(&member, std::iter::empty());
+    let fixture = load_test_runtime_with_groups(&member, std::iter::empty());
     let session = ChecklistSession::new(ChecklistWorkingSet::new());
     let mut repl = ChecklistRepl::new(
         test_app_config(),
         member,
-        runtime.clone(),
-        receivers,
+        fixture.runtime.clone(),
+        fixture.receivers,
         session,
     );
     let mut input = Cursor::new(b"\nyes\n".as_slice());
@@ -340,7 +336,8 @@ fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_cle
         "additional member id (blank to finish)> Create this group and send invitations? [y/N] "
     );
     assert_eq!(repl.session.default_group, None);
-    let group_state = runtime
+    let group_state = fixture
+        .runtime
         .group_state()
         .expect("group state should be available");
     assert_eq!(group_state.groups().count(), 1);
@@ -353,7 +350,7 @@ fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_cle
     );
     assert!(repl.session.working_set.read_token().is_ok());
 
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }
 
 #[test]
@@ -361,28 +358,23 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
     let member = MemberIdentity::from_array(["alice"]);
     let default_group_id = GroupId::new_random();
     let invited_group_id = GroupId::new_random();
-    let (_store, runtime, listener, receivers) =
-        load_test_runtime_with_groups(&member, [default_group_id, invited_group_id]);
-    let mut working_set = ChecklistWorkingSet::new();
-    block_on(load_group_snapshot(
-        runtime.as_ref(),
-        &mut working_set,
-        default_group_id,
-    ))
-    .expect("default group snapshot should load");
-    let mut session = ChecklistSession::new(working_set);
+    let fixture = load_test_runtime_with_groups(&member, [default_group_id, invited_group_id]);
+    let mut session = ChecklistSession::new(fixture.working_set);
     session.default_group = Some(default_group_id);
     let mut repl = ChecklistRepl::new(
         test_app_config(),
         member.clone(),
-        runtime.clone(),
-        receivers,
+        fixture.runtime.clone(),
+        fixture.receivers,
         session,
     );
     let decisions = Arc::new(Mutex::new(Vec::new()));
     let row_key = RowKey(Uuid::from_u128(72_001));
-    let read_token =
-        snapshot_read_token(runtime.as_ref(), invited_group_id, checklist_dataset_id());
+    let read_token = repl
+        .session
+        .working_set
+        .group_read_token(&invited_group_id)
+        .expect("invited group token should load during startup");
     let row_patch = ChecklistItem::new("listener row").to_row_values_patch();
     let row_values = RowValues::try_from_fields(&CHECKLIST_SCHEMA, row_patch.fields)
         .expect("listener test row should match the checklist schema");
@@ -394,24 +386,35 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
         Some("invited".to_owned()),
         None,
     );
-    block_on(listener.on_event(ReplicationEvent::GroupInvitation {
-        invitation,
-        respond: Box::new(RecordingInvitationResponder {
-            decisions: decisions.clone(),
-            accepted_event: Some(AcceptedListenerEvent {
-                read_position: data_change_read_position(DataChangeLineage::Update, read_token),
-                listener: listener.clone(),
-                changes: vec![RowChange {
-                    previous: PreviousRow::NotCompared,
-                    change: RowChangeKind::Upsert {
-                        row_id: RowId::new(invited_group_id, checklist_dataset_id(), row_key),
-                        row: Arc::new(row_values),
-                        previous_value_differences: None,
-                    },
-                }],
+    block_on(
+        fixture
+            .listener
+            .on_event(ReplicationEvent::GroupInvitation {
+                invitation,
+                respond: Box::new(RecordingInvitationResponder {
+                    decisions: decisions.clone(),
+                    accepted_event: Some(AcceptedListenerEvent {
+                        read_position: data_change_read_position(
+                            DataChangeLineage::Update,
+                            read_token,
+                        ),
+                        listener: fixture.listener.clone(),
+                        changes: vec![RowChange {
+                            previous: PreviousRow::NotCompared,
+                            change: RowChangeKind::Upsert {
+                                row_id: RowId::new(
+                                    invited_group_id,
+                                    checklist_dataset_id(),
+                                    row_key,
+                                ),
+                                row: Arc::new(row_values),
+                                previous_value_differences: None,
+                            },
+                        }],
+                    }),
+                }),
             }),
-        }),
-    }))
+    )
     .expect("invitation should reach the listener");
 
     assert!(
@@ -436,7 +439,7 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
         vec![RecordedInvitationDecision::Accepted]
     );
 
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }
 
 #[test]
@@ -444,14 +447,13 @@ fn migration_invitation_acceptance_applies_the_delivered_replacement_before_retu
     let member = MemberIdentity::from_array(["alice"]);
     let old_group_id = GroupId(Uuid::from_u128(72_101));
     let new_group_id = GroupId(Uuid::from_u128(72_102));
-    let (_store, runtime, listener, receivers) =
-        load_test_runtime_with_groups(&member, [new_group_id]);
-    let session = ChecklistSession::new(ChecklistWorkingSet::new());
+    let fixture = load_test_runtime_with_groups(&member, [new_group_id]);
+    let session = ChecklistSession::new(fixture.working_set);
     let mut repl = ChecklistRepl::new(
         test_app_config(),
         member.clone(),
-        runtime.clone(),
-        receivers,
+        fixture.runtime.clone(),
+        fixture.receivers,
         session,
     );
     let decisions = Arc::new(Mutex::new(Vec::new()));
@@ -470,28 +472,36 @@ fn migration_invitation_acceptance_applies_the_delivered_replacement_before_retu
         Some("replacement".to_owned()),
         None,
     );
-    let read_token = snapshot_read_token(runtime.as_ref(), new_group_id, checklist_dataset_id());
-    block_on(listener.on_event(ReplicationEvent::GroupInvitation {
-        invitation,
-        respond: Box::new(RecordingInvitationResponder {
-            decisions: decisions.clone(),
-            accepted_event: Some(AcceptedListenerEvent {
-                read_position: data_change_read_position(
-                    DataChangeLineage::GroupReplacement { migration_id },
-                    read_token,
-                ),
-                listener: listener.clone(),
-                changes: vec![RowChange {
-                    previous: PreviousRow::Unavailable,
-                    change: RowChangeKind::Upsert {
-                        row_id: RowId::new(new_group_id, checklist_dataset_id(), row_key),
-                        row: Arc::new(row_values),
-                        previous_value_differences: None,
-                    },
-                }],
+    let read_token = repl
+        .session
+        .working_set
+        .group_read_token(&new_group_id)
+        .expect("replacement group token should load during startup");
+    block_on(
+        fixture
+            .listener
+            .on_event(ReplicationEvent::GroupInvitation {
+                invitation,
+                respond: Box::new(RecordingInvitationResponder {
+                    decisions: decisions.clone(),
+                    accepted_event: Some(AcceptedListenerEvent {
+                        read_position: data_change_read_position(
+                            DataChangeLineage::GroupReplacement { migration_id },
+                            read_token,
+                        ),
+                        listener: fixture.listener.clone(),
+                        changes: vec![RowChange {
+                            previous: PreviousRow::Unavailable,
+                            change: RowChangeKind::Upsert {
+                                row_id: RowId::new(new_group_id, checklist_dataset_id(), row_key),
+                                row: Arc::new(row_values),
+                                previous_value_differences: None,
+                            },
+                        }],
+                    }),
+                }),
             }),
-        }),
-    }))
+    )
     .expect("migration invitation should reach the listener");
 
     assert!(
@@ -518,20 +528,19 @@ fn migration_invitation_acceptance_applies_the_delivered_replacement_before_retu
         vec![RecordedInvitationDecision::Accepted]
     );
 
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }
 
 #[test]
 fn invitation_reject_handler_reports_user_denied_without_changing_the_default() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (_store, runtime, listener, receivers) =
-        load_test_runtime_with_groups(&member, std::iter::empty());
+    let fixture = load_test_runtime_with_groups(&member, std::iter::empty());
     let session = ChecklistSession::new(ChecklistWorkingSet::new());
     let mut repl = ChecklistRepl::new(
         test_app_config(),
         member.clone(),
-        runtime.clone(),
-        receivers,
+        fixture.runtime.clone(),
+        fixture.receivers,
         session,
     );
     let decisions = Arc::new(Mutex::new(Vec::new()));
@@ -543,13 +552,17 @@ fn invitation_reject_handler_reports_user_denied_without_changing_the_default() 
         None,
         None,
     );
-    block_on(listener.on_event(ReplicationEvent::GroupInvitation {
-        invitation,
-        respond: Box::new(RecordingInvitationResponder {
-            decisions: decisions.clone(),
-            accepted_event: None,
-        }),
-    }))
+    block_on(
+        fixture
+            .listener
+            .on_event(ReplicationEvent::GroupInvitation {
+                invitation,
+                respond: Box::new(RecordingInvitationResponder {
+                    decisions: decisions.clone(),
+                    accepted_event: None,
+                }),
+            }),
+    )
     .expect("rejected invitation should reach the listener");
     assert!(
         block_on(repl.handle_command(ChecklistCommand::Group {
@@ -567,18 +580,19 @@ fn invitation_reject_handler_reports_user_denied_without_changing_the_default() 
     );
     assert_eq!(repl.session.default_group, None);
 
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }
 
 #[test]
 fn created_group_is_visible_to_the_runtime_registry_and_listener() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (_store, runtime, _listener, receivers) =
-        load_test_runtime_with_groups(&member, std::iter::empty());
+    let fixture = load_test_runtime_with_groups(&member, std::iter::empty());
     let request = checklist_group_creation_request("shared".to_owned(), member, Vec::new());
 
-    let group_id = block_on(runtime.create_group(request)).expect("group should be created");
-    let groups = runtime
+    let group_id =
+        block_on(fixture.runtime.create_group(request)).expect("group should be created");
+    let groups = fixture
+        .runtime
         .group_state()
         .expect("group state should be available");
     assert_eq!(groups.groups().count(), 1);
@@ -588,7 +602,8 @@ fn created_group_is_visible_to_the_runtime_registry_and_listener() {
     assert_eq!(group.group_id(), group_id);
     assert_eq!(group.group_name(), Some("shared"));
 
-    let listener_event = receivers
+    let listener_event = fixture
+        .receivers
         .events
         .try_recv()
         .expect("created group should deliver its read position through the listener");
@@ -598,7 +613,7 @@ fn created_group_is_visible_to_the_runtime_registry_and_listener() {
     assert!(working_set.listed_items().is_empty());
     assert!(working_set.read_token().is_ok());
 
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }
 
 #[test]
@@ -1043,9 +1058,9 @@ fn runtime_group_state_lists_several_groups_without_store_reads() {
     let member = MemberIdentity::from_array(["alice"]);
     let first_group_id = GroupId(Uuid::from_u128(70_001));
     let second_group_id = GroupId(Uuid::from_u128(70_002));
-    let (_store, runtime, _listener, _receivers) =
-        load_test_runtime_with_groups(&member, [first_group_id, second_group_id]);
-    let groups = runtime
+    let fixture = load_test_runtime_with_groups(&member, [first_group_id, second_group_id]);
+    let groups = fixture
+        .runtime
         .group_state()
         .expect("group state should be available");
     let group_ids = groups
@@ -1053,5 +1068,5 @@ fn runtime_group_state_lists_several_groups_without_store_reads() {
         .map(ReplicationGroupView::group_id)
         .collect::<HashSet<_>>();
     assert_eq!(group_ids, HashSet::from([first_group_id, second_group_id]));
-    block_on(runtime.shutdown()).expect("test runtime should shut down");
+    block_on(fixture.runtime.shutdown()).expect("test runtime should shut down");
 }

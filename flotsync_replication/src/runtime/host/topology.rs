@@ -149,9 +149,115 @@ where
 }
 
 pub(in crate::runtime::host) struct BuiltRuntimeSystem {
-    pub(in crate::runtime::host) system: KompactSystem,
+    pub system: KompactSystem,
     #[cfg(any(test, feature = "test-support"))]
-    pub(in crate::runtime::host) local_endpoint_lease: ReservedSocketLease,
+    pub local_endpoint_lease: ReservedSocketLease,
+}
+
+/// Unit-test-only host behaviour and components kept outside production topology payloads.
+///
+/// Callers select the required seams before the Kompact system exists. Host preparation then
+/// materialises only those components, leaving ordinary unit tests on the production wiring path.
+#[cfg(test)]
+pub(in crate::runtime) struct RuntimeHostTestSupport {
+    /// Whether configured routes are published automatically during host preparation.
+    route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+    /// Whether to insert an observer between group broadcast and runtime logic.
+    observe_group_broadcast_runtime: bool,
+    /// Optional observer created only for tests which request the corresponding boundary seam.
+    group_broadcast_runtime_proxy: Option<Arc<Component<PortTesterComponent<GroupBroadcastPort>>>>,
+}
+
+#[cfg(test)]
+impl RuntimeHostTestSupport {
+    /// Build ordinary test support which preserves direct production topology wiring.
+    pub(in crate::runtime) const fn direct() -> Self {
+        Self {
+            route_publish_mode: PreconfiguredPeerRoutesPublishMode::ManualForTest,
+            observe_group_broadcast_runtime: false,
+            group_broadcast_runtime_proxy: None,
+        }
+    }
+
+    /// Build test support with explicitly selected configured-route publication behaviour.
+    pub(in crate::runtime::host) fn with_route_publish_mode(
+        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+    ) -> Self {
+        Self {
+            route_publish_mode,
+            ..Self::direct()
+        }
+    }
+
+    /// Build test support which observes group-broadcast delivery into inactive runtime logic.
+    pub(in crate::runtime) fn observing_group_broadcast_runtime() -> Self {
+        Self {
+            observe_group_broadcast_runtime: true,
+            ..Self::direct()
+        }
+    }
+
+    /// Create the components requested before host preparation had access to the system.
+    pub(in crate::runtime::host) fn materialise(mut self, system: &KompactSystem) -> Self {
+        if self.observe_group_broadcast_runtime {
+            self.group_broadcast_runtime_proxy =
+                Some(system.create(GroupBroadcastPort::tester_component_forwarding));
+        }
+        self
+    }
+
+    /// Return the selected configured-route publication behaviour.
+    pub(in crate::runtime::host) const fn route_publish_mode(
+        &self,
+    ) -> PreconfiguredPeerRoutesPublishMode {
+        self.route_publish_mode
+    }
+
+    /// Wait until the optional observer receives one group-broadcast indication.
+    pub(in crate::runtime::host) fn wait_for_group_broadcast_runtime_indication(&self) {
+        let proxy = self
+            .group_broadcast_runtime_proxy
+            .as_ref()
+            .expect("group-broadcast/runtime observation must be explicitly requested");
+        let future = proxy.actor_ref().observe_indication(|_| true);
+        wait_for_test_reply(future)
+            .expect("group-broadcast indication should reach the runtime proxy");
+    }
+
+    /// Connect group broadcast directly or through the explicitly requested observer.
+    fn connect_group_broadcast_runtime(
+        &self,
+        delivery: &DeliveryTopology,
+        runtime_component: &Arc<Component<ReplicationRuntimeComponent>>,
+    ) -> Result<(), RuntimeHostError> {
+        if let Some(proxy) = &self.group_broadcast_runtime_proxy {
+            connect_components::<GroupBroadcastPort, _, _>(
+                delivery.group_broadcast_provider(),
+                proxy,
+                "group broadcast -> runtime test proxy",
+            )?;
+            connect_components::<GroupBroadcastPort, _, _>(
+                proxy,
+                runtime_component,
+                "runtime test proxy -> replication runtime",
+            )
+        } else {
+            connect_components::<GroupBroadcastPort, _, _>(
+                delivery.group_broadcast_provider(),
+                runtime_component,
+                "group broadcast -> replication runtime",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+impl ComponentTopology for RuntimeHostTestSupport {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        self.group_broadcast_runtime_proxy
+            .iter()
+            .map(|proxy| proxy as &dyn RuntimeLifecycleComponent)
+    }
 }
 
 /// IO driver and bridge topology.
@@ -261,9 +367,9 @@ impl ComponentTopology for TransportTopology {
 /// RouteDiscoveryPort ------------------------------------------------------------------------------------------+
 /// ```
 pub(in crate::runtime::host) struct DeliveryTopology {
-    pub(in crate::runtime::host) ingress: Arc<Component<DeliveryIngressComponent>>,
-    pub(in crate::runtime::host) group_broadcast: Arc<Component<GroupBroadcastComponent>>,
-    pub(in crate::runtime::host) reliable_delivery: Arc<Component<ReliableDeliveryComponent>>,
+    pub ingress: Arc<Component<DeliveryIngressComponent>>,
+    pub group_broadcast: Arc<Component<GroupBroadcastComponent>>,
+    pub reliable_delivery: Arc<Component<ReliableDeliveryComponent>>,
 }
 
 impl DeliveryTopology {
@@ -353,13 +459,12 @@ impl DeliveryTopology {
 
 impl ComponentTopology for DeliveryTopology {
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
-        std::iter::once(&self.ingress as &dyn RuntimeLifecycleComponent)
-            .chain(std::iter::once(
-                &self.group_broadcast as &dyn RuntimeLifecycleComponent,
-            ))
-            .chain(std::iter::once(
-                &self.reliable_delivery as &dyn RuntimeLifecycleComponent,
-            ))
+        [
+            &self.ingress as &dyn RuntimeLifecycleComponent,
+            &self.group_broadcast as &dyn RuntimeLifecycleComponent,
+            &self.reliable_delivery as &dyn RuntimeLifecycleComponent,
+        ]
+        .into_iter()
     }
 }
 
@@ -391,7 +496,7 @@ pub(in crate::runtime::host) struct DiscoveryTopology {
     manual_route_discovery: Arc<Component<PortTesterComponent<ManualRouteDiscoveryPort>>>,
     #[cfg(any(test, feature = "test-support"))]
     manual_route_discovery_ref: ActorRef<PortTestMsg<ManualRouteDiscoveryPort>>,
-    pub(in crate::runtime::host) local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
+    pub local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
     static_route_hints: PreconfiguredPeerRoutesConfig,
 }
 
@@ -653,7 +758,7 @@ impl ComponentTopology for DiscoveryTopology {
 pub(in crate::runtime::host) struct RuntimeLogicTopology {
     catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
     summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
-    pub(in crate::runtime::host) runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
+    pub runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
 /// Runtime-logic knobs that are not application or identity dependencies.
@@ -715,12 +820,22 @@ impl RuntimeLogicTopology {
         &self.summary_request_manager
     }
 
-    fn connect_delivery(&self, delivery: &DeliveryTopology) -> Result<(), RuntimeHostError> {
-        connect_components::<GroupBroadcastPort, _, _>(
-            delivery.group_broadcast_provider(),
-            &self.runtime_component,
-            "group broadcast -> replication runtime",
-        )?;
+    fn connect_delivery(
+        &self,
+        delivery: &DeliveryTopology,
+        #[cfg(test)] test_support: &RuntimeHostTestSupport,
+    ) -> Result<(), RuntimeHostError> {
+        cfg_select! {
+            test => test_support.connect_group_broadcast_runtime(
+                delivery,
+                &self.runtime_component,
+            )?,
+            _ => connect_components::<GroupBroadcastPort, _, _>(
+                delivery.group_broadcast_provider(),
+                &self.runtime_component,
+                "group broadcast -> replication runtime",
+            )?,
+        }
         connect_components::<GroupBroadcastPort, _, _>(
             delivery.group_broadcast_provider(),
             &self.catch_up_manager,
@@ -781,23 +896,23 @@ impl ComponentTopology for RuntimeLogicTopology {
 ///                       +-------------------------------routes----------------------------------------+
 /// ```
 pub(in crate::runtime::host) struct RuntimeTopology {
-    pub(in crate::runtime::host) io: IoTopology,
-    pub(in crate::runtime::host) transport: TransportTopology,
-    pub(in crate::runtime::host) delivery: DeliveryTopology,
-    pub(in crate::runtime::host) discovery: DiscoveryTopology,
-    pub(in crate::runtime::host) runtime: RuntimeLogicTopology,
+    pub io: IoTopology,
+    pub transport: TransportTopology,
+    pub delivery: DeliveryTopology,
+    pub discovery: DiscoveryTopology,
+    pub runtime: RuntimeLogicTopology,
 }
 
 /// Inputs needed to assemble a full runtime topology.
 pub(in crate::runtime::host) struct RuntimeTopologyBuildInput {
-    pub(in crate::runtime::host) group_memberships: Arc<SharedGroupState>,
-    pub(in crate::runtime::host) local_member: MemberIdentity,
-    pub(in crate::runtime::host) store: Arc<dyn ReplicationStore>,
-    pub(in crate::runtime::host) listener: Arc<dyn ReplicationEventListener>,
-    pub(in crate::runtime::host) config: ReplicationConfig,
-    pub(in crate::runtime::host) security: DeliverySecurity,
-    pub(in crate::runtime::host) host_config: DeliveryRuntimeHostConfig,
-    pub(in crate::runtime::host) static_route_hints: PreconfiguredPeerRoutesConfig,
+    pub group_memberships: Arc<SharedGroupState>,
+    pub local_member: MemberIdentity,
+    pub store: Arc<dyn ReplicationStore>,
+    pub listener: Arc<dyn ReplicationEventListener>,
+    pub config: ReplicationConfig,
+    pub security: DeliverySecurity,
+    pub host_config: DeliveryRuntimeHostConfig,
+    pub static_route_hints: PreconfiguredPeerRoutesConfig,
 }
 
 impl RuntimeTopology {
@@ -866,20 +981,29 @@ impl RuntimeTopology {
         }
     }
 
-    pub(in crate::runtime::host) fn connect_all(&self) -> Result<(), RuntimeHostError> {
+    pub(in crate::runtime::host) fn connect_all(
+        &self,
+        #[cfg(test)] test_support: &RuntimeHostTestSupport,
+    ) -> Result<(), RuntimeHostError> {
         self.delivery.connect_transport(&self.transport)?;
         self.discovery.connect_transport(&self.transport)?;
         self.delivery.connect_internal_routes()?;
         self.discovery.connect_internal_routes()?;
         self.delivery.connect_discovery(&self.discovery)?;
-        self.runtime.connect_delivery(&self.delivery)?;
+        self.runtime.connect_delivery(
+            &self.delivery,
+            #[cfg(test)]
+            test_support,
+        )?;
         self.runtime.connect_discovery(&self.discovery)
     }
 
-    pub(in crate::runtime::host) async fn start_all(
+    /// Start networking and delivery while leaving every runtime-logic component inactive.
+    pub(in crate::runtime::host) async fn start_network(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
+        #[cfg(test)] test_support: &RuntimeHostTestSupport,
     ) -> Result<(), RuntimeHostError> {
         self.io.start_all(system, control_timeout).await?;
         self.io
@@ -887,7 +1011,18 @@ impl RuntimeTopology {
             .await?;
         self.transport.start_all(system, control_timeout).await?;
         self.delivery.start_all(system, control_timeout).await?;
+        #[cfg(test)]
+        test_support.start_all(system, control_timeout).await?;
         self.discovery.start_all(system, control_timeout).await?;
+        Ok(())
+    }
+
+    /// Start runtime logic after the application listener has been installed.
+    pub(in crate::runtime::host) async fn start_runtime_logic(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
         self.runtime.start_all(system, control_timeout).await?;
         Ok(())
     }
@@ -896,9 +1031,12 @@ impl RuntimeTopology {
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
+        #[cfg(test)] test_support: &RuntimeHostTestSupport,
     ) -> Result<(), RuntimeHostError> {
         self.runtime.stop_all(system, control_timeout).await?;
         self.discovery.stop_all(system, control_timeout).await?;
+        #[cfg(test)]
+        test_support.stop_all(system, control_timeout).await?;
         self.delivery.stop_all(system, control_timeout).await?;
         self.transport.stop_all(system, control_timeout).await?;
         self.io.stop_all(system, control_timeout).await?;

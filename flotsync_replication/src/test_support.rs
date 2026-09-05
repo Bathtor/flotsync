@@ -1,6 +1,7 @@
 //! Shared replication test stores, memberships, listeners, and runtime fixtures.
 
 use crate::{
+    ReplicationRuntimeLoad,
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
     api::{
@@ -39,8 +40,6 @@ use crate::{
         RowId,
         RowMutation,
         SchemaSource,
-        SnapshotRowsRequest,
-        SnapshotValueRow,
         StoreSecretKeyId,
         load_error::RuntimeSnafu,
         process_batches,
@@ -76,8 +75,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroUsize,
+    collections::HashMap,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex, mpsc},
     time::Duration,
@@ -260,13 +258,22 @@ pub async fn load_replication_runtime_with_test_security_toml(
         application_id,
         application_schemas,
         store,
+        None,
         listener,
         config,
         test_replication_security_secrets(),
         runtime_config_toml,
     )
     .await?;
-    Ok(runtime)
+    match runtime {
+        ReplicationRuntimeLoad::Ready(runtime) => Ok(runtime),
+        ReplicationRuntimeLoad::Synchronising(synchronisation) => {
+            let runtime = synchronisation
+                .complete_discarding_synchronisation()
+                .await?;
+            Ok(runtime)
+        }
+    }
 }
 
 /// Wait for one test future to resolve within the standard replication timeout.
@@ -367,56 +374,6 @@ pub fn publish_changes(
     .expect("publish should succeed")
 }
 
-/// Read a snapshot only to obtain a current read token for later publish calls.
-///
-/// # Panics
-///
-/// Panics if the snapshot request or any snapshot batch fails, or the runtime
-/// does not reply within the test timeout.
-pub fn snapshot_read_token(
-    runtime: &dyn ReplicationApi,
-    group_id: GroupId,
-    dataset_id: DatasetId,
-) -> GroupReadToken {
-    let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
-        group_id,
-        datasets: HashSet::from([dataset_id]),
-        max_rows_per_batch: NonZeroUsize::new(16).expect("snapshot batch size is non-zero"),
-        include_tombstones: false,
-    }))
-    .expect("snapshot should start");
-    let read_token = snapshot.read_token.clone();
-    while let Some(_batch) =
-        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
-    {}
-    read_token
-}
-
-/// Drain one snapshot request into decoded title-schema row changes.
-///
-/// # Panics
-///
-/// Panics if the snapshot request, snapshot batch stream, or title-schema row
-/// decoding fails, or the runtime does not reply within the test timeout.
-pub fn drain_title_snapshot_rows(
-    runtime: &dyn ReplicationApi,
-    request: SnapshotRowsRequest,
-) -> Vec<CapturedRowChange> {
-    let mut snapshot =
-        wait_for_test_reply(runtime.snapshot_rows(request)).expect("snapshot should start");
-    let mut rows = Vec::new();
-    while let Some(batch) =
-        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
-    {
-        for row in batch.rows() {
-            rows.push(
-                CapturedRowChange::capture_snapshot(&row).expect("snapshot row should decode"),
-            );
-        }
-    }
-    rows
-}
-
 /// Row change captured by [`TestEventListener`] from title-schema tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapturedRowChange {
@@ -447,19 +404,6 @@ impl CapturedRowChange {
             }
             RowChangeKind::Delete { row_id } => Ok(Self::Delete { row_id }),
         }
-    }
-
-    fn capture_snapshot(row: &SnapshotValueRow<'_>) -> Result<Self, ListenerError> {
-        let row_id = row.row_id().clone();
-        if row.is_tombstoned() {
-            return Ok(Self::Delete { row_id });
-        }
-        let title = row
-            .get_field_value::<str>("title")
-            .boxed()
-            .context(ListenerExternalSnafu)?
-            .into_owned();
-        Ok(Self::Upsert { row_id, title })
     }
 }
 
@@ -858,6 +802,24 @@ impl RuntimeTestFixture {
             .membership_snapshot_for_test()
             .members(&group_id)
             .cloned()
+    }
+
+    /// Return one installed group's current test publication position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store transaction cannot be opened, read, or released, or
+    /// if `group_id` does not identify a stored group.
+    #[must_use]
+    pub fn group_read_token(&self, group_id: GroupId) -> GroupReadToken {
+        let mut transaction = wait_for_test_reply(self.store.begin_read_transaction())
+            .expect("test group token read transaction should open");
+        let group = wait_for_test_reply(transaction.load_replication_group(&group_id))
+            .expect("test group token should load from the replication store")
+            .expect("test group should exist in the replication store");
+        wait_for_test_reply(transaction.release())
+            .expect("test group token read transaction should release");
+        GroupReadToken::from_group_version(group_id, group.version_vector)
     }
 
     /// Temporarily install one group with deterministic group security material.
