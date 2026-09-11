@@ -1258,7 +1258,16 @@ async fn apply_checklist_snapshots(
     synchronisation: &mut ApplicationSynchronisation,
     working_set: &mut ChecklistWorkingSet,
 ) -> Result<(), ReplicatedChecklistError> {
-    while let Some(mut group) = synchronisation.next_group() {
+    while let Some(group) = synchronisation
+        .next_group()
+        .await
+        .context(repl_error::SynchronisationRowsSnafu)?
+    {
+        let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+            unreachable!(
+                "the checklist supplies no application token, so startup is snapshot-only"
+            );
+        };
         while let Some(batch) = group
             .rows()
             .next_batch()

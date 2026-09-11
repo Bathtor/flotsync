@@ -1,7 +1,12 @@
 //! Runtime-host and runtime-startup scenarios.
 
 use super::*;
-use crate::ApplicationSynchronisation;
+use crate::{
+    ApplicationSynchronisation,
+    SingleGroupSynchronisation,
+    StoreErrorClassificationSource as _,
+};
+use flotsync_utils::testing::assert_inferred_send;
 use kompact::prelude::ComponentDefinition as _;
 use smallvec::SmallVec;
 
@@ -15,9 +20,12 @@ fn title_upsert(row_id: RowId, title: &str) -> RowMutation {
 
 /// Exhaust the single empty group prepared by a focused lifecycle fixture.
 fn drain_empty_group(synchronisation: &mut ApplicationSynchronisation) {
-    let mut group = synchronisation
-        .next_group()
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("the prepared group should load")
         .expect("the prepared synchronisation should contain one group");
+    let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+        panic!("a startup without an application token should yield a snapshot");
+    };
     assert!(
         wait_for_test_reply(group.rows().next_batch())
             .expect("empty group synchronisation should complete")
@@ -61,19 +69,10 @@ fn load_staged_startup_with_config(
     store: Arc<dyn ReplicationStore>,
     config: ReplicationConfig,
 ) -> StagedStartup {
-    let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
-    let runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(0));
-    let load = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
-        app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store,
-        None,
-        Arc::new(ListenerStub::default()),
-        config,
-        test_replication_security_secrets(),
-        &runtime_config_toml,
-    ))
-    .expect("runtime preparation should succeed");
+    let PreparedRuntimeStartup {
+        endpoint_lease,
+        load,
+    } = prepare_runtime_startup(store, None, config);
     let ReplicationRuntimeLoad::Synchronising(synchronisation) = load else {
         panic!("a readable stored group should require application synchronisation");
     };
@@ -83,8 +82,33 @@ fn load_staged_startup_with_config(
     }
 }
 
-/// Build one concurrent-access classification for snapshot retry tests.
-fn snapshot_scan_failure(scope: StoreErrorScope) -> StoreErrorClassification {
+/// Prepare a runtime from one caller-selected application position.
+fn prepare_runtime_startup(
+    store: Arc<dyn ReplicationStore>,
+    application_read_token: Option<ApplicationReadToken>,
+    config: ReplicationConfig,
+) -> PreparedRuntimeStartup {
+    let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(0));
+    let load = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
+        app_probe_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store,
+        application_read_token,
+        Arc::new(ListenerStub::default()),
+        config,
+        test_replication_security_secrets(),
+        &runtime_config_toml,
+    ))
+    .expect("runtime preparation should succeed");
+    PreparedRuntimeStartup {
+        endpoint_lease,
+        load,
+    }
+}
+
+/// Build one retryable concurrent-access classification for provider tests.
+fn retryable_store_failure(scope: StoreErrorScope) -> StoreErrorClassification {
     StoreErrorClassification::UNKNOWN
         .with_scope(scope)
         .with_class(StoreErrorClass::ConcurrentAccess)
@@ -97,6 +121,14 @@ struct StagedStartup {
     _endpoint_lease: ReservedSocketLease,
     /// Application synchronisation returned by the standard test startup boundary.
     synchronisation: ApplicationSynchronisation,
+}
+
+/// Prepared runtime and its reserved endpoint retained together by startup tests.
+struct PreparedRuntimeStartup {
+    /// Reservation which keeps the configured endpoint exclusive until shutdown.
+    endpoint_lease: ReservedSocketLease,
+    /// Ready runtime or application reconciliation prepared from the store cut.
+    load: ReplicationRuntimeLoad,
 }
 
 #[test]
@@ -143,6 +175,7 @@ fn duplicate_readable_groups_return_a_structured_startup_error() {
         &alice_member,
         &TITLE_APPLICATION_SCHEMAS,
         &store,
+        None,
         NonZeroUsize::MIN,
     ));
 
@@ -155,6 +188,672 @@ fn duplicate_readable_groups_return_a_structured_startup_error() {
             group_id: duplicate_group_id,
         } if duplicate_group_id == group_id
     ));
+}
+
+#[test]
+fn exact_application_position_starts_ready_without_reconciliation() {
+    let alice_member = alice_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let seed_runtime = load_runtime_with_parts(
+        app_probe_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("exact-position group should be created");
+    let row_id = test_row_id(group_id, docs_dataset_id(), 70_000_101);
+    let initial_token = seed_runtime.group_read_token_for_test(group_id);
+    let receipt = publish_changes(
+        seed_runtime.as_ref(),
+        initial_token,
+        vec![title_upsert(row_id, "current")],
+    );
+    let application_token = ApplicationReadToken::from(receipt.read_token);
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(application_token),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Ready(runtime) = load else {
+        panic!("an exact application position should start ready");
+    };
+    wait_for_test_reply(runtime.shutdown()).expect("exact-position runtime should shut down");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one incremental scenario verifies coalescing, deletion, transient-row omission, row-free exhaustion semantics, and token advancement together"
+)]
+fn behind_application_position_yields_one_coalesced_group_change() {
+    let alice_member = alice_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let seed_runtime = load_runtime_with_parts(
+        app_probe_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("incremental group should be created");
+    let updated_row_id = test_row_id(group_id, docs_dataset_id(), 70_000_201);
+    let deleted_row_id = test_row_id(group_id, docs_dataset_id(), 70_000_202);
+    let transient_row_id = test_row_id(group_id, docs_dataset_id(), 70_000_203);
+    let initial_token = seed_runtime.group_read_token_for_test(group_id);
+    let source_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        initial_token,
+        vec![
+            title_upsert(updated_row_id.clone(), "source"),
+            title_upsert(deleted_row_id.clone(), "delete me"),
+        ],
+    );
+    let second_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        source_receipt.read_token.clone(),
+        vec![title_upsert(updated_row_id.clone(), "intermediate")],
+    );
+    let third_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        second_receipt.read_token,
+        vec![
+            title_upsert(updated_row_id.clone(), "current"),
+            title_upsert(transient_row_id, "temporary"),
+        ],
+    );
+    let target_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        third_receipt.read_token,
+        vec![
+            RowMutation::Delete {
+                row_id: deleted_row_id.clone(),
+            },
+            RowMutation::Delete {
+                row_id: test_row_id(group_id, docs_dataset_id(), 70_000_203),
+            },
+        ],
+    );
+    let target_token = target_receipt.read_token.clone();
+    let mut application_token = ApplicationReadToken::from(source_receipt.read_token);
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(application_token.clone()),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("a behind application position should require reconciliation");
+    };
+    let next_group = synchronisation.next_group();
+    assert_inferred_send(&next_group);
+    let group = wait_for_test_reply(next_group)
+        .expect("incremental preparation should succeed")
+        .expect("the behind group should be yielded");
+    let SingleGroupSynchronisation::Changes(mut group) = group else {
+        panic!("complete retained history should permit incremental changes");
+    };
+    assert_eq!(
+        group.position().lineage(),
+        DataChangeLineage::Update,
+        "startup coalescing should use the ordinary update lineage"
+    );
+    assert_eq!(group.position().group_read_token(), &target_token);
+    let position = group.position().clone();
+    let batch = wait_for_test_reply(group.rows().next_batch())
+        .expect("coalesced changes should load")
+        .expect("the group should contain visible changes");
+    assert_eq!(batch.len(), 2);
+    let actual = batch
+        .iter()
+        .map(|change| {
+            let title = change.row().map(|row| {
+                row.get_field_value::<str>("title")
+                    .expect("incremental title should decode")
+                    .into_owned()
+            });
+            (change.row_id().clone(), title)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            (updated_row_id, Some("current".to_owned())),
+            (deleted_row_id, None),
+        ]
+    );
+    assert!(
+        wait_for_test_reply(group.rows().next_batch())
+            .expect("change provider exhaustion should succeed")
+            .is_none()
+    );
+    application_token.apply_data_change(&position);
+    assert_eq!(
+        application_token.group_read_token(&group_id),
+        Some(target_token)
+    );
+    drop(group);
+    assert!(
+        wait_for_test_reply(synchronisation.next_group())
+            .expect("reconciliation exhaustion should succeed")
+            .is_none()
+    );
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("incremental reconciliation should activate the runtime");
+    wait_for_test_reply(runtime.shutdown()).expect("incremental runtime should shut down");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the multi-producer history fixture and exact range assertions belong together"
+)]
+fn incremental_history_loads_complete_ranges_for_multiple_producers() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let probe_member = MemberIdentity::from_array(PROBE_MEMBER_SEGMENTS);
+    let inner_store = sqlite_store(alice_member.clone());
+    let store = Arc::new(FailingStore::new(inner_store.clone()));
+    provision_test_security(
+        store.as_ref(),
+        &alice_member,
+        [bob_member.clone(), probe_member.clone()],
+    );
+    let seed_runtime = load_runtime_with_parts_and_application_schemas(
+        app_probe_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let group_id = GroupId(Uuid::from_u128(70_000_221));
+    let members = GroupMembers::from_ordered_members(vec![
+        alice_member,
+        bob_member.clone(),
+        probe_member.clone(),
+    ])
+    .expect("history fixture members should be canonical");
+    seed_runtime
+        .install_group_for_test(group_id, members)
+        .expect("history fixture group should install");
+    let source_token = seed_runtime.group_read_token_for_test(group_id);
+    let member_count = NonZeroUsize::new(3).expect("history fixture has three members");
+    let initial_versions = VersionVector::initial(member_count);
+    let mut bob_second_versions = initial_versions.clone();
+    bob_second_versions.increment_at(1);
+    let mut probe_second_versions = initial_versions.clone();
+    probe_second_versions.increment_at(2);
+    let updates = [
+        (
+            bob_member.clone(),
+            title_update_message(
+                group_id,
+                docs_dataset_id(),
+                70_000_222,
+                "bob one",
+                UpdateId {
+                    node_index: 1,
+                    version: 1,
+                },
+                initial_versions.clone(),
+            ),
+        ),
+        (
+            bob_member,
+            title_update_message(
+                group_id,
+                docs_dataset_id(),
+                70_000_223,
+                "bob two",
+                UpdateId {
+                    node_index: 1,
+                    version: 2,
+                },
+                bob_second_versions,
+            ),
+        ),
+        (
+            probe_member.clone(),
+            title_update_message(
+                group_id,
+                docs_dataset_id(),
+                70_000_224,
+                "probe one",
+                UpdateId {
+                    node_index: 2,
+                    version: 1,
+                },
+                initial_versions,
+            ),
+        ),
+        (
+            probe_member,
+            title_update_message(
+                group_id,
+                docs_dataset_id(),
+                70_000_225,
+                "probe two",
+                UpdateId {
+                    node_index: 2,
+                    version: 2,
+                },
+                probe_second_versions,
+            ),
+        ),
+    ];
+    let mut expected_row_ids = Vec::new();
+    for (sender, (row_id, update)) in updates {
+        expected_row_ids.push(row_id);
+        seed_runtime
+            .apply_update_for_test(sender, update)
+            .expect("history fixture update should apply");
+    }
+    let target_token = seed_runtime.group_read_token_for_test(group_id);
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let config = ReplicationConfig {
+        application_synchronisation_batch_size: NonZeroUsize::new(1)
+            .expect("history test batch size should be non-zero"),
+        ..Default::default()
+    };
+    let requests_before = store.replication_update_load_requests().len();
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(ApplicationReadToken::from(source_token)),
+        config,
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("the behind multi-producer group should require reconciliation");
+    };
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("multi-producer history should prepare")
+        .expect("the behind group should be yielded");
+    let SingleGroupSynchronisation::Changes(mut changes) = group else {
+        panic!("complete multi-producer history should remain incremental");
+    };
+    assert_eq!(changes.position().group_read_token(), &target_token);
+    let batch = wait_for_test_reply(changes.rows().next_batch())
+        .expect("multi-producer changes should load")
+        .expect("multi-producer changes should not be empty");
+    assert_eq!(
+        batch
+            .iter()
+            .map(|change| change.row_id().clone())
+            .collect::<Vec<_>>(),
+        expected_row_ids
+    );
+    assert!(
+        wait_for_test_reply(changes.rows().next_batch())
+            .expect("multi-producer changes should exhaust")
+            .is_none()
+    );
+    drop(changes);
+
+    let requests = store.replication_update_load_requests();
+    // TODO(flotsync-h3l): Expect reusable-batch page requests once the store
+    // exposes an explicit pagination contract.
+    assert_eq!(
+        &requests[requests_before..],
+        &[
+            ReplicationUpdateLoadRequest {
+                group_id,
+                filter: ReplicationUpdateFilter::ProducerRange {
+                    producer_index: MemberIndex::new(1),
+                    start_version: 1,
+                    end_version: 2,
+                },
+                limit: None,
+            },
+            ReplicationUpdateLoadRequest {
+                group_id,
+                filter: ReplicationUpdateFilter::ProducerRange {
+                    producer_index: MemberIndex::new(2),
+                    start_version: 1,
+                    end_version: 2,
+                },
+                limit: None,
+            },
+        ]
+    );
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("multi-producer reconciliation should activate the runtime");
+    wait_for_test_reply(runtime.shutdown()).expect("multi-producer runtime should shut down");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the mixed application cut verifies independent exact, empty-incremental, full-snapshot, and retirement planning in one startup"
+)]
+fn mixed_application_positions_reconcile_each_group_independently() {
+    let alice_member = alice_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let seed_runtime = load_runtime_with_parts(
+        app_probe_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let exact_group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("exact group should be created");
+    let incremental_group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("incremental group should be created");
+    let snapshot_group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("snapshot group should be created");
+    let exact_token = seed_runtime.group_read_token_for_test(exact_group_id);
+    let incremental_source = seed_runtime.group_read_token_for_test(incremental_group_id);
+    let transient_row_id = test_row_id(incremental_group_id, docs_dataset_id(), 70_000_251);
+    let insert_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        incremental_source.clone(),
+        vec![title_upsert(transient_row_id.clone(), "temporary")],
+    );
+    let incremental_target = publish_changes(
+        seed_runtime.as_ref(),
+        insert_receipt.read_token,
+        vec![RowMutation::Delete {
+            row_id: transient_row_id,
+        }],
+    )
+    .read_token;
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let retired_group_id = GroupId(Uuid::from_u128(70_000_252));
+    let retired_token = GroupReadToken::from_group_version(
+        retired_group_id,
+        VersionVector::initial(NonZeroUsize::MIN),
+    );
+    let application_token =
+        ApplicationReadToken::from_group_tokens([exact_token, incremental_source, retired_token]);
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(application_token),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("the mixed application position should require reconciliation");
+    };
+
+    let mut actual = Vec::new();
+    while let Some(group) = wait_for_test_reply(synchronisation.next_group())
+        .expect("mixed group reconciliation should load")
+    {
+        match group {
+            SingleGroupSynchronisation::Snapshot(mut snapshot) => {
+                let group_id = snapshot.group_id();
+                assert!(
+                    wait_for_test_reply(snapshot.rows().next_batch())
+                        .expect("empty unknown-group snapshot should drain")
+                        .is_none()
+                );
+                actual.push((group_id, "snapshot"));
+            }
+            SingleGroupSynchronisation::Changes(mut changes) => {
+                assert_eq!(changes.position().group_read_token(), &incremental_target);
+                assert!(
+                    wait_for_test_reply(changes.rows().next_batch())
+                        .expect("row-free change collection should drain")
+                        .is_none(),
+                    "creation and deletion after the source position should emit no row"
+                );
+                actual.push((incremental_group_id, "changes"));
+            }
+            SingleGroupSynchronisation::Retired(retired) => {
+                actual.push((retired.group_id(), "retired"));
+            }
+        }
+    }
+    let mut expected = vec![
+        (incremental_group_id, "changes"),
+        (snapshot_group_id, "snapshot"),
+        (retired_group_id, "retired"),
+    ];
+    expected.sort_by_key(|(group_id, _)| *group_id);
+    assert_eq!(actual, expected);
+    assert!(
+        actual
+            .iter()
+            .all(|(group_id, _)| *group_id != exact_group_id),
+        "the exact group should not produce reconciliation work"
+    );
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("mixed reconciliation should activate the runtime");
+    wait_for_test_reply(runtime.shutdown()).expect("mixed-position runtime should shut down");
+}
+
+#[test]
+fn closed_predecessor_and_unknown_successor_reconcile_independently() {
+    let alice_member = alice_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let old_group_id = GroupId(Uuid::from_u128(70_000_301));
+    let new_group_id = GroupId(Uuid::from_u128(70_000_302));
+    let versions = VersionVector::initial(NonZeroUsize::MIN);
+    let security_key_id = *test_replication_security_secrets().store_secret_key_id();
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: old_group_id,
+            member_keys: test_group_member_keys(vec![alice_member.clone()]),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::Closed {
+                successor_group_id: new_group_id,
+                final_versions: versions.clone(),
+            },
+            security_material: current_slice_placeholder_group_security_material_with_key_id(
+                old_group_id,
+                security_key_id,
+            ),
+            ..Default::default()
+        },
+    );
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: new_group_id,
+            member_keys: test_group_member_keys(vec![alice_member]),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material: current_slice_placeholder_group_security_material_with_key_id(
+                new_group_id,
+                security_key_id,
+            ),
+            ..Default::default()
+        },
+    );
+    let old_token = GroupReadToken::from_group_version(old_group_id, versions);
+    let mut application_token = ApplicationReadToken::from(old_token);
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(application_token.clone()),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("retirement and a new readable group should require reconciliation");
+    };
+
+    let first = wait_for_test_reply(synchronisation.next_group())
+        .expect("retirement should load")
+        .expect("the closed predecessor should be yielded");
+    let SingleGroupSynchronisation::Retired(retired) = first else {
+        panic!("the closed predecessor should be retired");
+    };
+    assert_eq!(retired.group_id(), old_group_id);
+    application_token.retire_group(&old_group_id);
+
+    let second = wait_for_test_reply(synchronisation.next_group())
+        .expect("successor snapshot should load")
+        .expect("the new readable successor should be yielded");
+    let SingleGroupSynchronisation::Snapshot(mut snapshot) = second else {
+        panic!("an unknown readable successor should receive a full snapshot");
+    };
+    assert_eq!(snapshot.group_id(), new_group_id);
+    assert!(
+        wait_for_test_reply(snapshot.rows().next_batch())
+            .expect("empty successor snapshot should drain")
+            .is_none()
+    );
+    application_token.merge_applied(snapshot.read_token());
+    drop(snapshot);
+    assert_eq!(&application_token, synchronisation.final_read_token());
+    assert!(
+        wait_for_test_reply(synchronisation.next_group())
+            .expect("lifecycle reconciliation should exhaust")
+            .is_none()
+    );
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("lifecycle reconciliation should activate the runtime");
+    wait_for_test_reply(runtime.shutdown()).expect("reconciled runtime should shut down");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fallback scenario compares missing history, ahead, concurrent, and incompatible positions against the same store cut"
+)]
+fn unsafe_application_positions_fall_back_to_group_snapshots() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
+    let one_member = NonZeroUsize::MIN;
+    let two_members = NonZeroUsize::new(2).expect("two members is non-zero");
+    let missing_history_id = GroupId(Uuid::from_u128(70_000_401));
+    let ahead_id = GroupId(Uuid::from_u128(70_000_402));
+    let concurrent_id = GroupId(Uuid::from_u128(70_000_403));
+    let incompatible_id = GroupId(Uuid::from_u128(70_000_404));
+    let one_current = VersionVector::initial(one_member).with_update_applied(UpdateId {
+        node_index: 0,
+        version: 1,
+    });
+    let concurrent_current = VersionVector::initial(two_members).with_update_applied(UpdateId {
+        node_index: 0,
+        version: 1,
+    });
+    let security_key_id = *test_replication_security_secrets().store_secret_key_id();
+    for group_id in [missing_history_id, ahead_id, incompatible_id] {
+        persist_group_in_store(
+            store.as_ref(),
+            ReplicationGroupRecord {
+                group_id,
+                member_keys: test_group_member_keys(vec![alice_member.clone()]),
+                local_member_index: MemberIndex::new(0),
+                group_schema: docs_group_schema(),
+                version_vector: one_current.clone(),
+                lifecycle: ReplicationGroupLifecycle::Open,
+                security_material: current_slice_placeholder_group_security_material_with_key_id(
+                    group_id,
+                    security_key_id,
+                ),
+                ..Default::default()
+            },
+        );
+    }
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: concurrent_id,
+            member_keys: test_group_member_keys(vec![alice_member, bob_member]),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: concurrent_current,
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material: current_slice_placeholder_group_security_material_with_key_id(
+                concurrent_id,
+                security_key_id,
+            ),
+            ..Default::default()
+        },
+    );
+    let ahead = one_current.with_update_applied(UpdateId {
+        node_index: 0,
+        version: 2,
+    });
+    let concurrent = VersionVector::initial(two_members).with_update_applied(UpdateId {
+        node_index: 1,
+        version: 1,
+    });
+    let application_token = ApplicationReadToken::from_group_tokens([
+        GroupReadToken::from_group_version(missing_history_id, VersionVector::initial(one_member)),
+        GroupReadToken::from_group_version(ahead_id, ahead),
+        GroupReadToken::from_group_version(concurrent_id, concurrent),
+        GroupReadToken::from_group_version(incompatible_id, VersionVector::initial(two_members)),
+    ]);
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(application_token),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("unsafe positions should require snapshot reconciliation");
+    };
+    let expected_ids = [missing_history_id, ahead_id, concurrent_id, incompatible_id];
+    for expected_id in expected_ids {
+        let group = wait_for_test_reply(synchronisation.next_group())
+            .expect("fallback classification should succeed")
+            .expect("every unsafe group should be yielded");
+        let SingleGroupSynchronisation::Snapshot(mut snapshot) = group else {
+            panic!("every unsafe position should select a group snapshot");
+        };
+        assert_eq!(snapshot.group_id(), expected_id);
+        assert!(
+            wait_for_test_reply(snapshot.rows().next_batch())
+                .expect("empty fallback snapshot should drain")
+                .is_none()
+        );
+    }
+    assert!(
+        wait_for_test_reply(synchronisation.next_group())
+            .expect("fallback reconciliation should exhaust")
+            .is_none()
+    );
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("fallback reconciliation should activate the runtime");
+    wait_for_test_reply(runtime.shutdown()).expect("fallback runtime should shut down");
 }
 
 #[test]
@@ -216,8 +915,6 @@ fn non_empty_store_replays_application_snapshot_before_runtime_activation() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
     let listener = Arc::new(ListenerStub::default());
-    let mut application_token = ApplicationReadToken::from(replay_group_token.clone());
-    application_token.merge_applied(&empty_group_token);
     let config = ReplicationConfig {
         application_synchronisation_batch_size: NonZeroUsize::new(2)
             .expect("test batch size should be non-zero"),
@@ -227,7 +924,7 @@ fn non_empty_store_replays_application_snapshot_before_runtime_activation() {
         app_probe_id(),
         &TWO_TITLE_APPLICATION_SCHEMAS,
         store.clone(),
-        Some(application_token),
+        None,
         listener.clone(),
         config,
         test_replication_security_secrets(),
@@ -257,7 +954,12 @@ fn non_empty_store_replays_application_snapshot_before_runtime_activation() {
     let mut replayed_group_ids = Vec::new();
     let mut replayed_rows = Vec::new();
     let mut batch_shapes = Vec::new();
-    while let Some(mut group) = synchronisation.next_group() {
+    while let Some(group) = wait_for_test_reply(synchronisation.next_group())
+        .expect("the next snapshot group should load")
+    {
+        let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+            panic!("startup without an application token should only yield snapshots");
+        };
         let current_group_id = group.group_id();
         replayed_group_ids.push(current_group_id);
         if current_group_id == group_id {
@@ -426,6 +1128,177 @@ fn inbound_work_queued_during_synchronisation_is_delivered_once_after_completion
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end scenario captures a real delivery, reloads a cut containing it, reinjects that delivery during synchronisation, and uses a later update as the processing barrier"
+)]
+fn update_represented_by_synchronisation_cut_is_not_redelivered_live() {
+    let runtime_endpoint_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let alice_store = sqlite_store(alice_member.clone());
+    let bob_store = sqlite_store(bob_member.clone());
+    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
+    provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
+    let group_id = GroupId(Uuid::from_u128(70_071));
+    let member_count = NonZeroUsize::new(2).expect("duplicate fixture has two members");
+    let security_material = load_test_runtime_security(bob_store.clone(), &bob_member)
+        .seal_group_secret(group_id.0, &test_group_key(group_id))
+        .expect("test group secret should seal");
+    persist_group_in_store(
+        bob_store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            member_keys: test_group_member_keys(vec![alice_member.clone(), bob_member.clone()]),
+            local_member_index: MemberIndex::new(1),
+            group_schema: docs_group_schema(),
+            version_vector: VersionVector::initial(member_count),
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material,
+            ..Default::default()
+        },
+    );
+
+    let alice_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
+    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
+        app_alice_id(),
+        &TITLE_APPLICATION_SCHEMAS,
+        alice_store.clone(),
+        Arc::new(ListenerStub::default()),
+        &alice_config_toml,
+    );
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("duplicate fixture members should be valid");
+    alice_runtime
+        .install_group_for_test(group_id, members)
+        .expect("sender group should install");
+
+    let bob_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(1));
+    let first_listener = Arc::new(ListenerStub::default());
+    let first_load = wait_for_test_reply(
+        load_replication_runtime_typed_with_observed_startup_for_test(
+            app_bob_id(),
+            &TITLE_APPLICATION_SCHEMAS,
+            bob_store.clone(),
+            first_listener.clone(),
+            ReplicationConfig::default(),
+            load_test_runtime_security(bob_store.clone(), &bob_member),
+            Some(&bob_config_toml),
+        ),
+    )
+    .expect("first receiver runtime should prepare");
+    let TypedReplicationRuntimeLoad::Synchronising(first_synchronisation) = first_load else {
+        panic!("the receiver group should initially require a full snapshot");
+    };
+    let first_bob_runtime =
+        wait_for_test_reply(first_synchronisation.complete_discarding_synchronisation())
+            .expect("first receiver runtime should activate");
+    alice_runtime.publish_direct_peer_route_for_test(
+        bob_member.clone(),
+        first_bob_runtime.advertised_loopback_udp_addr_for_test(),
+    );
+
+    let represented_row_id = test_row_id(group_id, docs_dataset_id(), 70_072);
+    let alice_source = alice_runtime.group_read_token_for_test(group_id);
+    publish_changes(
+        alice_runtime.as_ref(),
+        alice_source,
+        vec![title_upsert(
+            represented_row_id.clone(),
+            "represented by cut",
+        )],
+    );
+    let duplicate_indication = first_bob_runtime.capture_group_broadcast_inbound_for_test();
+    first_listener.wait_for_data_change_count(1);
+    wait_for_test_reply(first_bob_runtime.shutdown())
+        .expect("first receiver runtime should shut down");
+
+    let live_listener = Arc::new(ListenerStub::default());
+    let reload = wait_for_test_reply(
+        load_replication_runtime_typed_with_observed_startup_for_test(
+            app_bob_id(),
+            &TITLE_APPLICATION_SCHEMAS,
+            bob_store.clone(),
+            live_listener.clone(),
+            ReplicationConfig::default(),
+            load_test_runtime_security(bob_store.clone(), &bob_member),
+            Some(&bob_config_toml),
+        ),
+    )
+    .expect("receiver runtime should reload from the represented cut");
+    let TypedReplicationRuntimeLoad::Synchronising(mut synchronisation) = reload else {
+        panic!("a full reload should expose the represented row snapshot");
+    };
+    synchronisation.inject_group_broadcast_inbound_for_test(duplicate_indication);
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("represented snapshot should load")
+        .expect("represented group should be yielded");
+    let SingleGroupSynchronisation::Snapshot(mut snapshot) = group else {
+        panic!("a reload without an application token should yield a snapshot");
+    };
+    let snapshot_batch = wait_for_test_reply(snapshot.rows().next_batch())
+        .expect("represented snapshot rows should load")
+        .expect("represented snapshot should contain the row");
+    assert_eq!(
+        snapshot_batch
+            .rows()
+            .map(|row| row.row_id().clone())
+            .collect::<Vec<_>>(),
+        vec![represented_row_id]
+    );
+    assert!(
+        wait_for_test_reply(snapshot.rows().next_batch())
+            .expect("represented snapshot should exhaust")
+            .is_none()
+    );
+    drop(snapshot);
+    let bob_runtime = wait_for_test_reply(synchronisation.complete_discarding_synchronisation())
+        .expect("receiver runtime should activate after applying the represented cut");
+    alice_runtime.publish_direct_peer_route_for_test(
+        bob_member,
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
+    );
+
+    let post_cut_row_id = test_row_id(group_id, docs_dataset_id(), 70_073);
+    let alice_read_token = alice_runtime.group_read_token_for_test(group_id);
+    publish_changes(
+        alice_runtime.as_ref(),
+        alice_read_token,
+        vec![title_upsert(post_cut_row_id.clone(), "after cut")],
+    );
+    eventually(
+        TEST_WAIT_TIMEOUT,
+        || {
+            live_listener
+                .captured_data_changes()
+                .iter()
+                .flat_map(|change| &change.rows)
+                .any(|change| {
+                    matches!(
+                        change,
+                        CapturedRowChange::Upsert { row_id, .. } if row_id == &post_cut_row_id
+                    )
+                })
+        },
+        "timed out waiting for the post-cut update processing barrier",
+    );
+    assert_eq!(
+        live_listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: post_cut_row_id,
+                title: "after cut".to_owned(),
+            }],
+        }],
+        "the duplicate update represented by the startup cut must not be delivered live"
+    );
+    wait_for_test_reply(bob_runtime.shutdown()).expect("receiver runtime should shut down");
+    wait_for_test_reply(alice_runtime.shutdown()).expect("sender runtime should shut down");
+}
+
+#[test]
 fn incomplete_application_synchronisation_rejects_completion_and_shuts_down() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
@@ -472,16 +1345,16 @@ fn terminal_provider_release_failure_leaves_provider_invalid() {
     let mut synchronisation = staged.synchronisation;
     store.fail_next_read_release();
 
-    let mut group = synchronisation
-        .next_group()
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("the prepared group should load")
         .expect("the prepared synchronisation should contain one group");
+    let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+        panic!("the lifecycle fixture should yield a snapshot");
+    };
     let Err(first_error) = wait_for_test_reply(group.rows().next_batch()) else {
         panic!("terminal transaction release should fail");
     };
-    assert!(matches!(
-        first_error,
-        RowProviderError::ProviderExternal { .. }
-    ));
+    assert!(matches!(first_error, RowProviderError::Store { .. }));
     let Err(retry_error) = wait_for_test_reply(group.rows().next_batch()) else {
         panic!("an invalid provider must reject a later read");
     };
@@ -539,9 +1412,12 @@ fn operation_scoped_snapshot_scan_failure_can_retry_in_existing_transaction() {
     let staged = load_staged_startup_with_config(store.clone(), config);
     let mut synchronisation = staged.synchronisation;
 
-    let mut group = synchronisation
-        .next_group()
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("the prepared group should load")
         .expect("the prepared synchronisation should contain one group");
+    let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+        panic!("the retry fixture should yield a snapshot");
+    };
     let first_batch = wait_for_test_reply(group.rows().next_batch())
         .expect("the first bounded batch should load")
         .expect("the first bounded batch should contain a row");
@@ -553,13 +1429,15 @@ fn operation_scoped_snapshot_scan_failure_can_retry_in_existing_transaction() {
         vec![first_row_id.clone()]
     );
 
-    store.fail_next_snapshot_scan(snapshot_scan_failure(StoreErrorScope::Operation));
+    let classification = retryable_store_failure(StoreErrorScope::Operation);
+    store.fail_next_snapshot_scan(classification);
     let first_error = wait_for_test_reply(group.rows().next_batch())
         .expect_err("the injected operation failure should surface");
-    assert!(matches!(
-        first_error,
-        RowProviderError::ProviderExternal { .. }
-    ));
+    assert_eq!(
+        first_error.store_error_classification(),
+        Some(classification)
+    );
+    assert!(matches!(first_error, RowProviderError::Store { .. }));
     let mut remaining_rows = Vec::new();
     while let Some(batch) = wait_for_test_reply(group.rows().next_batch())
         .expect("the operation-scoped failure should be retryable")
@@ -591,6 +1469,89 @@ fn operation_scoped_snapshot_scan_failure_can_retry_in_existing_transaction() {
 }
 
 #[test]
+fn operation_scoped_incremental_preparation_failure_retries_the_same_group() {
+    let alice_member = alice_member();
+    let inner_store = sqlite_store(alice_member.clone());
+    let store = Arc::new(FailingStore::new(inner_store.clone()));
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let seed_runtime = load_runtime_with_parts(
+        app_probe_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("incremental retry group should be created");
+    let source_token = seed_runtime.group_read_token_for_test(group_id);
+    let target_receipt = publish_changes(
+        seed_runtime.as_ref(),
+        source_token.clone(),
+        vec![title_upsert(
+            test_row_id(group_id, docs_dataset_id(), 70_125_051),
+            "after source",
+        )],
+    );
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let PreparedRuntimeStartup {
+        endpoint_lease: _endpoint_lease,
+        load,
+    } = prepare_runtime_startup(
+        store.clone(),
+        Some(ApplicationReadToken::from(source_token)),
+        ReplicationConfig::default(),
+    );
+    let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
+        panic!("a behind group should require incremental preparation");
+    };
+    let loads_before_retry = store.replication_update_load_count();
+    let classification = retryable_store_failure(StoreErrorScope::Operation);
+    store.fail_next_replication_update_load(classification);
+
+    let Err(first_error) = wait_for_test_reply(synchronisation.next_group()) else {
+        panic!("the injected operation failure should surface");
+    };
+    assert_eq!(
+        first_error.store_error_classification(),
+        Some(classification)
+    );
+    assert!(matches!(first_error, RowProviderError::Store { .. }));
+    assert_eq!(
+        store.replication_update_load_count(),
+        loads_before_retry + 1
+    );
+
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("the operation-scoped failure should be retryable")
+        .expect("the same incremental group should remain pending");
+    let SingleGroupSynchronisation::Changes(mut changes) = group else {
+        panic!("the retried group should retain its incremental classification");
+    };
+    assert_eq!(
+        changes.position().group_read_token(),
+        &target_receipt.read_token
+    );
+    assert_eq!(
+        store.replication_update_load_count(),
+        loads_before_retry + 2,
+        "retry should repeat the failed range load in the retained transaction"
+    );
+    while wait_for_test_reply(changes.rows().next_batch())
+        .expect("retried incremental rows should drain")
+        .is_some()
+    {
+        // The test only needs to prove successful preparation and exhaustion.
+    }
+    drop(changes);
+    let runtime = wait_for_test_reply(synchronisation.complete())
+        .expect("successful incremental retry should permit activation");
+    wait_for_test_reply(runtime.shutdown()).expect("retried runtime should shut down");
+}
+
+#[test]
 fn compatibility_drain_failure_explicitly_releases_synchronisation() {
     let alice_member = alice_member();
     let inner_store = sqlite_store(alice_member.clone());
@@ -602,7 +1563,7 @@ fn compatibility_drain_failure_explicitly_releases_synchronisation() {
     let releases_before_load = store.read_release_count();
     let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(0));
-    store.fail_next_snapshot_scan(snapshot_scan_failure(StoreErrorScope::Operation));
+    store.fail_next_snapshot_scan(retryable_store_failure(StoreErrorScope::Operation));
 
     let result = wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
         app_probe_id(),
@@ -634,17 +1595,22 @@ fn transaction_scoped_snapshot_scan_failure_invalidates_provider() {
     persist_default_startup_group(store.as_ref(), &alice_member, group_id);
     let staged = load_staged_startup(store.clone());
     let mut synchronisation = staged.synchronisation;
-    store.fail_next_snapshot_scan(snapshot_scan_failure(StoreErrorScope::Transaction));
+    let classification = retryable_store_failure(StoreErrorScope::Transaction);
+    store.fail_next_snapshot_scan(classification);
 
-    let mut group = synchronisation
-        .next_group()
+    let group = wait_for_test_reply(synchronisation.next_group())
+        .expect("the prepared group should load")
         .expect("the prepared synchronisation should contain one group");
+    let SingleGroupSynchronisation::Snapshot(mut group) = group else {
+        panic!("the failure fixture should yield a snapshot");
+    };
     let first_error = wait_for_test_reply(group.rows().next_batch())
         .expect_err("the injected transaction failure should surface");
-    assert!(matches!(
-        first_error,
-        RowProviderError::ProviderExternal { .. }
-    ));
+    assert_eq!(
+        first_error.store_error_classification(),
+        Some(classification)
+    );
+    assert!(matches!(first_error, RowProviderError::Store { .. }));
     let retry_error = wait_for_test_reply(group.rows().next_batch())
         .expect_err("a transaction-scoped failure should invalidate the provider");
     assert!(matches!(retry_error, RowProviderError::ProviderFailed));
@@ -684,7 +1650,7 @@ fn explicit_synchronisation_shutdown_surfaces_provider_release_failure() {
     assert_eq!(application_id, app_probe_id());
     assert!(matches!(
         source.downcast_ref::<RowProviderError>(),
-        Some(RowProviderError::ProviderExternal { .. })
+        Some(RowProviderError::Store { .. })
     ));
 }
 

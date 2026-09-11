@@ -55,6 +55,7 @@ use flotsync_replication::{
     RowChange,
     RowFieldDifference,
     RowProviderError,
+    SingleGroupSynchronisation,
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
     StoreError,

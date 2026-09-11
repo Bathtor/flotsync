@@ -1,0 +1,31 @@
+id = "01a090dc-c0f3-70e2-92f4-750ccdf8412b"
+ref = "flotsync-r6x"
+title = "Split startup synchronisation module"
+body = """
+Goal
+
+Split the oversized runtime startup-synchronisation implementation into a documented folder module before flotsync-5ou.3 is merged, without changing behaviour.
+
+Requirements
+
+M01. First move flotsync_replication/src/runtime/synchronisation.rs intact to flotsync_replication/src/runtime/synchronisation/mod.rs, following the repository module-split rule.
+M02. Extract cohesive private modules for planning, provider state/batch streaming, incremental reconciliation, and tests where the dependency boundaries remain clear.
+M03. Preserve the public and restricted-visible API paths used by runtime::handle and tests.
+M04. Document every new module and retain the established top-level item ordering inside each file.
+M05. Avoid mixing behavioural redesign into the structural move; discovered behavioural issues must be recorded separately.
+M06. Validate formatting, focused and full replication tests, pedantic Clippy, rustdoc with warnings denied, and the Rust instruction audit.
+
+Context
+
+Discovered during the second full review of flotsync-5ou.3. synchronisation.rs is already roughly 1,600 lines and combines planning, provider lifecycle, snapshot streaming, incremental history validation, projection, local types, errors, and tests. This task blocks merge of flotsync-5ou.3.
+
+Sizing
+
+The initial move alone mechanically exceeds 1,000 changed lines. Perform the work in ordered checkpoints: intact move, production extraction, then test extraction and validation."""
+status = "open"
+type = "task"
+priority = 0
+blocks = ["01a060af-43d8-7250-8bb6-f7eb9ae61700"]
+parent = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+created_at = "2026-09-11T14:26:21.555832Z"
+updated_at = "2026-09-11T14:26:28.2667Z"

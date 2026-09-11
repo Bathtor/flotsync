@@ -578,8 +578,9 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Implementations must use its borrowed values only while executing the returned future and
     /// must not clone them into retained store state.
     ///
-    /// Implementations must include every distinct iterated `row_key` either as
-    /// present row metadata or in `DatasetRowStateSlice.missing_row_keys`.
+    /// Implementations must return only distinct iterated `row_key` values and
+    /// must include every distinct key exactly once: either as one present row
+    /// record or in `DatasetRowStateSlice.missing_row_keys`.
     fn load_dataset_rows<'a>(
         &'a mut self,
         dataset: GroupDatasetSchemaRef<'a>,

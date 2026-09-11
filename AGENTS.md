@@ -13,6 +13,7 @@
 - When the user provides substantial review feedback, capture every comment in a working note before implementation. Include stable IDs, file context, the feedback, current status, and the intended direction.
 - After plan alignment, update the working note with the agreed direction before editing production files.
 - During and after implementation, use the working note as the checklist. Before final response, double-check every captured feedback item and report any item that remains unresolved or intentionally deferred.
+- Before handing a change over for review, inspect the files touched by that change for newly duplicated helpers or logic. Extract the second occurrence into the narrowest sensible shared helper unless keeping the duplication is intentionally clearer, in which case explain why. Limit routine duplication checks to touched files; perform repository-wide duplicate analysis only when the user explicitly requests it.
 - Review-feedback working notes and gitrack issue bodies serve different purposes:
     - The working note is chronological review bookkeeping. Capture each review comment there with stable IDs, status, and intended disposition.
     - The gitrack issue body is the current holistic task plan. Do not replace it with only the latest review-fix delta.
@@ -37,10 +38,10 @@
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
-- Document the semantics of non-obvious boolean return values, especially helper methods where `true` means success, accepted, retained, skipped, or a no-op rather than simply returning a predicate.
+- Document every non-obvious return outcome. For `Option`, state exactly what `Some` and `None` mean; for booleans, state what `true` and `false` mean; for multi-way result types, document every variant. Prefer a named enum when absence or a boolean encodes domain policy, fallback, or failure rather than ordinary optional data or a predicate.
 - Document all modules, even if not public. But especially thoroughly if public.
 - Add loop labels when control flow spans non-trivial nested loops or retries.
-- Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep.
+- Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep. This includes `let ... else` branches whose `else` returns, continues, or breaks.
 - Prefer `async move {}.boxed()` over `Box::pin(async move {})` and similar for other future creating functions (e.g. `future::ready(_).boxed()` instead of `Box::pin(future::ready(_))`).
 - Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:
     1. public items (`pub`)
@@ -59,6 +60,7 @@
 ### Snafu
 
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
+- Represent expected fallback or unavailable evidence with a documented named outcome. Do not collapse malformed or internally inconsistent state into `None` or an ordinary fallback; return a contextual Snafu error instead.
 - Prefer `context(...)` / `with_context(...)` over manual `map_err(...)` when the target error still wraps the original source. Use `with_context(...)` when building the context captures clones, allocations, or other non-trivial work.
 - If the only reason to introduce a new error variant is to differentiate the use-site of an existing variant, prefer adding `location: Location` to the existing variant instead.
 - Use `#[snafu(module(...))]` plus module-qualified selector names when otherwise identical selector names would collide. Do not introduce custom selector aliases like `FooBarBazSnafu` just to disambiguate use sites.

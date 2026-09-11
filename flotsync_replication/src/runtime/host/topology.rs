@@ -213,15 +213,31 @@ impl RuntimeHostTestSupport {
         self.route_publish_mode
     }
 
-    /// Wait until the optional observer receives one group-broadcast indication.
-    pub(in crate::runtime::host) fn wait_for_group_broadcast_runtime_indication(&self) {
+    /// Wait for and clone one indication observed at the group-broadcast/runtime boundary.
+    pub(in crate::runtime::host) fn capture_group_broadcast_runtime_indication(
+        &self,
+    ) -> GroupBroadcastPortIndication {
         let proxy = self
             .group_broadcast_runtime_proxy
             .as_ref()
             .expect("group-broadcast/runtime observation must be explicitly requested");
         let future = proxy.actor_ref().observe_indication(|_| true);
         wait_for_test_reply(future)
-            .expect("group-broadcast indication should reach the runtime proxy");
+            .expect("group-broadcast indication should reach the runtime proxy")
+            .indication()
+            .clone()
+    }
+
+    /// Inject one previously captured indication towards runtime logic.
+    pub(in crate::runtime::host) fn inject_group_broadcast_runtime_indication(
+        &self,
+        indication: GroupBroadcastPortIndication,
+    ) {
+        let proxy = self
+            .group_broadcast_runtime_proxy
+            .as_ref()
+            .expect("group-broadcast/runtime injection must be explicitly requested");
+        proxy.actor_ref().inject_indication(indication);
     }
 
     /// Connect group broadcast directly or through the explicitly requested observer.

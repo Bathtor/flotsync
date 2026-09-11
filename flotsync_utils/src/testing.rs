@@ -1,3 +1,5 @@
+//! Shared helpers for compile-time assertions and compact test fixtures.
+
 /// A constant with all possible boolean values.
 pub const BOOLEAN_DOMAIN: [bool; 2] = [true, false];
 
@@ -25,6 +27,19 @@ where
 }
 
 pub type SVec16<T> = SmallVec<T, 16>;
+
+/// Infer the type of `value` and require it to implement [`Send`].
+///
+/// This supports compile-time assertions for opaque return types which cannot
+/// be named in a type-only assertion.
+pub fn assert_inferred_send<T: Send + ?Sized>(_: &T) {}
+
+/// Require one named application-facing type to support executor hand-off.
+pub fn assert_send<T: Send + ?Sized>() {}
+
+/// Require one named application-facing type to support shared access.
+pub fn assert_sync<T: Sync + ?Sized>() {}
+
 #[macro_export]
 macro_rules! svec16 {
     ($($elem:expr),* $(,)?) => {{

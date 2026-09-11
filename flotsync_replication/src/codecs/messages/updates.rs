@@ -529,6 +529,9 @@ impl DecodeProtoView for DatasetUpdateMessage {
             DatasetId::try_from_owned(dataset_id_value.clone()).context(InvalidDatasetIdSnafu {
                 value: dataset_id_value,
             })?;
+        // TODO(flotsync-h3l): Retain the generated operation views in a
+        // buffer-owning reusable update batch instead of allocating owned
+        // protobuf messages at the store boundary.
         let operations = message
             .operations
             .iter()

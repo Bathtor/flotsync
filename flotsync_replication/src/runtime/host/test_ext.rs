@@ -6,39 +6,42 @@
 )]
 use super::*;
 
-pub(crate) trait DeliveryRuntimeHostTestExt {
+/// Host controls available to feature-enabled integration-test support.
+pub(crate) trait DeliveryRuntimeHostTestSupportExt {
     /// Return the address peers should use when this host bound an unspecified interface.
     fn advertised_loopback_udp_addr(&self) -> SocketAddr;
     /// Publish a direct unicast peer route and wait until every route consumer observes it.
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
+}
+
+/// Additional host controls used only by in-crate unit tests.
+#[cfg(test)]
+pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Withdraw every direct route for one peer and wait until every route consumer observes it.
-    #[cfg(test)]
     fn withdraw_direct_peer_routes(&self, peer: MemberIdentity);
     /// Replace route-establishment watches with test-selected routes.
-    #[cfg(test)]
     fn replace_route_establishment_watches(
         &self,
         watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
     );
     /// Publish configured static routes after a test has explicitly requested them.
-    #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self);
     /// Return whether every direct-route consumer currently knows a peer route.
-    #[cfg(test)]
     fn knows_direct_peer_route(&self, peer: &MemberIdentity) -> bool;
     /// Wait until every direct-route consumer has observed a peer route.
-    #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity);
     /// Wait until the runtime component accepts one mailbox turn.
-    #[cfg(test)]
     fn wait_for_runtime_startup(&self);
     /// Wait until group broadcast hands one inbound message to runtime logic.
-    #[cfg(test)]
     fn wait_for_group_broadcast_inbound(&self);
+    /// Capture one inbound message at the group-broadcast/runtime boundary.
+    fn capture_group_broadcast_inbound(&self) -> GroupBroadcastPortIndication;
+    /// Inject one captured group-broadcast message towards runtime logic.
+    fn inject_group_broadcast_inbound(&self, indication: GroupBroadcastPortIndication);
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
+impl DeliveryRuntimeHostTestSupportExt for DeliveryRuntimeHost {
     fn advertised_loopback_udp_addr(&self) -> SocketAddr {
         loopback_advertise_addr(self.external_udp_addr)
     }
@@ -48,8 +51,10 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         self.publish_route_update(update);
         wait_for_direct_peer_route(self.topology(), &peer);
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     fn withdraw_direct_peer_routes(&self, peer: MemberIdentity) {
         self.publish_route_update(flotsync_routes::DiscoveryRouteUpdate::PeerRoutes {
             peer: peer.clone(),
@@ -58,7 +63,6 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         wait_for_no_direct_peer_route(self.topology(), &peer);
     }
 
-    #[cfg(test)]
     fn replace_route_establishment_watches(
         &self,
         watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
@@ -70,12 +74,10 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         wait_for_test_reply(future).expect("test route-establishment watches should be replaced");
     }
 
-    #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self) {
         self.publish_preconfigured_peer_routes_for_test();
     }
 
-    #[cfg(test)]
     fn knows_direct_peer_route(&self, peer: &MemberIdentity) -> bool {
         let broadcast_peer = peer.clone();
         let broadcast_knows = self
@@ -98,12 +100,10 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         broadcast_knows && reliable_knows && summary_knows
     }
 
-    #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity) {
         wait_for_direct_peer_route(self.topology(), peer);
     }
 
-    #[cfg(test)]
     fn wait_for_runtime_startup(&self) {
         let future = self
             .runtime_component()
@@ -119,10 +119,18 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         }
     }
 
-    #[cfg(test)]
     fn wait_for_group_broadcast_inbound(&self) {
+        let _indication = self.capture_group_broadcast_inbound();
+    }
+
+    fn capture_group_broadcast_inbound(&self) -> GroupBroadcastPortIndication {
         self.test_support
-            .wait_for_group_broadcast_runtime_indication();
+            .capture_group_broadcast_runtime_indication()
+    }
+
+    fn inject_group_broadcast_inbound(&self, indication: GroupBroadcastPortIndication) {
+        self.test_support
+            .inject_group_broadcast_runtime_indication(indication);
     }
 }
 

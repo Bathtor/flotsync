@@ -14,6 +14,8 @@ use super::{
 };
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
+#[cfg(test)]
+use crate::delivery::contracts::GroupBroadcastPortIndication;
 use crate::{
     api::{
         BoxError,
@@ -126,8 +128,10 @@ pub(in crate::runtime) use topology::RuntimeHostTestSupport;
 )]
 use topology::*;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use test_ext::DeliveryRuntimeHostTestExt;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_ext::DeliveryRuntimeHostTestSupportExt;
 
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;

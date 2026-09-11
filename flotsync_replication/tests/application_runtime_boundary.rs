@@ -12,16 +12,8 @@ use flotsync_replication::{
     ReplicationStore,
     load_replication_runtime,
 };
+use flotsync_utils::testing::{assert_inferred_send, assert_send, assert_sync};
 use std::sync::Arc;
-
-/// Require one named application-facing type to support executor hand-off.
-fn assert_send<T: Send + ?Sized>() {}
-
-/// Require one named application-facing type to support shared access.
-fn assert_sync<T: Sync + ?Sized>() {}
-
-/// Infer and require `Send` for an opaque return type which cannot be named at the type level.
-fn assert_inferred_send<T: Send + ?Sized>(_: &T) {}
 
 #[allow(dead_code)]
 fn assert_normal_build_load_future_is_send(

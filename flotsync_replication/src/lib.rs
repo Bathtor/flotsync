@@ -24,7 +24,10 @@ pub use local_identity::{
 };
 pub use runtime::{
     ApplicationSynchronisation,
+    GroupChangesSynchronisation,
+    GroupSnapshotSynchronisation,
     ReplicationRuntimeLoad,
+    RetiredGroupSynchronisation,
     SingleGroupSynchronisation,
     load_replication_runtime,
     load_replication_runtime_with_runtime_config_toml,

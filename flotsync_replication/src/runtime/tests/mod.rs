@@ -305,6 +305,17 @@ pub(in crate::runtime) struct DatasetRowStateTransitionPageFixture {
     pub(in crate::runtime) next_after: Option<RowKey>,
 }
 
+/// One retained-history query observed by the failure-injecting store wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplicationUpdateLoadRequest {
+    /// Group whose update history was queried.
+    group_id: GroupId,
+    /// History subset requested by the caller.
+    filter: ReplicationUpdateFilter,
+    /// Maximum records requested from the store.
+    limit: Option<NonZeroUsize>,
+}
+
 struct RuntimeFixture<S> {
     local_member: MemberIdentity,
     runtime: Arc<ReplicationRuntime>,
@@ -343,6 +354,9 @@ struct FailingStoreControlState {
     read_release_count: usize,
     snapshot_scan_failures: VecDeque<StoreErrorClassification>,
     snapshot_scan_requests: Vec<ProviderTestScanRequest>,
+    replication_update_load_failures: VecDeque<StoreErrorClassification>,
+    replication_update_load_count: usize,
+    replication_update_load_requests: Vec<ReplicationUpdateLoadRequest>,
     /// Optional deterministic replacement for all-groups reads in malformed-store tests.
     loaded_groups_override: Option<Vec<ReplicationGroupRecord>>,
 }
@@ -416,6 +430,25 @@ impl<S> FailingStore<S> {
         Self::lock_control(&self.control)
             .snapshot_scan_failures
             .push_back(classification);
+    }
+
+    /// Fail the next replication-update range load with the selected classification.
+    fn fail_next_replication_update_load(&self, classification: StoreErrorClassification) {
+        Self::lock_control(&self.control)
+            .replication_update_load_failures
+            .push_back(classification);
+    }
+
+    /// Return how many replication-update range loads passed through this wrapper.
+    fn replication_update_load_count(&self) -> usize {
+        Self::lock_control(&self.control).replication_update_load_count
+    }
+
+    /// Return every retained-history query observed by this wrapper.
+    fn replication_update_load_requests(&self) -> Vec<ReplicationUpdateLoadRequest> {
+        Self::lock_control(&self.control)
+            .replication_update_load_requests
+            .clone()
     }
 
     /// Return every ordinary snapshot scan request observed by this wrapper.
@@ -797,10 +830,31 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         filter: ReplicationUpdateFilter,
         limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_updates(group_id, filter, limit)
+        let injected_failure = {
+            let mut control = Self::lock_control(&self.control);
+            control.replication_update_load_count += 1;
+            control
+                .replication_update_load_requests
+                .push(ReplicationUpdateLoadRequest {
+                    group_id: *group_id,
+                    filter,
+                    limit,
+                });
+            control.replication_update_load_failures.pop_front()
+        };
+        match injected_failure {
+            Some(classification) => {
+                let source = std::io::Error::other(
+                    "failing store intentionally failed one update range load",
+                );
+                futures_util::future::ready(Err(StoreError::new(classification, source))).boxed()
+            }
+            None => self
+                .inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .load_replication_updates(group_id, filter, limit),
+        }
     }
 
     fn load_replication_update_ids<'a>(

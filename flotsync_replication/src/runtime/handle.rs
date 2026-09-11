@@ -1,9 +1,9 @@
 //! Public replication runtime handle, lifecycle ownership, and test-only controls.
 
 #[cfg(any(test, feature = "test-support"))]
-use super::host::DeliveryRuntimeHostTestExt;
+use super::host::DeliveryRuntimeHostTestSupportExt;
 #[cfg(test)]
-use super::host::RuntimeHostTestSupport;
+use super::host::{DeliveryRuntimeHostTestExt, RuntimeHostTestSupport};
 use super::{
     ReplicationRuntimeMessage,
     host::{DeliveryRuntimeHost, StartupEventPolicy},
@@ -14,9 +14,11 @@ use super::{
         validate_loaded_group_security,
     },
     synchronisation::{
+        ClaimedGroupSynchronisation,
         PreparedApplicationState,
+        StoreGroupChangeProvider,
         StoreGroupSnapshotProvider,
-        StoreSnapshotProvider,
+        StoreSynchronisationProvider,
         prepare_application_state,
     },
 };
@@ -110,17 +112,19 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// locally understood dataset. Stored group schemas remain authoritative; the
 /// runtime reuses one of these references only when its definition matches.
 /// `store` provides the local member identity and replication state.
-/// `application_read_token` is the last position stored atomically with the
-/// application's materialised state. Passing `None` requests a complete load.
-/// This runtime version also returns complete group snapshots for any non-empty
-/// readable state when a token is supplied.
+/// `application_read_token` describes the application's materialised state. It
+/// may be an aggregate stored atomically with that state or rebuilt from
+/// independently persisted complete group positions. Passing `None` requests
+/// a complete load.
+/// Compatible behind positions return coalesced group-local changes; positions
+/// which cannot be reconstructed safely fall back to complete group snapshots.
 /// `listener` receives replication events produced by inbound delivery.
 /// `config` carries public runtime policy and startup batch-size knobs.
 ///
-/// An empty store, or one without application-readable groups, returns
+/// A store cut which already matches the supplied application state returns
 /// [`ReplicationRuntimeLoad::Ready`]. Otherwise the caller must exhaust and
-/// apply every group returned by [`ApplicationSynchronisation::next_group`] before calling
-/// [`ApplicationSynchronisation::complete`].
+/// apply every group returned by [`ApplicationSynchronisation::next_group`]
+/// before calling [`ApplicationSynchronisation::complete`].
 ///
 /// # Errors
 ///
@@ -192,7 +196,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
 #[must_use = "a loaded runtime or staged synchronisation must be completed or shut down"]
 #[non_exhaustive]
 pub enum ReplicationRuntimeLoad<R = Arc<dyn ReplicationApi>> {
-    /// No application replay is required and listener delivery is active.
+    /// No application reconciliation is required and listener delivery is active.
     Ready(R),
     /// Application state must reach the prepared store cut before listener delivery starts.
     Synchronising(ApplicationSynchronisation),
@@ -210,11 +214,12 @@ impl<R> std::fmt::Debug for ReplicationRuntimeLoad<R> {
     }
 }
 
-/// Partly started runtime and coherent application replay prepared from local storage.
+/// Partly started runtime and coherent application reconciliation prepared from local storage.
 ///
-/// Apply each group snapshot and persist its resulting group read token before
-/// requesting the next group. Applications may additionally persist
-/// [`Self::final_read_token`] atomically after applying the complete replay.
+/// Apply each group reconciliation and record its resulting position before
+/// requesting the next group. Applications may persist positions independently
+/// per group, or persist [`Self::final_read_token`] atomically after applying
+/// the complete reconciliation.
 /// Call [`Self::complete`] only after every group is exhausted; completion then
 /// begins live replication operations.
 #[must_use = "startup synchronisation must be completed or explicitly shut down"]
@@ -227,41 +232,69 @@ impl ApplicationSynchronisation {
     /// Build the intermediate application handle from prepared state and host ownership.
     fn new(
         final_read_token: ApplicationReadToken,
-        snapshots: StoreSnapshotProvider,
+        groups: StoreSynchronisationProvider,
         pending: PendingReplicationRuntime,
     ) -> Self {
         Self {
             state: Box::new(ApplicationSynchronisationState {
                 final_read_token,
-                snapshots,
+                groups,
                 pending,
             }),
         }
     }
 
-    /// Return the next readable group snapshot in deterministic group-id order.
+    /// Prepare and return the next group reconciliation in deterministic group-id order.
     ///
-    /// The returned group must be exhausted before this method can yield a
-    /// later group. `None` means no further group can be claimed. It permits
-    /// completion only when every claimed group was exhausted naturally;
-    /// dropping an incomplete group also causes subsequent calls to return
-    /// `None`, but leaves this synchronisation ineligible for completion.
-    #[must_use]
-    pub fn next_group(&mut self) -> Option<SingleGroupSynchronisation<'_>> {
-        let (group_id, read_token) = self.state.snapshots.claim_next_group()?;
-        let rows = self.state.snapshots.rows_for_group(group_id);
-        Some(SingleGroupSynchronisation {
-            group_id,
-            read_token,
-            rows,
-        })
+    /// Snapshot and change providers must be exhausted before this method can
+    /// yield a later group. `Ok(None)` means no further group can be claimed.
+    /// It permits completion only when every claimed provider was exhausted
+    /// naturally; dropping an incomplete provider also causes subsequent calls
+    /// to return `Ok(None)`, but leaves this synchronisation incomplete.
+    ///
+    /// An operation-scoped retryable store failure leaves the current group
+    /// unclaimed, so the caller may repeat this method inside the same retained
+    /// store transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::RowProviderError`] when preparing incremental changes
+    /// or releasing the naturally exhausted store cut fails.
+    pub async fn next_group(
+        &mut self,
+    ) -> Result<Option<SingleGroupSynchronisation<'_>>, crate::api::RowProviderError> {
+        let group = self.state.groups.claim_next_group().await?;
+        let group = group.map(|group| match group {
+            ClaimedGroupSynchronisation::Snapshot {
+                group_id,
+                read_token,
+                rows,
+            } => {
+                let snapshot = GroupSnapshotSynchronisation {
+                    group_id,
+                    read_token,
+                    rows,
+                };
+                SingleGroupSynchronisation::Snapshot(snapshot)
+            }
+            ClaimedGroupSynchronisation::Changes { position, rows } => {
+                let changes = GroupChangesSynchronisation { position, rows };
+                SingleGroupSynchronisation::Changes(changes)
+            }
+            ClaimedGroupSynchronisation::Retired { group_id } => {
+                let retired = RetiredGroupSynchronisation { group_id };
+                SingleGroupSynchronisation::Retired(retired)
+            }
+        });
+        Ok(group)
     }
 
-    /// Return the optional aggregate convenience position for the complete replay.
+    /// Return the aggregate position which may optionally be persisted after
+    /// full reconciliation.
     ///
     /// Applications which persist state independently per group may instead
-    /// store each [`SingleGroupSynchronisation::read_token`] after applying
-    /// that group and do not need to store this aggregate token.
+    /// store the position carried by each snapshot, change, or retirement
+    /// entry and do not need to store this aggregate token.
     #[must_use]
     pub fn final_read_token(&self) -> &ApplicationReadToken {
         &self.state.final_read_token
@@ -271,12 +304,12 @@ impl ApplicationSynchronisation {
     ///
     /// # Errors
     ///
-    /// Returns [`LoadError::SynchronisationIncomplete`] if every group snapshot
-    /// was not exhausted. Such a partial application state has no defined
-    /// position from which incremental events can safely continue, so failed
-    /// completion shuts down the staged runtime and requires a fresh load.
-    /// Runtime startup or cleanup failures are returned through other
-    /// [`LoadError`] variants.
+    /// Returns [`LoadError::SynchronisationIncomplete`] if not every group
+    /// entry was consumed through natural provider exhaustion. Such a partial
+    /// application state has no defined position from which incremental events
+    /// can safely continue, so failed completion shuts down the staged runtime
+    /// and requires a fresh load. Runtime startup or cleanup failures are
+    /// returned through other [`LoadError`] variants.
     pub async fn complete(self) -> Result<Arc<dyn ReplicationApi>, LoadError> {
         let runtime = self.complete_typed().await?;
         Ok(runtime)
@@ -290,14 +323,14 @@ impl ApplicationSynchronisation {
     /// down the host fails. Every applicable cleanup step is still attempted.
     pub async fn shutdown(self) -> Result<(), LoadError> {
         let ApplicationSynchronisationState {
-            snapshots, pending, ..
+            groups, pending, ..
         } = *self.state;
         let PendingReplicationRuntime {
             application_id,
             mut host,
             ..
         } = pending;
-        let provider_result = snapshots.abort().await;
+        let provider_result = groups.abort().await;
         let host_result = host.shutdown().await;
         match (provider_result, host_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -318,16 +351,16 @@ impl ApplicationSynchronisation {
         }
     }
 
-    /// Drain every prepared snapshot without applying it and complete startup.
+    /// Drain every prepared reconciliation without applying it and complete startup.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn complete_discarding_synchronisation(
         mut self,
     ) -> Result<Arc<ReplicationRuntime>, LoadError> {
-        let drain_result = self.discard_snapshots().await;
+        let drain_result = self.discard_synchronisation().await;
         if let Err(error) = drain_result {
             if let Err(cleanup_error) = self.shutdown().await {
                 log::warn!(
-                    "replication synchronisation shutdown also failed after snapshot draining failed: {cleanup_error}"
+                    "replication synchronisation shutdown also failed after reconciliation draining failed: {cleanup_error}"
                 );
             }
             return Err(error);
@@ -335,22 +368,50 @@ impl ApplicationSynchronisation {
         self.complete_typed().await
     }
 
-    /// Discard every prepared group snapshot while preserving drain errors.
+    /// Discard every prepared group reconciliation while preserving drain errors.
     #[cfg(any(test, feature = "test-support"))]
-    async fn discard_snapshots(&mut self) -> Result<(), LoadError> {
+    async fn discard_synchronisation(&mut self) -> Result<(), LoadError> {
         let application_id = self.state.pending.application_id.clone();
-        while let Some(mut group) = self.next_group() {
-            while group
-                .rows()
-                .next_batch()
+        while let Some(mut group) =
+            self.next_group()
                 .await
                 .boxed()
                 .with_context(|_| load_error::RuntimeSnafu {
                     application_id: application_id.clone(),
                 })?
-                .is_some()
-            {
-                // Test-support callers deliberately discard each snapshot batch.
+        {
+            match &mut group {
+                SingleGroupSynchronisation::Snapshot(snapshot) => {
+                    while snapshot
+                        .rows()
+                        .next_batch()
+                        .await
+                        .boxed()
+                        .with_context(|_| load_error::RuntimeSnafu {
+                            application_id: application_id.clone(),
+                        })?
+                        .is_some()
+                    {
+                        // Test-support callers deliberately discard each snapshot batch.
+                    }
+                }
+                SingleGroupSynchronisation::Changes(changes) => {
+                    while changes
+                        .rows()
+                        .next_batch()
+                        .await
+                        .boxed()
+                        .with_context(|_| load_error::RuntimeSnafu {
+                            application_id: application_id.clone(),
+                        })?
+                        .is_some()
+                    {
+                        // Test-support callers deliberately discard each change batch.
+                    }
+                }
+                SingleGroupSynchronisation::Retired(_) => {
+                    // Merely receiving a retirement entry consumes its row-free work.
+                }
             }
         }
         Ok(())
@@ -359,9 +420,9 @@ impl ApplicationSynchronisation {
     /// Complete startup while retaining the concrete runtime for internal tests.
     async fn complete_typed(self) -> Result<Arc<ReplicationRuntime>, LoadError> {
         let ApplicationSynchronisationState {
-            snapshots, pending, ..
+            groups, pending, ..
         } = *self.state;
-        let exhausted = snapshots.is_exhausted();
+        let exhausted = groups.is_exhausted();
         if exhausted {
             pending.start().await
         } else {
@@ -370,7 +431,7 @@ impl ApplicationSynchronisation {
                 mut host,
                 ..
             } = pending;
-            if let Err(error) = snapshots.abort().await {
+            if let Err(error) = groups.abort().await {
                 log::warn!(
                     "synchronisation provider cleanup also failed after premature completion: {error}"
                 );
@@ -395,6 +456,18 @@ impl ApplicationSynchronisation {
     pub(super) fn wait_for_group_broadcast_inbound_for_test(&self) {
         self.state.pending.host.wait_for_group_broadcast_inbound();
     }
+
+    /// Inject one captured group-broadcast message into inactive runtime logic.
+    #[cfg(test)]
+    pub(super) fn inject_group_broadcast_inbound_for_test(
+        &self,
+        indication: crate::delivery::contracts::GroupBroadcastPortIndication,
+    ) {
+        self.state
+            .pending
+            .host
+            .inject_group_broadcast_inbound(indication);
+    }
 }
 
 impl std::fmt::Debug for ApplicationSynchronisation {
@@ -402,14 +475,37 @@ impl std::fmt::Debug for ApplicationSynchronisation {
         formatter
             .debug_struct("ApplicationSynchronisation")
             .field("final_read_token", &self.state.final_read_token)
-            .field("snapshots_exhausted", &self.state.snapshots.is_exhausted())
+            .field("groups_exhausted", &self.state.groups.is_exhausted())
             .finish_non_exhaustive()
     }
 }
 
-/// One readable replication group's startup snapshot.
-#[must_use = "the group snapshot must be exhausted before synchronisation can complete"]
-pub struct SingleGroupSynchronisation<'a> {
+/// One explicit group-level application reconciliation prepared at startup.
+#[must_use = "snapshot and change providers must be exhausted before synchronisation can complete"]
+#[non_exhaustive]
+pub enum SingleGroupSynchronisation<'a> {
+    /// Complete current rows for one readable group.
+    Snapshot(GroupSnapshotSynchronisation<'a>),
+    /// Coalesced current changes since one compatible supplied position.
+    Changes(GroupChangesSynchronisation<'a>),
+    /// One supplied group which is absent from the current readable store cut.
+    Retired(RetiredGroupSynchronisation),
+}
+
+impl SingleGroupSynchronisation<'_> {
+    /// Return the replication group affected by this reconciliation entry.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.group_id(),
+            Self::Changes(changes) => changes.group_id(),
+            Self::Retired(retired) => retired.group_id(),
+        }
+    }
+}
+
+/// One readable replication group's complete startup snapshot.
+pub struct GroupSnapshotSynchronisation<'a> {
     /// Replication group represented by this snapshot.
     group_id: GroupId,
     /// Group position reached after applying the complete snapshot.
@@ -418,7 +514,7 @@ pub struct SingleGroupSynchronisation<'a> {
     rows: StoreGroupSnapshotProvider<'a>,
 }
 
-impl SingleGroupSynchronisation<'_> {
+impl GroupSnapshotSynchronisation<'_> {
     /// Return the replication group represented by this snapshot.
     #[must_use]
     pub const fn group_id(&self) -> GroupId {
@@ -434,6 +530,54 @@ impl SingleGroupSynchronisation<'_> {
     /// Return this group's bounded snapshot-row provider.
     pub fn rows(&mut self) -> &mut SnapshotRowProvider<'_> {
         &mut self.rows
+    }
+}
+
+/// One readable replication group's coalesced incremental startup changes.
+pub struct GroupChangesSynchronisation<'a> {
+    /// Position reached after applying the complete change collection.
+    position: crate::api::DataChangeReadPosition,
+    /// In-memory changes exposed through the ordinary application row-provider contract.
+    rows: StoreGroupChangeProvider<'a>,
+}
+
+impl GroupChangesSynchronisation<'_> {
+    /// Return the replication group represented by these changes.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        self.position.group_read_token().group_id()
+    }
+
+    /// Return the group-local position reached after applying every change.
+    #[must_use]
+    pub const fn position(&self) -> &crate::api::DataChangeReadPosition {
+        &self.position
+    }
+
+    /// Return this group's coalesced row-change provider.
+    ///
+    /// The provider must be called through natural exhaustion even when it
+    /// contains no rows, because an empty collection can still advance the
+    /// application position.
+    pub fn rows(
+        &mut self,
+    ) -> &mut (dyn crate::api::BatchProvider<Batch = crate::api::RowChangeBatch> + '_) {
+        &mut self.rows
+    }
+}
+
+/// Explicit retirement of one group from the supplied application state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredGroupSynchronisation {
+    /// Group which is absent from the current readable store cut.
+    group_id: GroupId,
+}
+
+impl RetiredGroupSynchronisation {
+    /// Return the group whose application state and read token must be removed.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        self.group_id
     }
 }
 
@@ -454,10 +598,10 @@ impl ReplicationRuntimeLoad<Arc<ReplicationRuntime>> {
 
 /// Resources which exist together for the complete staged-startup lifetime.
 struct ApplicationSynchronisationState {
-    /// Optional aggregate convenience position reached after applying every group.
+    /// Aggregate position which applications may optionally persist after applying all groups.
     final_read_token: ApplicationReadToken,
-    /// Per-group snapshot provider retaining the store cut until exhausted or dropped.
-    snapshots: StoreSnapshotProvider,
+    /// Per-group work retaining the store cut until exhausted or dropped.
+    groups: StoreSynchronisationProvider,
     /// Partly started host and real listener retained until completion or shutdown.
     pending: PendingReplicationRuntime,
 }
@@ -660,7 +804,7 @@ async fn load_replication_runtime_typed_with_security_inner(
     application_id: ApplicationId,
     application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
-    _application_read_token: Option<ApplicationReadToken>,
+    application_read_token: Option<ApplicationReadToken>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
     security: DeliverySecurity,
@@ -679,6 +823,7 @@ async fn load_replication_runtime_typed_with_security_inner(
         &local_member,
         application_schemas,
         &store,
+        application_read_token,
         config.application_synchronisation_batch_size,
     )
     .await
@@ -739,10 +884,10 @@ async fn load_replication_runtime_typed_with_security_inner(
         }
         PreparedApplicationState::Synchronising {
             final_read_token,
-            snapshots,
+            synchronisation,
             ..
         } => Ok(TypedReplicationRuntimeLoad::Synchronising(
-            ApplicationSynchronisation::new(final_read_token, *snapshots, pending),
+            ApplicationSynchronisation::new(final_read_token, *synchronisation, pending),
         )),
     }
 }
@@ -1018,7 +1163,7 @@ impl ReplicationRuntime {
     }
 
     pub(crate) fn advertised_loopback_udp_addr_for_test(&self) -> std::net::SocketAddr {
-        self.with_host_for_test(DeliveryRuntimeHostTestExt::advertised_loopback_udp_addr)
+        self.with_host_for_test(DeliveryRuntimeHostTestSupportExt::advertised_loopback_udp_addr)
     }
 
     pub(crate) fn publish_direct_peer_route_for_test(
@@ -1052,6 +1197,14 @@ impl ReplicationRuntime {
     #[cfg(test)]
     pub(crate) fn wait_for_direct_peer_route_for_test(&self, peer: &MemberIdentity) {
         self.with_host_for_test(|host| host.wait_for_direct_peer_route(peer));
+    }
+
+    /// Capture one inbound message at an explicitly observed runtime boundary.
+    #[cfg(test)]
+    pub(super) fn capture_group_broadcast_inbound_for_test(
+        &self,
+    ) -> crate::delivery::contracts::GroupBroadcastPortIndication {
+        self.with_host_for_test(DeliveryRuntimeHostTestExt::capture_group_broadcast_inbound)
     }
 
     pub(crate) fn install_group_for_test(

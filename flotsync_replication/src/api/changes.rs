@@ -255,6 +255,13 @@ impl ApplicationReadToken {
         self.versions.groups.get(group_id)
     }
 
+    /// Iterate the contained group positions in deterministic group-id order.
+    pub(crate) fn group_versions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&GroupId, &VersionVector)> {
+        self.versions.groups.iter()
+    }
+
     /// Return whether this application position contains no groups.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -290,6 +297,16 @@ impl ApplicationReadToken {
     pub fn merge_applied(&mut self, applied: &GroupReadToken) {
         let versions = Arc::make_mut(&mut self.versions);
         versions.merge_group_position(applied.group_id, applied.version.as_ref().clone());
+    }
+
+    /// Retire one group from this application position.
+    ///
+    /// Startup synchronisation yields an explicit retired-group entry when the
+    /// supplied application state still contains a group which is no longer
+    /// readable in the prepared local store cut. Call this after removing that
+    /// group from the application state. Repeating the operation is a no-op.
+    pub fn retire_group(&mut self, group_id: &GroupId) {
+        Arc::make_mut(&mut self.versions).groups.remove(group_id);
     }
 
     /// Apply one listener data-change position, including group replacement semantics.

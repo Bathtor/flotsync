@@ -1,0 +1,32 @@
+id = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+ref = "flotsync-h3l"
+title = "Specify replication update paging contract"
+body = """
+Goal
+
+Define and enforce store pagination contracts so callers can advance reusable batches portably, without pretending that a one-shot limit is a pagination cursor.
+
+Requirements
+
+P01. Specify deterministic ascending update-ID ordering for load_replication_updates and load_replication_update_ids.
+P02. Specify exact filter semantics for producer ranges and explicit maximum-result semantics for an optional limit.
+P03. Design sensible replication-update pagination using the established reusable-batch provider pattern.
+P04. Replace every TODO(flotsync-h3l) temporary unlimited load with correct reusable-batch pagination and remove the TODO once migrated.
+P05. Re-audit every replication-update caller and every store implementation against the completed contract and fix deviations.
+P06. Add reusable store-contract tests covering order, range boundaries, empty pages, result limits, and cursor advancement.
+P07. Restore bounded retained-history loading without reintroducing assumptions that remain local or implicit.
+P08. Audit all store APIs: each collection-returning operation should either support correct pagination following the established reusable-batch patterns or expose no pagination surface at all.
+P09. Preserve generated protobuf operation views through the replication-update store boundary. The reusable batch should own or retain its backing buffers and expose borrowed SchemaOperationView values to consumers, instead of converting every operation into an owned protobuf message during store decoding.
+
+Context
+
+Discovered while reviewing flotsync-5ou.3: retained-history reconciliation necessarily depends on ordered, limit-bounded pages, but the public store trait currently leaves those guarantees unstated. flotsync-5ou.3 removes its limit-driven cursor and temporarily loads each complete missing producer range without a limit. The same review found that generated SchemaOperationView support already exists, but DatasetUpdateRecord currently owns SchemaOperation values and DatasetUpdateMessage decoding calls MessageView::to_owned_message. The reusable update-batch design should remove that eager ownership boundary rather than adding a temporary view carrier."""
+status = "open"
+type = "task"
+priority = 0
+created_at = "2026-09-11T12:29:45.882933Z"
+updated_at = "2026-09-11T14:25:13.84819Z"
+
+[[links]]
+target = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+label = "discovered from"

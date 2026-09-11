@@ -587,6 +587,12 @@ fn application_read_token_merges_group_progress_and_applies_replacement() {
         token.group_read_token(&replacement_group),
         Some(replacement)
     );
+
+    token.retire_group(&added_group);
+    token.retire_group(&added_group);
+
+    assert_eq!(token.group_count(), 1);
+    assert!(token.group_read_token(&added_group).is_none());
 }
 
 #[test]

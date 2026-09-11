@@ -184,21 +184,52 @@ impl LoadedGroupMeta {
     }
 }
 
+/// Reject an inbound update whose read position includes its own producer version.
 pub(super) fn validate_inbound_update_read_versions(
     update: &ReplicationUpdateRecord,
 ) -> Result<(), InboundDeliveryError> {
-    let producer_read_version = update
-        .read_versions
-        .version_at(update.update_id.node_index as usize);
-    ensure!(
-        producer_read_version < update.update_id.version,
-        inbound::SelfDependentReadVersionsSnafu {
+    match classify_producer_read_causality(update) {
+        ProducerReadCausality::PrecedesUpdate => Ok(()),
+        ProducerReadCausality::IncludesUpdate {
+            producer_read_version,
+        } => inbound::SelfDependentReadVersionsSnafu {
             group_id: update.group_id,
             update_id: update.update_id,
             producer_read_version,
         }
-    );
-    Ok(())
+        .fail(),
+    }
+}
+
+/// Classify whether an update's producer dependency precedes its own version.
+///
+/// The caller must first establish that the producer index is present in the
+/// update's read-version vector.
+pub(super) fn classify_producer_read_causality(
+    update: &ReplicationUpdateRecord,
+) -> ProducerReadCausality {
+    let producer_read_version = update
+        .read_versions
+        .version_at(update.update_id.node_index as usize);
+    if producer_read_version < update.update_id.version {
+        ProducerReadCausality::PrecedesUpdate
+    } else {
+        ProducerReadCausality::IncludesUpdate {
+            producer_read_version,
+        }
+    }
+}
+
+/// Relationship between an update and its own producer entry in its read position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProducerReadCausality {
+    /// The read position ends before the update, as required for causal validity.
+    PrecedesUpdate,
+    /// The read position includes this update or a later producer version.
+    IncludesUpdate {
+        /// Producer version carried in the update's read position.
+        producer_read_version: u64,
+    },
 }
 
 /// Persisted-but-not-yet-applied updates loaded for one transactional
