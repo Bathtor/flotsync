@@ -2,6 +2,10 @@
 
 use super::{load_security_error::LocalStoreSecretSnafu, *};
 
+/// Default maximum number of rows emitted in one startup synchronisation batch.
+pub const DEFAULT_APPLICATION_SYNCHRONISATION_BATCH_SIZE: NonZeroUsize =
+    NonZeroUsize::new(128).expect("the default synchronisation batch size is non-zero");
+
 /// Policy decision for one invitation or migration classification.
 ///
 /// The enum order is the restrictiveness order: automatic acceptance is the
@@ -100,7 +104,7 @@ pub enum GroupClosePolicy {
 }
 
 /// Runtime configuration passed during `load`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicationConfig {
     /// Policy used to derive runtime permissions from stored trust evidence.
     pub trust_policy: TrustPolicy,
@@ -110,6 +114,20 @@ pub struct ReplicationConfig {
     pub group_migration_policy: GroupMigrationPolicy,
     /// Local access policy reserved for the future standalone group-close flow.
     pub group_close_policy: GroupClosePolicy,
+    /// Maximum number of rows emitted in one application startup synchronisation batch.
+    pub application_synchronisation_batch_size: NonZeroUsize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            trust_policy: TrustPolicy::default(),
+            group_invitation_policy: GroupInvitationPolicy::default(),
+            group_migration_policy: GroupMigrationPolicy::default(),
+            group_close_policy: GroupClosePolicy::default(),
+            application_synchronisation_batch_size: DEFAULT_APPLICATION_SYNCHRONISATION_BATCH_SIZE,
+        }
+    }
 }
 
 /// Device-local security input required while loading one replication runtime.
@@ -291,7 +309,7 @@ impl Default for ChangeGroupMembershipRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishReceipt {
     pub update_id: UpdateId,
-    pub read_token: ReadToken,
+    pub read_token: GroupReadToken,
 }
 
 /// Source that explains why a group invitation was received.
@@ -765,19 +783,19 @@ pub enum ReplicationEvent {
     ///
     /// [`DataChangeLineage::GroupReplacement`] represents one atomic old-to-new
     /// application-view transition across the complete row provider. Applications
-    /// should consume and record every row before merging `read_token`; dropping
-    /// the provider abandons the remainder of that transition.
+    /// must apply complete `DataChanged` transitions in listener delivery order:
+    /// consume and record every row, then pass `position` to
+    /// [`ApplicationReadToken::apply_data_change`]. The runtime awaits each
+    /// listener callback and does not emit the next transition until the current
+    /// callback completes. Dropping the provider abandons the remainder of that
+    /// transition.
+    ///
+    /// Only independent group positions obtained from startup synchronisation, publish
+    /// receipts, or other compatible group-local progress may be merged out of
+    /// listener order with [`ApplicationReadToken::merge_applied`].
     DataChanged {
-        /// Context required to interpret row-level predecessor metadata.
-        lineage: DataChangeLineage,
-        /// Read position reached by the row changes in this event.
-        ///
-        /// Applications that keep local mutable state should merge this into
-        /// their stored [`ReadToken`] after applying all rows from the event.
-        /// This avoids replacing newer local publish progress with an older
-        /// listener token when local and inbound events are consumed out of
-        /// order.
-        read_token: ReadToken,
+        /// Lineage-bound read position reached by this complete transition.
+        position: DataChangeReadPosition,
         /// Batched row operations which comprise this event.
         rows: Box<RowProvider>,
     },
@@ -790,6 +808,27 @@ pub enum ReplicationEvent {
         /// Complete candidate set known when this event was emitted.
         proposals: SmallVec<[MigrationCandidateProposal; 1]>,
     },
+}
+
+impl fmt::Debug for ReplicationEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataChanged { position, .. } => formatter
+                .debug_struct("DataChanged")
+                .field("position", position)
+                .field("rows", &"<row provider>")
+                .finish(),
+            Self::GroupInvitation { invitation, .. } => formatter
+                .debug_struct("GroupInvitation")
+                .field("invitation", invitation)
+                .field("respond", &"<invitation responder>")
+                .finish(),
+            Self::MigrationProposals { proposals } => formatter
+                .debug_struct("MigrationProposals")
+                .field("proposals", proposals)
+                .finish(),
+        }
+    }
 }
 
 /// Batch-level relationship between emitted data changes and a preceding group view.
@@ -810,6 +849,16 @@ pub struct MigrationCandidateProposal {
     pub proposal: MigrationProposal,
     /// One-shot response for this specific candidate.
     pub respond: Box<dyn MigrationProposalResponder>,
+}
+
+impl fmt::Debug for MigrationCandidateProposal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MigrationCandidateProposal")
+            .field("proposal", &self.proposal)
+            .field("respond", &"<migration proposal responder>")
+            .finish()
+    }
 }
 
 /// Callback for applications to accept or reject one group invitation.
@@ -956,7 +1005,7 @@ pub trait ReplicationApi: Send + Sync {
         request: security::RecordPublicKeyBundleFeedbackRequest,
     ) -> BoxFuture<'_, Result<(), ApiError>>;
 
-    /// Publish one local set of row mutations from a known read token.
+    /// Publish one local set of row mutations from a known group read token.
     ///
     /// The request token is the read position of the application state used to
     /// decide the mutation list. Mutations are interpreted as sparse field
@@ -982,30 +1031,6 @@ pub trait ReplicationApi: Send + Sync {
         request: PublishChangesRequest,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
-    /// Open a batched stream over the latest locally stored projected row values for selected datasets.
-    ///
-    /// The request is scoped to one replication group and an explicit set of
-    /// application datasets. The stream reflects the latest state known to the
-    /// local store when the snapshot is opened; it does not wait for remote peers
-    /// and it does not perform catch-up. When `include_tombstones` is false, the
-    /// provider should emit only application-visible rows. When it is true,
-    /// retained delete tombstones are emitted as [`SnapshotValueRow`] views with
-    /// [`SnapshotValueRow::is_tombstoned`] set.
-    ///
-    /// The returned [`SnapshotValueRows`] provider may hold a store read transaction
-    /// while it is alive, so callers should drain or drop it promptly. Batches
-    /// are bounded by [`SnapshotRowsRequest::max_rows_per_batch`] and are emitted
-    /// through the same [`BatchProvider`] end-of-stream contract as listener row
-    /// providers.
-    ///
-    /// The method returns [`ApiError`] when the group is unknown, the request is
-    /// invalid, the runtime is unavailable, or the store cannot open the
-    /// snapshot.
-    fn snapshot_rows(
-        &self,
-        request: SnapshotRowsRequest,
-    ) -> BoxFuture<'_, Result<SnapshotValueRows, ApiError>>;
-
     /// Ask one group member for its current group version vector.
     fn request_summary(&self, request: SummaryRequest) -> BoxFuture<'_, Result<Summary, ApiError>>;
 
@@ -1019,9 +1044,9 @@ pub trait ReplicationApi: Send + Sync {
     /// dataset contents through ordinary [`Self::publish_changes`] updates.
     /// Before returning successfully, the runtime delivers an empty
     /// [`ReplicationEvent::DataChanged`] event containing the new group's read
-    /// position through [`ReplicationEventListener`]. Applications should merge
-    /// that event into their stored [`ReadToken`] before publishing the first
-    /// dataset changes for the group.
+    /// position through [`ReplicationEventListener`]. Applications should apply
+    /// that event's bound position to their stored [`ApplicationReadToken`]
+    /// before publishing the first dataset changes for the group.
     /// Locally supplied names are trimmed and rejected if the result is empty;
     /// invitation messages are carried verbatim, may be empty, and are discarded after
     /// activation.

@@ -42,8 +42,39 @@ pub enum DatasetIdError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum RowProviderError {
+    /// A provider operation failed for reasons unrelated to replication storage.
     #[snafu(display("Row provider failed: {source}"))]
     ProviderExternal { source: BoxError },
+    /// A provider operation failed while accessing replication storage.
+    #[snafu(display("Row provider store operation failed [{classification}]: {source}"))]
+    Store {
+        /// Typed store classification retained before boxing the concrete source.
+        classification: StoreErrorClassification,
+        /// Concrete store error retained for diagnostics and downcasting.
+        source: BoxError,
+    },
+    /// An earlier terminal provider operation left the provider invalid.
+    #[snafu(display("Row provider is invalid after an earlier terminal error."))]
+    ProviderFailed,
+}
+
+impl RowProviderError {
+    /// Box one store error while retaining its public retry classification.
+    pub(crate) fn from_store_error(source: StoreError) -> Self {
+        Self::Store {
+            classification: source.classification(),
+            source: source.into(),
+        }
+    }
+}
+
+impl StoreErrorClassificationSource for RowProviderError {
+    fn store_error_classification(&self) -> Option<StoreErrorClassification> {
+        match self {
+            Self::Store { classification, .. } => Some(*classification),
+            Self::ProviderExternal { .. } | Self::ProviderFailed => None,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -278,6 +309,11 @@ pub enum LoadError {
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
     Unavailable { application_id: ApplicationId },
+    /// Startup completion was requested before every prepared group reconciliation was consumed.
+    #[snafu(display(
+        "Application startup synchronisation for '{application_id}' was not fully consumed."
+    ))]
+    SynchronisationIncomplete { application_id: ApplicationId },
 }
 
 impl StoreErrorClassificationSource for LoadError {
@@ -285,7 +321,9 @@ impl StoreErrorClassificationSource for LoadError {
         match self {
             Self::StoreAccess { source, .. } => source.store_error_classification(),
             Self::Security { source, .. } => source.store_error_classification(),
-            Self::Runtime { .. } | Self::Unavailable { .. } => None,
+            Self::Runtime { .. }
+            | Self::Unavailable { .. }
+            | Self::SynchronisationIncomplete { .. } => None,
         }
     }
 }
@@ -364,6 +402,26 @@ mod tests {
                 assert!(source.downcast_ref::<UnclassifiedError>().is_some());
             }
             other => panic!("unexpected API error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_provider_store_conversion_exposes_classification_and_source() {
+        let error = RowProviderError::from_store_error(test_store_error());
+
+        assert_eq!(
+            error.store_error_classification(),
+            Some(test_classification())
+        );
+        match error {
+            RowProviderError::Store {
+                classification,
+                source,
+            } => {
+                assert_eq!(classification, test_classification());
+                assert!(source.downcast_ref::<StoreError>().is_some());
+            }
+            other => panic!("unexpected row-provider error: {other:?}"),
         }
     }
 

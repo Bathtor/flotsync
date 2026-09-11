@@ -1,0 +1,70 @@
+id = "01a090dc-c0f3-70e2-92f4-750ccdf8412b"
+ref = "flotsync-r6x"
+title = "Split startup synchronisation module"
+body = """
+Goal
+
+Split the oversized runtime startup-synchronisation implementation into a documented folder module before merge, without changing behaviour or existing restricted-visible API paths.
+
+Agreed layout
+
+L01. Move flotsync_replication/src/runtime/synchronisation.rs intact to flotsync_replication/src/runtime/synchronisation/mod.rs before extracting anything.
+L02. Keep synchronisation/mod.rs as the documented façade and store-cut orchestration. It owns prepare_application_state and PreparedApplicationState and re-exports the restricted provider types consumed by runtime::handle.
+L03. Put token classification, ReadableGroupSynchronisation, IncrementalCandidate, PendingGroupSynchronisation, and deterministic plan construction in synchronisation/planning.rs.
+L04. Put provider lifecycle, resolved/current state, claimed-group representation, snapshot and change batch adapters, transaction accessors, and provider error translation in synchronisation/provider/mod.rs.
+L05. Put retained-history loading and validation, affected-row collection, current-row projection, fallback evidence, and IncrementalPreparationError in synchronisation/provider/incremental.rs.
+L06. Put the focused provider and incremental unit tests in synchronisation/provider/tests.rs.
+L07. Keep snapshot and change streaming together in provider/mod.rs because both mutate the same pending/current/transaction state machine.
+
+Dependency direction
+
+D01. planning is independent of provider implementation and produces pending work, including IncrementalCandidate.
+D02. provider depends on planning and consumes pending work.
+D03. provider::incremental depends on planning for IncrementalCandidate and is private implementation used only by provider.
+D04. planning must not depend on provider or provider::incremental.
+D05. synchronisation/mod.rs depends on planning and provider while preserving runtime::synchronisation paths through restricted re-exports.
+
+Constraints
+
+C01. Preserve behaviour, names, error variants, fallback semantics, provider lifecycle, and test coverage.
+C02. Do not mix behavioural redesign into the structural move. Record any discovered behavioural defect separately before changing it.
+C03. Document every new module and preserve the established Rust item grouping and ordering.
+C04. Keep visibility as narrow as sibling-module access permits.
+C05. Inspect only files touched by this task for newly duplicated helpers or logic during normal review preparation.
+
+Implementation sequence
+
+I01. Perform the intact synchronisation.rs to synchronisation/mod.rs move and verify all-feature replication compilation.
+I02. Extract planning.rs and verify compilation and focused synchronisation tests.
+I03. Create provider/mod.rs, extract incremental.rs, then extract provider/tests.rs while preserving the dependency direction.
+I04. Audit imports, visibility, documentation, item ordering, paths, and touched-file duplication.
+I05. Run formatting, focused and full replication tests, pedantic Clippy, rustdoc with warnings denied, diff hygiene, and the Rust instruction audit.
+
+Sizing
+
+S01. The 1,707-line source move mechanically exceeds 1,000 displayed changed lines.
+S02. Expected steady-state sizes are approximately 160–190 LOC for synchronisation/mod.rs, 130–180 LOC for planning.rs, 500–600 LOC for provider/mod.rs, 580–680 LOC for provider/incremental.rs, and 240–280 LOC for provider/tests.rs.
+S03. Actual new content should remain around 30–70 LOC, primarily module documentation, imports, declarations, and restricted re-exports.
+S04. The intact move, production extraction, and test extraction are separate validation checkpoints so the oversized mechanical change remains reviewable."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocks = ["01a060af-43d8-7250-8bb6-f7eb9ae61700"]
+parent = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+created_at = "2026-09-11T14:26:21.555832Z"
+updated_at = "2026-09-11T15:32:02.523525Z"
+closed_at = "2026-09-11T15:32:02.523525Z"
+
+[[comments]]
+id = "01a09117-aca2-75c2-b57e-d3cd7cbdf334"
+author = "codex"
+body = "Implemented the agreed folder-module split: the façade remains in synchronisation/mod.rs, planning moved to planning.rs, provider lifecycle and streaming moved to provider/mod.rs, incremental evidence handling moved to provider/incremental.rs, and focused tests moved to provider/tests.rs. Behaviour and runtime-visible paths are preserved. Validation passed: all-feature/all-target compilation, focused provider tests, the full default-feature replication suite, all-feature secure-runtime tests, pedantic Clippy, rustdoc with warnings denied, rustfmt check, diff hygiene, touched-file duplicate inspection, and the Rust instruction audit."
+created_at = "2026-09-11T15:30:42.978234Z"
+
+[[comments]]
+id = "01a09118-e35b-7ea0-a907-4eb3cc501294"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-11T15:32:02.523525Z"

@@ -130,12 +130,15 @@ same transaction. For a migration proposal, the accepted predecessor also
 becomes closed in that transaction. Listener row changes are emitted only after
 commit.
 
-The activation listener `ReadToken` contains progress for every active group,
-not only the newly activated target group. Migration activation emits one
+The activation listener's bound `DataChangeReadPosition` contains the newly
+activated target-group position and its lineage. Migration activation emits one
 `DataChangeLineage::GroupReplacement` event even when both group views are
-empty. The event's row provider represents the complete old-to-new application
-view transition described by the
-[group replacement row lineage contract](group_replacement_row_lineage.md).
+empty. After consuming the complete event in listener delivery order,
+applications pass its bound position to
+`ApplicationReadToken::apply_data_change`; that operation retires the
+predecessor position and advances the successor. The event's row provider
+represents the complete old-to-new application view transition described by
+the [group replacement row lineage contract](group_replacement_row_lineage.md).
 Continuing members compare the locally hosted predecessor with its successor;
 newly added members receive successor rows with unavailable predecessor state.
 
@@ -179,7 +182,7 @@ Checked-in tests cover:
 - invitation and proposal accepted-activation resume
 - Metadata acceptance rejection without target-group activation
 - inactive-material isolation and target-group pending-work uniqueness
-- inline row embedding, listener changes, and global read tokens
+- inline row embedding, listener changes, and group-scoped read tokens
 - proposal delivery to continuing members and migration invitations to added members
 - update versus group-replacement lineage
 - hosted predecessor comparison, removed-row deletes, tombstones, and unavailable predecessors

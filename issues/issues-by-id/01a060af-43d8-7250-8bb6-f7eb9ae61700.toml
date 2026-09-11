@@ -1,0 +1,169 @@
+id = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+ref = "flotsync-5ou.3"
+title = "Optimise startup synchronisation incrementally"
+body = """
+Goal
+
+Optimise staged startup so applications reconcile from an optional ApplicationReadToken one group at a time, using coalesced incremental changes when retained evidence is complete and safe full-snapshot fallback otherwise, while preserving the strict pre-runtime listener boundary.
+
+Application contract
+
+A01. None requests snapshots for every readable group; Some(token) requests reconciliation from that position.
+A02. Ready is returned only when the supplied token exactly represents the current readable group set and no retirement remains.
+A03. ApplicationSynchronisation advances asynchronously and fallibly and yields explicit Snapshot, Changes, or Retired entries in deterministic group-id order.
+A04. Snapshot carries the target GroupReadToken and bounded SnapshotRowProvider. Changes carries DataChangeReadPosition and one complete group-local coalesced RowChange collection. Retired removes a supplied group which is no longer readable.
+A05. Applications may persist final_read_token atomically or persist positions independently after consuming each group.
+A06. Ok(None) from next_group means either complete natural exhaustion with transaction release or an incomplete previously dropped row provider; is_exhausted distinguishes them.
+A07. Active public store failures preserve StoreErrorClassification. Explicit shutdown remains terminal cleanup with the ordinary source chain.
+
+Planning and provider state
+
+P01. Select absent-token snapshot mode once. With a token, classify each readable group as exact, incremental candidate, or snapshot and add independent retirements.
+P02. Use one shared readable-group input containing group id, target token, and schema, with named conversions to pending work.
+P03. Keep deterministic unresolved work in a VecDeque and at most one separate resolved current snapshot or change entry. Pending and resolved variants remain different types; no claimed booleans.
+P04. Pop pending work before fallible resolution and restore it on error. Exceptional-path efficiency does not shape normal control flow.
+P05. Keep a current entry installed until its provider reports natural exhaustion. Dropping the provider early blocks later claims and completion.
+P06. Refactor snapshot and change batching to take the current entry once, operate on owned state, and restore it only when processing may continue. Terminal errors and exhaustion leave no current entry.
+P07. Use a named internal batch outcome for batch-produced versus group-exhausted semantics, translating to Option only at the BatchProvider boundary.
+P08. Centralise checked and invariant streaming-transaction access behind documented helpers.
+
+Classification and coalescing
+
+C01. Use VersionVector::missing_version_ranges_to and load each complete missing producer range inside the retained read transaction.
+C02. Until flotsync-h3l supplies reusable-batch pagination, request complete ranges without a limit and retain TODO(flotsync-h3l) markers.
+C03. Missing expected history and absent optional row-creation provenance select named snapshot fallback. Malformed store results, causal inconsistencies, unknown datasets, codec failures, inconsistent current rows, and invalid creator indices are contextual Snafu errors.
+C04. Reuse one producer-causality classifier for inbound and retained updates.
+C05. Collect affected identities in ordered deduplicating collections. Current visible rows become complete upserts; applicable tombstones become deletes; rows created and deleted after the supplied position emit nothing.
+C06. Reserve the output from the affected-row count and rely on the strengthened exact row-slice contract instead of redundant validation sets.
+C07. Keep the already-decoded protobuf operation row-id extractor for this task, but document that it does not operate on a wire-format view and test that it bypasses schema-dependent domain decoding with an invalid payload. Add TODO(flotsync-h3l) at the eager SchemaOperationView-to-owned conversion. flotsync-h3l owns the view-backed reusable update-batch design.
+
+Lifecycle and startup invariants
+
+L01. Do not reconstruct historical replacement transitions. Supplied groups no longer readable produce Retired; current readable groups absent from the token produce Snapshot.
+L02. Keep one coherent store cut while reconciliation is incomplete. Runtime logic remains inactive until completion so represented updates cannot also arrive live.
+L03. Retirement, snapshot, and change entries are independent; parallel group ingestion and transaction forking remain out of scope.
+
+Code quality and review fixes
+
+Q01. Keep unit-only host controls separate from feature test support and place cfg attributes at coherent trait/implementation boundaries.
+Q02. Build named fields before public enum variants rather than nesting large expressions.
+Q03. Document every non-obvious optional, boolean, and multi-way outcome, including state transitions and internal preconditions. Use named outcomes when None encodes domain policy.
+Q04. Apply the established early-return threshold to exiting let-else forms; use let-else normally for local invariant extraction without an early exit.
+Q05. Keep expected fallback separate from malformed state and use contextual Snafu errors for actual failures.
+Q06. Remove the PendingResolutionFailure bookkeeping wrapper rather than promoting queue restoration into an error type.
+Q07. Rename affected-row collection according to its actual collection role rather than claiming a separate validation phase.
+Q08. Assert the real next_group future is Send inside an existing host test which already owns ApplicationSynchronisation; remove the black_box function-pointer workaround.
+Q09. Update outcome documentation for claim_next_group, claim_streaming_group, expose_current_group, preparation-error handling, abort, transaction exhaustion, snapshot/change filling, current-row loading and projection, and incremental resolution.
+Q10. Do not add the proposed extract macro or vague structural/allocation agent rules.
+Q11. Share assert_inferred_send through flotsync_utils::testing and reuse one local malformed-operation fixture in the codec tests. Before review hand-off, check files touched by the change for duplicated helpers or logic and extract the second occurrence unless retaining it is explicitly justified. Do not expand routine checks repo-wide; repository-wide duplicate analysis occurs only when explicitly requested.
+
+Validation
+
+V01. Cover exact, missing, behind, ahead, concurrent, incompatible, retired, replacement, read-only, closed, and unknown group arrangements.
+V02. Cover coalesced upserts, deletes, repeated identities, row-free progress, created-then-deleted omission, and mixed group outcomes.
+V03. Cover missing evidence fallback and malformed retained history, self-dependency, unknown datasets, codec failures, row-slice violations, and invalid creators as errors.
+V04. Cover retry restoration inside the same transaction, sticky terminal failure, dropped-current incompleteness, and empty/non-empty batch exhaustion.
+V05. Cover represented-cut no-redelivery, multiple producer ranges, public Send/Sync boundaries, and the async application API.
+V06. Run formatting, focused and broader tests, pedantic Clippy, rustdoc with warnings denied, diff checks, and the Rust instruction audit.
+
+Deferrals and linked work
+
+D01. Do not reconstruct replacement lineage, historical value equality, parallel ingestion, gateways, or the general runtime FSM.
+D02. flotsync-5az owns genuinely bounded incremental materialisation and delivery.
+D03. flotsync-h3l owns correct reusable-batch pagination, replacement of temporary unlimited loads, view-backed update batches retaining protobuf backing storage, store contract tests, and the wider audit of store APIs for correct pagination or no pagination.
+D04. Priority-0 child/blocker flotsync-r6x owns the pre-merge split of runtime/synchronisation.rs into a folder module, beginning with an intact move to synchronisation/mod.rs and then cohesive extraction. The mechanical refactor exceeds 1,000 changed lines and remains separate.
+D05. Fast deterministic general duplicate-detection tooling is a possible future concern, not part of this task and not required for routine review readiness.
+
+Implementation sequence
+
+I01. Update the review ledger and holistic task plan.
+I02. Move assert_inferred_send to flotsync_utils::testing and update both callers.
+I03. Extract and reuse the local malformed protobuf operation fixture.
+I04. Add the touched-files-only duplication review rule to AGENTS.md.
+I05. Recheck all touched files for newly duplicated helpers or logic.
+I06. Run focused tests, formatting, pedantic Clippy, diff checks, and return the task to review.
+
+Sizing
+
+Z01. Third-round changes are approximately 15–30 LOC and should be a net reduction in duplicated test code.
+Z02. The later module split will exceed 1,000 mechanical changed lines and remains a separate blocker."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+blocked_by = [
+    "01a060af-0325-7591-9353-b025a5a27b68",
+    "01a090dc-c0f3-70e2-92f4-750ccdf8412b",
+]
+parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+children = ["01a090dc-c0f3-70e2-92f4-750ccdf8412b"]
+created_at = "2026-09-02T05:54:54.040853Z"
+updated_at = "2026-09-11T15:07:13.816177Z"
+closed_at = "2026-09-11T15:07:13.816177Z"
+
+[[comments]]
+id = "01a072a6-bd67-7543-aa17-aa16f66abbca"
+author = "codex"
+body = "Implemented the aligned incremental startup contract: exact-token Ready classification; async per-group Snapshot, Changes, and Retired entries; bounded retained-history validation with selective snapshot fallback; one-group in-memory change coalescing; operation-scoped retry within the retained transaction; explicit token retirement; checklist/test-support adaptation; and focused exact, coalescing, row-free progress, mixed-group, lifecycle, fallback, and retry coverage. Validation completed with the full flotsync_replication and replicated-checklist test suites, all-feature compilation, pedantic clippy for both affected crates, and rustdoc."
+created_at = "2026-09-05T17:38:45.223853Z"
+
+[[comments]]
+id = "01a072cf-0a89-7120-95c9-98a95e0af733"
+author = "codex"
+body = "Review delta accepted: keep the one-group materialised Changes batch in this slice and track genuine bounded materialisation/output as priority-4 flotsync-5az; expose store retry classification through every affected public error path; add represented-cut no-redelivery coverage plus paginated multi-producer history coverage; and update snapshot-only public wording to reconciliation terminology."
+created_at = "2026-09-05T18:22:46.409515Z"
+
+[[comments]]
+id = "01a072e4-0258-7a52-a181-9bc7707c5e1f"
+author = "codex"
+body = "Review fixes completed: classified RowProviderError store failures now cover startup and activation providers; operation retry classification is asserted; represented-cut duplicate delivery and paginated multi-producer history have focused regressions; reconciliation terminology is consistent at the public boundary; and flotsync-5az records the accepted priority-4 memory-bound follow-up. Full flotsync_replication and checklist example suites pass, as do pedantic clippy for both affected crates and the final Rust-instruction audit."
+created_at = "2026-09-05T18:45:40.568401Z"
+
+[[comments]]
+id = "01a0902a-e41c-7421-a5d1-be8580adfc22"
+author = "codex"
+body = "Full review plan agreed: split unit-only host controls from feature test support; reuse existing version-range utilities; replace mixed pending/resolved/claimed state with a pending queue plus current resolved entry; restore popped work on preparation errors; distinguish named snapshot fallback from contextual Snafu failures; simplify ordered row materialisation; add concrete documentation and early-return rules to AGENTS.md; and defer the proposed extract macro."
+created_at = "2026-09-11T11:12:05.148593Z"
+
+[[comments]]
+id = "01a0904d-d6eb-7383-b649-885128cc1e54"
+author = "codex"
+body = "Full review feedback is implemented and audited. The provider now uses a pending VecDeque plus one resolved current entry, restores popped incremental work on retryable errors, and separates named snapshot fallback from contextual Snafu failures. Planning selects the absent-token snapshot mode once, reuses VersionVector::missing_version_ranges_to, and uses a shared readable-group input. Ordered affected-row sets and the strengthened store slice contract remove redundant allocations; row-id discovery avoids full payload decoding. Unit-only and feature test-support host traits are split, public conversion and Send-boundary code are cleaned up, and AGENTS.md contains the agreed concrete review rules. R36/extract! remains intentionally deferred. Final validation: full messages, replication, and checklist example suites pass; all affected crates are pedantic-clippy clean; rustdoc and the Rust instruction audit pass."
+created_at = "2026-09-11T11:50:15.531049Z"
+
+[[comments]]
+id = "01a09072-9eca-78c3-978c-2c8b392d945c"
+author = "codex"
+body = "Follow-up audit accepted: retain ordinary source-chain diagnostics for terminal explicit shutdown; reuse the existing producer self-causality invariant for retained history; eliminate newly introduced short early-return violations; clarify aggregate-token persistence wording; and track the broader ordered, limit-bounded store paging contract separately as priority-0 flotsync-h3l."
+created_at = "2026-09-11T12:30:25.994841Z"
+
+[[comments]]
+id = "01a09081-feb8-7fb1-8ecb-ee91ecae68e0"
+author = "codex"
+body = "Follow-up review fixes completed: created and linked P0 flotsync-h3l for the store paging contract; reused one producer-causality classifier for inbound and retained updates with typed Snafu error and regression coverage; rewrote newly introduced short early exits; clarified aggregate-token persistence documentation. Explicit shutdown classification remains unchanged by agreement. Focused affected tests, pedantic clippy, rustdoc, formatting, and diff checks pass. Broad single-threaded replication runs twice timed out in the pre-existing partial_update_batch_retry_narrows_remaining_need shutdown path, while that test passes in isolation, so this follow-up does not claim a fresh full-suite pass."
+created_at = "2026-09-11T12:47:13.592971Z"
+
+[[comments]]
+id = "01a0908d-10da-70c1-b7a1-3eaf7a703314"
+author = "codex"
+body = "Corrected B01 scope: audited every replication-update and update-ID load caller now. Retained-history reconciliation was the only limit-driven fake paginator; it now performs one unlimited load per missing producer range, validates complete inclusive coverage, and has TODO(flotsync-h3l) markers in the implementation and request-shape regression. Other unlimited callers contain no pagination; catch-up uses its limit only to bound one outbound response; explicit SQLite limits are contract tests. flotsync-h3l now owns the proper reusable-batch replacement and wider store-API contract audit. Focused multi-producer, validator, and operation-retry tests pass; pedantic clippy, formatting, and diff checks are clean."
+created_at = "2026-09-11T12:59:19.130906Z"
+
+[[comments]]
+id = "01a090e6-e0d0-73d3-97f8-99259f7ca6a3"
+author = "codex"
+body = "Second-round review fixes completed. The protobuf row-id helper now states that it inspects an already-decoded owned message, and its regression proves that a schema-invalid payload fails full decoding while identity extraction succeeds. flotsync-h3l now requires view-backed reusable update batches and the eager view-to-owned conversion carries TODO(flotsync-h3l). The opaque next_group future is asserted and consumed in an existing real host fixture; the black_box workaround is gone. Provider batching now takes current work once, restores only continuable or retryable state, uses checked/invariant transaction accessors and CurrentBatchOutcome, and removes PendingResolutionFailure. All audited return and lifecycle semantics are documented. Priority-0 child/blocker flotsync-r6x tracks the required pre-merge module split. Full messages and replication suites pass; pedantic Clippy, rustdoc, formatting, diff checks, and the Rust instruction audit are clean."
+created_at = "2026-09-11T14:37:25.072209Z"
+
+[[comments]]
+id = "01a090fa-dff7-7803-aa81-92ff0d0e4a48"
+author = "codex"
+body = "Third-round review fix completed: assert_inferred_send is centralised in flotsync_utils::testing and reused by both replication test boundaries; both malformed-operation codec tests share one local fixture; and AGENTS.md now requires routine duplication checks only across files touched by the change, with repository-wide analysis reserved for explicit review requests. Messages tests, focused replication tests, formatting, pedantic Clippy, consumer rustdoc, and diff hygiene pass. Strict flotsync_utils rustdoc remains blocked by the pre-existing unresolved transform_state_match link in kompact_fsm.rs."
+created_at = "2026-09-11T14:59:15.575334Z"
+
+[[comments]]
+id = "01a09102-2c18-7b91-94c0-2a80eab39ea2"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-11T15:07:13.816177Z"

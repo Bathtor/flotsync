@@ -211,7 +211,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         hydrated_group.members().collect::<HashSet<_>>(),
         HashSet::from([alice_member.clone(), bob_member()])
     );
-    let read_token = snapshot_read_token(runtime.as_ref(), group_id, docs_dataset_id());
+    let read_token = group_read_token(runtime.as_ref(), group_id);
     publish_changes(
         runtime.as_ref(),
         read_token,
@@ -295,7 +295,7 @@ fn create_group_persists_membership_across_runtime_restart() {
     assert!(creation_events[0].rows.is_empty());
     let creation_tokens = first_listener.captured_data_change_read_tokens();
     assert_eq!(creation_tokens.len(), 1);
-    assert!(creation_tokens[0].group_version(&group_id).is_some());
+    assert_eq!(creation_tokens[0].group_id(), group_id);
     let created = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(created.group_name.as_deref(), Some("shared docs"));
     let created_state = runtime
@@ -322,7 +322,7 @@ fn create_group_persists_membership_across_runtime_restart() {
     wait_for_group_install(&restarted_runtime, group_id);
     let restarted = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(restarted.group_name.as_deref(), Some("shared docs"));
-    let read_token = snapshot_read_token(restarted_runtime.as_ref(), group_id, docs_dataset_id());
+    let read_token = group_read_token(restarted_runtime.as_ref(), group_id);
     publish_changes(
         restarted_runtime.as_ref(),
         read_token,
@@ -355,7 +355,7 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
     }))
     .expect("initial group creation should succeed");
     let old_row_id = RowId::new(old_group_id, dataset_id.clone(), row_key);
-    let read_token = snapshot_read_token(runtime.as_ref(), old_group_id, dataset_id.clone());
+    let read_token = group_read_token(runtime.as_ref(), old_group_id);
     publish_changes(
         runtime.as_ref(),
         read_token,
@@ -404,22 +404,6 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
     );
     wait_for_group_install(&restarted_runtime, successor_group_id);
     assert!(restarted_listener.captured_data_changes().is_empty());
-    assert_eq!(
-        drain_snapshot_rows(
-            restarted_runtime.as_ref(),
-            SnapshotRowsRequest {
-                group_id: successor_group_id,
-                datasets: HashSet::from([dataset_id.clone()]),
-                max_rows_per_batch: NonZeroUsize::new(16)
-                    .expect("snapshot batch size should be non-zero"),
-                include_tombstones: false,
-            },
-        ),
-        vec![CapturedRowChange::Upsert {
-            row_id: RowId::new(successor_group_id, dataset_id, row_key),
-            title: "survives missed activation event".to_owned(),
-        }]
-    );
     wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
 }
 
@@ -809,7 +793,7 @@ fn batched_activation_snapshot(
 }
 
 #[test]
-fn runtime_resumes_pending_group_activation_with_bounded_batches_and_global_read_token() {
+fn runtime_resumes_pending_group_activation_with_bounded_batches_and_group_read_token() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
@@ -891,13 +875,10 @@ fn runtime_resumes_pending_group_activation_with_bounded_batches_and_global_read
     let activation_read_token = read_tokens
         .last()
         .expect("activation event should carry a read token");
+    assert_eq!(activation_read_token.group_id(), group_id);
     assert_eq!(
-        activation_read_token.group_version(&group_id),
-        Some(&VersionVector::initial(member_count))
-    );
-    assert_eq!(
-        activation_read_token.group_version(&unrelated_group_id),
-        Some(&unrelated_versions)
+        activation_read_token.version(),
+        &VersionVector::initial(member_count)
     );
     assert!(load_pending_group_activations(store.as_ref()).is_empty());
     assert!(load_group_material(store.as_ref(), group_id).is_some());
@@ -1165,7 +1146,7 @@ fn active_group_invitation_replay_refreshes_metadata_without_reopening_decision(
     );
     let activation_tokens = listener.captured_data_change_read_tokens();
     assert_eq!(activation_tokens.len(), 1);
-    assert!(activation_tokens[0].group_version(&group_id).is_some());
+    assert_eq!(activation_tokens[0].group_id(), group_id);
 
     let mut replay = invitation;
     replay.group_name = Some(String::new());
@@ -1471,10 +1452,11 @@ fn runtime_replay_listener_failure_keeps_pending_group_decision() {
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
     listener.reject_pending_group_events();
+    let group_state = load_group_state_for_test(&alice_member, ApplicationSchemas::EMPTY, &store);
     let start_result =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
             &alice_member,
-            ApplicationSchemas::EMPTY,
+            group_state,
             store.clone(),
             listener.clone(),
             ReplicationConfig::default(),

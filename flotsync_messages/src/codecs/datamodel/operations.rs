@@ -163,6 +163,31 @@ pub fn decode_schema_operation(
     Ok(operation)
 }
 
+/// Decode the row identity addressed by one already-decoded protobuf operation.
+///
+/// This inspects the owned protobuf variant and validates its UUID
+/// representation. It deliberately does not interpret or validate the
+/// schema-dependent operation payload.
+///
+/// # Errors
+///
+/// See [`OperationCodecError`] for missing operation data or an invalid row id.
+pub fn decode_schema_operation_row_id(operation: &proto::SchemaOperation) -> OperationResult<Uuid> {
+    let operation = operation
+        .operation
+        .as_ref()
+        .context(MissingOneofSnafu {
+            name: "SchemaOperation.operation",
+        })
+        .context(CodecSnafu)?;
+    let row_id = match operation {
+        proto::schema_operation::Operation::Insert(operation) => &operation.row_id,
+        proto::schema_operation::Operation::Update(operation) => &operation.row_id,
+        proto::schema_operation::Operation::Delete(operation) => &operation.row_id,
+    };
+    decode_row_id(row_id)
+}
+
 /// Encode one row snapshot into its protobuf transport form.
 ///
 /// # Errors
@@ -766,6 +791,36 @@ mod tests {
         )])
     }
 
+    /// Build an update whose field payload conflicts with the exhaustive schema.
+    fn wrong_field_variant_schema_operation(row_id: Uuid) -> proto::SchemaOperation {
+        let operation = proto::TotalOrderRegisterSetOperation {
+            value: MessageField::some(encode_primitive_value(
+                PrimitiveValue::String("wrong".to_owned()).as_ref(),
+            )),
+            ..proto::TotalOrderRegisterSetOperation::default()
+        };
+        let field = proto::OperationField {
+            field_name: "linear_string".to_owned(),
+            value: Some(proto::operation_field::Value::TotalOrderRegisterSet(
+                Box::new(operation),
+            )),
+            ..proto::OperationField::default()
+        };
+        let update = proto::UpdateRowOperation {
+            row_id: encode_row_id(row_id),
+            fields: vec![field],
+            ..proto::UpdateRowOperation::default()
+        };
+        proto::SchemaOperation {
+            change_id: MessageField::some(encode_update_id(UpdateId {
+                version: 302,
+                node_index: 0,
+            })),
+            operation: Some(proto::schema_operation::Operation::Update(Box::new(update))),
+            ..proto::SchemaOperation::default()
+        }
+    }
+
     #[test]
     fn exhaustive_single_field_operations_roundtrip_via_protobuf() {
         let schema = exhaustive_schema();
@@ -787,6 +842,37 @@ mod tests {
         let decoded = decode_schema_operation(encoded, &schema).unwrap();
 
         assert_eq!(decoded, operation);
+    }
+
+    #[test]
+    fn schema_operation_row_id_decoder_does_not_interpret_schema_payload() {
+        let schema = exhaustive_schema();
+        let expected = row_id(303);
+        let encoded = wrong_field_variant_schema_operation(expected);
+
+        let full_decode = decode_schema_operation(encoded.clone(), &schema);
+        assert_matches!(
+            full_decode,
+            Err(OperationCodecError::InvalidSchemaOperation {
+                source: model::SchemaValueError::InvalidOperationFieldValue { field_name, .. },
+            }) if field_name == "linear_string"
+        );
+        assert_eq!(decode_schema_operation_row_id(&encoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn schema_operation_row_id_decoder_requires_an_operation_variant() {
+        let error = decode_schema_operation_row_id(&proto::SchemaOperation::default())
+            .expect_err("a missing operation variant should fail");
+
+        assert_matches!(
+            error,
+            OperationCodecError::Codec {
+                source: CodecError::MissingOneof {
+                    name: "SchemaOperation.operation"
+                }
+            }
+        );
     }
 
     #[test]
@@ -897,32 +983,7 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_field_variant_for_schema() {
         let schema = exhaustive_schema();
-        let operation = proto::TotalOrderRegisterSetOperation {
-            value: MessageField::some(encode_primitive_value(
-                PrimitiveValue::String("wrong".to_owned()).as_ref(),
-            )),
-            ..proto::TotalOrderRegisterSetOperation::default()
-        };
-        let field = proto::OperationField {
-            field_name: "linear_string".to_owned(),
-            value: Some(proto::operation_field::Value::TotalOrderRegisterSet(
-                Box::new(operation),
-            )),
-            ..proto::OperationField::default()
-        };
-        let update = proto::UpdateRowOperation {
-            row_id: encode_row_id(row_id(303)),
-            fields: vec![field],
-            ..proto::UpdateRowOperation::default()
-        };
-        let operation = proto::SchemaOperation {
-            change_id: MessageField::some(encode_update_id(UpdateId {
-                version: 302,
-                node_index: 0,
-            })),
-            operation: Some(proto::schema_operation::Operation::Update(Box::new(update))),
-            ..proto::SchemaOperation::default()
-        };
+        let operation = wrong_field_variant_schema_operation(row_id(303));
 
         let err = decode_schema_operation(operation, &schema).unwrap_err();
         assert_matches!(

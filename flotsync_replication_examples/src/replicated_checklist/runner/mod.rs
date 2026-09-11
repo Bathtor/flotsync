@@ -29,8 +29,10 @@ use flotsync_replication::{
     AcceptedCutRelation,
     ApiError,
     ApplicationSchemas,
+    ApplicationSynchronisation,
     CreateGroupRequest,
     DataChangeLineage,
+    DataChangeReadPosition,
     GroupInvitation,
     GroupInvitationResponder,
     GroupSchema,
@@ -42,19 +44,18 @@ use flotsync_replication::{
     PreviousRowEvidence,
     ProvisionLocalIdentityError,
     PublishChangesRequest,
-    ReadToken,
     RejectionReason,
     ReplicationApi,
     ReplicationConfig,
     ReplicationEvent,
     ReplicationEventListener,
-    ReplicationGroupView,
+    ReplicationRuntimeLoad,
     ReplicationSecuritySecrets,
     ReplicationStore,
     RowChange,
     RowFieldDifference,
     RowProviderError,
-    SnapshotRowsRequest,
+    SingleGroupSynchronisation,
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
     StoreError,
@@ -106,7 +107,6 @@ mod keys;
 mod repl;
 mod setup;
 
-const CHECKLIST_SNAPSHOT_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 /// Immutable dataset schema assigned to every group created by the checklist application.
 static CHECKLIST_GROUP_SCHEMA: LazyLock<GroupSchema> = LazyLock::new(|| {
     GroupSchema::new(HashMap::from([(
@@ -181,10 +181,12 @@ pub enum ReplicatedChecklistError {
     Store { source: StoreError },
     #[snafu(display("Failed to load replication runtime: {source}"))]
     LoadRuntime { source: LoadError },
+    #[snafu(display("Replication returned a startup state unsupported by this checklist build."))]
+    UnsupportedRuntimeLoadState,
     #[snafu(display("Replication API call failed: {source}"))]
     Replication { source: ApiError },
-    #[snafu(display("Failed to load checklist snapshot from replication store: {source}"))]
-    SnapshotRows { source: RowProviderError },
+    #[snafu(display("Failed to load checklist startup rows from replication store: {source}"))]
+    SynchronisationRows { source: RowProviderError },
     #[snafu(display("{source}"))]
     WorkingSet { source: ChecklistWorkingSetError },
     #[snafu(display("I/O failed while {action}: {source}"))]

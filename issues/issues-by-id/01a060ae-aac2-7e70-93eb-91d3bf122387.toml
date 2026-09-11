@@ -1,0 +1,95 @@
+id = "01a060ae-aac2-7e70-93eb-91d3bf122387"
+ref = "flotsync-5ou.1"
+title = "Introduce group-scoped read tokens"
+body = """
+Goal
+
+Make replication progress group-scoped for ordinary application work while retaining one serialisable aggregate position for application startup.
+
+Scope
+
+T01. Introduce GroupReadToken as the opaque position for one visible GroupId. Keep the underlying replication position private to the framework.
+T02. Introduce ApplicationReadToken as the serialisable aggregate of per-group positions used at the application startup boundary.
+T03. Convert snapshots and publish request/receipt paths from the current cross-group ReadToken to GroupReadToken. Bind listener lineage and its GroupReadToken in a framework-created DataChangeReadPosition.
+T04. Keep ApplicationReadToken::apply_data_change as the application-position operation and make it consume DataChangeReadPosition so replacement lineage cannot be paired with the wrong successor token.
+T05. Ensure group lifecycle and position events expose enough information for applications to maintain an ApplicationReadToken as groups advance, appear, retire, or are replaced.
+T06. Update codecs, public re-exports, test helpers, examples, and affected callers while preserving token validation at the appropriate group boundary.
+T07. Remove the per-update construction of an all-writable-groups token.
+
+Review corrections
+
+R01. Document that DataChanged events and their application-position transitions must be consumed in listener delivery order; limit out-of-order safety claims to ordinary compatible group-position merges.
+R02. Construct GroupReadToken values only when a listener event will actually be emitted and move them without an unnecessary clone.
+R03. Test that replacement preserves unrelated application-token groups and that only framework constructors can produce bound replacement positions.
+R04. Split checklist errors for a missing application aggregate and a missing requested group token, retaining the GroupId in the latter.
+R05. Restore the repository-preferred private Rust item ordering in the token module.
+R06. Keep public token documentation in application-facing position terminology and frame aggregate persistence as optional.
+R07. Give GroupReadToken and ApplicationReadToken distinct type-specific format bytes and protobuf payloads: ReadTokenGroup for group tokens and ReadToken for application tokens.
+R08. Add ApplicationReadToken::from_group_tokens so applications can rebuild an aggregate from separately persisted group tokens; make the singleton From implementation allocate its sorted map directly.
+R09. Add SortedArrayMap removal and apply replacements through one mutable aggregate backing-state access by removing the predecessor directly and merging the successor in place.
+R10. Make alternate GroupReadToken debug output exhaustive, express ApplicationReadToken debug formatting with if/else, simplify DataChangeReadPosition documentation, and inline the small text-decoding steps in both token parsers.
+
+Validation
+
+V01. Codec round trips preserve opaque group positions and the aggregate application token while cross-type decoding is rejected, including singleton aggregates.
+V02. Snapshots and publish APIs carry only the affected group position; data events carry a bound DataChangeReadPosition.
+V03. Aggregate-token tests cover reconstruction, adding, advancing, retiring, replacing, duplicate compatible group positions, and preserving unrelated group positions.
+V04. Listener-order documentation and tests cover the replacement-aware application-token path.
+V05. SortedArrayMap tests cover removal without disturbing sorted order.
+V06. Existing publication and listener behaviour remains unchanged apart from token scope.
+V07. Rustfmt, pedantic Clippy, affected crate tests, integration boundaries, Rustdoc, diff checks, and OKF documentation checks pass.
+
+Deferrals
+
+D01. Do not implement startup replay, synchronisation classification, or staged component startup in this task.
+D02. Do not reorganise ReplicationRuntimeComponent beyond changes directly required by the token conversion.
+
+Sizing
+
+The original implementation was estimated at 350-550 production LOC plus 250-400 test and call-site LOC. The second review adds approximately 120-190 production LOC plus 80-130 test LOC while replacing some existing helpers. The complete child may finish near 1000 added lines. The only sensible further split is the small SortedArrayMap removal dependency, which remains in this child because it is directly required for the agreed replacement implementation."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+blocks = ["01a060af-0325-7591-9353-b025a5a27b68"]
+parent = "01a041d5-ab95-7f33-915a-2f9b247522d7"
+created_at = "2026-09-02T05:54:14.850373Z"
+updated_at = "2026-09-02T16:05:42.988642Z"
+closed_at = "2026-09-02T16:05:42.988642Z"
+
+[[comments]]
+id = "01a060cc-24a1-73b1-a7e4-d0992583b2d4"
+author = "codex"
+body = "Implemented the agreed token split: ordinary snapshots, listener data changes, publish requests, and receipts now carry GroupReadToken; ApplicationReadToken remains the serialisable startup aggregate with framework-owned merge and replacement lifecycle semantics. Removed inbound per-update all-writable-group token construction, converted checklist/example consumers, added codec, aggregate lifecycle, runtime scoping, and wrong-group validation coverage, and updated affected design docs. Validation passed: replication lib tests (363 including the focused new validation test), replicated checklist lib tests (96), application boundary integration test, pedantic clippy across both crates, rustfmt check, diff check, and OKF docs check."
+created_at = "2026-09-02T06:26:26.593771Z"
+
+[[comments]]
+id = "01a0628f-93b1-7cd1-8f70-124fadafa6e9"
+author = "codex"
+body = "Review disposition: all findings accepted. B01 will use a framework-created DataChangeReadPosition binding lineage to GroupReadToken, while ApplicationReadToken::apply_data_change remains the owning mutation API and accepts that bound position. The same pass will address listener ordering documentation, conditional token allocation, unrelated-group preservation coverage, precise checklist missing-token errors, and private item ordering."
+created_at = "2026-09-02T14:39:31.761566Z"
+
+[[comments]]
+id = "01a062a0-5359-7930-aa33-e581c579cb50"
+author = "codex"
+body = "Resolved all accepted review findings. DataChanged now carries a framework-bound DataChangeReadPosition; ApplicationReadToken::apply_data_change remains the mutation API and consumes that position. Listener ordering is explicit, inbound token construction is conditional and clone-free, replacement coverage preserves unrelated groups and rejects successor mismatches, checklist token errors retain precise scope and GroupId, and token-module item ordering is corrected. Validation passed: 364 replication library tests, 96 checklist tests, 7 integration tests, pedantic Clippy across both crates and all targets, rustfmt, Rustdoc, git diff checks, and OKF generation/check."
+created_at = "2026-09-02T14:57:49.401705Z"
+
+[[comments]]
+id = "01a062c8-9b6b-7373-9bff-5b1e61b72deb"
+author = "codex"
+body = "Second review plan agreed: separate group/application token formats and protobuf payloads, add aggregate reconstruction from group tokens, remove replacement predecessors directly through SortedArrayMap, and simplify the public docs, debug output, singleton construction, and text parsing called out in review."
+created_at = "2026-09-02T15:41:49.291482Z"
+
+[[comments]]
+id = "01a062d5-9162-7ec3-95cb-24b2b5a2c79f"
+author = "codex"
+body = "Resolved the second review pass. Group and application tokens now use distinct type-specific format bytes and protobuf payloads; aggregate reconstruction from separately stored group tokens is public; singleton construction avoids a temporary HashMap; replacement removes the predecessor directly through one mutable aggregate backing-state access; and the requested documentation, Debug, and parsing simplifications are applied. Validation passed: 6 focused core map tests, 365 replication unit tests, 96 example/checklist tests, 7 integration tests, all-feature test-target compilation, pedantic Clippy across affected crates and targets, rustfmt, Rustdoc, diff checks, and OKF generation/check for 17 concept documents."
+created_at = "2026-09-02T15:55:58.690858Z"
+
+[[comments]]
+id = "01a062de-7bcc-7003-a50c-c3690c1cbd87"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-02T16:05:42.988642Z"

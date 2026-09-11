@@ -1,0 +1,38 @@
+id = "01a072ce-26ca-7483-8c26-72418618bb0e"
+ref = "flotsync-5az"
+title = "Bound incremental startup reconciliation memory"
+body = """
+Goal
+
+Make incremental application startup reconciliation genuinely memory-bounded without merely splitting an already-materialised in-memory change collection into smaller outward batches.
+
+Context
+
+C01. flotsync-5ou.3 deliberately prepares one complete coalesced result for one affected group at a time.
+C02. The current public Changes provider therefore emits that materialised group result as one batch; subdividing the Vec after construction would add complexity without reducing peak memory.
+
+Scope
+
+S01. Design bounded retained-history discovery, current-row loading, coalescing, and outward delivery as one coherent pipeline.
+S02. Preserve the invariant that each affected row identity is emitted at most once with its current full value or an explicit deletion.
+S03. Preserve operation-scoped retries, selective snapshot fallback, deterministic results, and one retained store cut.
+S04. Reuse the configured application synchronisation batch size for meaningful storage and output bounds once materialisation itself is bounded.
+
+Validation
+
+V01. Large incremental groups do not retain the complete RowChange collection in memory.
+V02. Output batches respect the configured bound.
+V03. Coalescing and retry semantics remain unchanged.
+
+Estimate
+
+E01. Expected change is approximately 400 to 800 LOC including tests; split further after the design pass if the chosen coalescing strategy pushes the work over 1000 LOC."""
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-09-05T18:21:48.106281Z"
+updated_at = "2026-09-05T18:22:02.704392Z"
+
+[[links]]
+target = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
+label = "discovered from"

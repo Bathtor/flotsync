@@ -14,11 +14,14 @@ use super::{
 };
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
+#[cfg(test)]
+use crate::delivery::contracts::GroupBroadcastPortIndication;
 use crate::{
     api::{
-        ApplicationSchemas,
         BoxError,
+        ListenerError,
         ReplicationConfig,
+        ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupSnapshot,
         ReplicationStore,
@@ -117,14 +120,18 @@ use discovery::PreconfiguredPeerRoutesConfig;
 #[cfg(test)]
 pub(super) use discovery::PreconfiguredPeerRoutesPublishMode;
 use local_endpoint::LocalEndpointManager;
+#[cfg(test)]
+pub(in crate::runtime) use topology::RuntimeHostTestSupport;
 #[allow(
     clippy::wildcard_imports,
     reason = "The host facade owns and reuses the local topology implementation vocabulary."
 )]
 use topology::*;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use test_ext::DeliveryRuntimeHostTestExt;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_ext::DeliveryRuntimeHostTestSupportExt;
 
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
@@ -190,7 +197,26 @@ mod config_keys {
     }
 }
 
-/// runtime component as a normal topology node in the current runtime.
+/// Behaviour if the inactive runtime component unexpectedly invokes its placeholder listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StartupEventPolicy {
+    /// Report and discard the unexpected event so production failure remains observable.
+    Log,
+    /// Panic immediately so lifecycle tests detect an invalid startup ordering.
+    #[allow(
+        dead_code,
+        reason = "the panic policy is retained for focused staged-startup lifecycle tests"
+    )]
+    Panic,
+}
+
+impl StartupEventPolicy {
+    /// Build a staged-startup listener with this unexpected-event policy.
+    pub(super) fn create_listener(self) -> Arc<dyn ReplicationEventListener> {
+        Arc::new(StartupEventListener::new(self))
+    }
+}
+
 /// Live internal host for the delivery-layer components used by replication.
 ///
 /// This owns the concrete Kompact/io topology and exposes a small imperative
@@ -210,6 +236,9 @@ pub(crate) struct DeliveryRuntimeHost {
     external_udp_addr: SocketAddr,
     #[cfg(any(test, feature = "test-support"))]
     local_endpoint_lease: ReservedSocketLease,
+    /// Unit-test-only behaviour and components kept outside the production topology.
+    #[cfg(test)]
+    test_support: RuntimeHostTestSupport,
 }
 
 impl DeliveryRuntimeHost {
@@ -220,6 +249,7 @@ impl DeliveryRuntimeHost {
         control_timeout: Duration,
         external_udp_addr: SocketAddr,
         #[cfg(any(test, feature = "test-support"))] local_endpoint_lease: ReservedSocketLease,
+        #[cfg(test)] test_support: RuntimeHostTestSupport,
     ) -> Self {
         Self {
             system: Some(system),
@@ -229,6 +259,8 @@ impl DeliveryRuntimeHost {
             external_udp_addr,
             #[cfg(any(test, feature = "test-support"))]
             local_endpoint_lease,
+            #[cfg(test)]
+            test_support,
         }
     }
 
@@ -256,66 +288,139 @@ impl DeliveryRuntimeHost {
         self.topology().discovery.route_discovery_provider()
     }
 
-    /// Start one new delivery runtime host with an additional in-memory TOML
+    /// Start one new active delivery runtime host with an additional in-memory TOML
     /// config fragment merged into the Kompact runtime config.
-    pub(crate) async fn start_with_runtime_config_toml(
+    ///
+    /// This compatibility path drains no application state. New application
+    /// loading uses [`Self::prepare_with_runtime_config_toml`] and activates the
+    /// runtime only after synchronisation.
+    #[cfg(test)]
+    pub(super) async fn start_with_runtime_config_toml(
         local_member: &MemberIdentity,
-        application_schemas: &'static ApplicationSchemas,
+        group_memberships: Arc<SharedGroupState>,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
     ) -> Result<Self, RuntimeHostError> {
-        Self::start_with_options(
+        let host = Self::prepare_with_options(
             local_member,
-            application_schemas,
+            group_memberships,
             store,
-            listener,
             config,
             security,
             runtime_config_toml,
+            StartupEventPolicy::Log.create_listener(),
             #[cfg(test)]
-            PreconfiguredPeerRoutesPublishMode::ManualForTest,
+            RuntimeHostTestSupport::direct(),
+        )
+        .await?;
+        host.activate_runtime(listener).await?;
+        Ok(host)
+    }
+
+    /// Prepare networking and delivery with an explicit inactive listener.
+    pub(super) async fn prepare_with_runtime_config_toml(
+        local_member: &MemberIdentity,
+        group_memberships: Arc<SharedGroupState>,
+        store: Arc<dyn ReplicationStore>,
+        config: ReplicationConfig,
+        security: DeliverySecurity,
+        runtime_config_toml: Option<&str>,
+        startup_listener: Arc<dyn ReplicationEventListener>,
+    ) -> Result<Self, RuntimeHostError> {
+        Self::prepare_with_options(
+            local_member,
+            group_memberships,
+            store,
+            config,
+            security,
+            runtime_config_toml,
+            startup_listener,
+            #[cfg(test)]
+            RuntimeHostTestSupport::direct(),
+        )
+        .await
+    }
+
+    /// Prepare a staged host with a caller-selected unit-test support payload.
+    ///
+    /// Ordinary preparation constructs direct production-equivalent support internally. This
+    /// special case exists so focused lifecycle tests can opt into additional host seams without
+    /// adding test concerns to the production preparation signature.
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "This focused test boundary mirrors the production preparation inputs and adds one isolated test-support payload."
+    )]
+    pub(super) async fn prepare_with_test_support(
+        local_member: &MemberIdentity,
+        group_memberships: Arc<SharedGroupState>,
+        store: Arc<dyn ReplicationStore>,
+        config: ReplicationConfig,
+        security: DeliverySecurity,
+        runtime_config_toml: Option<&str>,
+        startup_listener: Arc<dyn ReplicationEventListener>,
+        test_support: RuntimeHostTestSupport,
+    ) -> Result<Self, RuntimeHostError> {
+        Self::prepare_with_options(
+            local_member,
+            group_memberships,
+            store,
+            config,
+            security,
+            runtime_config_toml,
+            startup_listener,
+            test_support,
         )
         .await
     }
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "This internal startup boundary keeps independently owned runtime services explicit; the eighth argument exists only in tests."
+        reason = "This internal startup boundary keeps independently owned runtime services explicit; the eighth argument is a test-only support payload."
     )]
-    async fn start_with_options(
+    async fn prepare_with_options(
         local_member: &MemberIdentity,
-        application_schemas: &'static ApplicationSchemas,
+        group_memberships: Arc<SharedGroupState>,
         store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
-        #[cfg(test)] route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+        startup_listener: Arc<dyn ReplicationEventListener>,
+        #[cfg(test)] test_support: RuntimeHostTestSupport,
     ) -> Result<Self, RuntimeHostError> {
         let built_system = build_runtime_system(runtime_config_toml).await?;
         let system = built_system.system.clone();
+        #[cfg(test)]
+        let test_support = test_support.materialise(&system);
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
-        let group_memberships = Arc::new(SharedGroupState::new(application_schemas));
         let topology = RuntimeTopology::build(
             &system,
             RuntimeTopologyBuildInput {
                 group_memberships: group_memberships.clone(),
                 local_member: local_member.clone(),
                 store,
-                listener,
+                listener: startup_listener,
                 config,
                 security,
                 host_config,
                 static_route_hints: routes_config,
             },
         );
-        topology.connect_all()?;
+        topology.connect_all(
+            #[cfg(test)]
+            &test_support,
+        )?;
         topology
-            .start_all(&system, host_config.control_timeout)
+            .start_network(
+                &system,
+                host_config.control_timeout,
+                #[cfg(test)]
+                &test_support,
+            )
             .await?;
         let local_endpoint = local_endpoint::ensure_local_endpoint_bound(
             &topology.discovery.local_endpoint_manager,
@@ -338,7 +443,9 @@ impl DeliveryRuntimeHost {
             .configure_route_establishment_watches(host_config.control_timeout)
             .await?;
         #[cfg(test)]
-        if route_publish_mode == PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound {
+        if test_support.route_publish_mode()
+            == PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound
+        {
             topology
                 .discovery
                 .publish_preconfigured_peer_routes(local_endpoint.local_addr);
@@ -352,6 +459,8 @@ impl DeliveryRuntimeHost {
             local_endpoint.local_addr,
             #[cfg(any(test, feature = "test-support"))]
             local_endpoint_lease,
+            #[cfg(test)]
+            test_support,
         ))
     }
 
@@ -362,7 +471,7 @@ impl DeliveryRuntimeHost {
     )]
     pub(super) async fn start_with_route_publish_mode_for_test(
         local_member: &MemberIdentity,
-        application_schemas: &'static ApplicationSchemas,
+        group_memberships: Arc<SharedGroupState>,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         config: ReplicationConfig,
@@ -370,17 +479,41 @@ impl DeliveryRuntimeHost {
         runtime_config_toml: Option<&str>,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Result<Self, RuntimeHostError> {
-        Self::start_with_options(
+        let host = Self::prepare_with_options(
             local_member,
-            application_schemas,
+            group_memberships,
             store,
-            listener,
             config,
             security,
             runtime_config_toml,
-            route_publish_mode,
+            StartupEventPolicy::Log.create_listener(),
+            RuntimeHostTestSupport::with_route_publish_mode(route_publish_mode),
         )
-        .await
+        .await?;
+        host.activate_runtime(listener).await?;
+        Ok(host)
+    }
+
+    /// Install the real listener and start every runtime-logic component.
+    pub(crate) async fn activate_runtime(
+        &self,
+        listener: Arc<dyn ReplicationEventListener>,
+    ) -> Result<(), RuntimeHostError> {
+        let system = self
+            .system
+            .as_ref()
+            .expect("delivery runtime host system must still be live");
+        let runtime_component = self.runtime_component();
+        assert!(
+            !runtime_component.is_active(),
+            "replication runtime listener must be installed before component start"
+        );
+        runtime_component.on_definition(|component| {
+            component.replace_listener_before_start(listener);
+        });
+        self.topology()
+            .start_runtime_logic(system, self.control_timeout)
+            .await
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), RuntimeHostError> {
@@ -390,7 +523,14 @@ impl DeliveryRuntimeHost {
         let Some(system) = self.system.take() else {
             return Ok(());
         };
-        let stop_result = topology.stop_all(&system, self.control_timeout).await;
+        let stop_result = topology
+            .stop_all(
+                &system,
+                self.control_timeout,
+                #[cfg(test)]
+                &self.test_support,
+            )
+            .await;
         drop(topology);
         if let Err(error) = stop_result {
             system.shutdown_async();
@@ -456,11 +596,40 @@ impl Drop for DeliveryRuntimeHost {
             return;
         };
         log::warn!(
-            "replication runtime host dropped without graceful shutdown; call ReplicationApi::shutdown().await before dropping the runtime handle"
+            "replication runtime host dropped without graceful shutdown; call ReplicationApi::shutdown().await or ApplicationSynchronisation::shutdown().await before dropping its owning handle"
         );
         system.shutdown_async();
         #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
+    }
+}
+
+/// Non-optional listener installed until application startup synchronisation completes.
+struct StartupEventListener {
+    /// Observable response to an event emitted before real-listener installation.
+    policy: StartupEventPolicy,
+}
+
+impl StartupEventListener {
+    /// Build a placeholder with the selected event policy.
+    fn new(policy: StartupEventPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl ReplicationEventListener for StartupEventListener {
+    fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
+        log::error!(
+            "replication runtime emitted an event before startup synchronisation completed: {event:?}"
+        );
+        match self.policy {
+            StartupEventPolicy::Log => futures_util::future::ready(Ok(())).boxed(),
+            StartupEventPolicy::Panic => {
+                panic!(
+                    "replication runtime emitted an event before startup synchronisation completed"
+                )
+            }
+        }
     }
 }
 

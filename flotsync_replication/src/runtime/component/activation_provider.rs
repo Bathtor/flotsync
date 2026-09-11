@@ -120,8 +120,7 @@ impl StoreActivationRowProvider {
         };
         ReplicationStoreReadTransaction::release(transaction)
             .await
-            .boxed()
-            .context(ProviderExternalSnafu)
+            .map_err(RowProviderError::from_store_error)
     }
 
     /// Return the current dataset schema, if another dataset remains.
@@ -259,8 +258,7 @@ async fn fill_creation_dataset(
     let page = transaction
         .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
-        .boxed()
-        .context(ProviderExternalSnafu)?;
+        .map_err(RowProviderError::from_store_error)?;
     for current in state_rows.rows() {
         append_creation_row(
             output,
@@ -321,8 +319,7 @@ async fn fill_hosted_replacement_dataset(
             transition_rows,
         )
         .await
-        .boxed()
-        .context(ProviderExternalSnafu)?;
+        .map_err(RowProviderError::from_store_error)?;
     for transition in transition_rows.rows() {
         append_hosted_transition(
             output,
@@ -355,8 +352,7 @@ async fn fill_unavailable_replacement_dataset(
     let page = transaction
         .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
         .await
-        .boxed()
-        .context(ProviderExternalSnafu)?;
+        .map_err(RowProviderError::from_store_error)?;
     for current in state_rows.rows() {
         append_unavailable_current(
             output,
@@ -713,7 +709,13 @@ enum ReplacementPredecessor {
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowScanPage, PreviousRowAbsence, SchemaSource, StoreErrorClassification},
+        api::{
+            DatasetRowScanPage,
+            PreviousRowAbsence,
+            SchemaSource,
+            StoreErrorClassification,
+            StoreErrorClassificationSource as _,
+        },
         runtime::{
             in_memory::LocalDataset,
             tests::{
@@ -1017,9 +1019,14 @@ mod tests {
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
-        let Err(_error) = result else {
+        let Err(error) = result else {
             panic!("row scan failure must reach the listener provider");
         };
+        assert_eq!(
+            error.store_error_classification(),
+            Some(StoreErrorClassification::UNKNOWN)
+        );
+        assert!(matches!(error, RowProviderError::Store { .. }));
         drop(provider);
 
         let state = state
@@ -1078,9 +1085,14 @@ mod tests {
         };
 
         let result = wait_for_test_future(provider.fill_batch(RowChangeBatch::new()));
-        let Err(_error) = result else {
+        let Err(error) = result else {
             panic!("transition scan failure must reach the listener provider");
         };
+        assert_eq!(
+            error.store_error_classification(),
+            Some(StoreErrorClassification::UNKNOWN)
+        );
+        assert!(matches!(error, RowProviderError::Store { .. }));
         drop(provider);
 
         let state = state

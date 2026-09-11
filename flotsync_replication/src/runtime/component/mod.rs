@@ -22,7 +22,6 @@ use super::{
         GroupLifecycleTransitionError,
         InboundDeliveryError,
         InboundFailureAction,
-        InvalidGroupSnafu,
         InvalidMembersSnafu,
         LocalMemberMissingSnafu,
         PendingGroupActivationResumeSnafu,
@@ -30,7 +29,6 @@ use super::{
         ReplayPendingDecisionSnafu,
         RuntimeStartupError,
         SecuritySnafu,
-        SnapshotRowsError,
         StoreGroupSnafu,
         StoreStartupSnafu,
         SummaryError,
@@ -40,10 +38,9 @@ use super::{
         group_lifecycle,
         inbound,
         publish,
-        snapshot,
         summary,
     },
-    group_state::{RuntimeGroupStateSnapshot, SharedGroupState, resolve_group_schema},
+    group_state::SharedGroupState,
     in_memory::{
         LoadedGroupMeta,
         PendingUpdateSet,
@@ -71,6 +68,7 @@ use crate::{
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DataChangeLineage,
+        DataChangeReadPosition,
         DatasetId,
         DatasetRowStatePatch,
         DatasetRowStateWrite,
@@ -82,6 +80,7 @@ use crate::{
         GroupMemberKeys,
         GroupMigrationPolicy,
         GroupNameUpdate,
+        GroupReadToken,
         GroupSchema,
         InitialSnapshot,
         ListenerError,
@@ -96,7 +95,6 @@ use crate::{
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
-        ReadToken,
         RejectionReason,
         ReplicationConfig,
         ReplicationEvent,
@@ -115,13 +113,9 @@ use crate::{
         RowMutation,
         RowProvider,
         RowProviderError,
-        SnapshotRowsRequest,
-        SnapshotValueRowBatch,
-        SnapshotValueRows,
         StoreError,
         Summary,
         SummaryRequest,
-        WritableReplicationGroupVersionRecord,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
         security::{
@@ -200,7 +194,6 @@ mod activation_provider;
 mod group_work;
 mod inbound_support;
 mod listeners;
-mod snapshot_provider;
 
 use activation_provider::StoreActivationRowProvider;
 use group_work::{
@@ -233,13 +226,12 @@ use listeners::{
     notify_listener_data_change,
     notify_pending_activation_data_changes,
 };
-use snapshot_provider::StoreSnapshotRowProvider;
 
 /// One local publish batch after local apply, encoding, and delivery-envelope preparation.
 struct PreparedLocalPublish {
     group_id: GroupId,
     update_id: UpdateId,
-    read_token: ReadToken,
+    read_token: GroupReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
 }
@@ -283,8 +275,6 @@ pub enum ReplicationRuntimeMessage {
     RecordPublicKeyBundleFeedback(Ask<RecordPublicKeyBundleFeedbackRequest, Result<(), ApiError>>),
     /// Submit one local publish request through the component interface.
     PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
-    /// Request a local snapshot stream through the component interface.
-    SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotValueRows, ApiError>>),
     /// Ask one group member for its current group version vector.
     RequestSummary(Ask<SummaryRequest, Result<Summary, ApiError>>),
     /// Create one new fixed-membership group through the component interface.
@@ -336,6 +326,9 @@ pub enum ReplicationRuntimeTestMessage {
     /// Install a group directly in runtime state for integration scenarios that
     /// need pre-existing group membership until production group setup exists.
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
+    /// Read one group's current store position for publication-oriented unit tests.
+    #[cfg(test)]
+    ReadGroupToken(Ask<GroupId, Result<Option<GroupReadToken>, StoreError>>),
     /// Apply one inbound update directly to runtime logic tests.
     #[cfg(test)]
     ApplyUpdate(Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>),
@@ -362,6 +355,16 @@ impl ReplicationRuntimeMessage {
         Self::Test(ReplicationRuntimeTestMessage::InstallGroup(Ask::new(
             promise,
             (group_id, members),
+        )))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_read_group_token(
+        promise: KPromise<Result<Option<GroupReadToken>, StoreError>>,
+        group_id: GroupId,
+    ) -> Self {
+        Self::Test(ReplicationRuntimeTestMessage::ReadGroupToken(Ask::new(
+            promise, group_id,
         )))
     }
 
@@ -478,6 +481,18 @@ impl ReplicationRuntimeComponent {
         }
     }
 
+    /// Replace the listener while this component is still inactive.
+    ///
+    /// This method does not inspect Kompact lifecycle state. Calling it after
+    /// activation can redirect callbacks while an event is already in flight
+    /// and therefore violates the runtime's ordered-listener delivery contract.
+    pub(super) fn replace_listener_before_start(
+        &mut self,
+        listener: Arc<dyn ReplicationEventListener>,
+    ) {
+        self.listener = listener;
+    }
+
     fn reply_api<T>(
         &self,
         promise: KPromise<Result<T, ApiError>>,
@@ -489,6 +504,18 @@ impl ReplicationRuntimeComponent {
         if promise.fulfil(reply).is_err() {
             warn!(self.log(), "dropping {operation} reply");
         }
+    }
+
+    /// Load one current group position without restoring the removed snapshot API.
+    #[cfg(test)]
+    async fn load_group_read_token_for_test(
+        &mut self,
+        group_id: GroupId,
+    ) -> Result<Option<GroupReadToken>, StoreError> {
+        let mut transaction = self.store.begin_read_transaction().await?;
+        let group = transaction.load_replication_group(&group_id).await?;
+        transaction.release().await?;
+        Ok(group.map(|group| GroupReadToken::from_group_version(group_id, group.version_vector)))
     }
 
     fn record_inbound_failure(&self, failure: &InboundDeliveryFailure) -> InboundFailureAction {
@@ -563,67 +590,6 @@ impl ReplicationRuntimeComponent {
         Ok(())
     }
 
-    async fn snapshot_rows_from_store(
-        &mut self,
-        request: SnapshotRowsRequest,
-    ) -> Result<SnapshotValueRows, SnapshotRowsError> {
-        ensure!(!request.datasets.is_empty(), snapshot::EmptyDatasetsSnafu);
-        let group_state = self.group_memberships.application_snapshot();
-        let requested_group =
-            group_state
-                .group(&request.group_id)
-                .context(snapshot::UnknownGroupSnafu {
-                    group_id: request.group_id,
-                })?;
-        ensure!(
-            requested_group.is_readable(),
-            snapshot::GroupClosedSnafu {
-                group_id: request.group_id,
-            }
-        );
-
-        let mut transaction = self
-            .store
-            .begin_read_transaction()
-            .await
-            .context(snapshot::StoreAccessSnafu)?;
-        let group_versions = transaction
-            .load_writable_replication_group_versions()
-            .await
-            .context(snapshot::StoreAccessSnafu)?;
-        let read_token = Self::read_token_from_group_versions(group_versions);
-
-        let group_schema = self
-            .group_memberships
-            .group_schema(&request.group_id)
-            .expect("application snapshot groups retain resolved schemas");
-        for dataset_id in &request.datasets {
-            // The provider performs its own schema lookup when loading each dataset. This eager
-            // membership check exists only to return a complete request error before streaming.
-            ensure!(
-                group_schema.contains_dataset(dataset_id),
-                snapshot::MissingDatasetSchemaSnafu {
-                    group_id: request.group_id,
-                    dataset_id: dataset_id.clone(),
-                }
-            );
-        }
-
-        let provider = StoreSnapshotRowProvider::new(
-            transaction,
-            request.group_id,
-            request.datasets,
-            group_schema,
-            request.max_rows_per_batch,
-            request.include_tombstones,
-        );
-        Ok(SnapshotValueRows {
-            group_id: request.group_id,
-            read_token,
-            rows: Box::new(provider),
-        })
-    }
-
     /// Persist one set of explicit row patches back into the replication store.
     async fn apply_dataset_row_patches(
         transaction: &mut dyn ReplicationStoreTransaction,
@@ -689,27 +655,16 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Build one opaque application read token from currently stored group progress.
-    fn read_token_from_groups(
+    /// Build one opaque group read token from currently stored group progress.
+    fn group_read_token_from_groups(
         groups: impl IntoIterator<Item = ReplicationGroupRecord>,
-    ) -> ReadToken {
-        let group_versions = groups
+        group_id: GroupId,
+    ) -> GroupReadToken {
+        let group = groups
             .into_iter()
-            .filter(|group| group.lifecycle.is_writable())
-            .map(|group| (group.group_id, group.version_vector))
-            .collect();
-        ReadToken::from_group_versions(group_versions)
-    }
-
-    /// Build one opaque application read token from narrow writable-group progress records.
-    fn read_token_from_group_versions(
-        groups: impl IntoIterator<Item = WritableReplicationGroupVersionRecord>,
-    ) -> ReadToken {
-        let group_versions = groups
-            .into_iter()
-            .map(|group| (group.group_id, group.version_vector))
-            .collect();
-        ReadToken::from_group_versions(group_versions)
+            .find(|group| group.group_id == group_id)
+            .expect("installed group progress must include the activated group");
+        GroupReadToken::from_group_version(group_id, group.version_vector)
     }
 
     /// Return catch-up ranges required before an inbound update can apply.
@@ -1250,35 +1205,6 @@ impl ReplicationRuntimeComponent {
             .context(StoreGroupSnafu { group_id })?;
         self.group_memberships.replace(next_group_state);
         Ok(persisted_group)
-    }
-
-    /// Load the persisted active-group registry into one runtime snapshot during startup.
-    async fn load_hydrated_runtime_group_state(
-        &mut self,
-    ) -> Result<RuntimeGroupStateSnapshot, RuntimeStartupError> {
-        let mut transaction = self
-            .store
-            .begin_read_transaction()
-            .await
-            .context(StoreStartupSnafu)?;
-        let persisted_groups = transaction
-            .load_replication_groups()
-            .await
-            .context(StoreStartupSnafu)?;
-
-        let mut group_state = RuntimeGroupStateSnapshot::new();
-        for persisted_group in persisted_groups {
-            let group_id = persisted_group.group_id;
-            let resolved_group_schema = resolve_group_schema(
-                self.group_memberships.application_schemas(),
-                persisted_group.group_schema.clone(),
-            );
-            group_state
-                .insert_record(&self.local_member, resolved_group_schema, persisted_group)
-                .context(InvalidGroupSnafu { group_id })?;
-        }
-
-        Ok(group_state)
     }
 
     /// Re-fire unresolved listener-mediated group decisions after startup.
@@ -2069,7 +1995,7 @@ impl ReplicationRuntimeComponent {
                 active_groups.iter().cloned(),
             )
             .context(activation::InstallGroupSnafu { group_id })?;
-        let read_token = Self::read_token_from_groups(active_groups);
+        let read_token = Self::group_read_token_from_groups(active_groups, group_id);
         transaction
             .commit()
             .await
@@ -2091,7 +2017,7 @@ impl ReplicationRuntimeComponent {
         key: PendingGroupWorkKey,
         group_schema: &GroupSchema,
         hosted_predecessor: Option<(MemberIndex, VersionVector)>,
-        read_token: ReadToken,
+        read_token: GroupReadToken,
     ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
         let group_id = key.group_id();
         let read_transaction = self
@@ -2099,12 +2025,12 @@ impl ReplicationRuntimeComponent {
             .begin_read_transaction()
             .await
             .context(activation::PostCommitStoreAccessSnafu { group_id })?;
-        let (lineage, rows): (DataChangeLineage, Box<RowProvider>) = match key {
+        let (read_position, rows): (DataChangeReadPosition, Box<RowProvider>) = match key {
             PendingGroupWorkKey::GroupInvitation {
                 group_id,
                 source: crate::api::GroupInvitationSource::Creation,
             } => (
-                DataChangeLineage::Update,
+                DataChangeReadPosition::new(DataChangeLineage::Update, read_token),
                 Box::new(StoreActivationRowProvider::for_creation(
                     read_transaction,
                     group_id,
@@ -2115,7 +2041,10 @@ impl ReplicationRuntimeComponent {
                 source: crate::api::GroupInvitationSource::Migration { migration_id },
                 ..
             } => (
-                DataChangeLineage::GroupReplacement { migration_id },
+                DataChangeReadPosition::new(
+                    DataChangeLineage::GroupReplacement { migration_id },
+                    read_token,
+                ),
                 Box::new(StoreActivationRowProvider::unavailable_replacement(
                     read_transaction,
                     migration_id,
@@ -2126,7 +2055,10 @@ impl ReplicationRuntimeComponent {
                 let (local_member_index, final_versions) = hosted_predecessor
                     .expect("migration proposal activation must close its hosted predecessor");
                 (
-                    DataChangeLineage::GroupReplacement { migration_id },
+                    DataChangeReadPosition::new(
+                        DataChangeLineage::GroupReplacement { migration_id },
+                        read_token,
+                    ),
                     Box::new(StoreActivationRowProvider::hosted_replacement(
                         read_transaction,
                         migration_id,
@@ -2138,8 +2070,7 @@ impl ReplicationRuntimeComponent {
             }
         };
         Ok(PendingGroupActivationOutcome {
-            read_token,
-            lineage,
+            read_position,
             rows,
         })
     }
@@ -2307,10 +2238,14 @@ impl ReplicationRuntimeComponent {
         let mut local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
                 .context(publish::InvalidPersistedGroupSnafu { group_id })?;
-        let read_versions = read_token
-            .group_version(&group_id)
-            .cloned()
-            .context(publish::ReadTokenMissingGroupSnafu { group_id })?;
+        ensure!(
+            read_token.group_id() == group_id,
+            publish::ReadTokenGroupMismatchSnafu {
+                group_id,
+                read_token_group_id: read_token.group_id(),
+            }
+        );
+        let read_versions = read_token.version().clone();
         ensure!(
             read_versions.num_members() == local_group.member_count(),
             publish::ReadTokenMemberCountMismatchSnafu {
@@ -2366,7 +2301,7 @@ impl ReplicationRuntimeComponent {
             .update_replication_group_version_vector(&group_id, local_group.version_vector)
             .await
             .context(publish::StoreAccessSnafu)?;
-        let read_token = read_token.with_update_applied(group_id, update_id);
+        let read_token = read_token.with_update_applied(update_id);
         transaction
             .commit()
             .await
@@ -3192,26 +3127,17 @@ impl ReplicationRuntimeComponent {
         .context(inbound::StoreAccessSnafu)?;
         let mut working_datasets =
             replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
-        let writable_group_versions = transaction
-            .load_writable_replication_group_versions()
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let mut listener_read_token = Self::read_token_from_group_versions(writable_group_versions);
-        if lifecycle.is_writable() && listener_read_token.group_version(&group_id).is_none() {
-            listener_read_token = listener_read_token
-                .with_group_version(group_id, local_group.version_vector.clone());
-        }
         let mut event_batches = ListenerDataChangeBatches::new();
         for ready_update in &apply_plan.ready_chain {
             let applied_batch =
                 apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
-            if lifecycle.is_writable() {
-                listener_read_token = listener_read_token
-                    .with_group_version(group_id, local_group.version_vector.clone());
-            }
             if lifecycle.emits_data_changes() && !applied_batch.row_changes.is_empty() {
+                let read_token = GroupReadToken::from_group_version(
+                    group_id,
+                    local_group.version_vector.clone(),
+                );
                 event_batches.push(ListenerDataChanges {
-                    read_token: listener_read_token.clone(),
+                    read_token,
                     row_changes: applied_batch.row_changes,
                 });
             }
@@ -3454,21 +3380,6 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
-    fn handle_snapshot_rows(
-        &mut self,
-        ask: Ask<SnapshotRowsRequest, Result<SnapshotValueRows, ApiError>>,
-    ) -> HandlerResult {
-        let (promise, request) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .snapshot_rows_from_store(request)
-                .await
-                .map_err(ApiError::from_store_classification_source);
-            async_self.reply_api(promise, "snapshot_rows", reply);
-            Handled::OK
-        })
-    }
-
     fn handle_request_summary(
         &mut self,
         ask: Ask<SummaryRequest, Result<Summary, ApiError>>,
@@ -3616,7 +3527,8 @@ impl ReplicationRuntimeComponent {
             .store_new_replication_group(record)
             .await
             .map_err(ApiError::from_store_classification_source)?;
-        let read_token = Self::read_token_from_groups(std::iter::once(persisted_group.clone()));
+        let read_token =
+            GroupReadToken::from_group_version(group_id, persisted_group.version_vector.clone());
         notify_listener_data_change(
             self.listener.clone(),
             ListenerDataChanges {
@@ -3863,6 +3775,22 @@ impl ReplicationRuntimeComponent {
     }
 
     #[cfg(test)]
+    fn handle_test_read_group_token(
+        &mut self,
+        ask: Ask<GroupId, Result<Option<GroupReadToken>, StoreError>>,
+    ) -> HandlerResult {
+        let (promise, group_id) = ask.take();
+        self.spawn_local(async move |mut async_self| {
+            let reply = async_self.load_group_read_token_for_test(group_id).await;
+            if promise.fulfil(reply).is_err() {
+                warn!(async_self.log(), "dropping test group read-token reply");
+            }
+            Handled::OK
+        });
+        Handled::OK
+    }
+
+    #[cfg(test)]
     #[allow(
         clippy::unused_self,
         reason = "Kompact test messages use the same component method shape as production handlers."
@@ -3936,11 +3864,6 @@ impl ComponentLifecycle for ReplicationRuntimeComponent {
         self.max_inline_bootstrap_public_key_bundles =
             self.read_max_inline_bootstrap_public_key_bundles();
         Handled::block_on(self, async move |mut async_self| {
-            let hydrated_group_state = async_self
-                .load_hydrated_runtime_group_state()
-                .await
-                .whatever_unrecoverable("replication runtime startup failed")?;
-            async_self.group_memberships.replace(hydrated_group_state);
             let runtime_ref = async_self
                 .ctx
                 .actor_ref()
@@ -4009,7 +3932,6 @@ impl Actor for ReplicationRuntimeComponent {
                 self.handle_record_public_key_bundle_feedback(ask)
             }
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
-            ReplicationRuntimeMessage::SnapshotRows(ask) => self.handle_snapshot_rows(ask),
             ReplicationRuntimeMessage::RequestSummary(ask) => self.handle_request_summary(ask),
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
@@ -4025,6 +3947,10 @@ impl Actor for ReplicationRuntimeComponent {
             #[cfg(any(test, feature = "test-support"))]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {
                 self.handle_test_install_group(ask)
+            }
+            #[cfg(test)]
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ReadGroupToken(ask)) => {
+                self.handle_test_read_group_token(ask)
             }
             #[cfg(test)]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdate(ask)) => {

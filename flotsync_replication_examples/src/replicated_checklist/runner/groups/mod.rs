@@ -874,17 +874,29 @@ pub mod test_support {
 
     /// Listener event delivered before a successful test acceptance returns.
     pub struct AcceptedListenerEvent {
-        /// Lineage carried by the accepted activation event.
-        pub lineage: DataChangeLineage,
+        /// Lineage-bound position carried by the accepted activation event.
+        pub read_position: DataChangeReadPosition,
         /// Listener receiving the activation event before acceptance completes.
         pub listener: Arc<ChecklistListener>,
-        /// Read position carried by the activation event.
-        pub read_token: ReadToken,
         /// Complete activation changes carried by the test event.
         pub changes: Vec<RowChange>,
     }
 
     pub type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
+
+    /// Application resources loaded by one checklist runtime test fixture.
+    pub struct ChecklistRuntimeFixture {
+        /// Owned SQLite store which cleans up its test database on drop.
+        pub store: TestSqliteStore,
+        /// Loaded replication runtime.
+        pub runtime: Arc<dyn ReplicationApi>,
+        /// Listener installed into the runtime.
+        pub listener: Arc<ChecklistListener>,
+        /// Receiving halves for listener events and invitations.
+        pub receivers: ChecklistListenerReceivers,
+        /// Application state reconstructed during runtime startup.
+        pub working_set: ChecklistWorkingSet,
+    }
 
     impl GroupInvitationResponder for RecordingInvitationResponder {
         fn accept(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send>> {
@@ -893,8 +905,7 @@ pub mod test_support {
                     event
                         .listener
                         .on_event(ReplicationEvent::DataChanged {
-                            lineage: event.lineage,
-                            read_token: event.read_token,
+                            position: event.read_position,
                             rows: Box::new(VecRowProvider::new(event.changes)),
                         })
                         .await
@@ -971,12 +982,7 @@ pub mod test_support {
     pub fn load_test_runtime_with_groups(
         member: &MemberIdentity,
         group_ids: impl IntoIterator<Item = GroupId>,
-    ) -> (
-        TestSqliteStore,
-        Arc<dyn ReplicationApi>,
-        Arc<ChecklistListener>,
-        ChecklistListenerReceivers,
-    ) {
+    ) -> ChecklistRuntimeFixture {
         let groups = group_ids
             .into_iter()
             .map(|group_id| test_group(group_id, member));
@@ -987,12 +993,7 @@ pub mod test_support {
     pub fn load_test_runtime_with_group_records(
         member: &MemberIdentity,
         groups: impl IntoIterator<Item = ReplicationGroupRecord>,
-    ) -> (
-        TestSqliteStore,
-        Arc<dyn ReplicationApi>,
-        Arc<ChecklistListener>,
-        ChecklistListenerReceivers,
-    ) {
+    ) -> ChecklistRuntimeFixture {
         let store = provisioned_sqlite_store(member);
         block_on(provision_test_security(
             checklist_application_id(),
@@ -1012,22 +1013,30 @@ pub mod test_support {
             block_on(insert_test_group(store.as_ref(), group));
         }
         let (listener, listener_receivers) = ChecklistListener::pair();
-        let runtime = block_on(load_replication_runtime_with_runtime_config_toml(
+        let load = block_on(load_replication_runtime_with_runtime_config_toml(
             checklist_application_id(),
             &CHECKLIST_APPLICATION_SCHEMAS,
             store.clone(),
+            None,
             listener.clone(),
             ReplicationConfig::default(),
             security,
             "",
         ))
         .expect("test runtime should load");
-        (
-            SqliteStoreTestOwner::from_store(store),
+        let mut working_set = ChecklistWorkingSet::new();
+        let runtime = block_on(super::repl::complete_checklist_runtime_load(
+            load,
+            &mut working_set,
+        ))
+        .expect("test application synchronisation should complete");
+        ChecklistRuntimeFixture {
+            store: SqliteStoreTestOwner::from_store(store),
             runtime,
             listener,
-            listener_receivers,
-        )
+            receivers: listener_receivers,
+            working_set,
+        }
     }
 
     /// Build one test group with the supplied display name.
