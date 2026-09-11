@@ -87,8 +87,8 @@ Z01. flotsync-5ou.1 is approximately 350-550 production LOC plus 250-400 test/ca
 Z02. flotsync-5ou.2 is approximately 600-1,000 production/call-site LOC plus 650-1,100 tests.
 Z03. flotsync-5ou.3 is approximately 550-850 production LOC plus 450-900 tests.
 Z04. Total expected change remains roughly 2,850-4,800 LOC including tests and call-site churn. The three-child split is intentionally vertical: the middle child is larger because separating topology staging from replacement of snapshot_rows would leave no useful end-to-end startup contract."""
-status = "in-progress"
-status_reason = "plan agreed"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 assignee = "codex"
@@ -99,8 +99,15 @@ children = [
     "01a060af-43d8-7250-8bb6-f7eb9ae61700",
 ]
 created_at = "2026-08-27T06:08:37.269924Z"
-updated_at = "2026-09-02T05:55:46.194168Z"
+updated_at = "2026-09-11T15:32:05.999163Z"
+closed_at = "2026-09-11T15:32:05.999163Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5fb762bcf154"
 label = "discovered from"
+
+[[comments]]
+id = "01a09118-f0ef-77f2-a4f0-97fd7faa0a1d"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-11T15:32:05.999163Z"

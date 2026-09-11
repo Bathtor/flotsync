@@ -30,8 +30,8 @@ Estimated size:
 - Combined: approximately 1,270-1,850 LOC, which is why the work is divided into independently reviewable children.
 
 Validation is specified independently in each child issue. The parent remains open until both children are accepted."""
-status = "in-progress"
-status_reason = "plan agreed; split into child tasks"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 labels = [
@@ -46,7 +46,8 @@ children = [
     "01a05265-e37a-7d93-911a-d4db04183368",
 ]
 created_at = "2026-07-17T06:55:38.203915Z"
-updated_at = "2026-08-30T11:20:07.751916Z"
+updated_at = "2026-09-11T15:39:36.519057Z"
+closed_at = "2026-09-11T15:39:36.519057Z"
 
 [[links]]
 target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
@@ -57,3 +58,9 @@ id = "01a04cf4-4fea-7380-a22d-234c68e7902b"
 author = "codex"
 body = "Plan review aligned on three final refinements: OrderedSchema uses one whole-schema borrowed/owned representation rather than Cow per field; OrderedSchema PartialEq is positional while Schema cross-comparison and eq_unordered are unordered; and InMemoryStateRowBatch will own its OrderedSchema wrapper. Work was split into flotsync-nk9.1 for projected storage/schema and flotsync-nk9.2 for batch/store integration."
 created_at = "2026-08-29T09:57:54.794693Z"
+
+[[comments]]
+id = "01a0911f-d0c7-7240-89a4-8b2a507b638f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-11T15:39:36.519057Z"
