@@ -1,0 +1,47 @@
+id = "01a099f7-6090-7ee3-9045-a9a997904a48"
+ref = "flotsync-h3l.8"
+title = "Audit and finish store pagination contract"
+body = """
+Scope (AJ8)
+Perform the integrated audit and remove temporary compatibility surfaces. Estimate: 200-350 changed Rust LOC; if material missing implementation is discovered, record and split it rather than concealing it in this estimate. Blocked by flotsync-h3l.2 through flotsync-h3l.7.
+
+Starting points
+All public store traits in flotsync_replication/src/api/store.rs and delivery/contracts.rs, store/sqlite implementations/tests, runtime test wrappers, all load/scan/page call sites, and TODO(flotsync-h3l). Read the completed child bodies and parent full plan as the checklist.
+
+Work
+Audit every collection-returning store API. Each exposes the shared correct paging mechanism or a clearly complete-result API without pagination controls; remove old limit-only update loaders and temporary compatibility adapters once consumers are converted. Verify existing row/transition callers use the common mechanism, requested-row absence is explicit, lightweight ID queries do not decode payloads, and no unnecessary eager ownership remains at audited update read boundaries.
+Compare the integrated result against parent requirements P01-P09, including deterministic update ordering, precise inclusive producer filters, result bounds, all TODO removals, reusable backend contract tests, bounded retained-history payloads, generic applicability and generated operation-view projections.
+Review error classification, snapshot/read-your-own-writes contracts, transaction/operation identity, cancellation cleanup, switched batches/limits and unlimited mode across implementations. Preserve existing application-facing providers as adapters where used.
+Routine duplicate checks remain limited to touched files; do not start an unrelated repository-wide refactor. Record discovered future concerns as linked issues/comments rather than leaving untracked notes. Do not close this child or parent without user agreement.
+
+Acceptance
+No TODO(flotsync-h3l), superseded fake pagination surface or undocumented temporary adapter remains. All backend/wrapper/caller contracts are accounted for. Run relevant integrated tests and pedantic clippy following serial cargo/socket requirements. Report any intentionally complete-result APIs and outstanding issues explicitly. Tests must include the shared suite across adopted query families and regression coverage from each child; do not merely list local commands as PR validation.
+
+Agreed context and API contract
+
+This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+
+Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+
+ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+
+Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+
+Validation and delivery
+
+Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = [
+    "01a099f7-5ef6-7451-b756-e6f2a0fca0fb",
+    "01a099f7-5f38-7b23-afbd-f06add65c741",
+    "01a099f7-5f7c-7cd1-bf55-486209d43e07",
+    "01a099f7-5fc1-7513-a339-d390405d7581",
+    "01a099f7-6005-7f50-8f48-0cdf96312901",
+    "01a099f7-604c-7293-bc3f-0ba12773e3e7",
+]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.296322Z"
+updated_at = "2026-09-13T08:53:13.185869Z"

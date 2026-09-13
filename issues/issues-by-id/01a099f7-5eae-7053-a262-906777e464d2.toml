@@ -1,0 +1,43 @@
+id = "01a099f7-5eae-7053-a262-906777e464d2"
+ref = "flotsync-h3l.1"
+title = "Implement shared store paging foundation"
+body = """
+Scope (AJ1)
+Implement the reusable paging foundation and transaction identity plumbing. Estimate: 550-800 changed Rust LOC including documentation/tests. This is the first implementation task; it has no child-task prerequisite.
+
+Starting points
+flotsync_replication/src/api/store.rs (read/mutable/store/provisioning traits and current row scans), api/changes.rs (ProviderBatch and BatchProvider), api/errors.rs and api/store_error.rs, store/sqlite/mod.rs (SqliteReplicationStoreTransaction), runtime/tests/mod.rs (transaction wrappers). Inspect exports in api/mod.rs. Keep existing application-facing BatchProvider contracts functional; do not make a transaction-owning provider the new store mechanism.
+
+Work
+Implement PageCursor<Params, Key>, fixed UUID-backed transaction identity with backend-controlled creation, page status/result with generic metadata, bounded/unlimited batch policy, object-safe borrowed-view projection batch interface, Vec and const-generic SmallVec projection implementations, and contextual PageError. Define and document the one-to-one custom-batch contract. Supply a shared per-page helper that centralises binding, limits, ordering and lifecycle rather than requiring each backend to copy it. Include cancellation/drop behaviour and final empty-page handling. Identity plumbing must work through existing dyn transaction interfaces and wrappers; wrappers of the same transaction forward identity. Validate zero inline capacity explicitly.
+Provide narrowly scoped implementation examples or test fixtures for future backend authors. The helper must not retain a transaction borrow between calls or require Params to implement a capability trait. Query/operation mismatches need a clear contract error; consider distinct parameter types where suitable. Support metadata on empty pages without assuming all queries have unit metadata.
+
+Acceptance
+Tests cover exclusive advancement, equal/non-increasing keys, over-limit backend input, empty/exact-multiple results, permanent exhaustion, wrong transaction/operation, failed projection/store/cancelled fill, cleared partial output, rotated batch instances and changed limits/projections, one-to-one result count, inline non-spilling capacity and unlimited traversal. Borrowed views cannot escape into projected output. Verify object safety with existing dyn transaction usage. No collection conversion is required except identity plumbing and minimal compile integration; AJ2-AJ4 exercise real scans.
+
+Agreed context and API contract
+
+This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+
+Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+
+ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+
+Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+
+Validation and delivery
+
+Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocks = [
+    "01a099f7-5ef6-7451-b756-e6f2a0fca0fb",
+    "01a099f7-5f38-7b23-afbd-f06add65c741",
+    "01a099f7-5f7c-7cd1-bf55-486209d43e07",
+    "01a099f7-604c-7293-bc3f-0ba12773e3e7",
+]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:00.814322Z"
+updated_at = "2026-09-13T08:53:12.767756Z"

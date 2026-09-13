@@ -4,29 +4,93 @@ title = "Specify replication update paging contract"
 body = """
 Goal
 
-Define and enforce store pagination contracts so callers can advance reusable batches portably, without pretending that a one-shot limit is a pagination cursor.
+Define and implement a general reusable store paging mechanism, apply it across current collection APIs, and restore bounded replication-history reads without eager operation ownership. The user approved this holistic plan and its eight-child breakdown. Status: plan agreed; no production implementation has started.
 
 Requirements
 
-P01. Specify deterministic ascending update-ID ordering for load_replication_updates and load_replication_update_ids.
-P02. Specify exact filter semantics for producer ranges and explicit maximum-result semantics for an optional limit.
-P03. Design sensible replication-update pagination using the established reusable-batch provider pattern.
-P04. Replace every TODO(flotsync-h3l) temporary unlimited load with correct reusable-batch pagination and remove the TODO once migrated.
-P05. Re-audit every replication-update caller and every store implementation against the completed contract and fix deviations.
-P06. Add reusable store-contract tests covering order, range boundaries, empty pages, result limits, and cursor advancement.
-P07. Restore bounded retained-history loading without reintroducing assumptions that remain local or implicit.
-P08. Audit all store APIs: each collection-returning operation should either support correct pagination following the established reusable-batch patterns or expose no pagination surface at all.
-P09. Preserve generated protobuf operation views through the replication-update store boundary. The reusable batch should own or retain its backing buffers and expose borrowed SchemaOperationView values to consumers, instead of converting every operation into an owned protobuf message during store decoding.
+P01. Replication updates and update IDs have deterministic ascending UpdateId ordering: (version, node_index).
+P02. ProducerRange selects exactly one producer and inclusive start/end versions, independent of applied status; inverted ranges are empty. Bounded batch limits are exact maxima. The catch-up optional total response cap remains distinct.
+P03. Use generic PageCursor<Params, Key> with ordinary immutable parameter data and private continuation. No PageQuery trait, per-query cursor factory, separate filter/cursor arguments or separate page-size argument. One object-safe store method per pageable query.
+P04. Replace every TODO(flotsync-h3l) temporary unlimited history load with correct reusable paging; remove all associated TODOs when their paths are converted.
+P05. Audit every update caller and store implementation/wrapper, preserving causality, validation, lifecycle and transaction semantics.
+P06. Provide reusable backend contract tests for ordering, filters, boundaries, empty/exact-size pages, maxima, continuation, metadata, failures and batch reuse.
+P07. Restore bounded retained-history payload loading. Missing retained evidence requests a snapshot; malformed/inconsistent evidence is a contextual error. Accumulated affected-row sets/dependency metadata need not have constant size.
+P08. Apply one general paging protocol to updates/IDs, metadata collections, dataset rows/transitions, requested-row lookup and reliable-delivery metadata. Complete-result conveniences may remain without partial-result controls and should reuse scans where useful.
+P09. Offer generated borrowed SchemaOperationView values during store projection and retain only one projected result per source record. Do not default to retaining entire encoded buffers or materialising every owned operation. This supersedes the original P09 wording requiring a buffer-owning batch.
+
+Agreed API and backend reuse
+
+PageCursor::new(params) is generic; the store method determines Params/Key types. Bind on first use to a common opaque UUID-backed transaction identity and operation identity where needed. UUID generation is backend controlled, not mandated v4; identities distinguish transactions across pools/store instances accessible to surviving cursors. No associated identity propagation or memory-address identity. Cursors retain no transaction borrow between page calls.
+
+ProjectionBatch<View> supplies page_limit(), clear() and fallible push(view). It owns the projection and retained storage. Higher-ranked borrowed views cannot escape into results. Projection is one-to-one: no skipping/expansion. PageLimit is Records(NonZeroUsize) or Unlimited. Provide reusable runtime Vec and nonzero compile-time SmallVec batches; enforced one-to-one bounds permit inline fixed storage. Clear preserves policy/projection/capacity. Batch instance, projection and limit may change each call, including rotating buffers; cursor retains none of them. Sample the limit once per fill. Unlimited consumes the remaining result in that call while releasing source payloads incrementally.
+
+The shared helper handles binding, lifecycle, batch clearing, projection dispatch, maxima, strict key advancement, continuation, exhaustion and failed/cancelled page cleanup. Backends implement selection, ordered retrieval and decoding. Each query defines a deterministic unique key and exclusive continuation. Exact-size final pages may need one empty follow-up. Exhaustion is permanent; page result carries query-specific metadata even when empty. Failure/cancellation clears partial output and fails the cursor; external callback effects cannot be rolled back. Snafu PageError distinguishes contextual store/projection/contract failures and preserves store classification.
+
+Read cursors observe their transaction snapshot. Mutable transactions retain read-your-own-writes and do not revisit changes behind continuation. External schema/query input borrows may live with the cursor, but not a transaction borrow. Existing application-facing BatchProvider APIs may remain adapters.
+
+Collection and runtime specifics
+
+Groups/progress use GroupId order; keys/evidence/work use documented canonical unique identities. Dataset rows use RowKey; transitions use the union RowKey with both existence flags. Requested-row queries fix distinct requested keys and emit present/missing outcomes exactly once. Delivery metadata gets a narrow consistent read session and MessageId ordering without envelope loading.
+
+Retained-history reconciliation projects per-update affected-row information and validates continuity across pages. Availability uses ID-only reads without payload decoding. Replay and pending application retain IDs plus read_versions dependency frontiers, schedule IDs, then load bounded ready payload groups within the same transaction; ID order alone is not causal order. Catch-up preserves an optional total response maximum independently from individual read sizes. Audit single-update reads alongside pages to avoid leaving eager conversion there. Retain owned append input where useful. Use established protobuf codec/view traits and adapters; request approval for necessary deviations.
+
+Child breakdown and dependencies
+
+flotsync-h3l.1 / AJ1: Shared paging foundation, transaction identity plumbing, reusable batches/helper and lifecycle tests. 550-800 changed Rust LOC.
+flotsync-h3l.2 / AJ2: Metadata collection paging and reusable backend contract suite. Blocked by .1. 450-750 LOC.
+flotsync-h3l.3 / AJ3: Rows, transitions, requested-key outcomes and positional batch integration. Blocked by .1. 600-900 LOC.
+flotsync-h3l.4 / AJ4: Projected update/ID reads, SQLite and borrowed codecs, single-read audit. Blocked by .1. 650-950 LOC.
+flotsync-h3l.5 / AJ5: History, availability and catch-up consumers. Blocked by .4. 450-700 LOC.
+flotsync-h3l.6 / AJ6: Dependency-only causal scheduling and bounded payload loading. Blocked by .4. 650-950 LOC.
+flotsync-h3l.7 / AJ7: Delivery metadata paging/read session. Blocked by .1. 250-450 LOC.
+flotsync-h3l.8 / AJ8: Integrated audit, removal of superseded surfaces/adapters/TODOs. Blocked by .2-.7. 200-350 LOC.
+
+Total estimate: 3,800-5,850 changed Rust LOC including documentation and relevant tests. Each child is below 1,000 LOC. Recommended execution order begins .1 -> .2 -> .3 -> .4 to validate generality before update consumer conversion; only the explicit blocker links are hard dependencies. Narrow temporary compatibility adapters may keep intermediate children buildable; .8 removes them. No database migrations or unrelated runtime-store genericisation.
+
+Validation and completion
+
+Every child remains buildable, includes meaningful regression/contract tests, runs appropriate tests and pedantic clippy under repository rules, and checks touched-file duplication. Integrated coverage includes cross-page causal dependencies, range gaps, limits, inconsistent metadata, failure/cancellation, rotated and inline batches, and no unnecessary full-buffer retention. Audit all P01-P09 requirements before handover. Update issue state before commits; close children/parent only after user agreement.
 
 Context
 
-Discovered while reviewing flotsync-5ou.3: retained-history reconciliation necessarily depends on ordered, limit-bounded pages, but the public store trait currently leaves those guarantees unstated. flotsync-5ou.3 removes its limit-driven cursor and temporarily loads each complete missing producer range without a limit. The same review found that generated SchemaOperationView support already exists, but DatasetUpdateRecord currently owns SchemaOperation values and DatasetUpdateMessage decoding calls MessageView::to_owned_message. The reusable update-batch design should remove that eager ownership boundary rather than adding a temporary view carrier."""
-status = "open"
+Discovered during flotsync-5ou.3 review (linked as discovered from). The previous implementation temporarily removed limit-driven retained-history cursors because ordering/limits were not a portable contract. Review also found eager MessageView::to_owned_message conversion in DatasetUpdateMessage decoding. Subsequent user discussion generalised the solution beyond updates, moved projection and sizing into batches, and fixed one-to-one semantics. Chronological feedback is in .agent_local_docs/tmp/flotsync-h3l-plan-feedback.md; this issue is the authoritative holistic plan.
+"""
+status = "in-progress"
+status_reason = "plan agreed"
 type = "task"
 priority = 0
+assignee = "codex"
+children = [
+    "01a099f7-5eae-7053-a262-906777e464d2",
+    "01a099f7-5ef6-7451-b756-e6f2a0fca0fb",
+    "01a099f7-5f38-7b23-afbd-f06add65c741",
+    "01a099f7-5f7c-7cd1-bf55-486209d43e07",
+    "01a099f7-5fc1-7513-a339-d390405d7581",
+    "01a099f7-6005-7f50-8f48-0cdf96312901",
+    "01a099f7-604c-7293-bc3f-0ba12773e3e7",
+    "01a099f7-6090-7ee3-9045-a9a997904a48",
+]
 created_at = "2026-09-11T12:29:45.882933Z"
-updated_at = "2026-09-11T14:25:13.84819Z"
+updated_at = "2026-09-13T08:53:12.357208Z"
 
 [[links]]
 target = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
 label = "discovered from"
+
+[[comments]]
+id = "01a099db-97d7-7540-a3b3-d40d101ab650"
+author = "codex"
+body = "Tentative API alignment: O + R1. Use object-safe store page methods accepting reusable batches that project each borrowed record view; use PageCursor<Params, Key> with ordinary immutable parameter data and private continuation, without a PageQuery capability trait. This supersedes retaining complete update buffers as the default batch representation. Cursor creation remains under discussion: aim for one backend method per pageable query and shared lifecycle/validation machinery. The full implementation plan is not yet agreed; status remains planning."
+created_at = "2026-09-13T08:21:40.439608Z"
+
+[[comments]]
+id = "01a099df-c8c1-7190-be68-5691c68a964c"
+author = "codex"
+body = "Further API alignment: T and W accepted as directions. Construct PageCursor generically from immutable parameters, bind it on first page use, and expose one backend method per pageable query. Share lifecycle, continuation validation, projection dispatch, limit enforcement and failed-page cleanup in a paging helper. Discussing a common opaque transaction-instance identity and batch-owned bounded/unlimited page sizing. Full implementation plan remains under discussion."
+created_at = "2026-09-13T08:26:15.105038Z"
+
+[[comments]]
+id = "01a099eb-a03a-7ed3-80fd-18f3c93a4806"
+author = "codex"
+body = "API decisions consolidated: use a fixed UUID-backed transaction identity, with generation controlled by the backend (v4 is not required); identities must distinguish transaction instances across pools/store instances accessible to surviving cursors. Associated identity types are rejected to avoid propagation through runtime trait objects. Projection is one-to-one; batches own per-call bounded or unlimited sizing and may be replaced or rotated between calls. Provide reusable Vec and compile-time inline SmallVec batch implementations. Generic cursor construction, first-use binding, one object-safe method per pageable query, and shared paging lifecycle machinery remain agreed directions. Preparing the holistic implementation plan and proposed child-task boundaries; implementation has not started."
+created_at = "2026-09-13T08:39:11.162631Z"

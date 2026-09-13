@@ -1,0 +1,40 @@
+id = "01a099f7-5ef6-7451-b756-e6f2a0fca0fb"
+ref = "flotsync-h3l.2"
+title = "Page store metadata collections"
+body = """
+Scope (AJ2)
+Adopt the shared protocol for groups/progress, member keys/trust evidence and pending decisions/activations. Estimate: 450-750 changed Rust LOC. Blocked by flotsync-h3l.1 (shared foundation). This deliberately tests generality before update consumers are converted.
+
+Starting points
+flotsync_replication/src/api/store.rs: load_replication_groups, load_writable_replication_group_versions, load_replication_groups_for_ids, load_member_public_key_ids, load_member_public_keys_for_member, load_member_public_keys_for_fingerprint, load_member_key_trust_evidence, load_pending_group_decisions and load_pending_group_activations. SQLite implementations are under store/sqlite/; wrappers under runtime/tests/mod.rs. Find all callers using rg rather than assuming this list covers them.
+
+Work
+Provide one paged method per logical query family with immutable ordinary selection data, reusing the shared cursor/helper and batch protocol. Preserve current lifecycle/member/fingerprint/ID selection semantics. Use deterministic unique keys: GroupId for groups, canonical member-key identity for keys, canonical evidence identity for evidence, and unique pending-work key for pending work. Document tie-breakers explicitly. Preserve missing-ID omission where that is the existing groups-for-IDs contract.
+Adapt existing callers or maintain clearly documented complete-result conveniences through unlimited batches where useful; do not leave a fake limit-only pagination surface or duplicate backend traversal implementation. Do not redesign unrelated key/trust semantics.
+Create reusable store-contract test infrastructure driven by backend setup so SQLite and test implementations can execute the same ordering/continuation assertions. Subsequent children should extend this instead of creating isolated copies.
+
+Acceptance
+Exercise at least multiple metadata families with the same machinery, including filtered selection, empty results, ties in non-unique fields, exact boundaries, continued reads interleaved with other transaction work and full-result equivalence. Verify all affected wrappers and callers compile and preserve existing semantics. Document any intentional complete-result convenience. Leave rows, updates and delivery conversion to their designated children.
+
+Agreed context and API contract
+
+This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+
+Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+
+ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+
+Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+
+Validation and delivery
+
+Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
+blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:00.886254Z"
+updated_at = "2026-09-13T08:53:12.835515Z"

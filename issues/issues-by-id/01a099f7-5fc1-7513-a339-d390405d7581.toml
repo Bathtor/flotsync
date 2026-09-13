@@ -1,0 +1,41 @@
+id = "01a099f7-5fc1-7513-a339-d390405d7581"
+ref = "flotsync-h3l.5"
+title = "Page history and catch-up update consumers"
+body = """
+Scope (AJ5)
+Convert retained-history reconciliation, availability checks and catch-up responses to projected pages. Estimate: 450-700 changed Rust LOC. Blocked by flotsync-h3l.4; shared foundation is transitive.
+
+Starting points
+flotsync_replication/src/runtime/synchronisation/provider/incremental.rs: load_affected_rows/load_retained_update_range and retained-range validation; runtime/catch_up_manager.rs: refresh_known_available_from_store/load_update_batch_from_store; runtime/component/mod.rs: inspect_summary_catch_up; runtime/tests/host.rs, synchronisation/provider/tests.rs and SQLite/runtime fixtures. Search every TODO(flotsync-h3l) and loader call to locate affected code.
+
+Work
+Consume retained producer ranges through reusable bounded batches. Project each update into its required affected-row identity information, then fold per-update projected results into the deduplicated set after reading; do not violate one-to-one batch projection by emitting/skipping arbitrary records. Validate exact expected producer/version continuity across pages, including missing first/last records and final exhaustion. Missing retained history yields the existing named snapshot-required outcome; malformed metadata, wrong order or inconsistent records remain contextual errors. Remove corresponding temporary unlimited-load TODOs and update request expectations.
+Convert availability/frontier scans to ID pages and range accumulation without payload decoding.
+Convert catch-up response construction to bounded store pages. Preserve its optional total response maximum separately from each batch's page limit: None means no response cap, not necessarily unbounded individual reads. Honour remaining response capacity across producer ranges and avoid eager materialisation of data not needed in the response.
+Audit all changed callers and wrappers against common consistency/error contracts.
+
+Acceptance
+Tests cover gaps straddling pages, empty/missing endpoints, exact multiples, producer ties where relevant, corrupted evidence versus snapshot fallback, bounded retained payloads, multiple catch-up ranges sharing one total cap, unlimited total responses with paged reads and ID-only availability. Existing reconciliation/lifecycle behaviour remains unchanged. This task does not claim bounded total size for affected-row sets or requested response output. Causal replay/pending application is AJ6.
+
+Agreed context and API contract
+
+This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+
+Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+
+ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+
+Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+
+Validation and delivery
+
+Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = ["01a099f7-5f7c-7cd1-bf55-486209d43e07"]
+blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.089125Z"
+updated_at = "2026-09-13T08:53:13.037514Z"

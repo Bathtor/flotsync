@@ -1,0 +1,44 @@
+id = "01a099f7-5f7c-7cd1-bf55-486209d43e07"
+ref = "flotsync-h3l.4"
+title = "Add projected replication update store reads"
+body = """
+Scope (AJ4)
+Implement update/ID paging and borrowed-view decoding through the store boundary. Estimate: 650-950 changed Rust LOC. Blocked by flotsync-h3l.1. Runtime conversion is split into flotsync-h3l.5 and flotsync-h3l.6.
+
+Starting points
+flotsync_replication/src/api/store.rs: ReplicationUpdateRecord, DatasetUpdateRecord, ReplicationUpdateFilter and update loaders; store/sqlite/updates.rs; store/sqlite/shared.rs: decode_stored_update_row; codecs/messages/updates.rs and encoding.rs; flotsync_messages/src/proto.rs and generated update/datamodel view APIs. Inspect SQLite tests and runtime test wrappers.
+
+Work
+Add one object-safe full-update page method and one lightweight ID page method using common cursors/helper/batches. Deterministic ascending order is UpdateId Ord, i.e. (version, node_index), not producer-first or causal order. ProducerRange selects exactly the producer and inclusive start/end versions, irrespective of applied status; inverted ranges are empty. All/Applied/PendingApply preserve their stated semantics. Use exclusive keyset continuation and preserve full supported unsigned version ordering.
+Full-update reads decode and validate temporary record/envelope/indexed metadata, offer borrowed SchemaOperationView values, immediately project and release temporary backing buffers. Do not materialise every operation as an owned protobuf message. Use established EncodeProto/DecodeProto/contextual/borrowed-view traits and source adapters; call out any necessary deviation for approval. ID-only reads must not fetch/decode payloads.
+Audit single-update reads for the same unnecessary eager ownership boundary and offer a compatible projected-read path or shared decoding integration. Owned append input may remain. Preserve existing validation, error context and applied metadata. Keep repository buildable for old consumers until AJ5/AJ6 convert them: narrowly scoped temporary compatibility adapters are permissible, documented for removal in AJ8, without becoming a second permanent pagination design.
+
+Acceptance
+Reusable tests compare ID/full-record selection, all filters, inclusive and inverted ranges, same-version producer ties, large versions, empty/exact-multiple pages, maximum counts and advancement. Test malformed/index-inconsistent records as errors and operation-view projection lifetimes. Confirm small projections retain no whole update buffer. Add test-wrapper support for new APIs. No whole-buffer default batch and no PageQuery trait.
+
+Agreed context and API contract
+
+This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+
+Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+
+ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+
+Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+
+Validation and delivery
+
+Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
+blocks = [
+    "01a099f7-5fc1-7513-a339-d390405d7581",
+    "01a099f7-6005-7f50-8f48-0cdf96312901",
+    "01a099f7-6090-7ee3-9045-a9a997904a48",
+]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.020993Z"
+updated_at = "2026-09-13T08:53:12.96951Z"
