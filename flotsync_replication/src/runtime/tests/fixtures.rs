@@ -138,17 +138,13 @@ pub(super) fn setup_api_test_security_secrets() -> ReplicationSecuritySecrets {
     )
 }
 
-pub(super) fn load_test_runtime_security<S>(
-    store: Arc<S>,
+pub(super) fn load_test_runtime_security(
+    store: Arc<dyn ReplicationStore>,
     local_member: &MemberIdentity,
-) -> DeliverySecurity
-where
-    S: ReplicationStore + 'static,
-{
-    let store: Arc<dyn ReplicationStore> = store;
+) -> DeliverySecurity {
     wait_for_test_reply(load_test_delivery_security(
         app_probe_id(),
-        store.clone(),
+        store,
         local_member,
     ))
     .expect("runtime security state should load")
@@ -388,7 +384,8 @@ pub(super) fn replay_one_pending_invitation(
     group_id: GroupId,
 ) -> (Arc<ReplicationRuntime>, Box<dyn GroupInvitationResponder>) {
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener.clone());
+    let builder = runtime_builder(app_alice_id(), store, listener.clone());
+    let runtime = load_runtime(builder);
     listener.wait_for_pending_group_event_count(1);
     let mut events = listener.take_pending_group_events();
     assert_eq!(events.len(), 1);
@@ -440,12 +437,9 @@ pub(super) fn load_runtime_fixture(
     let store = sqlite_store(local_member);
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        application_id,
-        application_schemas,
-        store.clone(),
-        listener.clone(),
-    );
+    let builder = runtime_builder(application_id, store.clone(), listener.clone())
+        .application_schemas(application_schemas);
+    let runtime = load_runtime(builder);
     RuntimeFixture {
         local_member,
         runtime,
@@ -622,8 +616,8 @@ pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
         .zip(stores)
         .map(|((application_id, local_member), store)| {
             let listener = Arc::new(ListenerStub::default());
-            let runtime =
-                load_runtime_with_parts(application_id.clone(), store.clone(), listener.clone());
+            let builder = runtime_builder(application_id.clone(), store.clone(), listener.clone());
+            let runtime = load_runtime(builder);
             RuntimeFixture {
                 local_member: local_member.clone(),
                 runtime,
@@ -659,16 +653,17 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> TestDeliveryRuntimeHo
     let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
     let group_state = load_group_state_for_test(local_member, ApplicationSchemas::EMPTY, &store);
-    let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
+    let args = DeliveryRuntimeHostPrepareArgs {
         local_member,
-        group_state,
-        store.clone(),
-        listener,
-        ReplicationConfig::default(),
+        group_memberships: group_state,
+        store: store.clone(),
+        config: ReplicationConfig::default(),
         security,
-        None,
-    ))
-    .expect("host should start");
+        runtime_config_fragments: smallvec::SmallVec::new(),
+    };
+    let host = kompact::prelude::block_on(DeliveryRuntimeHost::prepare(args))
+        .expect("host should prepare");
+    kompact::prelude::block_on(host.activate_runtime(listener)).expect("host should start");
     host.wait_for_runtime_startup();
     SqliteStoreTestOwner::new(host, store)
 }
@@ -696,105 +691,34 @@ where
     group_state
 }
 
-pub(super) fn load_runtime_with_parts<S>(
+/// Build the runtime configuration shared by ordinary runtime tests.
+pub(super) fn runtime_builder<S>(
     application_id: ApplicationId,
     store: Arc<S>,
     listener: Arc<ListenerStub>,
-) -> Arc<ReplicationRuntime>
+) -> ReplicationRuntimeBuilder
 where
     S: ReplicationStore + 'static,
 {
-    load_runtime_with_parts_and_application_schemas_and_config(
-        application_id,
-        ApplicationSchemas::EMPTY,
-        store,
-        listener,
-        ReplicationConfig::default(),
-    )
+    ReplicationRuntime::builder(application_id)
+        .store(store)
+        .listener(listener)
 }
 
-pub(super) fn load_runtime_with_parts_and_application_schemas<S>(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<S>,
-    listener: Arc<ListenerStub>,
-) -> Arc<ReplicationRuntime>
-where
-    S: ReplicationStore + 'static,
-{
-    load_runtime_with_parts_and_application_schemas_and_config(
-        application_id,
-        application_schemas,
-        store,
-        listener,
-        ReplicationConfig::default(),
-    )
-}
-
-pub(super) fn load_runtime_with_parts_and_config<S>(
-    application_id: ApplicationId,
-    store: Arc<S>,
-    listener: Arc<ListenerStub>,
-    config: ReplicationConfig,
-) -> Arc<ReplicationRuntime>
-where
-    S: ReplicationStore + 'static,
-{
-    load_runtime_with_parts_and_application_schemas_and_config(
-        application_id,
-        ApplicationSchemas::EMPTY,
-        store,
-        listener,
-        config,
-    )
-}
-
-fn load_runtime_with_parts_and_application_schemas_and_config<S>(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<S>,
-    listener: Arc<ListenerStub>,
-    config: ReplicationConfig,
-) -> Arc<ReplicationRuntime>
-where
-    S: ReplicationStore + 'static,
-{
+/// Load a runtime from a complete test builder using the store-provisioned test security.
+pub(super) fn load_runtime(builder: ReplicationRuntimeBuilder) -> Arc<ReplicationRuntime> {
+    let store = builder
+        .store_ref()
+        .expect("test runtime builder must provide a store")
+        .clone();
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
     let security = load_test_runtime_security(store.clone(), &local_member);
+    let inputs = builder
+        .into_validated_with_security(security)
+        .expect("test runtime inputs should be complete");
     wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
-        application_id,
-        application_schemas,
-        store,
-        listener,
-        config,
-        security,
-        None,
-    ))
-    .expect("runtime should load")
-}
-
-pub(super) fn load_runtime_with_parts_and_runtime_config_toml<S>(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<S>,
-    listener: Arc<ListenerStub>,
-    runtime_config_toml: &str,
-) -> Arc<ReplicationRuntime>
-where
-    S: ReplicationStore + 'static,
-{
-    let local_member = wait_for_test_reply(store.local_member_identity())
-        .expect("local member identity should load");
-    let security = load_test_runtime_security(store.clone(), &local_member);
-    wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
-        application_id,
-        application_schemas,
-        store,
-        listener,
-        ReplicationConfig::default(),
-        security,
-        Some(runtime_config_toml),
+        inputs,
     ))
     .expect("runtime should load")
 }

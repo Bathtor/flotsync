@@ -42,3 +42,4 @@ uuid = { workspace = true }
 flotsync_routes = { path = "../flotsync_routes", features = ["test-support"] }
 flotsync_security = { path = "../flotsync_security", features = ["test-support"] }
 indoc = { workspace = true }
+trybuild = { workspace = true }

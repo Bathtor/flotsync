@@ -287,6 +287,16 @@ impl StoreErrorClassificationSource for LoadSecurityError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(load_error))]
 pub enum LoadError {
+    /// Required application inputs were omitted from the runtime builder.
+    #[snafu(display(
+        "Cannot load replication for application '{application_id}'; missing required builder inputs: {}.",
+        missing_fields.join(", ")
+    ))]
+    MissingBuilderInputs {
+        application_id: ApplicationId,
+        /// Builder setter names which must be supplied before loading.
+        missing_fields: Box<[&'static str]>,
+    },
     /// Replication-store access failed before the runtime could start.
     #[snafu(display(
         "Failed to access the replication store for application '{application_id}': {source}"
@@ -321,7 +331,8 @@ impl StoreErrorClassificationSource for LoadError {
         match self {
             Self::StoreAccess { source, .. } => source.store_error_classification(),
             Self::Security { source, .. } => source.store_error_classification(),
-            Self::Runtime { .. }
+            Self::MissingBuilderInputs { .. }
+            | Self::Runtime { .. }
             | Self::Unavailable { .. }
             | Self::SynchronisationIncomplete { .. } => None,
         }

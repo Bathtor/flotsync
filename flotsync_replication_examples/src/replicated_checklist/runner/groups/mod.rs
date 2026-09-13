@@ -1013,17 +1013,13 @@ pub mod test_support {
             block_on(insert_test_group(store.as_ref(), group));
         }
         let (listener, listener_receivers) = ChecklistListener::pair();
-        let load = block_on(load_replication_runtime_with_runtime_config_toml(
-            checklist_application_id(),
-            &CHECKLIST_APPLICATION_SCHEMAS,
-            store.clone(),
-            None,
-            listener.clone(),
-            ReplicationConfig::default(),
-            security,
-            "",
-        ))
-        .expect("test runtime should load");
+        let builder = ReplicationRuntime::builder(checklist_application_id())
+            .application_schemas(&CHECKLIST_APPLICATION_SCHEMAS)
+            .store(store.clone())
+            .listener(listener.clone())
+            .security_secrets(security)
+            .runtime_config_toml("");
+        let load = block_on(builder.load()).expect("test runtime should load");
         let mut working_set = ChecklistWorkingSet::new();
         let runtime = block_on(super::repl::complete_checklist_runtime_load(
             load,

@@ -47,3 +47,4 @@ uuid = "1"
 kompact = "0.12"
 log = "0.4"
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-async-std"] }
+trybuild = "1"

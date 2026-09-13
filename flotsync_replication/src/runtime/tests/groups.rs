@@ -173,12 +173,9 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        listener,
-    );
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     let row_id = test_row_id(group_id, dataset_id.clone(), 32);
 
     wait_for_group_install(&runtime, group_id);
@@ -229,11 +226,12 @@ fn group_state_retains_one_coherent_view_across_publications() {
     let alice_member = alice_member();
     let group_schema = docs_group_schema();
     let store = sqlite_store(alice_member.clone());
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_alice_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
     let before_creation = runtime
         .group_state()
         .expect("initial group state should be available");
@@ -277,12 +275,9 @@ fn create_group_persists_membership_across_runtime_restart() {
     let dataset_id = docs_dataset_id();
     let store = sqlite_store(alice_member.clone());
     let first_listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        first_listener.clone(),
-    );
+    let builder = runtime_builder(app_alice_id(), store.clone(), first_listener.clone())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("  shared docs  ".to_owned()),
         message: Some(String::new()),
@@ -311,12 +306,9 @@ fn create_group_persists_membership_across_runtime_restart() {
     drop(runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime = load_runtime_with_parts_and_application_schemas(
-        app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        restarted_listener,
-    );
+    let restarted_builder = runtime_builder(app_alice_id(), store.clone(), restarted_listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let restarted_runtime = load_runtime(restarted_builder);
     let row_id = test_row_id(group_id, dataset_id, 33);
 
     wait_for_group_install(&restarted_runtime, group_id);
@@ -342,12 +334,13 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
     let row_key = RowKey(Uuid::from_u128(33_001));
     let sqlite_store = sqlite_store(alice_member.clone());
     let failing_store = Arc::new(FailingStore::new(sqlite_store.clone()));
-    let runtime = load_runtime_with_parts_and_application_schemas(
+    let builder = runtime_builder(
         app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
         failing_store.clone(),
         Arc::new(ListenerStub::default()),
-    );
+    )
+    .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
@@ -396,12 +389,13 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
         .expect("runtime host should shut down after the induced component fault");
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime = load_runtime_with_parts_and_application_schemas(
+    let restarted_builder = runtime_builder(
         app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
         sqlite_store.clone(),
         restarted_listener.clone(),
-    );
+    )
+    .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let restarted_runtime = load_runtime(restarted_builder);
     wait_for_group_install(&restarted_runtime, successor_group_id);
     assert!(restarted_listener.captured_data_changes().is_empty());
     wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
@@ -411,11 +405,12 @@ fn post_commit_activation_read_failure_faults_runtime_and_requires_restart_resyn
 fn create_group_rejects_empty_name_after_trimming() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_alice_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
 
     let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some(" \t ".to_owned()),
@@ -441,11 +436,12 @@ fn create_group_rejects_empty_name_after_trimming() {
 fn create_group_default_is_rejected_as_incomplete() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member);
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_alice_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
 
     let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest::default()))
         .expect_err("default request should be incomplete");
@@ -470,7 +466,8 @@ fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
     store_pending_group_decision(store.as_ref(), runtime_test_migration_proposal_decision());
     let listener = Arc::new(ListenerStub::default());
 
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_pending_group_event_count(2);
     let events = listener.take_pending_group_events();
@@ -515,8 +512,9 @@ fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
     drop(runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime =
-        load_runtime_with_parts(app_alice_id(), store.clone(), restarted_listener.clone());
+    let restarted_builder =
+        runtime_builder(app_alice_id(), store.clone(), restarted_listener.clone());
+    let restarted_runtime = load_runtime(restarted_builder);
 
     assert!(restarted_listener.take_pending_group_events().is_empty());
     assert!(load_pending_group_decisions(store.as_ref()).is_empty());
@@ -547,7 +545,8 @@ fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_
         migration_proposal_decision(old_group_id, competing_group_id),
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_pending_group_event_count(2);
     assert_eq!(listener.migration_proposal_event_sizes(), vec![2]);
@@ -633,8 +632,9 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
     let bob_store = Arc::new(FailingStore::new(bob_sqlite_store.clone()));
     let alice_listener = Arc::new(ListenerStub::default());
     let bob_listener = Arc::new(ListenerStub::default());
-    let alice_runtime =
-        load_runtime_with_parts(app_alice_id(), alice_store.clone(), alice_listener.clone());
+    let alice_builder =
+        runtime_builder(app_alice_id(), alice_store.clone(), alice_listener.clone());
+    let alice_runtime = load_runtime(alice_builder);
     let auto_accept_config = ReplicationConfig {
         group_invitation_policy: GroupInvitationPolicy {
             creation: PolicyDecision::AutoAccept,
@@ -642,12 +642,9 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
         },
         ..ReplicationConfig::default()
     };
-    let bob_runtime = load_runtime_with_parts_and_config(
-        app_bob_id(),
-        bob_store.clone(),
-        bob_listener,
-        auto_accept_config.clone(),
-    );
+    let bob_builder = runtime_builder(app_bob_id(), bob_store.clone(), bob_listener)
+        .config(auto_accept_config.clone());
+    let bob_runtime = load_runtime(bob_builder);
     publish_direct_peer_routes(&alice_runtime, &alice_member, &bob_runtime, &bob_member);
     bob_store.fail_after_next_pending_group_commit();
 
@@ -671,12 +668,13 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
     wait_for_test_reply(bob_runtime.shutdown())
         .expect("runtime host should shut down after the induced component fault");
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime = load_runtime_with_parts_and_config(
+    let restarted_builder = runtime_builder(
         app_bob_id(),
         bob_sqlite_store.clone(),
         restarted_listener.clone(),
-        auto_accept_config,
-    );
+    )
+    .config(auto_accept_config);
+    let restarted_runtime = load_runtime(restarted_builder);
 
     eventually(
         TEST_WAIT_TIMEOUT,
@@ -706,11 +704,12 @@ fn failed_auto_accepted_migration_activation_keeps_published_source_read_only() 
     let sqlite_store = sqlite_store(bob_member.clone());
     provision_test_security(sqlite_store.as_ref(), &bob_member, [alice_member.clone()]);
     let store = Arc::new(FailingStore::new(sqlite_store.clone()));
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_bob_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
     runtime
         .install_group_for_test(old_group_id, members.clone())
         .expect("source group should install");
@@ -846,7 +845,8 @@ fn runtime_resumes_pending_group_activation_with_bounded_batches_and_group_read_
         )),
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_data_change_count(1);
     assert_eq!(
@@ -937,7 +937,8 @@ fn runtime_resumes_pending_migration_proposal_activation() {
         }),
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_data_change_count(1);
     assert_eq!(
@@ -988,7 +989,8 @@ fn runtime_keeps_inactive_group_material_hidden_without_accepted_work() {
         ),
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     assert!(load_persisted_groups(store.as_ref()).is_empty());
     assert!(load_group_material(store.as_ref(), group_id).is_some());
@@ -1028,7 +1030,8 @@ fn runtime_accepts_replayed_invitation_with_stored_group_material() {
         )),
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_pending_group_event_count(1);
     let mut events = listener.take_pending_group_events();
@@ -1115,7 +1118,8 @@ fn active_group_invitation_replay_refreshes_metadata_without_reopening_decision(
     let bob_store = sqlite_store(bob_member.clone());
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_bob_id(), bob_store.clone(), listener.clone());
+    let builder = runtime_builder(app_bob_id(), bob_store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
     let invitation = GroupInvitation::new_creation(
         group_id,
         members.ordered_members(),
@@ -1192,7 +1196,8 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
     let bob_store = sqlite_store(bob_member.clone());
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_bob_id(), bob_store.clone(), listener.clone());
+    let builder = runtime_builder(app_bob_id(), bob_store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
     runtime
         .install_group_for_test(old_group_id, members.clone())
         .expect("old group should install");
@@ -1272,12 +1277,9 @@ fn migration_proposal_with_changed_schema_is_rejected_before_pending_work_is_sto
     let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        app_bob_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        listener,
-    );
+    let builder = runtime_builder(app_bob_id(), store.clone(), listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     runtime
         .install_group_for_test(old_group_id, members.clone())
         .expect("source group should install");
@@ -1339,7 +1341,8 @@ fn assert_metadata_work_accept_rejects_without_activation(record: PendingGroupDe
     let store = sqlite_store(alice_member());
     store_pending_group_decision(store.as_ref(), record);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
 
     listener.wait_for_pending_group_event_count(1);
     let mut events = listener.take_pending_group_events();
@@ -1453,16 +1456,23 @@ fn runtime_replay_listener_failure_keeps_pending_group_decision() {
     let listener = Arc::new(ListenerStub::default());
     listener.reject_pending_group_events();
     let group_state = load_group_state_for_test(&alice_member, ApplicationSchemas::EMPTY, &store);
-    let start_result =
-        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
-            &alice_member,
-            group_state,
-            store.clone(),
-            listener.clone(),
-            ReplicationConfig::default(),
-            security,
-            None,
-        ));
+    let args = DeliveryRuntimeHostPrepareArgs {
+        local_member: &alice_member,
+        group_memberships: group_state,
+        store: store.clone(),
+        config: ReplicationConfig::default(),
+        security,
+        runtime_config_fragments: smallvec::SmallVec::new(),
+    };
+    let prepare_result = kompact::prelude::block_on(DeliveryRuntimeHost::prepare(args));
+    let start_result = match prepare_result {
+        Ok(host) => {
+            let activate_result =
+                kompact::prelude::block_on(host.activate_runtime(listener.clone()));
+            activate_result.map(|()| host)
+        }
+        Err(error) => Err(error),
+    };
 
     match start_result {
         Ok(mut host) => {

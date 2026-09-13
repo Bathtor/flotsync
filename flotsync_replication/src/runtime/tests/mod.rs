@@ -12,6 +12,7 @@ use super::{
     group_state::{RuntimeGroupStateSnapshot, SharedGroupState},
     handle::{
         ReplicationRuntime,
+        ReplicationRuntimeBuilder,
         ReplicationRuntimeLoad,
         TypedReplicationRuntimeLoad,
         load_replication_runtime_typed_with_observed_startup_for_test,
@@ -20,8 +21,8 @@ use super::{
     },
     host::{
         DeliveryRuntimeHost,
+        DeliveryRuntimeHostPrepareArgs,
         DeliveryRuntimeHostTestExt,
-        PreconfiguredPeerRoutesPublishMode,
         RuntimeHostError,
         StartupEventPolicy,
     },
@@ -33,8 +34,6 @@ use super::{
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
-    load_replication_runtime,
-    load_replication_runtime_with_runtime_config_toml,
     synchronisation::prepare_application_state,
 };
 use crate::{

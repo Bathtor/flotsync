@@ -247,7 +247,8 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("old docs".to_owned()),
         message: Some("old message".to_owned()),
@@ -332,7 +333,8 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("old docs".to_owned()),
         message: Some("old message".to_owned()),
@@ -393,11 +395,12 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
 fn membership_change_default_rejects_nil_group_id() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member);
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_alice_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
 
     let error = wait_for_test_reply(
         runtime.change_group_membership(ChangeGroupMembershipRequest::default()),
@@ -437,7 +440,8 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
 
     let read_token = runtime.group_read_token_for_test(group_id);
     assert_eq!(read_token.group_id(), group_id);
@@ -694,7 +698,8 @@ fn publish_changes_rejects_reserved_local_update_version() {
         },
     );
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener.clone());
+    let runtime = load_runtime(builder);
     let row_id = test_row_id(group_id, dataset_id, 40_102);
     let read_token = GroupReadToken::from_group_version(group_id, version_vector);
 

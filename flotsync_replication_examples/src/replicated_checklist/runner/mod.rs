@@ -46,9 +46,9 @@ use flotsync_replication::{
     PublishChangesRequest,
     RejectionReason,
     ReplicationApi,
-    ReplicationConfig,
     ReplicationEvent,
     ReplicationEventListener,
+    ReplicationRuntime,
     ReplicationRuntimeLoad,
     ReplicationSecuritySecrets,
     ReplicationStore,
@@ -61,7 +61,6 @@ use flotsync_replication::{
     StoreError,
     StoreSecretKeyId,
     SummaryRequest,
-    load_replication_runtime_with_runtime_config_toml,
     provision_local_identity,
     security::{
         AssessPublicKeyBundleRequest,

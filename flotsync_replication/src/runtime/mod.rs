@@ -40,11 +40,11 @@ pub use handle::{
     ApplicationSynchronisation,
     GroupChangesSynchronisation,
     GroupSnapshotSynchronisation,
+    ReplicationRuntime,
+    ReplicationRuntimeBuilder,
     ReplicationRuntimeLoad,
     RetiredGroupSynchronisation,
     SingleGroupSynchronisation,
-    load_replication_runtime,
-    load_replication_runtime_with_runtime_config_toml,
 };
 
 #[cfg(test)]
