@@ -4,26 +4,80 @@ title = "Refactor replication runtime load arguments"
 body = """
 Goal
 
-Replace the growing positional replication-runtime loader APIs with one or more named argument structs so call sites are readable, optional inputs can have sensible defaults, and loader evolution does not require repetitive signature churn.
+Replace positional replication-runtime loading and host preparation APIs with a readable application-facing builder and validated named internal inputs. Preserve startup synchronisation, security validation, listener activation, socket ownership, and shutdown behaviour.
+
+Public runtime builder
+
+P01. Keep ReplicationRuntime::builder(application_id) as the primary application entry point. Use a handwritten builder with private state, consuming setters, and public read accessors for every stored value.
+
+P02. Required setters are store, listener, and security_secrets. Validate all omissions together before store access, security loading, or runtime creation. Store missing field names as a boxed slice and join them only for error display.
+
+P03. Default application schemas to ApplicationSchemas::EMPTY. Supplying schemas remains an optional process-static reference reuse optimisation. Retain the defaults of no application read token and ReplicationConfig::default().
+
+P04. Keep runtime TOML fragments in SmallVec<[String; 1]> as a temporary owned representation. runtime_config_toml appends fragments in order and later values take precedence. Keep the TODO link to https://github.com/kompics/kompact/issues/232 and build the non-Send runtime configuration only inside the blocking system-construction boundary.
+
+P05. Remove maybe_runtime_config_toml. Optional fragments are handled explicitly at use sites.
+
+P06. Provide documented public borrowed accessors for application id, schemas, store, listener, security secrets, application read token, runtime policy, and runtime configuration. Expose runtime configuration as an opaque ordered iterator of string slices so the backing representation can later change without altering the accessor API.
+
+P07. Keep focused rustdoc on the builder, setters, and accessors. Use runtime-facing vocabulary, keep listener execution guidance on the listener setter, and keep shutdown and synchronisation obligations on lifecycle APIs.
+
+Validated internal loading
+
+P08. Use ValidatedRuntimeInputs<S> for both security stages, parameterised by ReplicationSecuritySecrets before store loading and DeliverySecurity afterwards. Keep its fields private and construct it only after missing-input validation.
+
+P09. Reuse ReplicationRuntimeBuilder for already-loaded-security paths through the crate-private conversion. Build and bind each stage separately.
+
+P10. Deterministic test-security support reads builder state through the same public accessors available to every caller.
+
+Host preparation
+
+P11. Use DeliveryRuntimeHost::prepare(args) for ordinary preparation and retain prepare_with_test_support(args, test_support) for the distinct test seam. Keep removed specialised start and TOML-named host methods removed.
+
+P12. Keep the startup listener internal to host preparation. Strict inactive-listener behaviour belongs to RuntimeHostTestSupport. Active-host tests prepare and then activate their application listener explicitly.
+
+P13. Pass ordered owned runtime configuration fragments through host preparation and merge them on the blocking construction thread.
+
+Test fixtures and call sites
+
+P14. Replace the load_runtime_with_parts family with runtime_builder(application_id, store, listener), which applies common test inputs, and load_runtime(builder), which reads the configured store, loads test security, validates the builder, and completes test startup.
+
+P15. Tests override schemas, runtime policy, application position, or configuration fragments directly on named builders before passing them to load_runtime.
+
+P16. Update the fragment-precedence delivery test to append both fragments directly to an actual builder.
+
+P17. Keep higher-level fixtures that assemble several related objects, but implement their runtime loading through the common builder and loader.
+
+P18. Bind every builder before loading it. Avoid nesting builder chains or validated input construction inside block_on, wait_for_test_reply, or other expressions.
+
+Compile-time and behaviour coverage
+
+P19. Keep private trybuild pass fixtures for normal and configured load futures being Send, including ownership of temporary TOML strings. Keep ordinary trait assertions in the integration test.
+
+P20. Preserve coverage for omitted schemas, structured missing inputs, validation ordering, configuration precedence, security conversion, staged listener activation, reconciliation, route publication, and shutdown.
+
+Validation and review readiness
+
+P21. Run formatting, the full serial replication test suite, affected example checks, rustdoc validation, and pedantic Clippy for replication and examples.
+
+P22. Inspect touched files for stale helper names and new duplication, audit changed Rust against AGENTS.md, reconcile every review note, and return the issue to in-review status.
 
 Scope
 
-P01. Redesign the public load entry points around cohesive argument structs while preserving the standard and explicit runtime-config entry points where useful.
-P02. Include the internal typed loader, security-ready loader, test-support loader, and lifecycle-test loader so positional forwarding is removed throughout the complete call chain.
-P03. Define defaults only where they are semantically safe and unsurprising; keep required identity, schema, store, listener, and security inputs explicit.
-P04. Update examples, test support, integration tests, and documentation to use the named inputs.
-P05. Remove obsolete too-many-arguments allowances after the conversion.
-P06. Include the host preparation chain—prepare_with_runtime_config_toml, prepare_with_test_support, prepare_with_options, and DeliveryRuntimeHost construction—so the eventual named inputs remove positional forwarding and the corresponding too-many-arguments allowances at this lower boundary as well. Keep optional test seams isolated from ordinary host preparation inputs.
+The additional review round is expected to rewrite approximately 180 to 300 lines, mostly mechanical test call sites, and remains below 1,000 lines. The broader issue already includes the public builder, validated input model, host consolidation, compile checks, documentation, and application call-site updates.
 
 Context
 
-Discovered during review of flotsync-5ou.2. Keep this refactor separate from the startup-synchronisation correctness and terminology fixes in that issue."""
-status = "open"
+This work was discovered during flotsync-5ou.2 and must preserve its startup-synchronisation correctness. The separate lifecycle-ownership concern in flotsync-3ht remains out of scope."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 blocked_by = ["01a060af-0325-7591-9353-b025a5a27b68"]
 created_at = "2026-09-03T15:23:30.931531Z"
-updated_at = "2026-09-05T08:34:00.661449Z"
+updated_at = "2026-09-13T06:58:07.451861Z"
+closed_at = "2026-09-13T06:58:07.451861Z"
 
 [[links]]
 target = "01a060af-0325-7591-9353-b025a5a27b68"
@@ -34,3 +88,27 @@ id = "01a070b4-0355-7be1-bc63-c39ee7e1100a"
 author = "lkroll"
 body = "Scope expanded from the sixth flotsync-5ou.2 review: include DeliveryRuntimeHost::prepare_with_runtime_config_toml, prepare_with_test_support, prepare_with_options, and host construction in the named-argument refactor, while keeping optional test seams separate from ordinary preparation inputs."
 created_at = "2026-09-05T08:34:00.661449Z"
+
+[[comments]]
+id = "01a0946e-38e7-7413-ac6c-86e7821dd4dc"
+author = "codex"
+body = "Review delta: keep MissingBuilderInputs.missing_fields as a comma-separated String. Vec::new() remains allocation-free for complete builders because no fields are pushed on the successful path. Expand ReplicationRuntimeBuilder and every public setter with specification-quality rustdoc covering input impact, defaults, replacement behaviour, loading outcomes, and caller lifecycle obligations."
+created_at = "2026-09-12T07:04:06.631131Z"
+
+[[comments]]
+id = "01a094ac-005a-7d83-8087-99f1dddaeffd"
+author = "codex"
+body = "Review delta agreed: application schemas now default to empty; runtime configuration becomes an owned SmallVec-backed ordered fragment list with a TODO for kompics/kompact#232; security-stage inputs unify as ValidatedRuntimeInputs<S>; ordinary host preparation creates its startup listener internally; builder call sites are unnested; missing fields become a boxed slice; and Send coverage moves to private trybuild fixtures."
+created_at = "2026-09-12T08:11:35.386636Z"
+
+[[comments]]
+id = "01a0998a-19e8-7532-bce1-303f8f7b05e9"
+author = "codex"
+body = "Additional review resolved: every builder value now has a documented public read accessor, runtime configuration is exposed through an opaque ordered iterator, maybe_runtime_config_toml is removed, and runtime tests now use one common builder plus one builder-consuming loader with explicit per-test overrides."
+created_at = "2026-09-13T06:52:39.784831Z"
+
+[[comments]]
+id = "01a0998f-19db-7aa0-8210-074873af7776"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-13T06:58:07.451861Z"

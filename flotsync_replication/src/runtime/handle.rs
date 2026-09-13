@@ -6,7 +6,7 @@ use super::host::DeliveryRuntimeHostTestSupportExt;
 use super::host::{DeliveryRuntimeHostTestExt, RuntimeHostTestSupport};
 use super::{
     ReplicationRuntimeMessage,
-    host::{DeliveryRuntimeHost, StartupEventPolicy},
+    host::{DeliveryRuntimeHost, DeliveryRuntimeHostPrepareArgs},
     store_security_validation::{
         load_security_error_from_local_member,
         load_security_error_from_runtime,
@@ -68,6 +68,7 @@ use flotsync_security::PublicKeyBundle;
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
 use kompact::{KompactLogger, prelude::*};
+use smallvec::SmallVec;
 use snafu::prelude::*;
 use std::sync::{Arc, RwLock, Weak};
 
@@ -89,107 +90,326 @@ type UnitResult<E> = Result<(), E>;
 #[cfg(any(test, feature = "test-support"))]
 const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Create one concrete replication runtime for the given application identity.
+/// Primary application entry point for configuring and loading one replication runtime.
 ///
-/// This asynchronous entry point returns a `Send` future which may move between
-/// executor threads.
+/// Create this builder with [`ReplicationRuntime::builder`]. It collects application-facing
+/// inputs without accessing the store or starting runtime resources; those operations begin only
+/// when [`Self::load`] is awaited.
 ///
-/// Clones of the returned handle share one internal runtime and lifecycle.
+/// # Required inputs
 ///
-/// Listener callbacks run from the internally owned runtime rather than the
-/// caller's executor. A listener which needs thread-affine application state
-/// should hand the event to its application executor or event bus and resolve
-/// its callback future when that hand-off has completed.
+/// Callers must explicitly supply:
 ///
-/// Before closing a caller-owned store or exiting the process, call
-/// [`ReplicationApi::shutdown`] and await its completion. Applications should
-/// explicitly shut down any outstanding [`ApplicationSynchronisation`] and
-/// finish any event row providers before closing the store.
+/// - [`Self::store`], containing the local replication identity and state;
+/// - [`Self::listener`], receiving live replication events; and
+/// - [`Self::security_secrets`], opening the stored replication security material.
 ///
-/// `application_id` scopes the loaded runtime instance for diagnostics and future
-/// multi-application hosting.
-/// `application_schemas` provides the process-static application schema for each
-/// locally understood dataset. Stored group schemas remain authoritative; the
-/// runtime reuses one of these references only when its definition matches.
-/// `store` provides the local member identity and replication state.
-/// `application_read_token` describes the application's materialised state. It
-/// may be an aggregate stored atomically with that state or rebuilt from
-/// independently persisted complete group positions. Passing `None` requests
-/// a complete load.
-/// Compatible behind positions return coalesced group-local changes; positions
-/// which cannot be reconstructed safely fall back to complete group snapshots.
-/// `listener` receives replication events produced by inbound delivery.
-/// `config` carries public runtime policy and startup batch-size knobs.
+/// [`Self::load`] reports every omitted required setter together before performing I/O, loading
+/// security material, or creating runtime resources.
 ///
-/// A store cut which already matches the supplied application state returns
-/// [`ReplicationRuntimeLoad::Ready`]. Otherwise the caller must exhaust and
-/// apply every group returned by [`ApplicationSynchronisation::next_group`]
-/// before calling [`ApplicationSynchronisation::complete`].
+/// # Defaults and replacement
 ///
-/// # Errors
+/// The builder starts with these defaults:
 ///
-/// See `LoadError` for failure conditions.
-pub async fn load_replication_runtime(
+/// - no application schemas, which disables process-static schema reuse;
+/// - no application read token, which requests complete reconciliation from stored state;
+/// - [`ReplicationConfig::default`] for runtime policy; and
+/// - no additional runtime configuration fragments.
+///
+/// Every setter consumes and returns the builder. Repeating a value setter replaces its earlier
+/// value. The runtime configuration setter instead appends fragments which are merged in call
+/// order.
+///
+/// # Loading and lifecycle
+///
+/// Loading validates and opens the caller-owned store, loads replication security, and prepares a
+/// coherent store cut. [`ReplicationRuntimeLoad::Ready`] means the application already represents
+/// that cut and live listener delivery has started. [`ReplicationRuntimeLoad::Synchronising`]
+/// retains the partly started runtime while the application applies the returned reconciliation;
+/// listener delivery starts only after [`ApplicationSynchronisation::complete`] succeeds.
+///
+/// A loaded runtime or outstanding synchronisation retains store access. See the lifecycle types
+/// returned by [`Self::load`] for completion and shutdown obligations.
+#[must_use = "the runtime builder does nothing until load is called"]
+pub struct ReplicationRuntimeBuilder {
     application_id: ApplicationId,
     application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
+    store: Option<Arc<dyn ReplicationStore>>,
+    listener: Option<Arc<dyn ReplicationEventListener>>,
+    security_secrets: Option<ReplicationSecuritySecrets>,
     application_read_token: Option<ApplicationReadToken>,
-    listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
-    security_secrets: ReplicationSecuritySecrets,
-) -> Result<ReplicationRuntimeLoad, LoadError> {
-    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
-        application_id,
-        application_schemas,
-        store,
-        application_read_token,
-        listener,
-        config,
-        security_secrets,
-        None,
-    )
-    .await?;
-    Ok(runtime.into_public())
+    /// Ordered TOML fragments merged while building the runtime system.
+    ///
+    /// TODO: Replace this temporary representation with a proper runtime configuration builder
+    /// once <https://github.com/kompics/kompact/issues/232> is resolved.
+    runtime_config_fragments: SmallVec<[String; 1]>,
 }
 
-/// Create one concrete replication runtime with an additional in-memory TOML
-/// config fragment merged into the internal Kompact runtime config.
-///
-/// This function has the same executor, ownership, listener, and shutdown
-/// contract as [`load_replication_runtime`].
-///
-/// The TOML string only needs to live until this function returns; Kompact
-/// copies it into its config builder before the runtime system is built.
-///
-/// # Errors
-///
-/// See `LoadError` for failure conditions.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "this explicit public startup boundary mirrors load_replication_runtime and adds only the borrowed runtime configuration fragment"
-)]
-pub async fn load_replication_runtime_with_runtime_config_toml(
+impl ReplicationRuntimeBuilder {
+    /// Return the application identity this runtime represents.
+    #[must_use]
+    pub fn application_id(&self) -> &ApplicationId {
+        &self.application_id
+    }
+
+    /// Return the process-static schemas currently configured for this builder.
+    ///
+    /// This returns [`ApplicationSchemas::EMPTY`] when no schemas were supplied explicitly.
+    #[must_use]
+    pub fn application_schemas_ref(&self) -> &'static ApplicationSchemas {
+        self.application_schemas
+    }
+
+    /// Return the replication store currently configured for this builder.
+    ///
+    /// `Some(store)` contains the store supplied through [`Self::store`]. `None` means the required
+    /// store setter has not been called.
+    #[must_use]
+    pub fn store_ref(&self) -> Option<&Arc<dyn ReplicationStore>> {
+        self.store.as_ref()
+    }
+
+    /// Return the replication event listener currently configured for this builder.
+    ///
+    /// `Some(listener)` contains the listener supplied through [`Self::listener`]. `None` means the
+    /// required listener setter has not been called.
+    #[must_use]
+    pub fn listener_ref(&self) -> Option<&Arc<dyn ReplicationEventListener>> {
+        self.listener.as_ref()
+    }
+
+    /// Return the replication security secrets currently configured for this builder.
+    ///
+    /// `Some(secrets)` contains the value supplied through [`Self::security_secrets`]. `None` means
+    /// the required security setter has not been called.
+    #[must_use]
+    pub fn security_secrets_ref(&self) -> Option<&ReplicationSecuritySecrets> {
+        self.security_secrets.as_ref()
+    }
+
+    /// Return the application read token currently configured for this builder.
+    ///
+    /// `Some(token)` contains the position supplied through [`Self::application_read_token`] or
+    /// [`Self::maybe_application_read_token`]. `None` means loading will request complete
+    /// reconciliation from stored state.
+    #[must_use]
+    pub fn application_read_token_ref(&self) -> Option<&ApplicationReadToken> {
+        self.application_read_token.as_ref()
+    }
+
+    /// Return the public runtime policy currently configured for this builder.
+    #[must_use]
+    pub fn config_ref(&self) -> &ReplicationConfig {
+        &self.config
+    }
+
+    /// Iterate over additional runtime configuration fragments in merge order.
+    ///
+    /// The iterator is empty when no fragments were supplied. Later items take precedence over
+    /// earlier items when the runtime configuration is assembled.
+    pub fn runtime_configs(&self) -> impl Iterator<Item = &str> {
+        self.runtime_config_fragments.iter().map(String::as_str)
+    }
+
+    /// Set the process-static schemas understood by this application build.
+    ///
+    /// This optional registry associates locally understood dataset identifiers with schema
+    /// definitions. Stored group schemas remain authoritative. During loading, the runtime reuses
+    /// a process-static schema reference only when its complete definition matches the stored
+    /// definition; supplying a schema with the same identifier does not replace stored metadata.
+    ///
+    /// Applications normally construct one registry in [`std::sync::LazyLock`] and share its
+    /// `&'static` reference across every runtime they load. Omitting this setter is equivalent to
+    /// passing [`ApplicationSchemas::EMPTY`].
+    pub fn application_schemas(mut self, application_schemas: &'static ApplicationSchemas) -> Self {
+        self.application_schemas = application_schemas;
+        self
+    }
+
+    /// Set the caller-owned store containing the local identity and replication state.
+    ///
+    /// This required store must already represent exactly one authoritative local member identity
+    /// and its provisioned security records. Loading reads that identity, validates stored group
+    /// security, and opens the coherent read transaction used for application reconciliation.
+    ///
+    /// Runtime components retain clones of this [`Arc`]. The application must await
+    /// [`ReplicationApi::shutdown`], shut down any outstanding [`ApplicationSynchronisation`], and
+    /// finish or drop row providers before closing the underlying store.
+    pub fn store(mut self, store: Arc<dyn ReplicationStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Set the application listener which accepts live replication events.
+    ///
+    /// This required listener is installed immediately when loading returns
+    /// [`ReplicationRuntimeLoad::Ready`]. A synchronising load retains it without delivering live
+    /// events until [`ApplicationSynchronisation::complete`] activates the runtime.
+    ///
+    /// Callbacks originate from the internally owned runtime and may run on a different thread or
+    /// executor from the caller. The runtime awaits each returned callback future, so listeners
+    /// should perform a bounded hand-off to application state rather than blocking the runtime.
+    pub fn listener(mut self, listener: Arc<dyn ReplicationEventListener>) -> Self {
+        self.listener = Some(listener);
+        self
+    }
+
+    /// Set the device-local store secret used to open replication security records.
+    ///
+    /// This required value supplies the store-secret key and identifier used to decrypt the local
+    /// member's private keys and validate stored group security. The identifier and key must match
+    /// the records provisioned in [`Self::store`]; a missing or mismatched record is reported as a
+    /// [`LoadError::Security`] failure.
+    ///
+    /// This setter does not provision an identity or create security records. Applications using
+    /// the platform local-secret store normally obtain this value with
+    /// [`ReplicationSecuritySecrets::load_or_create_local`].
+    pub fn security_secrets(mut self, security_secrets: ReplicationSecuritySecrets) -> Self {
+        self.security_secrets = Some(security_secrets);
+        self
+    }
+
+    /// Describe the replication position already represented by application state.
+    ///
+    /// Applications may supply an aggregate token persisted atomically with their complete
+    /// materialised state, or rebuild one from independently persisted group positions with
+    /// [`ApplicationReadToken::from_group_tokens`]. Loading compares this position with a coherent
+    /// store cut. Compatible positions behind that cut produce coalesced group-local changes;
+    /// positions which cannot be reconstructed safely produce complete group snapshots instead.
+    /// The returned [`ApplicationSynchronisation`] identifies the exact work to apply.
+    pub fn application_read_token(mut self, application_read_token: ApplicationReadToken) -> Self {
+        self.application_read_token = Some(application_read_token);
+        self
+    }
+
+    /// Set or clear the replication position already represented by application state.
+    ///
+    /// `Some(token)` has the reconciliation behaviour documented by
+    /// [`Self::application_read_token`]. `None` clears any token set earlier and requests a complete
+    /// reconciliation from stored state.
+    pub fn maybe_application_read_token(
+        mut self,
+        application_read_token: Option<ApplicationReadToken>,
+    ) -> Self {
+        self.application_read_token = application_read_token;
+        self
+    }
+
+    /// Set the public policy used during loading and by the live runtime.
+    ///
+    /// The configuration controls trust evaluation, invitation and group-transition policy, local
+    /// group-close behaviour, and the maximum startup synchronisation batch size. Its trust policy
+    /// is applied while loading security, so changing this value can make existing stored keys
+    /// acceptable or reject them before runtime startup. When this setter is omitted, loading uses
+    /// [`ReplicationConfig::default`].
+    pub fn config(mut self, config: ReplicationConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Append one TOML fragment to the runtime configuration.
+    ///
+    /// This low-level override configures the runtime system and its transport components; it is
+    /// independent of the application-facing policy in [`Self::config`]. The builder owns a copy
+    /// of the fragment. Repeated calls append fragments in order, with later values taking
+    /// precedence when the runtime merges them.
+    pub fn runtime_config_toml(mut self, runtime_config_toml: &str) -> Self {
+        self.runtime_config_fragments
+            .push(runtime_config_toml.to_owned());
+        self
+    }
+
+    /// Validate the builder, load security, and prepare the replication runtime.
+    ///
+    /// This asynchronous entry point returns a `Send` future which may move between executor
+    /// threads. Clones of a successfully loaded handle share one runtime and lifecycle.
+    ///
+    /// The builder is consumed whether or not loading succeeds.
+    ///
+    /// A store cut which already matches the supplied application state returns
+    /// [`ReplicationRuntimeLoad::Ready`]. Otherwise the caller must exhaust and apply every
+    /// group returned by [`ApplicationSynchronisation::next_group`] before calling
+    /// [`ApplicationSynchronisation::complete`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::MissingBuilderInputs`] if required setters were omitted. Validation
+    /// completes before the store or runtime is accessed. See [`LoadError`] for loading failures.
+    pub async fn load(self) -> Result<ReplicationRuntimeLoad, LoadError> {
+        let inputs = ValidatedRuntimeInputs::try_from(self)?;
+        let runtime = load_replication_runtime_typed(inputs).await?;
+        Ok(runtime.into_public())
+    }
+
+    /// Validate this builder and pair its runtime inputs with already loaded test security.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn into_validated_with_security(
+        self,
+        security: DeliverySecurity,
+    ) -> Result<ValidatedRuntimeInputs<DeliverySecurity>, LoadError> {
+        self.into_validated_inputs(Some(security), "security")
+    }
+
+    /// Validate required application inputs before constructing the internal runtime payload.
+    ///
+    /// `Some(security)` supplies the security stage represented by `S`. `None` reports
+    /// `security_field` alongside any other missing required builder inputs.
+    fn into_validated_inputs<S>(
+        self,
+        security: Option<S>,
+        security_field: &'static str,
+    ) -> Result<ValidatedRuntimeInputs<S>, LoadError> {
+        let mut missing_fields = SmallVec::<[&'static str; 3]>::new();
+        if self.store.is_none() {
+            missing_fields.push("store");
+        }
+        if self.listener.is_none() {
+            missing_fields.push("listener");
+        }
+        if security.is_none() {
+            missing_fields.push(security_field);
+        }
+
+        if missing_fields.is_empty() {
+            Ok(ValidatedRuntimeInputs {
+                application_id: self.application_id,
+                application_schemas: self.application_schemas,
+                store: self.store.expect("validated store must be present"),
+                application_read_token: self.application_read_token,
+                listener: self.listener.expect("validated listener must be present"),
+                config: self.config,
+                runtime_config_fragments: self.runtime_config_fragments,
+                security: security.expect("validated security input must be present"),
+            })
+        } else {
+            Err(LoadError::MissingBuilderInputs {
+                application_id: self.application_id,
+                missing_fields: missing_fields.into_vec().into_boxed_slice(),
+            })
+        }
+    }
+}
+
+/// Complete runtime inputs whose security stage is represented by `S`.
+pub(crate) struct ValidatedRuntimeInputs<S> {
     application_id: ApplicationId,
     application_schemas: &'static ApplicationSchemas,
     store: Arc<dyn ReplicationStore>,
     application_read_token: Option<ApplicationReadToken>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
-    security_secrets: ReplicationSecuritySecrets,
-    runtime_config_toml: &str,
-) -> Result<ReplicationRuntimeLoad, LoadError> {
-    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
-        application_id,
-        application_schemas,
-        store,
-        application_read_token,
-        listener,
-        config,
-        security_secrets,
-        Some(runtime_config_toml),
-    )
-    .await?;
-    Ok(runtime.into_public())
+    runtime_config_fragments: SmallVec<[String; 1]>,
+    security: S,
+}
+
+impl TryFrom<ReplicationRuntimeBuilder> for ValidatedRuntimeInputs<ReplicationSecuritySecrets> {
+    type Error = LoadError;
+
+    fn try_from(mut builder: ReplicationRuntimeBuilder) -> Result<Self, Self::Error> {
+        let security_secrets = builder.security_secrets.take();
+        builder.into_validated_inputs(security_secrets, "security_secrets")
+    }
 }
 
 /// Result of preparing one replication runtime at the application startup boundary.
@@ -646,20 +866,19 @@ impl PendingReplicationRuntime {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the internal typed loader mirrors the explicit public startup inputs"
-)]
-pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    application_read_token: Option<ApplicationReadToken>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    security_secrets: ReplicationSecuritySecrets,
-    runtime_config_toml: Option<&str>,
+async fn load_replication_runtime_typed(
+    inputs: ValidatedRuntimeInputs<ReplicationSecuritySecrets>,
 ) -> Result<TypedReplicationRuntimeLoad, LoadError> {
+    let ValidatedRuntimeInputs {
+        application_id,
+        application_schemas,
+        store,
+        application_read_token,
+        listener,
+        config,
+        runtime_config_fragments,
+        security: security_secrets,
+    } = inputs;
     let local_member =
         store
             .local_member_identity()
@@ -687,40 +906,32 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         .await
         .map_err(load_security_error_from_runtime)
         .map_err(|source| security_load_error(application_id.clone(), source))?;
-    load_replication_runtime_typed_with_security(
+    let inputs = ValidatedRuntimeInputs {
         application_id,
         application_schemas,
         store,
         application_read_token,
         listener,
         config,
+        runtime_config_fragments,
         security,
-        runtime_config_toml,
-        StartupEventPolicy::Log,
+    };
+    load_replication_runtime_typed_with_security(
+        inputs,
+        #[cfg(test)]
+        None,
     )
     .await
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    security: DeliverySecurity,
-    runtime_config_toml: Option<&str>,
+    inputs: ValidatedRuntimeInputs<DeliverySecurity>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     let load = load_replication_runtime_typed_with_security(
-        application_id,
-        application_schemas,
-        store,
+        inputs,
+        #[cfg(test)]
         None,
-        listener,
-        config,
-        security,
-        runtime_config_toml,
-        StartupEventPolicy::Log,
     )
     .await?;
     match load {
@@ -736,82 +947,31 @@ pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
 /// The returned host alone inserts a proxy at the group-broadcast/runtime boundary so the focused
 /// lifecycle test can observe inbound work while runtime logic remains inactive.
 #[cfg(test)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the test loader mirrors the staged runtime inputs and opts into isolated host observation"
-)]
 pub(super) async fn load_replication_runtime_typed_with_observed_startup_for_test(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    security: DeliverySecurity,
-    runtime_config_toml: Option<&str>,
+    inputs: ValidatedRuntimeInputs<DeliverySecurity>,
 ) -> Result<TypedReplicationRuntimeLoad, LoadError> {
-    load_replication_runtime_typed_with_security_inner(
-        application_id,
-        application_schemas,
-        store,
-        None,
-        listener,
-        config,
-        security,
-        runtime_config_toml,
-        StartupEventPolicy::Panic,
+    load_replication_runtime_typed_with_security(
+        inputs,
         Some(RuntimeHostTestSupport::observing_group_broadcast_runtime()),
     )
     .await
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the internal security-ready loader mirrors the explicit public startup inputs"
-)]
+/// Shared implementation for ordinary loading and the focused unit-test host seam.
 async fn load_replication_runtime_typed_with_security(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    application_read_token: Option<ApplicationReadToken>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    security: DeliverySecurity,
-    runtime_config_toml: Option<&str>,
-    startup_event_policy: StartupEventPolicy,
+    inputs: ValidatedRuntimeInputs<DeliverySecurity>,
+    #[cfg(test)] runtime_host_test_support: Option<RuntimeHostTestSupport>,
 ) -> Result<TypedReplicationRuntimeLoad, LoadError> {
-    load_replication_runtime_typed_with_security_inner(
+    let ValidatedRuntimeInputs {
         application_id,
         application_schemas,
         store,
         application_read_token,
         listener,
         config,
+        runtime_config_fragments,
         security,
-        runtime_config_toml,
-        startup_event_policy,
-        #[cfg(test)]
-        None,
-    )
-    .await
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the internal loader adds one isolated unit-test support payload to the explicit startup inputs"
-)]
-/// Shared implementation for ordinary loading and the focused unit-test host seam.
-async fn load_replication_runtime_typed_with_security_inner(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    application_read_token: Option<ApplicationReadToken>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    security: DeliverySecurity,
-    runtime_config_toml: Option<&str>,
-    startup_event_policy: StartupEventPolicy,
-    #[cfg(test)] runtime_host_test_support: Option<RuntimeHostTestSupport>,
-) -> Result<TypedReplicationRuntimeLoad, LoadError> {
+    } = inputs;
     let local_member =
         store
             .local_member_identity()
@@ -835,38 +995,23 @@ async fn load_replication_runtime_typed_with_security_inner(
         PreparedApplicationState::Ready { group_state }
         | PreparedApplicationState::Synchronising { group_state, .. } => group_state.clone(),
     };
-    let startup_listener = startup_event_policy.create_listener();
+    let host_args = DeliveryRuntimeHostPrepareArgs {
+        local_member: &local_member,
+        group_memberships: group_state,
+        store,
+        config: config.clone(),
+        security,
+        runtime_config_fragments,
+    };
     let host_result = cfg_select! {
         test => match runtime_host_test_support {
             Some(test_support) => DeliveryRuntimeHost::prepare_with_test_support(
-                &local_member,
-                group_state,
-                store,
-                config.clone(),
-                security,
-                runtime_config_toml,
-                startup_listener,
+                host_args,
                 test_support,
             ).await,
-            None => DeliveryRuntimeHost::prepare_with_runtime_config_toml(
-                &local_member,
-                group_state,
-                store,
-                config.clone(),
-                security,
-                runtime_config_toml,
-                startup_listener,
-            ).await,
+            None => DeliveryRuntimeHost::prepare(host_args).await,
         },
-        _ => DeliveryRuntimeHost::prepare_with_runtime_config_toml(
-            &local_member,
-            group_state,
-            store,
-            config.clone(),
-            security,
-            runtime_config_toml,
-            startup_listener,
-        ).await,
+        _ => DeliveryRuntimeHost::prepare(host_args).await,
     };
     let host = host_result.boxed().context(load_error::RuntimeSnafu {
         application_id: application_id.clone(),
@@ -924,8 +1069,11 @@ fn replication_runtime_from_host(
     })
 }
 
-/// Concrete application-facing runtime returned by `load_replication_runtime`.
-pub(crate) struct ReplicationRuntime {
+/// Concrete application-facing replication runtime.
+///
+/// Use [`Self::builder`] to configure and load a runtime. Successfully loaded instances are
+/// exposed through [`ReplicationRuntimeLoad`] as [`ReplicationApi`] handles.
+pub struct ReplicationRuntime {
     _application_id: ApplicationId,
     /// Non-owning self-view used to expose another trait object for this exact allocation.
     self_weak: Weak<Self>,
@@ -947,6 +1095,24 @@ struct RuntimeLifecycle {
 }
 
 impl ReplicationRuntime {
+    /// Begin configuring a replication runtime for `application_id` without performing I/O.
+    ///
+    /// The application identity scopes this runtime in errors and diagnostics. The returned
+    /// builder contains only the documented optional defaults; callers must provide its required
+    /// store, listener, and security inputs before calling [`ReplicationRuntimeBuilder::load`].
+    pub fn builder(application_id: ApplicationId) -> ReplicationRuntimeBuilder {
+        ReplicationRuntimeBuilder {
+            application_id,
+            application_schemas: ApplicationSchemas::EMPTY,
+            store: None,
+            listener: None,
+            security_secrets: None,
+            application_read_token: None,
+            config: ReplicationConfig::default(),
+            runtime_config_fragments: SmallVec::new(),
+        }
+    }
+
     fn runtime_ref(
         &self,
         operation: &'static str,

@@ -1357,18 +1357,13 @@ async fn load_checklist_runtime(
     listener: Arc<ChecklistListener>,
     working_set: &mut ChecklistWorkingSet,
 ) -> Result<Arc<dyn ReplicationApi>, ReplicatedChecklistError> {
-    let load = load_replication_runtime_with_runtime_config_toml(
-        checklist_application_id(),
-        &CHECKLIST_APPLICATION_SCHEMAS,
-        setup.store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        setup.replication_security.clone(),
-        &setup.config.runtime_config_toml,
-    )
-    .await
-    .context(repl_error::LoadRuntimeSnafu)?;
+    let builder = ReplicationRuntime::builder(checklist_application_id())
+        .application_schemas(&CHECKLIST_APPLICATION_SCHEMAS)
+        .store(setup.store.clone())
+        .listener(listener)
+        .security_secrets(setup.replication_security.clone())
+        .runtime_config_toml(&setup.config.runtime_config_toml);
+    let load = builder.load().await.context(repl_error::LoadRuntimeSnafu)?;
     complete_checklist_runtime_load(load, working_set).await
 }
 
@@ -1490,17 +1485,13 @@ mod tests {
     ) -> (Arc<dyn ReplicationApi>, ChecklistWorkingSet) {
         let (listener, _receivers) = ChecklistListener::pair();
         let concrete_store = Arc::clone(&**store);
-        let load = block_on(load_replication_runtime_with_runtime_config_toml(
-            checklist_application_id(),
-            &CHECKLIST_APPLICATION_SCHEMAS,
-            concrete_store,
-            None,
-            listener,
-            ReplicationConfig::default(),
-            test_replication_security_secrets(),
-            "",
-        ))
-        .expect("persisted checklist runtime should reload");
+        let builder = ReplicationRuntime::builder(checklist_application_id())
+            .application_schemas(&CHECKLIST_APPLICATION_SCHEMAS)
+            .store(concrete_store)
+            .listener(listener)
+            .security_secrets(test_replication_security_secrets())
+            .runtime_config_toml("");
+        let load = block_on(builder.load()).expect("persisted checklist runtime should reload");
         let mut working_set = ChecklistWorkingSet::new();
         let runtime = block_on(complete_checklist_runtime_load(load, &mut working_set))
             .expect("persisted checklist synchronisation should complete");

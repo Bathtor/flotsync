@@ -93,6 +93,7 @@ use kompact::{
     prelude::*,
     runtime::KompactError,
 };
+use smallvec::SmallVec;
 use snafu::prelude::*;
 use std::{
     collections::HashSet,
@@ -217,6 +218,22 @@ impl StartupEventPolicy {
     }
 }
 
+/// Named inputs required to prepare a delivery runtime host.
+pub(super) struct DeliveryRuntimeHostPrepareArgs<'a> {
+    /// Identity represented by this runtime host.
+    pub(super) local_member: &'a MemberIdentity,
+    /// Shared replication-group state installed in the runtime topology.
+    pub(super) group_memberships: Arc<SharedGroupState>,
+    /// Store shared by delivery and replication components.
+    pub(super) store: Arc<dyn ReplicationStore>,
+    /// Public runtime policy shared by the topology.
+    pub(super) config: ReplicationConfig,
+    /// Loaded delivery security used by the topology.
+    pub(super) security: DeliverySecurity,
+    /// Ordered TOML fragments merged before the runtime system is built.
+    pub(super) runtime_config_fragments: SmallVec<[String; 1]>,
+}
+
 /// Live internal host for the delivery-layer components used by replication.
 ///
 /// This owns the concrete Kompact/io topology and exposes a small imperative
@@ -242,28 +259,6 @@ pub(crate) struct DeliveryRuntimeHost {
 }
 
 impl DeliveryRuntimeHost {
-    fn new(
-        system: KompactSystem,
-        topology: RuntimeTopology,
-        group_memberships: Arc<SharedGroupState>,
-        control_timeout: Duration,
-        external_udp_addr: SocketAddr,
-        #[cfg(any(test, feature = "test-support"))] local_endpoint_lease: ReservedSocketLease,
-        #[cfg(test)] test_support: RuntimeHostTestSupport,
-    ) -> Self {
-        Self {
-            system: Some(system),
-            topology: Some(topology),
-            group_memberships,
-            control_timeout,
-            external_udp_addr,
-            #[cfg(any(test, feature = "test-support"))]
-            local_endpoint_lease,
-            #[cfg(test)]
-            test_support,
-        }
-    }
-
     fn topology(&self) -> &RuntimeTopology {
         self.topology
             .as_ref()
@@ -288,56 +283,12 @@ impl DeliveryRuntimeHost {
         self.topology().discovery.route_discovery_provider()
     }
 
-    /// Start one new active delivery runtime host with an additional in-memory TOML
-    /// config fragment merged into the Kompact runtime config.
-    ///
-    /// This compatibility path drains no application state. New application
-    /// loading uses [`Self::prepare_with_runtime_config_toml`] and activates the
-    /// runtime only after synchronisation.
-    #[cfg(test)]
-    pub(super) async fn start_with_runtime_config_toml(
-        local_member: &MemberIdentity,
-        group_memberships: Arc<SharedGroupState>,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-        config: ReplicationConfig,
-        security: DeliverySecurity,
-        runtime_config_toml: Option<&str>,
-    ) -> Result<Self, RuntimeHostError> {
-        let host = Self::prepare_with_options(
-            local_member,
-            group_memberships,
-            store,
-            config,
-            security,
-            runtime_config_toml,
-            StartupEventPolicy::Log.create_listener(),
-            #[cfg(test)]
-            RuntimeHostTestSupport::direct(),
-        )
-        .await?;
-        host.activate_runtime(listener).await?;
-        Ok(host)
-    }
-
     /// Prepare networking and delivery with an explicit inactive listener.
-    pub(super) async fn prepare_with_runtime_config_toml(
-        local_member: &MemberIdentity,
-        group_memberships: Arc<SharedGroupState>,
-        store: Arc<dyn ReplicationStore>,
-        config: ReplicationConfig,
-        security: DeliverySecurity,
-        runtime_config_toml: Option<&str>,
-        startup_listener: Arc<dyn ReplicationEventListener>,
+    pub(super) async fn prepare(
+        args: DeliveryRuntimeHostPrepareArgs<'_>,
     ) -> Result<Self, RuntimeHostError> {
         Self::prepare_with_options(
-            local_member,
-            group_memberships,
-            store,
-            config,
-            security,
-            runtime_config_toml,
-            startup_listener,
+            args,
             #[cfg(test)]
             RuntimeHostTestSupport::direct(),
         )
@@ -350,51 +301,34 @@ impl DeliveryRuntimeHost {
     /// special case exists so focused lifecycle tests can opt into additional host seams without
     /// adding test concerns to the production preparation signature.
     #[cfg(test)]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "This focused test boundary mirrors the production preparation inputs and adds one isolated test-support payload."
-    )]
     pub(super) async fn prepare_with_test_support(
-        local_member: &MemberIdentity,
-        group_memberships: Arc<SharedGroupState>,
-        store: Arc<dyn ReplicationStore>,
-        config: ReplicationConfig,
-        security: DeliverySecurity,
-        runtime_config_toml: Option<&str>,
-        startup_listener: Arc<dyn ReplicationEventListener>,
+        args: DeliveryRuntimeHostPrepareArgs<'_>,
         test_support: RuntimeHostTestSupport,
     ) -> Result<Self, RuntimeHostError> {
-        Self::prepare_with_options(
+        Self::prepare_with_options(args, test_support).await
+    }
+
+    async fn prepare_with_options(
+        args: DeliveryRuntimeHostPrepareArgs<'_>,
+        #[cfg(test)] test_support: RuntimeHostTestSupport,
+    ) -> Result<Self, RuntimeHostError> {
+        let DeliveryRuntimeHostPrepareArgs {
             local_member,
             group_memberships,
             store,
             config,
             security,
-            runtime_config_toml,
-            startup_listener,
-            test_support,
-        )
-        .await
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "This internal startup boundary keeps independently owned runtime services explicit; the eighth argument is a test-only support payload."
-    )]
-    async fn prepare_with_options(
-        local_member: &MemberIdentity,
-        group_memberships: Arc<SharedGroupState>,
-        store: Arc<dyn ReplicationStore>,
-        config: ReplicationConfig,
-        security: DeliverySecurity,
-        runtime_config_toml: Option<&str>,
-        startup_listener: Arc<dyn ReplicationEventListener>,
-        #[cfg(test)] test_support: RuntimeHostTestSupport,
-    ) -> Result<Self, RuntimeHostError> {
-        let built_system = build_runtime_system(runtime_config_toml).await?;
+            runtime_config_fragments,
+        } = args;
+        let built_system = build_runtime_system(runtime_config_fragments).await?;
         let system = built_system.system.clone();
         #[cfg(test)]
         let test_support = test_support.materialise(&system);
+        #[cfg(test)]
+        let startup_event_policy = test_support.startup_event_policy();
+        #[cfg(not(test))]
+        let startup_event_policy = StartupEventPolicy::Log;
+        let startup_listener = startup_event_policy.create_listener();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
         let topology = RuntimeTopology::build(
@@ -451,47 +385,17 @@ impl DeliveryRuntimeHost {
                 .publish_preconfigured_peer_routes(local_endpoint.local_addr);
         }
 
-        Ok(Self::new(
-            system,
-            topology,
+        Ok(Self {
+            system: Some(system),
+            topology: Some(topology),
             group_memberships,
-            host_config.control_timeout,
-            local_endpoint.local_addr,
+            control_timeout: host_config.control_timeout,
+            external_udp_addr: local_endpoint.local_addr,
             #[cfg(any(test, feature = "test-support"))]
             local_endpoint_lease,
             #[cfg(test)]
             test_support,
-        ))
-    }
-
-    #[cfg(test)]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "This test-only startup boundary adds explicit route publication control to the production runtime inputs."
-    )]
-    pub(super) async fn start_with_route_publish_mode_for_test(
-        local_member: &MemberIdentity,
-        group_memberships: Arc<SharedGroupState>,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-        config: ReplicationConfig,
-        security: DeliverySecurity,
-        runtime_config_toml: Option<&str>,
-        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
-    ) -> Result<Self, RuntimeHostError> {
-        let host = Self::prepare_with_options(
-            local_member,
-            group_memberships,
-            store,
-            config,
-            security,
-            runtime_config_toml,
-            StartupEventPolicy::Log.create_listener(),
-            RuntimeHostTestSupport::with_route_publish_mode(route_publish_mode),
-        )
-        .await?;
-        host.activate_runtime(listener).await?;
-        Ok(host)
+        })
     }
 
     /// Install the real listener and start every runtime-logic component.
@@ -635,19 +539,18 @@ impl ReplicationEventListener for StartupEventListener {
 
 /// Create the Kompact system without retaining its thread-local config state in this future.
 async fn build_runtime_system(
-    runtime_config_toml: Option<&str>,
+    runtime_config_fragments: SmallVec<[String; 1]>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
-    let runtime_config_toml = runtime_config_toml.map(str::to_owned);
     // KompactConfig contains Rc-backed builders and build() returns a local future. Keep both
     // entirely on the reusable blocking pool until Kompact provides a Send-compatible path:
     // https://github.com/kompics/kompact/issues/232
-    blocking::unblock(move || build_runtime_system_blocking(runtime_config_toml.as_deref())).await
+    blocking::unblock(move || build_runtime_system_blocking(runtime_config_fragments)).await
 }
 
 /// Build the test-support system synchronously on a blocking-pool worker.
 #[cfg(any(test, feature = "test-support"))]
 fn build_runtime_system_blocking(
-    runtime_config_toml: Option<&str>,
+    runtime_config_fragments: SmallVec<[String; 1]>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let local_endpoint_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
@@ -657,9 +560,7 @@ fn build_runtime_system_blocking(
     set_test_system_label(&mut config, "replication-runtime-host-test-system");
     enable_bind_reuse_address(&mut config);
     configure_replication_runtime(&mut config);
-    if let Some(runtime_config_toml) = runtime_config_toml {
-        config.load_config_str(runtime_config_toml);
-    }
+    load_runtime_config_fragments(&mut config, runtime_config_fragments);
     config.set_config_value(
         &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
         local_endpoint_bind_addr,
@@ -678,15 +579,23 @@ fn build_runtime_system_blocking(
 /// Build the production system synchronously on a blocking-pool worker.
 #[cfg(not(any(test, feature = "test-support")))]
 fn build_runtime_system_blocking(
-    runtime_config_toml: Option<&str>,
+    runtime_config_fragments: SmallVec<[String; 1]>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let mut config = KompactConfig::default();
     configure_replication_runtime(&mut config);
-    if let Some(runtime_config_toml) = runtime_config_toml {
-        config.load_config_str(runtime_config_toml);
-    }
+    load_runtime_config_fragments(&mut config, runtime_config_fragments);
     let system = config.build().wait().context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem { system })
+}
+
+/// Merge owned runtime configuration fragments in their builder call order.
+fn load_runtime_config_fragments(
+    config: &mut KompactConfig,
+    runtime_config_fragments: SmallVec<[String; 1]>,
+) {
+    for runtime_config_toml in runtime_config_fragments {
+        config.load_config_str(runtime_config_toml);
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

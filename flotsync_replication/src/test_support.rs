@@ -1,6 +1,8 @@
 //! Shared replication test stores, memberships, listeners, and runtime fixtures.
 
 use crate::{
+    ReplicationRuntime,
+    ReplicationRuntimeBuilder,
     ReplicationRuntimeLoad,
     SqliteReplicationStore,
     SqliteReplicationStoreProvisioner,
@@ -47,11 +49,7 @@ use crate::{
     delivery::security::DeliverySecurity,
     runtime::{
         application_snapshot_from_records,
-        handle::{
-            ReplicationRuntime,
-            load_replication_runtime_typed_with_security_for_test,
-            load_replication_runtime_with_runtime_config_toml,
-        },
+        handle::load_replication_runtime_typed_with_security_for_test,
     },
     security_store::SecurityStore,
 };
@@ -220,7 +218,7 @@ pub fn docs_group_schema() -> GroupSchema {
     )]))
 }
 
-/// Load a replication runtime for tests that have not yet gained real security setup.
+/// Load a configured replication runtime after provisioning deterministic test security.
 ///
 /// This helper provisions deterministic local-private member keys into the
 /// supplied store, loads runtime security from those records, and then starts
@@ -232,14 +230,19 @@ pub fn docs_group_schema() -> GroupSchema {
 ///
 /// Returns [`LoadError`] when store access, deterministic key generation,
 /// local-private-key sealing, or runtime startup fails.
-pub async fn load_replication_runtime_with_test_security_toml(
-    application_id: ApplicationId,
-    application_schemas: &'static ApplicationSchemas,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-    runtime_config_toml: &str,
+///
+/// # Panics
+///
+/// Panics if the builder has no store. This helper is test scaffolding and requires a store before
+/// it can provision deterministic security.
+pub async fn load_replication_runtime_with_test_security(
+    builder: ReplicationRuntimeBuilder,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
+    let application_id = builder.application_id().clone();
+    let store = builder
+        .store_ref()
+        .expect("test-security runtime builder must provide a store")
+        .clone();
     let local_member = store
         .local_member_identity()
         .await
@@ -254,17 +257,8 @@ pub async fn load_replication_runtime_with_test_security_toml(
         std::iter::empty::<MemberIdentity>(),
     )
     .await?;
-    let runtime = load_replication_runtime_with_runtime_config_toml(
-        application_id,
-        application_schemas,
-        store,
-        None,
-        listener,
-        config,
-        test_replication_security_secrets(),
-        runtime_config_toml,
-    )
-    .await?;
+    let builder = builder.security_secrets(test_replication_security_secrets());
+    let runtime = builder.load().await?;
     match runtime {
         ReplicationRuntimeLoad::Ready(runtime) => Ok(runtime),
         ReplicationRuntimeLoad::Synchronising(synchronisation) => {
@@ -721,14 +715,16 @@ impl RuntimeTestFixture {
         let listener = Arc::new(TestEventListener::default());
         let store_for_runtime: Arc<dyn ReplicationStore> = store.clone();
         let listener_for_runtime: Arc<dyn ReplicationEventListener> = listener.clone();
+        let builder = ReplicationRuntime::builder(application_id)
+            .application_schemas(application_schemas)
+            .store(store_for_runtime)
+            .listener(listener_for_runtime)
+            .config(config);
+        let inputs = builder
+            .into_validated_with_security(security)
+            .expect("test runtime inputs should be complete");
         let runtime = wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
-            application_id,
-            application_schemas,
-            store_for_runtime,
-            listener_for_runtime,
-            config,
-            security,
-            None,
+            inputs,
         ))
         .expect("runtime should load");
         Self {

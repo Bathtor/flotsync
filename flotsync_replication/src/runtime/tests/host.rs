@@ -90,17 +90,15 @@ fn prepare_runtime_startup(
 ) -> PreparedRuntimeStartup {
     let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(0));
-    let load = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
-        app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store,
-        application_read_token,
-        Arc::new(ListenerStub::default()),
-        config,
-        test_replication_security_secrets(),
-        &runtime_config_toml,
-    ))
-    .expect("runtime preparation should succeed");
+    let builder = ReplicationRuntime::builder(app_probe_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(store)
+        .listener(Arc::new(ListenerStub::default()))
+        .security_secrets(test_replication_security_secrets())
+        .maybe_application_read_token(application_read_token)
+        .config(config)
+        .runtime_config_toml(&runtime_config_toml);
+    let load = wait_for_test_reply(builder.load()).expect("runtime preparation should succeed");
     PreparedRuntimeStartup {
         endpoint_lease,
         load,
@@ -195,11 +193,12 @@ fn exact_application_position_starts_ready_without_reconciliation() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts(
+    let seed_builder = runtime_builder(
         app_probe_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
@@ -239,11 +238,12 @@ fn behind_application_position_yields_one_coalesced_group_change() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts(
+    let seed_builder = runtime_builder(
         app_probe_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
@@ -376,12 +376,13 @@ fn incremental_history_loads_complete_ranges_for_multiple_producers() {
         &alice_member,
         [bob_member.clone(), probe_member.clone()],
     );
-    let seed_runtime = load_runtime_with_parts_and_application_schemas(
+    let seed_builder = runtime_builder(
         app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
         store.clone(),
         Arc::new(ListenerStub::default()),
-    );
+    )
+    .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = GroupId(Uuid::from_u128(70_000_221));
     let members = GroupMembers::from_ordered_members(vec![
         alice_member,
@@ -548,11 +549,12 @@ fn mixed_application_positions_reconcile_each_group_independently() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts(
+    let seed_builder = runtime_builder(
         app_probe_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let seed_runtime = load_runtime(seed_builder);
     let exact_group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
         group_schema: docs_group_schema(),
@@ -865,12 +867,13 @@ fn non_empty_store_replays_application_snapshot_before_runtime_activation() {
     let alice_member = alice_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts_and_application_schemas(
+    let seed_builder = runtime_builder(
         app_probe_id(),
-        &TWO_TITLE_APPLICATION_SCHEMAS,
         store.clone(),
         Arc::new(ListenerStub::default()),
-    );
+    )
+    .application_schemas(&TWO_TITLE_APPLICATION_SCHEMAS);
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
         group_schema: two_title_group_schema(),
@@ -920,17 +923,14 @@ fn non_empty_store_replays_application_snapshot_before_runtime_activation() {
             .expect("test batch size should be non-zero"),
         ..Default::default()
     };
-    let load = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
-        app_probe_id(),
-        &TWO_TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        None,
-        listener.clone(),
-        config,
-        test_replication_security_secrets(),
-        &runtime_config_toml,
-    ))
-    .expect("runtime preparation should succeed");
+    let builder = ReplicationRuntime::builder(app_probe_id())
+        .application_schemas(&TWO_TITLE_APPLICATION_SCHEMAS)
+        .store(store.clone())
+        .listener(listener.clone())
+        .security_secrets(test_replication_security_secrets())
+        .config(config)
+        .runtime_config_toml(&runtime_config_toml);
+    let load = wait_for_test_reply(builder.load()).expect("runtime preparation should succeed");
     let ReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
         panic!("a readable stored group should require application synchronisation");
     };
@@ -1064,13 +1064,10 @@ fn inbound_work_queued_during_synchronisation_is_delivered_once_after_completion
     );
     let alice_listener = Arc::new(ListenerStub::default());
     let alice_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
-    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
-        app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        alice_store.clone(),
-        alice_listener,
-        &alice_config_toml,
-    );
+    let alice_builder = runtime_builder(app_alice_id(), alice_store.clone(), alice_listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .runtime_config_toml(&alice_config_toml);
+    let alice_runtime = load_runtime(alice_builder);
     let members =
         GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
             .expect("test group members should be valid");
@@ -1080,18 +1077,17 @@ fn inbound_work_queued_during_synchronisation_is_delivered_once_after_completion
 
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(1));
-    let load = wait_for_test_reply(
-        load_replication_runtime_typed_with_observed_startup_for_test(
-            app_bob_id(),
-            &TITLE_APPLICATION_SCHEMAS,
-            bob_store.clone(),
-            listener.clone(),
-            ReplicationConfig::default(),
-            security,
-            Some(&runtime_config_toml),
-        ),
-    )
-    .expect("runtime preparation should succeed");
+    let builder = ReplicationRuntime::builder(app_bob_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(bob_store.clone())
+        .listener(listener.clone())
+        .runtime_config_toml(&runtime_config_toml);
+    let inputs = builder
+        .into_validated_with_security(security)
+        .expect("test runtime inputs should be complete");
+    let load =
+        wait_for_test_reply(load_replication_runtime_typed_with_observed_startup_for_test(inputs))
+            .expect("runtime preparation should succeed");
     let TypedReplicationRuntimeLoad::Synchronising(mut synchronisation) = load else {
         panic!("a readable stored group should require application synchronisation");
     };
@@ -1161,13 +1157,14 @@ fn update_represented_by_synchronisation_cut_is_not_redelivered_live() {
     );
 
     let alice_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
-    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
+    let alice_builder = runtime_builder(
         app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
         alice_store.clone(),
         Arc::new(ListenerStub::default()),
-        &alice_config_toml,
-    );
+    )
+    .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+    .runtime_config_toml(&alice_config_toml);
+    let alice_runtime = load_runtime(alice_builder);
     let members =
         GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
             .expect("duplicate fixture members should be valid");
@@ -1177,16 +1174,17 @@ fn update_represented_by_synchronisation_cut_is_not_redelivered_live() {
 
     let bob_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(1));
     let first_listener = Arc::new(ListenerStub::default());
+    let first_builder = ReplicationRuntime::builder(app_bob_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(bob_store.clone())
+        .listener(first_listener.clone())
+        .runtime_config_toml(&bob_config_toml);
+    let first_security = load_test_runtime_security(bob_store.clone(), &bob_member);
+    let first_inputs = first_builder
+        .into_validated_with_security(first_security)
+        .expect("test runtime inputs should be complete");
     let first_load = wait_for_test_reply(
-        load_replication_runtime_typed_with_observed_startup_for_test(
-            app_bob_id(),
-            &TITLE_APPLICATION_SCHEMAS,
-            bob_store.clone(),
-            first_listener.clone(),
-            ReplicationConfig::default(),
-            load_test_runtime_security(bob_store.clone(), &bob_member),
-            Some(&bob_config_toml),
-        ),
+        load_replication_runtime_typed_with_observed_startup_for_test(first_inputs),
     )
     .expect("first receiver runtime should prepare");
     let TypedReplicationRuntimeLoad::Synchronising(first_synchronisation) = first_load else {
@@ -1216,16 +1214,17 @@ fn update_represented_by_synchronisation_cut_is_not_redelivered_live() {
         .expect("first receiver runtime should shut down");
 
     let live_listener = Arc::new(ListenerStub::default());
+    let reload_builder = ReplicationRuntime::builder(app_bob_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(bob_store.clone())
+        .listener(live_listener.clone())
+        .runtime_config_toml(&bob_config_toml);
+    let reload_security = load_test_runtime_security(bob_store.clone(), &bob_member);
+    let reload_inputs = reload_builder
+        .into_validated_with_security(reload_security)
+        .expect("test runtime inputs should be complete");
     let reload = wait_for_test_reply(
-        load_replication_runtime_typed_with_observed_startup_for_test(
-            app_bob_id(),
-            &TITLE_APPLICATION_SCHEMAS,
-            bob_store.clone(),
-            live_listener.clone(),
-            ReplicationConfig::default(),
-            load_test_runtime_security(bob_store.clone(), &bob_member),
-            Some(&bob_config_toml),
-        ),
+        load_replication_runtime_typed_with_observed_startup_for_test(reload_inputs),
     )
     .expect("receiver runtime should reload from the represented cut");
     let TypedReplicationRuntimeLoad::Synchronising(mut synchronisation) = reload else {
@@ -1377,12 +1376,13 @@ fn operation_scoped_snapshot_scan_failure_can_retry_in_existing_transaction() {
     let inner_store = sqlite_store(alice_member.clone());
     let store = Arc::new(FailingStore::new(inner_store.clone()));
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts_and_application_schemas(
+    let seed_builder = runtime_builder(
         app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
         store.clone(),
         Arc::new(ListenerStub::default()),
-    );
+    )
+    .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
@@ -1474,11 +1474,12 @@ fn operation_scoped_incremental_preparation_failure_retries_the_same_group() {
     let inner_store = sqlite_store(alice_member.clone());
     let store = Arc::new(FailingStore::new(inner_store.clone()));
     provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_runtime = load_runtime_with_parts(
+    let seed_builder = runtime_builder(
         app_probe_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let seed_runtime = load_runtime(seed_builder);
     let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
@@ -1565,14 +1566,16 @@ fn compatibility_drain_failure_explicitly_releases_synchronisation() {
     let runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(0));
     store.fail_next_snapshot_scan(retryable_store_failure(StoreErrorScope::Operation));
 
+    let builder = ReplicationRuntime::builder(app_probe_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(store.clone())
+        .listener(Arc::new(ListenerStub::default()))
+        .runtime_config_toml(&runtime_config_toml);
+    let inputs = builder
+        .into_validated_with_security(security)
+        .expect("test runtime inputs should be complete");
     let result = wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
-        app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        Arc::new(ListenerStub::default()),
-        ReplicationConfig::default(),
-        security,
-        Some(&runtime_config_toml),
+        inputs,
     ));
     let Err(error) = result else {
         panic!("compatibility draining should return the injected scan failure");
@@ -1726,17 +1729,13 @@ fn stored_state_without_readable_groups_starts_ready() {
         },
     );
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
-    let load = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
-        app_probe_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        None,
-        Arc::new(ListenerStub::default()),
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-        &runtime_config_toml,
-    ))
-    .expect("closed group state should load");
+    let builder = ReplicationRuntime::builder(app_probe_id())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .store(store.clone())
+        .listener(Arc::new(ListenerStub::default()))
+        .security_secrets(test_replication_security_secrets())
+        .runtime_config_toml(&runtime_config_toml);
+    let load = wait_for_test_reply(builder.load()).expect("closed group state should load");
     let ReplicationRuntimeLoad::Ready(runtime) = load else {
         panic!("closed groups should not require application synchronisation");
     };
@@ -1772,17 +1771,13 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
-        application_id,
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        security,
-        &runtime_config_toml,
-    ))
-    .expect("public runtime loading should accept provisioned security");
+    let builder = ReplicationRuntime::builder(application_id)
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(security)
+        .runtime_config_toml(&runtime_config_toml);
+    let loaded_runtime = wait_for_test_reply(builder.load())
+        .expect("public runtime loading should accept provisioned security");
     let crate::ReplicationRuntimeLoad::Ready(loaded_runtime) = loaded_runtime else {
         panic!("empty store should not require application synchronisation");
     };
@@ -1799,7 +1794,8 @@ fn runtime_shutdown_is_graceful_idempotent_and_marks_runtime_unavailable() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
 
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down gracefully");
     wait_for_test_reply(runtime.shutdown()).expect("second shutdown should be a no-op");
@@ -1814,7 +1810,8 @@ fn diagnostics_share_the_runtime_allocation_and_lifecycle() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
     let runtime_api: Arc<dyn ReplicationApi> = runtime.clone();
 
     let diagnostics = runtime_api.diagnostics();
@@ -1840,7 +1837,8 @@ fn diagnostics_arc_keeps_the_concrete_runtime_alive() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
     let runtime_weak = Arc::downgrade(&runtime);
     let diagnostics = runtime.diagnostics();
 
@@ -1858,7 +1856,8 @@ fn dropping_runtime_inside_test_executor_does_not_reenter_local_pool() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
 
     wait_for_test_future(async move {
         drop(runtime);
@@ -1888,15 +1887,11 @@ fn load_replication_runtime_reports_unsupported_identity_without_private_keys() 
     let store = Arc::new(FailingStore::new(inner_store.clone()).with_hidden_local_private_keys());
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
+    let builder = ReplicationRuntime::builder(application_id.clone())
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(test_replication_security_secrets());
+    let loaded_runtime = wait_for_test_reply(builder.load());
     let Err(error) = loaded_runtime else {
         panic!("runtime loading should reject an identity without private keys");
     };
@@ -1912,6 +1907,54 @@ fn load_replication_runtime_reports_unsupported_identity_without_private_keys() 
     ));
 }
 
+/// Return the required builder fields reported before runtime loading begins.
+fn missing_runtime_builder_fields(builder: ReplicationRuntimeBuilder) -> Box<[&'static str]> {
+    let result = wait_for_test_reply(builder.load());
+    let Err(LoadError::MissingBuilderInputs { missing_fields, .. }) = result else {
+        panic!("incomplete runtime builder should report its missing inputs: {result:?}");
+    };
+    missing_fields
+}
+
+#[test]
+fn runtime_builder_reports_all_missing_required_inputs_together() {
+    let builder = ReplicationRuntime::builder(app_probe_id());
+    let missing_fields = missing_runtime_builder_fields(builder);
+
+    assert_eq!(
+        missing_fields.as_ref(),
+        ["store", "listener", "security_secrets"]
+    );
+}
+
+#[test]
+fn runtime_builder_reports_each_missing_required_input_before_loading() {
+    let store_owner = sqlite_store(alice_member());
+    let concrete_store = Arc::clone(&*store_owner);
+    let store: Arc<dyn ReplicationStore> = concrete_store;
+    let listener: Arc<dyn ReplicationEventListener> = Arc::new(ListenerStub::default());
+    let security = test_replication_security_secrets();
+    let missing_store = ReplicationRuntime::builder(app_probe_id())
+        .listener(listener.clone())
+        .security_secrets(security.clone());
+    let missing_listener = ReplicationRuntime::builder(app_probe_id())
+        .store(store.clone())
+        .security_secrets(security.clone());
+    let missing_security = ReplicationRuntime::builder(app_probe_id())
+        .store(store)
+        .listener(listener);
+    let cases = [
+        ("store", missing_store),
+        ("listener", missing_listener),
+        ("security_secrets", missing_security),
+    ];
+
+    for (expected, builder) in cases {
+        let missing_fields = missing_runtime_builder_fields(builder);
+        assert_eq!(missing_fields.as_ref(), [expected]);
+    }
+}
+
 #[test]
 fn load_replication_runtime_rejects_wrong_store_secret_key() {
     let application_id = app_probe_id();
@@ -1924,15 +1967,11 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
         Arc::new(StoreSecretKey::from_bytes([42; 32])),
     );
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        wrong_security,
-    ));
+    let builder = ReplicationRuntime::builder(application_id.clone())
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(wrong_security);
+    let loaded_runtime = wait_for_test_reply(builder.load());
     let Err(error) = loaded_runtime else {
         panic!("public runtime loading should reject wrong store-secret key");
     };
@@ -1958,15 +1997,11 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
+    let builder = ReplicationRuntime::builder(application_id.clone())
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(test_replication_security_secrets());
+    let loaded_runtime = wait_for_test_reply(builder.load());
     let Err(error) = loaded_runtime else {
         panic!("public runtime loading should reject group security key-id mismatch");
     };
@@ -1996,15 +2031,11 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
     persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
+    let builder = ReplicationRuntime::builder(application_id.clone())
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(test_replication_security_secrets());
+    let loaded_runtime = wait_for_test_reply(builder.load());
     let Err(error) = loaded_runtime else {
         panic!("public runtime loading should reject unsupported group security version");
     };
@@ -2035,15 +2066,11 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
     persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        None,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
+    let builder = ReplicationRuntime::builder(application_id.clone())
+        .store(store.clone())
+        .listener(listener)
+        .security_secrets(test_replication_security_secrets());
+    let loaded_runtime = wait_for_test_reply(builder.load());
     let Err(error) = loaded_runtime else {
         panic!("public runtime loading should reject invalid group security nonce length");
     };
@@ -2086,7 +2113,8 @@ fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
 
     wait_for_group_install(&runtime, group_id);
     assert_eq!(
@@ -2140,7 +2168,8 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener);
+    let runtime = load_runtime(builder);
 
     wait_for_group_install(&runtime, group_id);
     assert_eq!(
@@ -2166,13 +2195,9 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_runtime_config_toml(
-        app_alice_id(),
-        ApplicationSchemas::EMPTY,
-        store.clone(),
-        listener,
-        runtime_config_toml.as_str(),
-    );
+    let builder = runtime_builder(app_alice_id(), store.clone(), listener)
+        .runtime_config_toml(runtime_config_toml.as_str());
+    let runtime = load_runtime(builder);
 
     assert!(
         !runtime.knows_direct_peer_route_for_test(&bob_member),
@@ -2190,7 +2215,8 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     persist_group_membership_for_member(bob_store.as_ref(), group_id, members.clone(), 1);
     let bob_listener = Arc::new(ListenerStub::default());
-    let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store.clone(), bob_listener);
+    let bob_builder = runtime_builder(app_bob_id(), bob_store.clone(), bob_listener);
+    let bob_runtime = load_runtime(bob_builder);
     wait_for_group_install(&bob_runtime, group_id);
 
     let alice_store = sqlite_store(alice_member.clone());
@@ -2201,13 +2227,9 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
         &bob_member,
         bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
-        app_alice_id(),
-        ApplicationSchemas::EMPTY,
-        alice_store.clone(),
-        alice_listener,
-        runtime_config_toml.as_str(),
-    );
+    let alice_builder = runtime_builder(app_alice_id(), alice_store.clone(), alice_listener)
+        .runtime_config_toml(runtime_config_toml.as_str());
+    let alice_runtime = load_runtime(alice_builder);
     wait_for_group_install(&alice_runtime, group_id);
 
     alice_runtime.wait_for_direct_peer_route_for_test(&bob_member);
@@ -2225,18 +2247,17 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
     let group_state = load_group_state_for_test(&alice_member, ApplicationSchemas::EMPTY, &store);
-    let mut host =
-        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
-            &alice_member,
-            group_state,
-            store.clone(),
-            listener,
-            ReplicationConfig::default(),
-            security,
-            Some(runtime_config_toml.as_str()),
-            PreconfiguredPeerRoutesPublishMode::ManualForTest,
-        ))
-        .expect("host should start");
+    let args = DeliveryRuntimeHostPrepareArgs {
+        local_member: &alice_member,
+        group_memberships: group_state,
+        store: store.clone(),
+        config: ReplicationConfig::default(),
+        security,
+        runtime_config_fragments: smallvec::smallvec![runtime_config_toml],
+    };
+    let mut host = kompact::prelude::block_on(DeliveryRuntimeHost::prepare(args))
+        .expect("host should prepare");
+    kompact::prelude::block_on(host.activate_runtime(listener)).expect("host should start");
     host.wait_for_runtime_startup();
 
     host.publish_preconfigured_peer_routes();
@@ -2252,22 +2273,23 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
     let group_state = load_group_state_for_test(&alice_member, ApplicationSchemas::EMPTY, &store);
-    let mut host =
-        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
-            &alice_member,
-            group_state,
-            store.clone(),
-            listener,
-            ReplicationConfig::default(),
-            security,
-            Some(
-                r"
-            [flotsync.replication.runtime.catch-up]
-            max-updates-per-batch = 0
-            ",
-            ),
-            PreconfiguredPeerRoutesPublishMode::ManualForTest,
-        ))
+    let args = DeliveryRuntimeHostPrepareArgs {
+        local_member: &alice_member,
+        group_memberships: group_state,
+        store: store.clone(),
+        config: ReplicationConfig::default(),
+        security,
+        runtime_config_fragments: smallvec::smallvec![
+            r"
+                [flotsync.replication.runtime.catch-up]
+                max-updates-per-batch = 0
+                "
+            .to_owned()
+        ],
+    };
+    let mut host = kompact::prelude::block_on(DeliveryRuntimeHost::prepare(args))
+        .expect("host should prepare");
+    kompact::prelude::block_on(host.activate_runtime(listener))
         .expect("zero catch-up batch size should mean unlimited");
     host.wait_for_runtime_startup();
     wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");

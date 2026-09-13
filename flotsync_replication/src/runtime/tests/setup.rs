@@ -8,11 +8,12 @@ fn create_group_rejects_missing_permitted_keys_without_storing_group() {
     let bob_member = bob_member();
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
-    let runtime = load_runtime_with_parts(
+    let builder = runtime_builder(
         app_alice_id(),
         store.clone(),
         Arc::new(ListenerStub::default()),
     );
+    let runtime = load_runtime(builder);
 
     let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member.clone()],

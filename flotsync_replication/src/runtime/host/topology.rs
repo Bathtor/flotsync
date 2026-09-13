@@ -160,6 +160,8 @@ pub(in crate::runtime::host) struct BuiltRuntimeSystem {
 /// materialises only those components, leaving ordinary unit tests on the production wiring path.
 #[cfg(test)]
 pub(in crate::runtime) struct RuntimeHostTestSupport {
+    /// Behaviour if inactive runtime logic unexpectedly emits an application event.
+    startup_event_policy: StartupEventPolicy,
     /// Whether configured routes are published automatically during host preparation.
     route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     /// Whether to insert an observer between group broadcast and runtime logic.
@@ -173,28 +175,25 @@ impl RuntimeHostTestSupport {
     /// Build ordinary test support which preserves direct production topology wiring.
     pub(in crate::runtime) const fn direct() -> Self {
         Self {
+            startup_event_policy: StartupEventPolicy::Log,
             route_publish_mode: PreconfiguredPeerRoutesPublishMode::ManualForTest,
             observe_group_broadcast_runtime: false,
             group_broadcast_runtime_proxy: None,
         }
     }
 
-    /// Build test support with explicitly selected configured-route publication behaviour.
-    pub(in crate::runtime::host) fn with_route_publish_mode(
-        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
-    ) -> Self {
+    /// Build test support which observes group-broadcast delivery into inactive runtime logic.
+    pub(in crate::runtime) fn observing_group_broadcast_runtime() -> Self {
         Self {
-            route_publish_mode,
+            startup_event_policy: StartupEventPolicy::Panic,
+            observe_group_broadcast_runtime: true,
             ..Self::direct()
         }
     }
 
-    /// Build test support which observes group-broadcast delivery into inactive runtime logic.
-    pub(in crate::runtime) fn observing_group_broadcast_runtime() -> Self {
-        Self {
-            observe_group_broadcast_runtime: true,
-            ..Self::direct()
-        }
+    /// Return the selected response to an event emitted before listener activation.
+    pub(in crate::runtime::host) const fn startup_event_policy(&self) -> StartupEventPolicy {
+        self.startup_event_policy
     }
 
     /// Create the components requested before host preparation had access to the system.

@@ -158,16 +158,21 @@ fn partial_update_batch_retry_narrows_remaining_need() {
     let alice_listener = Arc::new(ListenerStub::default());
     let alice_store = sqlite_store(alice_member.clone());
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
-    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
-        app_alice_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        alice_store.clone(),
-        alice_listener,
-        r"
-        [flotsync.replication.runtime.catch-up]
-        max-updates-per-batch = 1
-        ",
-    );
+    let alice_builder = runtime_builder(app_alice_id(), alice_store.clone(), alice_listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS)
+        .runtime_config_toml(
+            r"
+            [flotsync.replication.runtime.catch-up]
+            max-updates-per-batch = 2
+            ",
+        )
+        .runtime_config_toml(
+            r"
+            [flotsync.replication.runtime.catch-up]
+            max-updates-per-batch = 1
+            ",
+        );
+    let alice_runtime = load_runtime(alice_builder);
     let bob_fixture =
         load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     provision_test_security(
@@ -1010,8 +1015,9 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     drop(bob_runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime =
-        load_runtime_with_parts(app_bob_id(), bob_store.clone(), restarted_listener.clone());
+    let restarted_builder =
+        runtime_builder(app_bob_id(), bob_store.clone(), restarted_listener.clone());
+    let restarted_runtime = load_runtime(restarted_builder);
     wait_for_group_install(&restarted_runtime, group_id);
     let mut edit_read_versions = VersionVector::initial(member_count);
     edit_read_versions.increment_at(0);
@@ -1200,12 +1206,9 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let schema = title_schema_static();
     let store = sqlite_store(bob_member.clone());
     let first_listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        app_bob_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        first_listener,
-    );
+    let builder = runtime_builder(app_bob_id(), store.clone(), first_listener)
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     let group_id = GroupId(Uuid::from_u128(35));
     runtime
         .install_group_for_test(
@@ -1275,8 +1278,9 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     drop(runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
-    let restarted_runtime =
-        load_runtime_with_parts(app_bob_id(), store.clone(), restarted_listener.clone());
+    let restarted_builder =
+        runtime_builder(app_bob_id(), store.clone(), restarted_listener.clone());
+    let restarted_runtime = load_runtime(restarted_builder);
     restarted_runtime
         .apply_update_for_test(alice_member, first_message)
         .expect("missing predecessor should apply and drain the persisted successor");
@@ -1338,12 +1342,9 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let sqlite_store = sqlite_store(bob_member.clone());
     let store = Arc::new(FailingStore::new(sqlite_store.clone()));
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts_and_application_schemas(
-        app_bob_id(),
-        &TITLE_APPLICATION_SCHEMAS,
-        store.clone(),
-        listener.clone(),
-    );
+    let builder = runtime_builder(app_bob_id(), store.clone(), listener.clone())
+        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
+    let runtime = load_runtime(builder);
     let group_id = GroupId(Uuid::from_u128(37));
     runtime
         .install_group_for_test(
