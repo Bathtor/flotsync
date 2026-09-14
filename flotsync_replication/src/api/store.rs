@@ -463,6 +463,13 @@ pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
 /// snapshot streams and may be held by a provider across multiple `next_batch`
 /// calls, so callers should drain or drop the provider promptly.
 pub trait ReplicationStoreReadTransaction: Send {
+    /// Return the stable identity of this concrete transaction instance.
+    ///
+    /// Wrappers around the same transaction must forward its identity. Store
+    /// implementations control UUID generation, but must not reuse an identity
+    /// while a cursor from the earlier transaction could still be supplied.
+    fn transaction_id(&self) -> StoreTransactionId;
+
     /// Load one persisted replication group by id.
     fn load_replication_group<'a>(
         &'a mut self,

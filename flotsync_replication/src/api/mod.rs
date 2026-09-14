@@ -35,6 +35,7 @@ use std::{
 
 mod errors;
 mod ids;
+mod paging;
 pub mod providers;
 pub mod security;
 pub mod store_error;
@@ -56,6 +57,7 @@ pub use flotsync_data_types::{
 };
 pub use flotsync_security::{LocalStoreSecretProfile, StoreSecretKeyId};
 pub use ids::*;
+pub use paging::*;
 
 /// Convenience macro to build a [`RowValuesPatch`] inline.
 #[macro_export]

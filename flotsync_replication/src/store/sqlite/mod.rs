@@ -42,6 +42,7 @@ use crate::{
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        StoreTransactionId,
         WritableReplicationGroupVersionRecord,
         ensure_matching_transition_dataset_references,
         invalid_default_group_security_material,
@@ -103,7 +104,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -111,6 +112,12 @@ use uuid::Uuid;
 
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Next process-wide numeric identity assigned to a SQLite pool.
+///
+/// The sequence wraps after every `u64` value has been used. Pool identity
+/// uniqueness therefore assumes that no pool survives a complete sequence
+/// cycle, which would require creating `2^64` later pools in one process.
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// SQLite store handle used before a local identity has been provisioned.
 ///
@@ -265,6 +272,7 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 SqliteReplicationTransactionKind::Write,
+                pool.next_transaction_id(),
             )) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -321,6 +329,7 @@ impl ReplicationStore for SqliteReplicationStore {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 SqliteReplicationTransactionKind::Write,
+                pool.next_transaction_id(),
             )) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -340,6 +349,7 @@ impl ReplicationStore for SqliteReplicationStore {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 SqliteReplicationTransactionKind::Read,
+                pool.next_transaction_id(),
             )) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
@@ -429,20 +439,50 @@ impl Drop for SqliteReplicationStore {
     }
 }
 
+/// Take the current sequence value and advance it with wrapping arithmetic.
+///
+/// Callers rely on no object carrying an earlier value surviving the complete
+/// `u64` allocation cycle. Tracking live identities would add coordination for
+/// a collision that requires `2^64` intervening allocations.
+fn allocate_sequence_id(sequence: &AtomicU64) -> u64 {
+    sequence.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Transferable owner of one SQLite connection pool and its orderly-shutdown state.
 struct SqliteStorePool {
     connections: Arc<SqlitePool>,
     /// Monotonic application-owned state shared by every activated-store `Arc` handle.
     state: AtomicU8,
+    /// Process-wide sequence value allocated to this concrete pool.
+    pool_id: u64,
+    /// Next sequence value available to a transaction created from this pool.
+    ///
+    /// A value can repeat only after this pool creates `2^64` transactions. The
+    /// identity scheme assumes no transaction or cursor survives that cycle.
+    next_transaction_id: AtomicU64,
 }
 
 impl SqliteStorePool {
     /// Build one open pool resource.
     fn new(connections: SqlitePool) -> Self {
+        let pool_id = allocate_sequence_id(&NEXT_POOL_ID);
         Self {
             connections: Arc::new(connections),
             state: AtomicU8::new(SqliteStoreState::Open as u8),
+            pool_id,
+            next_transaction_id: AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a practically unique identity among transactions created by
+    /// SQLite pools in this process.
+    ///
+    /// The pool and transaction halves may each wrap. Reuse requires a complete
+    /// `u64` allocation cycle while an object carrying the original pair remains
+    /// available.
+    fn next_transaction_id(&self) -> StoreTransactionId {
+        let transaction_id = allocate_sequence_id(&self.next_transaction_id);
+        StoreTransactionId::from_uuid(Uuid::from_u64_pair(self.pool_id, transaction_id))
     }
 
     /// Close every connection and publish completed closure.
@@ -512,13 +552,20 @@ impl SqliteStoreState {
 /// open transaction lets `SQLx` queue a rollback before returning the connection
 /// to the pool.
 struct SqliteReplicationStoreTransaction {
+    /// Stable identity of this transaction instance.
+    transaction_id: StoreTransactionId,
     connection: Option<SqliteStoreTransaction>,
     kind: SqliteReplicationTransactionKind,
 }
 
 impl SqliteReplicationStoreTransaction {
-    fn new(connection: SqliteStoreTransaction, kind: SqliteReplicationTransactionKind) -> Self {
+    fn new(
+        connection: SqliteStoreTransaction,
+        kind: SqliteReplicationTransactionKind,
+        transaction_id: StoreTransactionId,
+    ) -> Self {
         Self {
+            transaction_id,
             connection: Some(connection),
             kind,
         }
@@ -550,6 +597,10 @@ enum SqliteReplicationTransactionKind {
 }
 
 impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
+    fn transaction_id(&self) -> StoreTransactionId {
+        self.transaction_id
+    }
+
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,

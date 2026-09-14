@@ -219,6 +219,44 @@ fn third_member() -> MemberIdentity {
 }
 
 #[test]
+fn sqlite_transactions_have_distinct_stable_identities() {
+    let first_store = in_memory_store(local_member());
+    let second_store = in_memory_store(local_member());
+    wait_for_store_future(async {
+        let first = first_store
+            .begin_read_transaction()
+            .await
+            .expect("first transaction should start");
+        let second = first_store
+            .begin_read_transaction()
+            .await
+            .expect("second transaction should start");
+        let other_pool = second_store
+            .begin_read_transaction()
+            .await
+            .expect("transaction from second pool should start");
+
+        assert_eq!(first.transaction_id(), first.transaction_id());
+        assert_ne!(first.transaction_id(), second.transaction_id());
+        assert_ne!(first.transaction_id(), other_pool.transaction_id());
+        assert_ne!(second.transaction_id(), other_pool.transaction_id());
+
+        first
+            .release()
+            .await
+            .expect("first transaction should release");
+        second
+            .release()
+            .await
+            .expect("second transaction should release");
+        other_pool
+            .release()
+            .await
+            .expect("transaction from second pool should release");
+    });
+}
+
+#[test]
 fn sqlite_store_close_is_idempotent_and_rejects_new_operations() {
     let store = in_memory_store(local_member());
 

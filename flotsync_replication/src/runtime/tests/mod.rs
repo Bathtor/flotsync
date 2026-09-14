@@ -131,6 +131,7 @@ use crate::{
         StoreErrorScope,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        StoreTransactionId,
         SummaryRequest,
         TrustPolicy,
         WritableReplicationGroupVersionRecord,
@@ -485,6 +486,7 @@ where
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
+                standalone_transaction_id: StoreTransactionId::new_random(),
                 inner: Some(FailingStoreTransactionInner::Write(inner)),
                 control,
                 hide_local_private_keys,
@@ -524,6 +526,7 @@ where
         async move {
             let inner = inner.begin_read_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
+                standalone_transaction_id: StoreTransactionId::new_random(),
                 inner: Some(FailingStoreTransactionInner::Read(inner)),
                 hide_local_private_keys,
                 control,
@@ -624,6 +627,8 @@ impl std::ops::DerefMut for FailingStoreTransactionInner {
 
 /// Read or write transaction wrapper sharing the store's failure controls.
 struct FailingStoreTransaction {
+    /// Identity for tests without an underlying transaction.
+    standalone_transaction_id: StoreTransactionId,
     /// Actual store transaction, absent only in deterministic provider unit tests.
     inner: Option<FailingStoreTransactionInner>,
     /// Whether this transaction emulates an absent local-private key record.
@@ -665,6 +670,14 @@ impl FailingStoreTransaction {
 }
 
 impl ReplicationStoreReadTransaction for FailingStoreTransaction {
+    fn transaction_id(&self) -> StoreTransactionId {
+        self.inner
+            .as_ref()
+            .map_or(self.standalone_transaction_id, |inner| {
+                inner.transaction_id()
+            })
+    }
+
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -1650,6 +1663,7 @@ pub(in crate::runtime) fn provider_test_read_transaction(
 ) {
     let state = Arc::new(Mutex::new(ProviderTestTransactionState::default()));
     let transaction = FailingStoreTransaction {
+        standalone_transaction_id: StoreTransactionId::new_random(),
         inner: None,
         hide_local_private_keys: false,
         control: Arc::new(Mutex::new(FailingStoreControlState::default())),
