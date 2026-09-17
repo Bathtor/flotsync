@@ -77,14 +77,20 @@ use crate::{
         LocalMemberPrivateKeysRecord,
         LocalStoreSecretProfile,
         MemberKeyId,
+        MemberKeyPageKey,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberKeyTrustEvidenceSet,
         MemberKeyTrustRequirement,
+        MemberPublicKeyPredicate,
         MemberPublicKeysRecord,
         MigrationId,
         MigrationProposal,
         MigrationProposalResponder,
+        OwnedPageBatchInput,
+        PageBatch,
+        PageCursor,
+        PageError,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
@@ -100,6 +106,7 @@ use crate::{
         ReplicationEventListener,
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
+        ReplicationGroupPredicate,
         ReplicationGroupRecord,
         ReplicationGroupSnapshot,
         ReplicationGroupView,
@@ -688,6 +695,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_replication_group(group_id)
     }
 
+    fn load_replication_groups_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>, GroupId>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<ReplicationGroupRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_groups_into(cursor, batch)
+    }
+
     fn load_replication_groups(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
@@ -701,6 +719,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_groups()
+    }
+
+    fn load_writable_replication_group_versions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<WritableReplicationGroupVersionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_writable_replication_group_versions_into(cursor, batch)
     }
 
     fn load_writable_replication_group_versions(
@@ -765,6 +797,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_member_public_keys(key_id)
     }
 
+    fn load_member_public_key_ids_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), MemberKeyPageKey>,
+        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<MemberKeyId>, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_key_ids_into(cursor, batch)
+    }
+
     fn load_member_public_key_ids(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
@@ -772,6 +815,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_member_public_key_ids()
+    }
+
+    fn load_member_public_keys_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>, MemberKeyPageKey>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<MemberPublicKeysRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_keys_into(cursor, batch)
     }
 
     fn load_member_public_keys_for_member<'a>(
@@ -792,6 +846,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_member_public_keys_for_fingerprint(fingerprint)
+    }
+
+    fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId, String>,
+        batch: &'call mut dyn PageBatch<
+            Input = OwnedPageBatchInput<MemberKeyTrustEvidenceKind>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_key_trust_evidence_into(cursor, batch)
     }
 
     fn load_member_key_trust_evidence<'a>(
@@ -1015,6 +1083,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .scan_dataset_row_transition_batch(previous_group, current_group, after, limit, output)
     }
 
+    fn load_pending_group_decisions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupDecisionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_decisions_into(cursor, batch)
+    }
+
     fn load_pending_group_decisions(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
@@ -1032,6 +1114,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_pending_group_decision(group_id)
+    }
+
+    fn load_pending_group_activations_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupActivationRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_activations_into(cursor, batch)
     }
 
     fn load_pending_group_activations(

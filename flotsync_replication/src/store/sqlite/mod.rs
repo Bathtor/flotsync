@@ -17,15 +17,23 @@ use crate::{
         LocalIdentityProvisioningStore,
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
+        MemberKeyPageKey,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
-        MemberKeyTrustEvidenceSet,
+        MemberPublicKeyPredicate,
         MemberPublicKeysRecord,
+        OwnedPageBatchInput,
+        PageAttempt,
+        PageBatch,
+        PageCursor,
+        PageError,
+        PageLimit,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
+        ReplicationGroupPredicate,
         ReplicationGroupRecord,
         ReplicationRowMetadata,
         ReplicationRowStateSnapshot,
@@ -608,25 +616,34 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
-    fn load_replication_groups(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
+    fn load_replication_groups_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>, GroupId>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, ReplicationGroupRecord>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            groups::load_replication_groups_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
     }
 
-    fn load_writable_replication_group_versions(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>> {
-        async move { load_writable_replication_group_versions(self.assert_open_connection()).await }
-            .boxed()
-    }
-
-    fn load_replication_groups_for_ids<'a>(
+    fn load_writable_replication_group_versions_into<'a>(
         &'a mut self,
-        group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
-            .boxed()
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, WritableReplicationGroupVersionRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            groups::load_writable_replication_group_versions_into(
+                self.assert_open_connection(),
+                page,
+            )
+            .await
+        }
+        .boxed()
     }
 
     fn load_group_dataset_schema<'a>(
@@ -661,37 +678,43 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
     }
 
-    fn load_member_public_key_ids(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
-        async move { load_member_public_key_ids(self.assert_open_connection()).await }.boxed()
-    }
-
-    fn load_member_public_keys_for_member<'a>(
+    fn load_member_public_key_ids_into<'a>(
         &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
-        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
-            .boxed()
-    }
-
-    fn load_member_public_keys_for_fingerprint<'a>(
-        &'a mut self,
-        fingerprint: &'a KeyFingerprint,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        cursor: &'a mut PageCursor<(), MemberKeyPageKey>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, MemberKeyId>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_member_public_keys_for_fingerprint(self.assert_open_connection(), fingerprint)
-                .await
+            let page = cursor.begin_page(transaction_id, batch)?;
+            security::load_member_public_key_ids_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
 
-    fn load_member_key_trust_evidence<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
-        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
-            .boxed()
+    fn load_member_public_keys_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>, MemberKeyPageKey>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, MemberPublicKeysRecord>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            security::load_member_public_keys_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId, String>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, MemberKeyTrustEvidenceKind>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            security::load_member_key_trust_evidence_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
     }
 
     fn is_key_fingerprint_blocked<'a>(
@@ -783,10 +806,18 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_pending_group_decisions(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
-        async move { load_pending_group_decisions(self.assert_open_connection()).await }.boxed()
+    fn load_pending_group_decisions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, PendingGroupDecisionRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            pending_groups::load_pending_group_decisions_into(self.assert_open_connection(), page)
+                .await
+        }
+        .boxed()
     }
 
     fn load_pending_group_decision<'a>(
@@ -797,10 +828,18 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_pending_group_activations(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
-        async move { load_pending_group_activations(self.assert_open_connection()).await }.boxed()
+    fn load_pending_group_activations_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, PendingGroupActivationRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page(transaction_id, batch)?;
+            pending_groups::load_pending_group_activations_into(self.assert_open_connection(), page)
+                .await
+        }
+        .boxed()
     }
 
     fn load_pending_group_activation<'a>(
@@ -1032,6 +1071,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 
 type SqliteStoreConnection = SqliteConnection;
 type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
+/// Page batch shape used by SQLite metadata queries which accept owned records
+/// and produce no query-specific metadata.
+type OwnedNoMetadataPageBatch<'a, Record> =
+    dyn PageBatch<Input = OwnedPageBatchInput<Record>, Metadata = ()> + 'a;
 
 const GROUP_LIFECYCLE_OPEN_SQL: &str = "open";
 const GROUP_LIFECYCLE_READ_ONLY_SQL: &str = "read_only";
@@ -1207,6 +1250,7 @@ async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(),
 
 mod error;
 mod groups;
+mod paging;
 mod pending_groups;
 mod reliable_delivery;
 mod rows;
@@ -1224,6 +1268,7 @@ use error::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use groups::*;
+use paging::{push_page_order_and_limit, push_text_page_window, push_text_window};
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."

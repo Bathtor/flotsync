@@ -1,5 +1,7 @@
 //! Shared helpers for compile-time assertions and compact test fixtures.
 
+use std::fmt::Debug;
+
 /// A constant with all possible boolean values.
 pub const BOOLEAN_DOMAIN: [bool; 2] = [true, false];
 
@@ -39,6 +41,39 @@ pub fn assert_send<T: Send + ?Sized>() {}
 
 /// Require one named application-facing type to support shared access.
 pub fn assert_sync<T: Sync + ?Sized>() {}
+
+/// Assert that two slices contain equal values with equal multiplicities.
+///
+/// Element order may differ. The comparison only requires [`PartialEq`] and
+/// therefore uses a quadratic search suitable for test assertions.
+///
+/// # Panics
+///
+/// Panics when the slices have different lengths or an expected value cannot be
+/// matched to a distinct actual value.
+pub fn assert_unordered_eq<T>(actual: &[T], expected: &[T])
+where
+    T: Debug + PartialEq,
+{
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "unordered collections have different lengths; actual: {actual:?}; expected: {expected:?}"
+    );
+    let mut unmatched = actual.iter().collect::<Vec<_>>();
+    for expected_value in expected {
+        let position = unmatched
+            .iter()
+            .position(|actual_value| *actual_value == expected_value);
+        if let Some(position) = position {
+            unmatched.swap_remove(position);
+        } else {
+            panic!(
+                "missing expected collection value {expected_value:?}; actual values: {actual:?}"
+            );
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! svec16 {
@@ -130,5 +165,21 @@ impl<T: Copy, const N: usize> FromIterator<T> for SmallVec<T, N> {
 
         out.len = i;
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unordered_equality_accepts_distinct_orders() {
+        assert_unordered_eq(&[1, 2, 3], &[3, 1, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing expected collection value")]
+    fn unordered_equality_respects_multiplicity() {
+        assert_unordered_eq(&[1, 1, 2], &[1, 2, 2]);
     }
 }

@@ -1,0 +1,63 @@
+id = "01a0a36d-6908-7213-936e-f0ef7b3daa00"
+ref = "flotsync-o3o"
+title = "Make paging continuations backend-opaque"
+body = """
+Problem
+
+The current PageCursor<Params, Key> contract assumes that a Rust Key ordering can reproduce the ordering used by every storage engine. That is not generally valid: database collations, composite index semantics, backend-specific tie-breakers, and server-side cursors may not have an equivalent Rust Ord implementation. The caller should know that paging is stable without observing or defining the backend continuation order.
+
+Status
+
+Planning only. Do not implement until the API direction is aligned. This task was split from flotsync-h3l.2 so the current metadata paging change can be reviewed independently.
+
+Required contract
+
+C01. Each backend supplies a deterministic total order for a pageable operation within the bound transaction.
+C02. The backend continuation resumes strictly after the final successfully accepted source record in that engine-defined order.
+C03. Continuation state is opaque to the page caller and must not borrow the transaction between calls.
+C04. Shared paging machinery continues to enforce transaction binding, limits, batch clearing, completion, failure, and cancellation.
+C05. The shared contract must not require Ord or claim to validate ordering it cannot reproduce.
+C06. Logical fields such as GroupId or MemberKeyId may remain advisory order hints, but do not define the backend order or all tie-breakers.
+C07. Preserve object-safe store traits, rotated batches and limits, complete-result conveniences, and wrapper forwarding.
+C08. Backend contract tests verify termination, completeness, no duplication, filters, exact-limit continuation, and backend-specific collation boundaries.
+
+Option O01: typed, type-erased continuation
+
+Keep a caller-owned generic cursor shell. On begin_page, the backend selects a private Send + static continuation type. The cursor erases it between calls and PageAttempt exposes it with the backend-selected type. PageAttempt::push accepts the continuation corresponding to the accepted record and stores the latest value without comparing it. Bind the continuation type on first use so a different backend or operation cannot resume the cursor accidentally.
+
+This is the current preferred option. It preserves typed backend implementation code, requires no serialisation, supports composite keys and server cursor handles, and keeps backend representation opaque to callers.
+
+Option O02: opaque byte continuation
+
+Store an owned byte token and expose byte slices to backend implementations. This makes the cursor representation simple and serialisable, but requires every backend to define a codec, creates malformed-token failure paths, allocates encoded state, and weakens protection against mixing continuation formats. Cursor serialisation is not currently required.
+
+Option O03: backend-owned cursor state
+
+Explore making the entire PageCursor opaque and owned by the backend rather than only erasing its continuation. Compare at least two shapes:
+
+- a caller-owned public cursor wrapper lazily initialised with a completely backend-defined boxed state;
+- a store or transaction cursor factory returning a backend cursor object which owns parameters, continuation, and page lifecycle state.
+
+Evaluate object safety, transaction binding, whether the cursor may outlive an individual page call without borrowing the transaction, cancellation cleanup, wrapper composition, discoverability of paged and complete methods, and support for rotating PageBatch implementations. Determine whether backend ownership removes enough shared complexity to justify cursor factories and additional trait objects.
+
+Logical order hints
+
+Evaluate retaining PageCursor<Params, OrderHint> with OrderHint as a non-owning phantom marker and no Ord bound. It can communicate a preferred logical leading field and preserve useful API distinctions without constraining backend comparison. Also evaluate omitting the hint from the type entirely and documenting preferred fields on each store method.
+
+Expected implementation impact
+
+The typed erased-continuation design is estimated at 180-300 changed Rust LOC including contract tests and SQLite adaptation. A fully backend-owned cursor design is likely 250-500 changed Rust LOC because it changes construction and forwarding APIs. Either direction should remain below 1,000 LOC, but it must be completed before later paging children depend further on the current key-ordered contract.
+
+Validation expectations
+
+Add shared lifecycle tests for opaque continuation installation, resumption, type mismatch, exact-limit pages, cancellation, and rotated batches. Update reusable backend tests to bound page-call counts and assert complete content without relying on Rust ordering. Retain backend-specific collation regression coverage. Run focused paging and SQLite tests, the complete replication library suite, documentation tests, rustfmt, and all-target pedantic Clippy. Leave changes unstaged for review."""
+status = "open"
+type = "task"
+priority = 0
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-15T04:57:31.656937Z"
+updated_at = "2026-09-15T04:57:41.960405Z"
+
+[[links]]
+target = "01a099f7-5ef6-7451-b756-e6f2a0fca0fb"
+label = "discovered from"

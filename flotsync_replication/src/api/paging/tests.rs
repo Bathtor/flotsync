@@ -80,7 +80,7 @@ fn bounded_pages_advance_exclusively_and_require_a_final_empty_page() {
 }
 
 #[test]
-fn exhausted_cursor_clears_and_completes_each_new_batch() {
+fn exhausted_cursor_reuse_clears_the_batch_and_returns_an_error() {
     let mut cursor: PageCursor<(), u32> = PageCursor::new(());
     let mut batch = VecPageBatch::<u32, &str>::unlimited();
     {
@@ -90,13 +90,12 @@ fn exhausted_cursor_clears_and_completes_each_new_batch() {
     PageBatch::push(&mut batch, 99).unwrap();
     assert_eq!(batch.values(), &[99]);
 
-    {
-        let page = cursor.begin_page(TRANSACTION_A, &mut batch).unwrap();
-        assert!(page.is_exhausted());
-        page.finish("repeated").unwrap();
-    }
+    assert!(matches!(
+        cursor.begin_page(TRANSACTION_A, &mut batch),
+        Err(PageError::CursorExhausted)
+    ));
     assert!(batch.is_empty());
-    assert_eq!(batch.metadata(), Some(&"repeated"));
+    assert_eq!(batch.metadata(), None);
     assert!(cursor.is_exhausted());
 }
 
@@ -114,6 +113,42 @@ fn unlimited_batch_consumes_remaining_records() {
     assert_eq!(batch.values(), &[1, 2, 3, 4]);
     assert_eq!(batch.metadata(), Some(&()));
     assert!(cursor.is_exhausted());
+}
+
+#[test]
+fn unlimited_batch_accepts_backend_order_and_checks_an_existing_lower_bound() {
+    let mut cursor = PageCursor::new(());
+    let mut bounded = VecPageBatch::<u32, ()>::bounded(NonZeroUsize::new(1).unwrap());
+    {
+        let mut page = cursor.begin_page(TRANSACTION_A, &mut bounded).unwrap();
+        page.push(2, 2).unwrap();
+        page.finish(()).unwrap();
+    }
+
+    let mut unlimited = VecPageBatch::<u32, ()>::unlimited();
+    {
+        let mut page = cursor.begin_page(TRANSACTION_A, &mut unlimited).unwrap();
+        page.push(4, 4).unwrap();
+        page.push(3, 3).unwrap();
+        page.finish(()).unwrap();
+    }
+    assert_eq!(unlimited.values(), &[4, 3]);
+    assert!(cursor.is_exhausted());
+
+    let mut cursor = PageCursor::new(());
+    let mut bounded = VecPageBatch::<u32, ()>::bounded(NonZeroUsize::new(1).unwrap());
+    {
+        let mut page = cursor.begin_page(TRANSACTION_A, &mut bounded).unwrap();
+        page.push(2, 2).unwrap();
+        page.finish(()).unwrap();
+    }
+    let mut unlimited = VecPageBatch::<u32, ()>::unlimited();
+    let error = {
+        let mut page = cursor.begin_page(TRANSACTION_A, &mut unlimited).unwrap();
+        page.push(1, 1)
+            .expect_err("record below the lower bound must fail")
+    };
+    assert!(matches!(error, PageError::NonIncreasingKey { .. }));
 }
 
 #[test]
@@ -177,7 +212,7 @@ fn dropped_attempt_clears_output_and_metadata_and_fails_cursor() {
 #[test]
 fn contract_and_batch_failures_invalidate_and_clear() {
     let mut cursor = PageCursor::new(());
-    let mut batch = VecPageBatch::<u32, ()>::unlimited();
+    let mut batch = VecPageBatch::<u32, ()>::bounded(NonZeroUsize::new(2).unwrap());
     {
         let mut page = cursor.begin_page(TRANSACTION_A, &mut batch).unwrap();
         page.push(2, 2).unwrap();
@@ -223,6 +258,29 @@ fn store_failure_preserves_classification_and_attempt_cleanup() {
     assert_eq!(error.store_error_classification(), Some(classification));
     assert!(batch.is_empty());
     assert!(cursor.is_failed());
+}
+
+#[test]
+fn page_errors_convert_to_store_errors_without_hiding_backend_failures() {
+    let classification = StoreErrorClassification::UNKNOWN
+        .with_scope(StoreErrorScope::Store)
+        .with_class(StoreErrorClass::Unavailable)
+        .with_resolution(StoreErrorResolution::Retry);
+    let backend = StoreError::new(
+        classification,
+        std::io::Error::other("preserved backend failure"),
+    );
+    let converted: StoreError = PageError::from_store_error(backend).into();
+    assert_eq!(converted.classification(), classification);
+    assert!(converted.to_string().contains("preserved backend failure"));
+
+    let contract: StoreError = PageError::PageLimitExceeded.into();
+    assert_eq!(contract.classification().class, StoreErrorClass::Contract);
+    assert_eq!(contract.classification().scope, StoreErrorScope::Operation);
+    assert_eq!(
+        contract.classification().resolution,
+        StoreErrorResolution::FixBug
+    );
 }
 
 #[test]

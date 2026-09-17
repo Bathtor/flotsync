@@ -28,6 +28,9 @@ pub enum PageError {
         expected: StoreTransactionId,
         actual: StoreTransactionId,
     },
+    /// This cursor has already reached the end of its query.
+    #[snafu(display("Page cursor is already exhausted."))]
+    CursorExhausted,
     /// An earlier unfinished or failed fill invalidated this cursor.
     #[snafu(display("Page cursor is invalid after an earlier unsuccessful fill."))]
     CursorFailed,
@@ -42,14 +45,6 @@ pub enum PageError {
     /// A page attempt or fixed-capacity batch received an input beyond its limit.
     #[snafu(display("Page record limit exceeded."))]
     PageLimitExceeded,
-    /// The backend attempted to append to an exhausted cursor.
-    #[snafu(display(
-        "Page backend returned a record after the cursor was exhausted in transaction {transaction_id}."
-    ))]
-    RecordAfterExhaustion {
-        /// Transaction in which the cursor was already exhausted.
-        transaction_id: StoreTransactionId,
-    },
 }
 
 impl PageError {
@@ -72,15 +67,30 @@ impl StoreErrorClassificationSource for PageError {
             Self::Store { source } => Some(source.classification()),
             Self::BatchPush { .. } => None,
             Self::TransactionMismatch { .. }
+            | Self::CursorExhausted
             | Self::CursorFailed
             | Self::NonIncreasingKey { .. }
-            | Self::PageLimitExceeded
-            | Self::RecordAfterExhaustion { .. } => Some(
+            | Self::PageLimitExceeded => Some(
                 StoreErrorClassification::UNKNOWN
                     .with_scope(StoreErrorScope::Operation)
                     .with_class(StoreErrorClass::Contract)
                     .with_resolution(StoreErrorResolution::FixBug),
             ),
         }
+    }
+}
+
+impl From<PageError> for StoreError {
+    fn from(error: PageError) -> Self {
+        match error {
+            PageError::Store { source } => source,
+            error => Self::from_classification_source(error),
+        }
+    }
+}
+
+impl From<StoreError> for PageError {
+    fn from(source: StoreError) -> Self {
+        Self::from_store_error(source)
     }
 }

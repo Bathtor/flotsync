@@ -2,39 +2,126 @@ id = "01a099f7-5ef6-7451-b756-e6f2a0fca0fb"
 ref = "flotsync-h3l.2"
 title = "Page store metadata collections"
 body = """
-Scope (AJ2)
-Adopt the shared protocol for groups/progress, member keys/trust evidence and pending decisions/activations. Estimate: 450-750 changed Rust LOC. Blocked by flotsync-h3l.1 (shared foundation). This deliberately tests generality before update consumers are converted.
+Scope
 
-Starting points
-flotsync_replication/src/api/store.rs: load_replication_groups, load_writable_replication_group_versions, load_replication_groups_for_ids, load_member_public_key_ids, load_member_public_keys_for_member, load_member_public_keys_for_fingerprint, load_member_key_trust_evidence, load_pending_group_decisions and load_pending_group_activations. SQLite implementations are under store/sqlite/; wrappers under runtime/tests/mod.rs. Find all callers using rg rather than assuming this list covers them.
+Adopt the shared paging protocol for replication groups and progress, member keys and trust evidence, and pending decisions and activations. This child tests the common paging foundation across several metadata shapes before rows and replication updates are converted.
 
-Work
-Provide one paged method per logical query family with immutable ordinary selection data, reusing the shared cursor/helper and batch protocol. Preserve current lifecycle/member/fingerprint/ID selection semantics. Use deterministic unique keys: GroupId for groups, canonical member-key identity for keys, canonical evidence identity for evidence, and unique pending-work key for pending work. Document tie-breakers explicitly. Preserve missing-ID omission where that is the existing groups-for-IDs contract.
-Adapt existing callers or maintain clearly documented complete-result conveniences through unlimited batches where useful; do not leave a fake limit-only pagination surface or duplicate backend traversal implementation. Do not redesign unrelated key/trust semantics.
-Create reusable store-contract test infrastructure driven by backend setup so SQLite and test implementations can execute the same ordering/continuation assertions. Subsequent children should extend this instead of creating isolated copies.
+Current foundation
 
-Acceptance
-Exercise at least multiple metadata families with the same machinery, including filtered selection, empty results, ties in non-unique fields, exact boundaries, continued reads interleaved with other transaction work and full-result equivalence. Verify all affected wrappers and callers compile and preserve existing semantics. Document any intentional complete-result convenience. Leave rows, updates and delivery conversion to their designated children.
+Use PageCursor::begin_page with the object-safe PageBatch contract, PageLimit::Max or Unlimited, batch-owned metadata, and cursor-owned continuation and lifecycle. Page methods return PageError. Paging counts successful source-record pushes independently from retained output count. StoreTransactionId binds a cursor to one transaction.
 
-Agreed context and API contract
+P201. Public store API
 
-This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+Keep each batch-filling method immediately beside its complete-result convenience. Name batch-filling methods load_*_into. The complete method uses an unlimited identity VecPageBatch, preserves the existing method name and StoreError boundary, and relies on normal type inference in simple cases.
 
-Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+Provide batch-filling methods for selected replication groups, writable group versions, member-key identities, member public keys selected by member or fingerprint, trust evidence for one MemberKeyId, pending decisions, and pending activations. Preserve exact-record methods and missing-ID omission.
 
-ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+Spell concrete PageCursor parameter and continuation types at use sites rather than query-specific cursor aliases. Name filters as predicates: ReplicationGroupPredicate with All and GroupIdIn, and MemberPublicKeyPredicate with MemberEq and FingerprintEq. Predicate values may borrow caller-owned sets or identities.
 
-Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+P202. Page lifecycle and ordering
 
-Validation and delivery
+PageCursor::begin_page returns PageAttempt directly. Supplying an exhausted cursor is a contract error represented by PageError::CursorExhausted; the batch is cleared and the cursor remains exhausted. Remove PageStart, the exhausted-metadata argument, and active-page adapters in tests and backends.
 
-Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
-"""
-status = "open"
+Resolve bounded versus unlimited comparison state once when an attempt begins. Bounded attempts compare against and advance from the current continuation. Unlimited attempts retain the initial lower bound without requiring ordering between records in the same fill. Finishing a full bounded page commits the final accepted key; shorter and unlimited fills exhaust the cursor.
+
+Use GroupId for groups and pending work. Temporarily use a composite member-key continuation whose Rust ordering matches SQLite ordering over serialised member_identity TEXT and key_fingerprint BLOB. TODO(flotsync-o3o) marks this temporary public key for the backend-opaque continuation redesign.
+
+Bounded fills require deterministic ascending backend order, ORDER BY, an exclusive lower bound, and LIMIT. Unlimited fills omit ORDER BY unless the API explicitly promises ordering; after a cursor continuation exists, every returned key must remain above it.
+
+P203. Borrowed predicates
+
+Keep separate call and predicate lifetimes on methods whose cursor stores borrowed predicate data. The predicate lifetime outlives each call lifetime, allowing one cursor to be borrowed mutably for successive page calls. Name both lifetimes explicitly for clarity. SQLite implementations mirror the public trait signatures.
+
+P204. Complete-result conveniences and errors
+
+Default complete-result methods construct borrowing predicates where applicable, use an unlimited identity VecPageBatch, invoke the matching load_*_into method once, and return retained values. Convert PageError to StoreError while preserving enclosed backend StoreError values unchanged.
+
+Trust-evidence loading temporarily collects into VecPageBatch and then populates MemberKeyTrustEvidenceSet. TODO(flotsync-yzq) marks the conversion for the custom-collection follow-up.
+
+P205. SQLite implementation boundary
+
+Implement ReplicationStoreReadTransaction methods in sqlite/mod.rs as the paging boundary: obtain the transaction identity, begin the page, and pass PageAttempt by value to groups.rs, security.rs, or pending_groups.rs. Query-module load_*_into helpers handle backend selection, decoding, pushes, and finish.
+
+Add a private lifetime-aware SQLite alias for dyn PageBatch with OwnedPageBatchInput<T> and unit metadata. Use it to shorten SQLite adapter and query-helper signatures. Keep the expanded PageBatch constraints in the public store API.
+
+P206. SQLite query construction
+
+Use SQLite-local query-builder helpers for the common single-column continuation window and for bounded ordering and limit application with composite continuations. Apply predicates before the window helper. SQL column and ordering fragments remain static backend-owned values. Match ReplicationGroupPredicate once, including empty GroupIdIn. Apply SQL ordering and limits only to bounded fills.
+
+P207. Wrappers and callers
+
+Forward all seven load_*_into methods through FailingStoreTransaction and preserve complete-group fault injection. Existing callers continue through complete-result conveniences. Update public backend contract helpers and all call sites.
+
+P208. Reusable backend contract support
+
+Expose metadata paging scenarios through public test support. Validate fixtures once, then use focused helpers for interleaved continuation, group predicates, writable progress, public-key predicates, trust evidence, pending work, and complete-result equivalence.
+
+Use multiplicity-aware unordered collection equality from flotsync_utils::testing and itertools tuple combinations for structured-versus-text member-order fixture checks.
+
+Cover bounded continuation, exhausted-cursor rejection, empty and exact-size final pages, filters, omitted missing IDs, composite member-key ties, pending-work keys, interleaved reads, rotated batches and limits, unlimited unordered fills, and complete-result equivalence.
+
+P209. Linked follow-up work
+
+flotsync-o3o redesigns continuation state so backend order is opaque and explores a fully backend-owned PageCursor.
+flotsync-yzq explores custom collection-backed batches to avoid intermediate Vec allocations.
+
+P210. Validation and delivery
+
+Run rustfmt, focused paging and metadata tests serially, the complete flotsync_replication and flotsync_utils library suites, documentation tests, and all-target pedantic Clippy. Inspect touched files for duplicated helpers. Leave Git index state untouched and do not close the issue without user agreement.
+
+Implementation estimate
+
+The remaining agreed review round is approximately 140-250 changed Rust LOC: 60-100 for lifecycle simplification, 40-80 for the private SQLite batch alias, and 40-70 for tests and documentation."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
 blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
 parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
 created_at = "2026-09-13T08:52:00.886254Z"
-updated_at = "2026-09-13T08:53:12.835515Z"
+updated_at = "2026-09-17T05:38:57.727274Z"
+closed_at = "2026-09-17T05:38:57.727274Z"
+
+[[comments]]
+id = "01a09fb8-bc93-74b0-9c46-b9e778a5ae30"
+author = "codex"
+body = "Plan agreed with two clarifications: keep every paged method immediately beside its complete-result convenience, and add SQL ordering only for bounded paging or an explicit ordering guarantee. Unlimited fills therefore validate only an existing cursor lower bound and may accept remaining records in backend order."
+created_at = "2026-09-14T11:41:19.379241Z"
+
+[[comments]]
+id = "01a09ff6-b725-7fe1-bbc7-4ddd9c71be94"
+author = "codex"
+body = "Implemented all seven metadata page methods and adjacent unlimited conveniences, conditional SQLite ordering and limits, wrapper forwarding, PageError conversion, and reusable metadata paging contract support. SQLite now exercises bounded continuation, empty and exact-size pages, selection filters and missing ids, composite key ties, interleaved cursors, rotated limits, pending work, and complete-result equivalence. Validation passed for 408 library tests, both integration test targets, documentation tests, rustfmt, and all-target pedantic Clippy."
+created_at = "2026-09-14T12:49:01.221575Z"
+
+[[comments]]
+id = "01a0a00e-0981-7522-97ec-25cba3d36a89"
+author = "codex"
+body = "Resolved review findings: member-key cursors now use canonical text plus fingerprint ordering consistent with SQLite; group and security query parameters avoid whole-value clones; test support now uses the folder module layout; nested fallible decoding was extracted; and the backend contract fixture exercises the text-versus-segment ordering boundary for both key-id and public-key pages. Focused contract tests, all 408 library tests, doctests, rustfmt, pedantic Clippy, and diff checks pass."
+created_at = "2026-09-14T13:14:29.633457Z"
+
+[[comments]]
+id = "01a0a3a4-908d-76f3-af09-45db06ff5ac1"
+author = "lkroll"
+body = "Review round agreed: remove cursor aliases, adopt predicate and load_*_into naming, allow borrowed cursor predicates, move page start to the SQLite adapter boundary, short-circuit exhausted cursors during begin, resolve key comparison policy once, extract SQLite paging query helpers, decompose metadata contract tests, and move multiplicity-aware unordered assertions to flotsync_utils. Add TODO(flotsync-o3o) at the temporary member-key continuation and TODO(flotsync-yzq) at the Vec-to-set trust-evidence conversion."
+created_at = "2026-09-15T05:57:46.253447Z"
+
+[[comments]]
+id = "01a0a3ba-fda4-7411-aebb-7d0b75c16a24"
+author = "lkroll"
+body = "Implemented the agreed review round. Page starts now return active-or-exhausted outcomes and resolve comparison policy once; public APIs use concrete borrowing predicate cursors and load_*_into names; SQLite adapters prepare attempts and share conditional continuation/order/limit helpers; metadata contract scenarios are decomposed; and multiplicity-aware unordered equality lives in flotsync_utils. TODO(flotsync-o3o) marks the temporary public continuation key and TODO(flotsync-yzq) marks the trust-evidence double allocation. Validation passed: rustfmt, all-target pedantic Clippy, focused paging and SQLite metadata tests, 408 replication library tests, 27 utility tests, and documentation tests. One initial full-suite run hit a transient existing runtime cleanup failure; that test passed in isolation and the complete fresh suite then passed."
+created_at = "2026-09-15T06:22:15.972793Z"
+
+[[comments]]
+id = "01a0add7-696a-74e0-b180-0fe69bd12770"
+author = "lkroll"
+body = "Implemented the final agreed review round. Exhausted cursor reuse now returns PageError::CursorExhausted; PageStart, exhausted metadata injection, and the test helper workaround are removed. Borrowing cursor APIs retain separately named call and predicate lifetimes. SQLite uses a private OwnedNoMetadataPageBatch alias while the public trait keeps expanded constraints. Validation passed for focused paging and SQLite metadata tests, 408 replication library tests, 27 utility tests, documentation tests, rustfmt, cargo check, and all-target pedantic Clippy. The first full replication run hit the previously observed runtime destructor-cleanup flake; the affected test passed alone and the complete fresh rerun passed."
+created_at = "2026-09-17T05:29:30.730209Z"
+
+[[comments]]
+id = "01a0ade0-103f-7012-9818-5eeab87b035f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-17T05:38:57.727274Z"

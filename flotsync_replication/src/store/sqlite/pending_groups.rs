@@ -53,29 +53,6 @@ pub(super) fn stored_pending_group_payload_from_row(
     })
 }
 
-pub(super) async fn load_pending_group_payloads(
-    connection: &mut SqliteStoreConnection,
-    state: PendingGroupWorkState,
-) -> Result<Vec<StoredPendingGroupPayload>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT state, work_kind, old_group_id, new_group_id, payload
-FROM pending_group_work
-WHERE state = ?1
-",
-    )
-    .bind(state.as_sql())
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-    let mut payloads = Vec::with_capacity(rows.len());
-    for row in rows {
-        let payload = stored_pending_group_payload_from_row(&row)?;
-        payloads.push(payload);
-    }
-    Ok(payloads)
-}
-
 pub(super) async fn load_pending_group_payload(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -111,21 +88,34 @@ WHERE new_group_id = ?1
     }
 }
 
-pub(super) async fn load_pending_group_decisions(
+pub(super) async fn load_pending_group_decisions_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<PendingGroupDecisionRecord>, StoreError> {
-    let payloads =
-        load_pending_group_payloads(connection, PendingGroupWorkState::AwaitingDecision).await?;
-    let mut records = Vec::with_capacity(payloads.len());
+    mut page: PageAttempt<
+        '_,
+        (),
+        GroupId,
+        OwnedNoMetadataPageBatch<'_, PendingGroupDecisionRecord>,
+    >,
+) -> Result<(), PageError> {
+    let after = page.after().copied();
+    let limit = page.limit();
+    let payloads = load_pending_group_payloads(
+        connection,
+        PendingGroupWorkState::AwaitingDecision,
+        after,
+        limit,
+    )
+    .await?;
     for stored in payloads {
+        let continuation = stored.key.new_group_id;
         let record = decode_stored_proto(
             "pending group decision",
             decode_pending_group_decision_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
-        records.push(record);
+        page.push(continuation, record)?;
     }
-    Ok(records)
+    page.finish(())
 }
 
 pub(super) async fn load_pending_group_decision(
@@ -149,21 +139,34 @@ pub(super) async fn load_pending_group_decision(
     Ok(Some(record))
 }
 
-pub(super) async fn load_pending_group_activations(
+pub(super) async fn load_pending_group_activations_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<PendingGroupActivationRecord>, StoreError> {
-    let payloads =
-        load_pending_group_payloads(connection, PendingGroupWorkState::AcceptedActivation).await?;
-    let mut records = Vec::with_capacity(payloads.len());
+    mut page: PageAttempt<
+        '_,
+        (),
+        GroupId,
+        OwnedNoMetadataPageBatch<'_, PendingGroupActivationRecord>,
+    >,
+) -> Result<(), PageError> {
+    let after = page.after().copied();
+    let limit = page.limit();
+    let payloads = load_pending_group_payloads(
+        connection,
+        PendingGroupWorkState::AcceptedActivation,
+        after,
+        limit,
+    )
+    .await?;
     for stored in payloads {
+        let continuation = stored.key.new_group_id;
         let record = decode_stored_proto(
             "pending group activation",
             decode_pending_group_activation_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
-        records.push(record);
+        page.push(continuation, record)?;
     }
-    Ok(records)
+    page.finish(())
 }
 
 pub(super) async fn load_pending_group_activation(
@@ -462,4 +465,31 @@ pub(super) fn validate_pending_group_payload_key(
             sql_key,
         },
     ))
+}
+
+/// Load one storage page for a single pending-work lifecycle state.
+async fn load_pending_group_payloads(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+    after: Option<GroupId>,
+    limit: PageLimit,
+) -> Result<Vec<StoredPendingGroupPayload>, StoreError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT state, work_kind, old_group_id, new_group_id, payload \
+         FROM pending_group_work WHERE state = ",
+    );
+    query_builder.push_bind(state.as_sql());
+    push_text_window(&mut query_builder, after.as_ref(), limit, "new_group_id");
+
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    let mut payloads = Vec::with_capacity(rows.len());
+    for row in rows {
+        let payload = stored_pending_group_payload_from_row(&row)?;
+        payloads.push(payload);
+    }
+    Ok(payloads)
 }

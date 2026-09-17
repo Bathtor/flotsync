@@ -6,10 +6,11 @@
 //! query metadata for inspection after the fill completes.
 //!
 //! Store implementations use the cursor to begin a [`PageAttempt`], select
-//! records after its exclusive lower bound, offer them in increasing key order,
-//! and finish the attempt with query metadata. Finishing commits the next
-//! continuation; dropping an unfinished attempt clears partial output and fails
-//! the cursor.
+//! records after its exclusive lower bound, offer them to the attempt, and
+//! finish with query metadata. Bounded fills use increasing key order so they
+//! can continue; unlimited fills consume the complete remainder and need no
+//! within-fill ordering. Finishing commits the next continuation; dropping an
+//! unfinished attempt clears partial output and fails the cursor.
 //!
 //! ```
 //! use flotsync_replication::{
@@ -24,20 +25,18 @@
 //!     stored: &[u32],
 //! ) -> Result<(), PageError> {
 //!     let mut page = cursor.begin_page(transaction_id, batch)?;
-//!     if !page.is_exhausted() {
-//!         let after = page.after().copied();
-//!         let maximum = match page.limit() {
-//!             PageLimit::Max(limit) => limit.get(),
-//!             PageLimit::Unlimited => usize::MAX,
-//!         };
-//!         let records = stored
-//!             .iter()
-//!             .copied()
-//!             .filter(|key| after.is_none_or(|after| *key > after))
-//!             .take(maximum);
-//!         for record in records {
-//!             page.push(record, record)?;
-//!         }
+//!     let after = page.after().copied();
+//!     let maximum = match page.limit() {
+//!         PageLimit::Max(limit) => limit.get(),
+//!         PageLimit::Unlimited => usize::MAX,
+//!     };
+//!     let records = stored
+//!         .iter()
+//!         .copied()
+//!         .filter(|key| after.is_none_or(|after| *key > after))
+//!         .take(maximum);
+//!     for record in records {
+//!         page.push(record, record)?;
 //!     }
 //!     page.finish(stored.len())
 //! }
@@ -237,12 +236,13 @@ impl<Params, Key> PageCursor<Params, Key> {
     ///
     /// The batch is cleared before the transaction association is checked. A
     /// transaction mismatch leaves the cursor usable with its original
-    /// transaction association.
+    /// transaction association. An exhausted cursor remains exhausted when the
+    /// rejected attempt returns an error.
     ///
     /// # Errors
     ///
-    /// Returns a contract error when the cursor is failed or belongs to another
-    /// transaction.
+    /// Returns a contract error when the cursor is exhausted, failed, or belongs
+    /// to another transaction.
     pub fn begin_page<'a, Batch>(
         &'a mut self,
         transaction_id: StoreTransactionId,
@@ -252,7 +252,25 @@ impl<Params, Key> PageCursor<Params, Key> {
         Key: Clone + Ord,
         Batch: PageBatch + ?Sized,
     {
-        PageAttempt::begin(self, transaction_id, batch)
+        batch.clear();
+        self.bind(transaction_id)?;
+        let after = match &self.position {
+            PagePosition::Ready(after) => Ok(after.clone()),
+            PagePosition::Exhausted => Err(PageError::CursorExhausted),
+            PagePosition::Failed => Err(PageError::CursorFailed),
+        }?;
+        let limit = batch.page_limit();
+        let key_progress = PageKeyProgress::new(limit, after);
+        Ok(PageAttempt {
+            cursor: self,
+            batch,
+            transaction_id,
+            limit,
+            state: PageAttemptState::Filling {
+                key_progress,
+                records: 0,
+            },
+        })
     }
 
     /// Bind an unused cursor or validate its existing transaction association.
@@ -274,11 +292,11 @@ impl<Params, Key> PageCursor<Params, Key> {
 /// Shared state machine used by backend page implementations.
 ///
 /// Begin an attempt through [`PageCursor::begin_page`] immediately before
-/// reading backend records. Return early when [`Self::is_exhausted`] is true,
-/// offer successive records whose keys form a strictly increasing sequence
-/// through [`Self::push`], and consume the attempt with [`Self::finish`].
-/// Dropping an unfinished filling attempt clears its batch and invalidates its
-/// cursor, including when asynchronous work is cancelled.
+/// reading backend records, offer selected records through [`Self::push`], and
+/// consume the attempt with [`Self::finish`]. Bounded attempts require
+/// increasing keys; unlimited attempts only require keys beyond an existing
+/// cursor continuation. Dropping an unfinished attempt clears its batch and
+/// invalidates its cursor, including when asynchronous work is cancelled.
 pub struct PageAttempt<'a, Params, Key, Batch>
 where
     Batch: PageBatch + ?Sized,
@@ -295,49 +313,11 @@ where
     state: PageAttemptState<Key>,
 }
 
-impl<'a, Params, Key, Batch> PageAttempt<'a, Params, Key, Batch>
+impl<Params, Key, Batch> PageAttempt<'_, Params, Key, Batch>
 where
     Key: Clone + Ord,
     Batch: PageBatch + ?Sized,
 {
-    /// Start one page fill on behalf of [`PageCursor::begin_page`].
-    ///
-    /// A transaction mismatch leaves the cursor usable with its original
-    /// transaction association.
-    ///
-    /// # Errors
-    ///
-    /// Returns a contract error when the cursor is failed or belongs to another
-    /// transaction.
-    fn begin(
-        cursor: &'a mut PageCursor<Params, Key>,
-        transaction_id: StoreTransactionId,
-        batch: &'a mut Batch,
-    ) -> Result<Self, PageError> {
-        batch.clear();
-        cursor.bind(transaction_id)?;
-        if matches!(cursor.position, PagePosition::Failed) {
-            Err(PageError::CursorFailed)
-        } else {
-            let state = if matches!(cursor.position, PagePosition::Exhausted) {
-                PageAttemptState::Exhausted
-            } else {
-                PageAttemptState::Filling {
-                    last_key: None,
-                    records: 0,
-                }
-            };
-            let limit = batch.page_limit();
-            Ok(Self {
-                cursor,
-                batch,
-                transaction_id,
-                limit,
-                state,
-            })
-        }
-    }
-
     /// Return the immutable query parameters for the backend selection.
     #[must_use]
     pub fn params(&self) -> &Params {
@@ -359,18 +339,12 @@ where
         self.limit
     }
 
-    /// Return `true` when the cursor was already exhausted before this fill.
-    #[must_use]
-    pub const fn is_exhausted(&self) -> bool {
-        matches!(self.state, PageAttemptState::Exhausted)
-    }
-
-    /// Offer the next source record in a strictly increasing key sequence.
+    /// Offer one source record selected for this fill.
     ///
-    /// This method maintains the page contract: keys advance strictly from the
-    /// cursor's exclusive continuation and from one successful push to the next;
-    /// the number of accepted source records does not exceed the sampled
-    /// maximum; and the cursor continuation remains unchanged until
+    /// For bounded fills, keys advance strictly from the cursor's exclusive
+    /// continuation and from one successful push to the next. Unlimited fills
+    /// may arrive in any order, but every key must remain beyond an existing
+    /// continuation. The cursor continuation remains unchanged until
     /// [`Self::finish`] commits the complete fill. Any failure clears values and
     /// metadata and invalidates the cursor.
     ///
@@ -384,13 +358,15 @@ where
         input: <Batch::Input as PageBatchInput>::Value<'_>,
     ) -> Result<(), PageError> {
         let validation = match &self.state {
-            PageAttemptState::Filling { last_key, records } => {
+            PageAttemptState::Filling {
+                key_progress,
+                records,
+            } => {
                 let limit_exceeded = self
                     .limit
                     .into_option()
                     .is_some_and(|limit| *records == limit.get());
-                let previous_key = last_key.as_ref().or_else(|| self.after());
-                let key_did_not_advance = previous_key.is_some_and(|previous| key <= *previous);
+                let key_did_not_advance = key_progress.rejects(&key);
                 if limit_exceeded {
                     Err(PageError::PageLimitExceeded)
                 } else if key_did_not_advance {
@@ -401,9 +377,6 @@ where
                     Ok(*records + 1)
                 }
             }
-            PageAttemptState::Exhausted => Err(PageError::RecordAfterExhaustion {
-                transaction_id: self.transaction_id,
-            }),
             PageAttemptState::Failed | PageAttemptState::Completed => Err(PageError::CursorFailed),
         };
 
@@ -411,13 +384,14 @@ where
             Ok(next_records) => match self.batch.push(input) {
                 Ok(()) => {
                     match &mut self.state {
-                        PageAttemptState::Filling { last_key, records } => {
-                            *last_key = Some(key);
+                        PageAttemptState::Filling {
+                            key_progress,
+                            records,
+                        } => {
+                            key_progress.accept(key);
                             *records = next_records;
                         }
-                        PageAttemptState::Exhausted
-                        | PageAttemptState::Failed
-                        | PageAttemptState::Completed => {
+                        PageAttemptState::Failed | PageAttemptState::Completed => {
                             unreachable!("validated page attempt must still be filling")
                         }
                     }
@@ -449,20 +423,19 @@ where
     pub fn finish(mut self, metadata: Batch::Metadata) -> Result<(), PageError> {
         let state = mem::replace(&mut self.state, PageAttemptState::Completed);
         match state {
-            PageAttemptState::Filling { last_key, records } => {
+            PageAttemptState::Filling {
+                key_progress,
+                records,
+            } => {
                 let filled_bounded_page = self
                     .limit
                     .into_option()
                     .is_some_and(|limit| records == limit.get());
                 self.cursor.position = if filled_bounded_page {
-                    PagePosition::Ready(last_key)
+                    PagePosition::Ready(key_progress.into_continuation())
                 } else {
                     PagePosition::Exhausted
                 };
-                self.batch.set_metadata(metadata);
-                Ok(())
-            }
-            PageAttemptState::Exhausted => {
                 self.batch.set_metadata(metadata);
                 Ok(())
             }
@@ -497,17 +470,67 @@ pub(super) fn accept_owned<Value>(value: Value) -> Result<Value, BoxError> {
 enum PageAttemptState<Key> {
     /// Records may be accepted; the key and count describe this fill only.
     Filling {
-        /// Last key accepted during this fill.
-        last_key: Option<Key>,
+        /// Comparison policy and key selected when the attempt began.
+        key_progress: PageKeyProgress<Key>,
         /// Number of source records accepted during this fill.
         records: usize,
     },
-    /// The cursor was already exhausted when the attempt began.
-    Exhausted,
     /// A batch or paging contract failure invalidated the cursor.
     Failed,
     /// `finish` committed the attempt and suppresses drop cleanup.
     Completed,
+}
+
+/// Key comparison and continuation behaviour selected for one page attempt.
+enum PageKeyProgress<Key> {
+    /// Bounded records must advance and each accepted key becomes the new bound.
+    Advancing(Option<Key>),
+    /// Unlimited records only compare against the cursor's initial lower bound.
+    FixedLowerBound(Option<Key>),
+}
+
+impl<Key> PageKeyProgress<Key> {
+    /// Select key behaviour from the sampled page limit.
+    fn new(limit: PageLimit, after: Option<Key>) -> Self {
+        match limit {
+            PageLimit::Max(_) => Self::Advancing(after),
+            PageLimit::Unlimited => Self::FixedLowerBound(after),
+        }
+    }
+
+    /// Return `true` when `key` does not satisfy this attempt's selected bound.
+    fn rejects(&self, key: &Key) -> bool
+    where
+        Key: Ord,
+    {
+        let previous = match self {
+            Self::Advancing(previous) | Self::FixedLowerBound(previous) => previous,
+        };
+        previous.as_ref().is_some_and(|previous| key <= previous)
+    }
+
+    /// Record an accepted key according to this attempt's continuation policy.
+    fn accept(&mut self, key: Key) {
+        match self {
+            Self::Advancing(previous) => *previous = Some(key),
+            Self::FixedLowerBound(_) => {
+                // Unlimited pages exhaust the cursor and need no new continuation.
+            }
+        }
+    }
+
+    /// Return the accepted continuation for a full bounded page.
+    ///
+    /// `Some` contains its final accepted key. `None` means the bounded page
+    /// accepted no records. Calling this for an unlimited page is a bug.
+    fn into_continuation(self) -> Option<Key> {
+        match self {
+            Self::Advancing(last_key) => last_key,
+            Self::FixedLowerBound(_) => {
+                unreachable!("only a bounded page can retain a continuation")
+            }
+        }
+    }
 }
 
 /// Lifecycle and exclusive lower bound for one cursor.

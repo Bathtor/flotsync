@@ -86,6 +86,12 @@ where
         &mut self.values
     }
 
+    /// Consume the batch and return its retained values.
+    #[must_use]
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
+    }
+
     /// Return metadata from the latest successful fill.
     ///
     /// `Some` contains successful-fill metadata. `None` means this batch is new,

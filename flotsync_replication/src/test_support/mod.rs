@@ -79,6 +79,10 @@ use std::{
     time::Duration,
 };
 
+mod metadata_paging;
+
+pub use metadata_paging::{MetadataPagingFixtures, assert_metadata_paging_contract};
+
 const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);

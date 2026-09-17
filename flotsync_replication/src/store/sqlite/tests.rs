@@ -26,7 +26,9 @@ use crate::{
     delivery::shared::MessageId,
     provision_local_identity,
     test_support::{
+        MetadataPagingFixtures,
         SqliteStoreTestOwner,
+        assert_metadata_paging_contract,
         test_public_member_keys,
         test_replication_security_secrets,
     },
@@ -1872,6 +1874,171 @@ fn sqlite_store_loads_only_writable_group_versions_without_ordering() {
         HashMap::from([(writable_group_id, expected_writable_versions)])
     );
     wait_for_store_future(transaction.release()).expect("transaction should release");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The shared metadata paging contract needs one coherently populated store fixture."
+)]
+fn sqlite_store_satisfies_metadata_paging_contract() {
+    let store = in_memory_store(local_member());
+    let provisioned_keys = wait_for_store_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should start");
+        let key_ids = transaction
+            .load_member_public_key_ids()
+            .await
+            .expect("provisioned key id should load");
+        let [key_id] = key_ids.as_slice() else {
+            panic!("freshly provisioned store should contain one member key: {key_ids:?}");
+        };
+        let record = transaction
+            .load_member_public_keys(key_id)
+            .await
+            .expect("provisioned public keys should load")
+            .expect("provisioned public keys should exist");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        record
+    });
+    let group_ids = [
+        GroupId(Uuid::from_u128(20_001)),
+        GroupId(Uuid::from_u128(20_002)),
+        GroupId(Uuid::from_u128(20_003)),
+    ];
+    let successor_group_id = GroupId(Uuid::from_u128(20_004));
+    let mut groups = group_ids.map(sample_group).to_vec();
+    let final_versions = groups[1].version_vector.clone();
+    groups[1].lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id,
+        final_versions: final_versions.clone(),
+    };
+    let writable_group_versions = [groups[0].clone(), groups[2].clone()]
+        .map(|group| WritableReplicationGroupVersionRecord {
+            group_id: group.group_id,
+            version_vector: group.version_vector,
+        })
+        .to_vec();
+
+    let first_tied_member_keys =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+    let mut second_tied_member_keys =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&third_member()));
+    second_tied_member_keys.key_id.member_id = remote_member();
+    let mut tied_fingerprint_keys = first_tied_member_keys.clone();
+    tied_fingerprint_keys.key_id.member_id = third_member();
+    let text_first_keys = MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(
+        &MemberIdentity::from_array(["app", "a-", "x"]),
+    ));
+    let mut text_second_keys = text_first_keys.clone();
+    text_second_keys.key_id.member_id = MemberIdentity::from_array(["app", "a", "x"]);
+    let member_public_keys = vec![
+        provisioned_keys,
+        text_first_keys.clone(),
+        text_second_keys.clone(),
+        first_tied_member_keys.clone(),
+        second_tied_member_keys.clone(),
+        tied_fingerprint_keys.clone(),
+    ];
+    let member_key_trust_evidence = vec![MemberKeyTrustEvidenceRecord {
+        key_id: first_tied_member_keys.key_id.clone(),
+        evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+    }];
+
+    let pending_group_decisions = vec![
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_001))),
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_002))),
+    ];
+    let pending_group_activations = vec![
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_003))).into_activation(),
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_004))).into_activation(),
+    ];
+
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        for group in groups.iter().cloned() {
+            let mut stored_group = group;
+            stored_group.lifecycle = ReplicationGroupLifecycle::Open;
+            transaction
+                .insert_replication_group(stored_group)
+                .await
+                .expect("paging group should store");
+        }
+        transaction
+            .update_replication_group_lifecycle(
+                &groups[1].group_id,
+                ReplicationGroupLifecycle::ReadOnly {
+                    successor_group_id,
+                    final_versions,
+                },
+            )
+            .await
+            .expect("paging group lifecycle should update");
+        for record in [
+            first_tied_member_keys,
+            second_tied_member_keys,
+            tied_fingerprint_keys,
+            text_first_keys,
+            text_second_keys,
+        ] {
+            transaction
+                .ensure_member_public_keys(record)
+                .await
+                .expect("paging public keys should store");
+        }
+        for record in member_key_trust_evidence.iter().cloned() {
+            transaction
+                .ensure_member_key_trust_evidence(record)
+                .await
+                .expect("paging trust evidence should store");
+        }
+        for record in pending_group_decisions.iter().cloned() {
+            let (material, _) = sample_group(record.group_id()).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("pending-decision group material should store");
+            transaction
+                .upsert_pending_group_decision(record)
+                .await
+                .expect("pending decision should store");
+        }
+        for record in pending_group_activations.iter().cloned() {
+            let (material, _) = sample_group(record.group_id()).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("pending-activation group material should store");
+            transaction
+                .upsert_pending_group_activation(record)
+                .await
+                .expect("pending activation should store");
+        }
+        transaction
+            .commit()
+            .await
+            .expect("paging fixtures should commit");
+    });
+
+    let fixtures = MetadataPagingFixtures {
+        groups,
+        writable_group_versions,
+        member_public_keys,
+        member_key_trust_evidence,
+        pending_group_decisions,
+        pending_group_activations,
+        missing_group_id: GroupId(Uuid::from_u128(29_999)),
+    };
+    wait_for_store_future(assert_metadata_paging_contract(store.as_ref(), &fixtures))
+        .expect("SQLite metadata paging contract should pass");
 }
 
 #[test]

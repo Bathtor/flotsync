@@ -84,33 +84,62 @@ WHERE group_id = ?1
     Ok(Some(group))
 }
 
-pub(super) async fn load_replication_groups(
+pub(super) async fn load_replication_groups_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<ReplicationGroupRecord>, StoreError> {
-    let group_ids = sqlx::query_scalar::<_, String>(
-        "
-SELECT group_id
-FROM replication_groups
-ORDER BY group_id
-",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-    let mut groups = Vec::with_capacity(group_ids.len());
-    for group_id in group_ids {
-        let group_id = decode_group_id(&group_id)?;
-        if let Some(group) = load_replication_group(connection, &group_id).await? {
-            groups.push(group);
+    mut page: PageAttempt<
+        '_,
+        ReplicationGroupPredicate<'_>,
+        GroupId,
+        OwnedNoMetadataPageBatch<'_, ReplicationGroupRecord>,
+    >,
+) -> Result<(), PageError> {
+    let mut query_builder =
+        QueryBuilder::<Sqlite>::new("SELECT group_id FROM replication_groups WHERE 1 = 1");
+    match page.params() {
+        ReplicationGroupPredicate::All => {
+            // No predicate is required when every group is selected.
+        }
+        ReplicationGroupPredicate::GroupIdIn(group_ids) if group_ids.is_empty() => {
+            return page.finish(());
+        }
+        ReplicationGroupPredicate::GroupIdIn(group_ids) => {
+            query_builder.push(" AND group_id IN (");
+            {
+                let mut separated = query_builder.separated(", ");
+                for group_id in *group_ids {
+                    separated.push_bind(group_id.to_string());
+                }
+            }
+            query_builder.push(")");
         }
     }
-    Ok(groups)
+    push_text_page_window(&mut query_builder, &page, "group_id");
+
+    let group_ids = query_builder
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    for raw_group_id in group_ids {
+        let group_id = decode_group_id(&raw_group_id)?;
+        let group = load_replication_group(connection, &group_id)
+            .await?
+            .expect("selected active group must remain present in its read transaction");
+        page.push(group_id, group)?;
+    }
+    page.finish(())
 }
 
-pub(super) async fn load_writable_replication_group_versions(
+pub(super) async fn load_writable_replication_group_versions_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<WritableReplicationGroupVersionRecord>, StoreError> {
-    let rows = sqlx::query(
+    mut page: PageAttempt<
+        '_,
+        (),
+        GroupId,
+        OwnedNoMetadataPageBatch<'_, WritableReplicationGroupVersionRecord>,
+    >,
+) -> Result<(), PageError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
 SELECT
     active.group_id,
@@ -120,15 +149,17 @@ SELECT
     material.member_count
 FROM replication_groups AS active
 JOIN replication_group_material AS material USING (group_id)
-WHERE active.lifecycle = ?1
-",
-    )
-    .bind(GROUP_LIFECYCLE_OPEN_SQL)
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
+WHERE active.lifecycle = ",
+    );
+    query_builder.push_bind(GROUP_LIFECYCLE_OPEN_SQL);
+    push_text_page_window(&mut query_builder, &page, "active.group_id");
 
-    let mut group_versions = Vec::with_capacity(rows.len());
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+
     for row in rows {
         let successor_group_id = row.get::<Option<String>, _>("successor_group_id");
         let final_versions = row.get::<Option<Vec<u8>>, _>("final_versions");
@@ -141,49 +172,13 @@ WHERE active.lifecycle = ?1
         let member_count = decode_non_zero_member_count(row.get::<i64, _>("member_count"))?;
         let version_vector =
             decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
-        group_versions.push(WritableReplicationGroupVersionRecord {
+        let record = WritableReplicationGroupVersionRecord {
             group_id,
             version_vector,
-        });
+        };
+        page.push(group_id, record)?;
     }
-    Ok(group_versions)
-}
-
-pub(super) async fn load_replication_groups_for_ids(
-    connection: &mut SqliteStoreConnection,
-    requested_group_ids: &HashSet<GroupId>,
-) -> Result<Vec<ReplicationGroupRecord>, StoreError> {
-    if requested_group_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut query_builder = QueryBuilder::<Sqlite>::new(
-        "
-SELECT group_id
-FROM replication_groups
-WHERE group_id IN (",
-    );
-    {
-        let mut separated = query_builder.separated(", ");
-        for group_id in requested_group_ids {
-            separated.push_bind(group_id.to_string());
-        }
-    }
-    query_builder.push(") ORDER BY group_id");
-
-    let group_ids = query_builder
-        .build_query_scalar::<String>()
-        .fetch_all(&mut *connection)
-        .await
-        .context(SqlxSnafu)?;
-    let mut groups = Vec::with_capacity(group_ids.len());
-    for group_id in group_ids {
-        let group_id = decode_group_id(&group_id)?;
-        if let Some(group) = load_replication_group(connection, &group_id).await? {
-            groups.push(group);
-        }
-    }
-    Ok(groups)
+    page.finish(())
 }
 
 pub(super) async fn load_group_schema(

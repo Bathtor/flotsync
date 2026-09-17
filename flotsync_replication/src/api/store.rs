@@ -457,6 +457,24 @@ pub enum DatasetRowStateWrite {
 /// Iterator used to stream requested row keys into one store transaction.
 pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
 
+/// Predicate applied when loading replication groups into a page batch.
+#[derive(Clone, Debug)]
+pub enum ReplicationGroupPredicate<'a> {
+    /// Every persisted replication group.
+    All,
+    /// Replication groups whose ids occur in this borrowed set.
+    GroupIdIn(&'a HashSet<GroupId>),
+}
+
+/// Predicate applied when loading member public keys into a page batch.
+#[derive(Clone, Debug)]
+pub enum MemberPublicKeyPredicate<'a> {
+    /// Public-key records whose member identity equals this borrowed value.
+    MemberEq(&'a MemberIdentity),
+    /// Every public-key record with this fingerprint.
+    FingerprintEq(KeyFingerprint),
+}
+
 /// Read-only transaction over one replication store implementation.
 ///
 /// Read transactions are release-on-drop. They are intended for consistent
@@ -476,17 +494,26 @@ pub trait ReplicationStoreReadTransaction: Send {
         group_id: &'a GroupId,
     ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
 
+    /// Load persisted replication groups selected by the cursor into `batch`.
+    fn load_replication_groups_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>, GroupId>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<ReplicationGroupRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
+
     /// Load all persisted replication groups currently known to the store.
     fn load_replication_groups(
         &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
-
-    /// Load ids and stored progress for all currently writable replication groups.
-    ///
-    /// Results have no ordering guarantee and exclude non-writable lifecycle states.
-    fn load_writable_replication_group_versions(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>>;
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(ReplicationGroupPredicate::All);
+            let mut batch = VecPageBatch::unlimited();
+            self.load_replication_groups_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load persisted replication groups whose ids are included in `group_ids`.
     ///
@@ -495,7 +522,43 @@ pub trait ReplicationStoreReadTransaction: Send {
     fn load_replication_groups_for_ids<'a>(
         &'a mut self,
         group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move {
+            let predicate = ReplicationGroupPredicate::GroupIdIn(group_ids);
+            let mut cursor = PageCursor::new(predicate);
+            let mut batch = VecPageBatch::unlimited();
+            self.load_replication_groups_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
+
+    /// Load ids and stored progress for writable replication groups into `batch`.
+    fn load_writable_replication_group_versions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<WritableReplicationGroupVersionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>>;
+
+    /// Load ids and stored progress for all currently writable replication groups.
+    ///
+    /// Results have no ordering guarantee and exclude non-writable lifecycle states.
+    fn load_writable_replication_group_versions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::unlimited();
+            self.load_writable_replication_group_versions_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load one dataset schema stored for a specific replication group.
     fn load_group_dataset_schema<'a>(
@@ -524,27 +587,95 @@ pub trait ReplicationStoreReadTransaction: Send {
         key_id: &'a MemberKeyId,
     ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
 
+    /// Load observed member-key identities into `batch` without key material.
+    fn load_member_public_key_ids_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), MemberKeyPageKey>,
+        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<MemberKeyId>, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>>;
+
     /// Load every observed member-key identity without returning public key material.
-    fn load_member_public_key_ids(&mut self)
-    -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>>;
+    fn load_member_public_key_ids(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::unlimited();
+            self.load_member_public_key_ids_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
+
+    /// Load public keys selected by the cursor predicate into `batch`.
+    fn load_member_public_keys_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>, MemberKeyPageKey>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<MemberPublicKeysRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Load every observed public key material record for one member identity.
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move {
+            let predicate = MemberPublicKeyPredicate::MemberEq(member_id);
+            let mut cursor = PageCursor::new(predicate);
+            let mut batch = VecPageBatch::unlimited();
+            self.load_member_public_keys_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load every observed public key material record for one key fingerprint.
     fn load_member_public_keys_for_fingerprint<'a>(
         &'a mut self,
         fingerprint: &'a KeyFingerprint,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move {
+            let predicate = MemberPublicKeyPredicate::FingerprintEq(*fingerprint);
+            let mut cursor = PageCursor::new(predicate);
+            let mut batch = VecPageBatch::unlimited();
+            self.load_member_public_keys_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
+
+    /// Load trust-evidence kinds for one exact member-key binding into `batch`.
+    fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId, String>,
+        batch: &'call mut dyn PageBatch<
+            Input = OwnedPageBatchInput<MemberKeyTrustEvidenceKind>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Load trust evidence for one exact member-key binding.
     fn load_member_key_trust_evidence<'a>(
         &'a mut self,
         key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>>;
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(key_id);
+            let mut batch = VecPageBatch::unlimited();
+            self.load_member_key_trust_evidence_into(&mut cursor, &mut batch)
+                .await?;
+            // TODO(flotsync-yzq): Populate this set through a collection-backed page batch.
+            let mut evidence = MemberKeyTrustEvidenceSet::empty();
+            for evidence_kind in batch.into_values() {
+                evidence.insert(evidence_kind);
+            }
+            Ok(evidence)
+        }
+        .boxed()
+    }
 
     /// Return whether a fingerprint is globally blocked.
     fn is_key_fingerprint_blocked<'a>(
@@ -657,10 +788,29 @@ pub trait ReplicationStoreReadTransaction: Send {
         .boxed()
     }
 
+    /// Load unresolved listener-mediated group decisions into `batch`.
+    fn load_pending_group_decisions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupDecisionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>>;
+
     /// Load all unresolved listener-mediated group decisions.
     fn load_pending_group_decisions(
         &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>>;
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::unlimited();
+            self.load_pending_group_decisions_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load the unresolved decision for one target group, if present.
     fn load_pending_group_decision<'a>(
@@ -668,10 +818,29 @@ pub trait ReplicationStoreReadTransaction: Send {
         group_id: &'a GroupId,
     ) -> BoxFuture<'a, Result<Option<PendingGroupDecisionRecord>, StoreError>>;
 
+    /// Load accepted group activations awaiting external activation into `batch`.
+    fn load_pending_group_activations_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<(), GroupId>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupActivationRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>>;
+
     /// Load all accepted group activations that are not externally active yet.
     fn load_pending_group_activations(
         &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>>;
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
+        async move {
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::unlimited();
+            self.load_pending_group_activations_into(&mut cursor, &mut batch)
+                .await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load accepted activation work targeting one group, if present.
     fn load_pending_group_activation<'a>(

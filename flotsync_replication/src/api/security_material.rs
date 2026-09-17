@@ -262,6 +262,43 @@ pub struct MemberKeyId {
     pub fingerprint: KeyFingerprint,
 }
 
+/// Continuation key for member-key collection pages.
+///
+/// Ordering compares the canonical textual member identity first and the raw
+/// fingerprint bytes second. This defines the collection order used by member
+/// key paging and matches the composite SQLite primary key.
+// TODO(flotsync-o3o): Remove this SQLite-shaped public key when continuations become backend-opaque.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MemberKeyPageKey {
+    /// Canonical textual representation of the member identity.
+    member_identity: String,
+    /// Fingerprint bytes ordered after the member identity.
+    fingerprint: KeyFingerprint,
+}
+
+impl MemberKeyPageKey {
+    /// Build the continuation key for one exact member-key binding.
+    #[must_use]
+    pub fn from_key_id(key_id: &MemberKeyId) -> Self {
+        Self {
+            member_identity: key_id.member_id.to_string(),
+            fingerprint: key_id.fingerprint,
+        }
+    }
+
+    /// Return the canonical member-identity text used for ordering.
+    #[must_use]
+    pub fn member_identity_text(&self) -> &str {
+        &self.member_identity
+    }
+
+    /// Return the fingerprint used for ordering within one member identity.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &KeyFingerprint {
+        &self.fingerprint
+    }
+}
+
 /// Public key material observed for one exact member-key binding.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemberPublicKeysRecord {

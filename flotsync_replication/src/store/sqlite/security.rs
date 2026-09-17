@@ -143,99 +143,80 @@ WHERE member_identity = ?1 AND key_fingerprint = ?2
     }))
 }
 
-pub(super) async fn load_member_public_key_ids(
+pub(super) async fn load_member_public_key_ids_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<MemberKeyId>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT member_identity, key_fingerprint
-FROM member_public_keys
-",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-
-    let mut key_ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        key_ids.push(MemberKeyId {
-            member_id: decode_member_identity(&row.get::<String, _>("member_identity"))?,
-            fingerprint: decode_key_fingerprint(&row.get::<Vec<u8>, _>("key_fingerprint"))?,
-        });
+    mut page: PageAttempt<'_, (), MemberKeyPageKey, OwnedNoMetadataPageBatch<'_, MemberKeyId>>,
+) -> Result<(), PageError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT member_identity, key_fingerprint FROM member_public_keys WHERE 1 = 1",
+    );
+    if let Some(after) = page.after() {
+        push_member_key_lower_bound(&mut query_builder, after);
     }
-    Ok(key_ids)
+    push_page_order_and_limit(
+        &mut query_builder,
+        page.limit(),
+        "member_identity, key_fingerprint",
+    );
+
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    for row in rows {
+        let key_id = decode_member_key_id(&row)?;
+        let page_key = MemberKeyPageKey::from_key_id(&key_id);
+        page.push(page_key, key_id)?;
+    }
+    page.finish(())
 }
 
-pub(super) async fn load_member_public_keys_for_member(
+pub(super) async fn load_member_public_keys_into(
     connection: &mut SqliteStoreConnection,
-    member_id: &MemberIdentity,
-) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT key_fingerprint, signing_public_key, encryption_public_key
-FROM member_public_keys
-WHERE member_identity = ?1
-ORDER BY key_fingerprint
-",
-    )
-    .bind(member_id.to_string())
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        let fingerprint = decode_key_fingerprint(&row.get::<Vec<u8>, _>("key_fingerprint"))?;
-        records.push(MemberPublicKeysRecord {
-            key_id: MemberKeyId {
-                member_id: member_id.clone(),
-                fingerprint,
-            },
-            signing_public_key: row
-                .get::<Vec<u8>, _>("signing_public_key")
-                .into_boxed_slice(),
-            encryption_public_key: row
-                .get::<Vec<u8>, _>("encryption_public_key")
-                .into_boxed_slice(),
-        });
+    mut page: PageAttempt<
+        '_,
+        MemberPublicKeyPredicate<'_>,
+        MemberKeyPageKey,
+        OwnedNoMetadataPageBatch<'_, MemberPublicKeysRecord>,
+    >,
+) -> Result<(), PageError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT member_identity, key_fingerprint, signing_public_key, encryption_public_key \
+         FROM member_public_keys WHERE ",
+    );
+    match page.params() {
+        MemberPublicKeyPredicate::MemberEq(member_id) => {
+            query_builder
+                .push("member_identity = ")
+                .push_bind(member_id.to_string());
+        }
+        MemberPublicKeyPredicate::FingerprintEq(fingerprint) => {
+            query_builder
+                .push("key_fingerprint = ")
+                .push_bind(fingerprint.as_ref().to_vec());
+        }
     }
-    Ok(records)
-}
-
-pub(super) async fn load_member_public_keys_for_fingerprint(
-    connection: &mut SqliteStoreConnection,
-    fingerprint: &KeyFingerprint,
-) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT member_identity, signing_public_key, encryption_public_key
-FROM member_public_keys
-WHERE key_fingerprint = ?1
-ORDER BY member_identity
-",
-    )
-    .bind(fingerprint.as_ref())
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        let member_id = decode_member_identity(&row.get::<String, _>("member_identity"))?;
-        records.push(MemberPublicKeysRecord {
-            key_id: MemberKeyId {
-                member_id,
-                fingerprint: *fingerprint,
-            },
-            signing_public_key: row
-                .get::<Vec<u8>, _>("signing_public_key")
-                .into_boxed_slice(),
-            encryption_public_key: row
-                .get::<Vec<u8>, _>("encryption_public_key")
-                .into_boxed_slice(),
-        });
+    if let Some(after) = page.after() {
+        push_member_key_lower_bound(&mut query_builder, after);
     }
-    Ok(records)
+    push_page_order_and_limit(
+        &mut query_builder,
+        page.limit(),
+        "member_identity, key_fingerprint",
+    );
+
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    for row in rows {
+        let record = decode_member_public_keys_row(&row)?;
+        let page_key = MemberKeyPageKey::from_key_id(&record.key_id);
+        page.push(page_key, record)?;
+    }
+    page.finish(())
 }
 
 pub(super) async fn ensure_member_public_keys(
@@ -275,28 +256,36 @@ VALUES (?1, ?2, ?3, ?4)
     Ok(())
 }
 
-pub(super) async fn load_member_key_trust_evidence(
+pub(super) async fn load_member_key_trust_evidence_into(
     connection: &mut SqliteStoreConnection,
-    key_id: &MemberKeyId,
-) -> Result<MemberKeyTrustEvidenceSet, StoreError> {
-    let evidence_kinds = sqlx::query_scalar::<_, String>(
-        "
-SELECT evidence_kind
-FROM member_key_trust_evidence
-WHERE member_identity = ?1 AND key_fingerprint = ?2
-",
-    )
-    .bind(key_id.member_id.to_string())
-    .bind(key_id.fingerprint.as_ref())
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-    let mut evidence = MemberKeyTrustEvidenceSet::empty();
-    for evidence_kind in evidence_kinds {
-        let evidence_kind = decode_member_key_trust_evidence_kind(&evidence_kind)?;
-        evidence.insert(evidence_kind);
+    mut page: PageAttempt<
+        '_,
+        &MemberKeyId,
+        String,
+        OwnedNoMetadataPageBatch<'_, MemberKeyTrustEvidenceKind>,
+    >,
+) -> Result<(), PageError> {
+    let member_id = page.params().member_id.to_string();
+    let fingerprint = page.params().fingerprint.as_ref().to_vec();
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT evidence_kind FROM member_key_trust_evidence WHERE member_identity = ",
+    );
+    query_builder
+        .push_bind(member_id)
+        .push(" AND key_fingerprint = ")
+        .push_bind(fingerprint);
+    push_text_page_window(&mut query_builder, &page, "evidence_kind");
+
+    let evidence_kinds = query_builder
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    for raw_evidence_kind in evidence_kinds {
+        let evidence_kind = decode_member_key_trust_evidence_kind(&raw_evidence_kind)?;
+        page.push(raw_evidence_kind, evidence_kind)?;
     }
-    Ok(evidence)
+    page.finish(())
 }
 
 pub(super) async fn ensure_member_key_trust_evidence(
@@ -355,4 +344,45 @@ VALUES (?1)
     .await
     .context(SqlxSnafu)?;
     Ok(())
+}
+
+/// Decode the composite member-key identity selected by a collection query.
+fn decode_member_key_id(row: &sqlx::sqlite::SqliteRow) -> Result<MemberKeyId, StoreError> {
+    let raw_member_id = row.get::<String, _>("member_identity");
+    let member_id = decode_member_identity(&raw_member_id)?;
+    let raw_fingerprint = row.get::<Vec<u8>, _>("key_fingerprint");
+    let fingerprint = decode_key_fingerprint(&raw_fingerprint)?;
+    Ok(MemberKeyId {
+        member_id,
+        fingerprint,
+    })
+}
+
+/// Decode one complete public-key record selected by a collection query.
+fn decode_member_public_keys_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<MemberPublicKeysRecord, StoreError> {
+    let key_id = decode_member_key_id(row)?;
+    Ok(MemberPublicKeysRecord {
+        key_id,
+        signing_public_key: row
+            .get::<Vec<u8>, _>("signing_public_key")
+            .into_boxed_slice(),
+        encryption_public_key: row
+            .get::<Vec<u8>, _>("encryption_public_key")
+            .into_boxed_slice(),
+    })
+}
+
+/// Add the exclusive lower bound for SQLite's composite member-key order.
+fn push_member_key_lower_bound(query_builder: &mut QueryBuilder<Sqlite>, after: &MemberKeyPageKey) {
+    let member_id = after.member_identity_text().to_owned();
+    query_builder
+        .push(" AND (member_identity > ")
+        .push_bind(member_id.clone())
+        .push(" OR (member_identity = ")
+        .push_bind(member_id)
+        .push(" AND key_fingerprint > ")
+        .push_bind(after.fingerprint().as_ref().to_vec())
+        .push("))");
 }
