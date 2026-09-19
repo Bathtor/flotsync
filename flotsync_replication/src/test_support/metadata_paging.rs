@@ -1,7 +1,6 @@
 //! Reusable store-backend contract scenarios for metadata pagination.
 
 use crate::api::{
-    MemberKeyPageKey,
     MemberKeyTrustEvidenceRecord,
     MemberPublicKeyPredicate,
     MemberPublicKeysRecord,
@@ -85,6 +84,8 @@ pub async fn assert_metadata_paging_contract(
 const SINGLE_RECORD_PAGE: NonZeroUsize = NonZeroUsize::new(1).expect("one is non-zero");
 /// Two-record page used before rotating to a smaller batch.
 const TWO_RECORD_PAGE: NonZeroUsize = NonZeroUsize::new(2).expect("two is non-zero");
+/// Maximum calls allowed in one contract scenario before paging is considered stuck.
+const MAX_PAGE_CALLS: usize = 64;
 
 /// Fixture values selected once for scenarios that require tied records.
 struct ValidatedFixtures<'a> {
@@ -193,7 +194,9 @@ async fn assert_interleaved_group_and_key_paging(
     key_ids.extend(first_key_ids_batch.into_values());
 
     let mut final_group_page_len = usize::MAX;
+    let mut group_page_calls = 1;
     while groups_cursor.has_more() {
+        record_page_call(&mut group_page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_replication_groups_into(&mut groups_cursor, &mut batch)
@@ -209,7 +212,9 @@ async fn assert_interleaved_group_and_key_paging(
     assert_unordered_eq(&groups, &fixtures.groups);
 
     let mut final_key_page_len = usize::MAX;
+    let mut key_page_calls = 1;
     while key_ids_cursor.has_more() {
+        record_page_call(&mut key_page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_member_public_key_ids_into(&mut key_ids_cursor, &mut batch)
@@ -255,7 +260,9 @@ async fn assert_group_predicates(
     let predicate = ReplicationGroupPredicate::GroupIdIn(&selected_group_ids);
     let mut cursor = PageCursor::new(predicate);
     let mut selected = Vec::new();
+    let mut page_calls = 0;
     while cursor.has_more() {
+        record_page_call(&mut page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_replication_groups_into(&mut cursor, &mut batch)
@@ -290,7 +297,9 @@ async fn assert_writable_group_paging(
 ) {
     let mut cursor = PageCursor::new(());
     let mut writable = Vec::new();
+    let mut page_calls = 0;
     while cursor.has_more() {
+        record_page_call(&mut page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_writable_replication_group_versions_into(&mut cursor, &mut batch)
@@ -398,10 +407,12 @@ async fn assert_pending_group_paging(
 /// Load every public-key page with a one-record maximum.
 async fn drain_public_key_pages(
     transaction: &mut dyn ReplicationStoreReadTransaction,
-    cursor: &mut PageCursor<MemberPublicKeyPredicate<'_>, MemberKeyPageKey>,
+    cursor: &mut PageCursor<MemberPublicKeyPredicate<'_>>,
 ) -> Vec<MemberPublicKeysRecord> {
     let mut records = Vec::new();
+    let mut page_calls = 0;
     while cursor.has_more() {
+        record_page_call(&mut page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_member_public_keys_into(cursor, &mut batch)
@@ -418,7 +429,9 @@ async fn drain_pending_decision_pages(
 ) -> Vec<PendingGroupDecisionRecord> {
     let mut cursor = PageCursor::new(());
     let mut records = Vec::new();
+    let mut page_calls = 0;
     while cursor.has_more() {
+        record_page_call(&mut page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_pending_group_decisions_into(&mut cursor, &mut batch)
@@ -435,7 +448,9 @@ async fn drain_pending_activation_pages(
 ) -> Vec<PendingGroupActivationRecord> {
     let mut cursor = PageCursor::new(());
     let mut records = Vec::new();
+    let mut page_calls = 0;
     while cursor.has_more() {
+        record_page_call(&mut page_calls);
         let mut batch = VecPageBatch::bounded(SINGLE_RECORD_PAGE);
         transaction
             .load_pending_group_activations_into(&mut cursor, &mut batch)
@@ -444,6 +459,15 @@ async fn drain_pending_activation_pages(
         records.extend(batch.into_values());
     }
     records
+}
+
+/// Count one page call and fail promptly when a cursor cannot terminate.
+fn record_page_call(page_calls: &mut usize) {
+    *page_calls += 1;
+    assert!(
+        *page_calls <= MAX_PAGE_CALLS,
+        "metadata paging did not terminate within {MAX_PAGE_CALLS} calls"
+    );
 }
 
 /// Return whether the records exercise distinct structured and textual member ordering.

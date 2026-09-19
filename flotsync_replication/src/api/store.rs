@@ -480,6 +480,12 @@ pub enum MemberPublicKeyPredicate<'a> {
 /// Read transactions are release-on-drop. They are intended for consistent
 /// snapshot streams and may be held by a provider across multiple `next_batch`
 /// calls, so callers should drain or drop the provider promptly.
+///
+/// Bounded collection pages use a deterministic backend-defined traversal order
+/// within this transaction. Unlimited fills need not order their results. Cursor
+/// continuations are opaque: callers must not infer result ordering or backend
+/// comparison semantics from logical record fields unless the individual method
+/// explicitly promises an order.
 pub trait ReplicationStoreReadTransaction: Send {
     /// Return the stable identity of this concrete transaction instance.
     ///
@@ -497,7 +503,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load persisted replication groups selected by the cursor into `batch`.
     fn load_replication_groups_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>, GroupId>,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<ReplicationGroupRecord>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>>;
 
@@ -537,7 +543,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load ids and stored progress for writable replication groups into `batch`.
     fn load_writable_replication_group_versions_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<WritableReplicationGroupVersionRecord>,
             Metadata = (),
@@ -590,7 +596,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load observed member-key identities into `batch` without key material.
     fn load_member_public_key_ids_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), MemberKeyPageKey>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<MemberKeyId>, Metadata = ()>,
     ) -> BoxFuture<'a, Result<(), PageError>>;
 
@@ -611,7 +617,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load public keys selected by the cursor predicate into `batch`.
     fn load_member_public_keys_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>, MemberKeyPageKey>,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<MemberPublicKeysRecord>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>>;
 
@@ -650,7 +656,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load trust-evidence kinds for one exact member-key binding into `batch`.
     fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<&'predicate MemberKeyId, String>,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId>,
         batch: &'call mut dyn PageBatch<
             Input = OwnedPageBatchInput<MemberKeyTrustEvidenceKind>,
             Metadata = (),
@@ -791,7 +797,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load unresolved listener-mediated group decisions into `batch`.
     fn load_pending_group_decisions_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<PendingGroupDecisionRecord>,
             Metadata = (),
@@ -821,7 +827,7 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load accepted group activations awaiting external activation into `batch`.
     fn load_pending_group_activations_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<PendingGroupActivationRecord>,
             Metadata = (),

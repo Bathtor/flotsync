@@ -77,7 +77,6 @@ use crate::{
         LocalMemberPrivateKeysRecord,
         LocalStoreSecretProfile,
         MemberKeyId,
-        MemberKeyPageKey,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberKeyTrustEvidenceSet,
@@ -697,7 +696,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_replication_groups_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>, GroupId>,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<ReplicationGroupRecord>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>> {
         self.inner
@@ -723,7 +722,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_writable_replication_group_versions_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<WritableReplicationGroupVersionRecord>,
             Metadata = (),
@@ -799,7 +798,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_member_public_key_ids_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), MemberKeyPageKey>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<MemberKeyId>, Metadata = ()>,
     ) -> BoxFuture<'a, Result<(), PageError>> {
         self.inner
@@ -819,7 +818,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_member_public_keys_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>, MemberKeyPageKey>,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<MemberPublicKeysRecord>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>> {
         self.inner
@@ -850,7 +849,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
         &'call mut self,
-        cursor: &'call mut PageCursor<&'predicate MemberKeyId, String>,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId>,
         batch: &'call mut dyn PageBatch<
             Input = OwnedPageBatchInput<MemberKeyTrustEvidenceKind>,
             Metadata = (),
@@ -1085,7 +1084,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_pending_group_decisions_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<PendingGroupDecisionRecord>,
             Metadata = (),
@@ -1118,7 +1117,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
 
     fn load_pending_group_activations_into<'a>(
         &'a mut self,
-        cursor: &'a mut PageCursor<(), GroupId>,
+        cursor: &'a mut PageCursor<()>,
         batch: &'a mut dyn PageBatch<
             Input = OwnedPageBatchInput<PendingGroupActivationRecord>,
             Metadata = (),

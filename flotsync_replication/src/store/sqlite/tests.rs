@@ -21,6 +21,7 @@ use crate::{
         ReplicationUpdateFilter,
         SnapshotRef,
         StoreErrorClass,
+        VecPageBatch,
         current_slice_placeholder_group_security_material,
     },
     delivery::shared::MessageId,
@@ -2039,6 +2040,82 @@ fn sqlite_store_satisfies_metadata_paging_contract() {
     };
     wait_for_store_future(assert_metadata_paging_contract(store.as_ref(), &fixtures))
         .expect("SQLite metadata paging contract should pass");
+}
+
+#[test]
+fn opaque_continuation_follows_sqlite_collation() {
+    wait_for_store_future(async {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool should open");
+        sqlx::query("CREATE TABLE paging_collation (value TEXT COLLATE NOCASE PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("collation fixture table should be created");
+        sqlx::query("INSERT INTO paging_collation (value) VALUES ('a'), ('B'), ('c')")
+            .execute(&pool)
+            .await
+            .expect("collation fixture values should be inserted");
+
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("collation fixture connection should be acquired");
+        let transaction_id = StoreTransactionId::new_random();
+        let mut cursor = PageCursor::new(());
+        let mut actual = Vec::new();
+        let mut page_calls = 0;
+        while cursor.has_more() {
+            page_calls += 1;
+            assert!(page_calls <= 4, "collation paging should terminate");
+            let mut batch = VecPageBatch::bounded(NonZeroUsize::new(1).unwrap());
+            let mut page = cursor
+                .begin_page::<SqliteTextPageContinuation, _>(transaction_id, &mut batch)
+                .expect("collation page should begin");
+            let mut query_builder =
+                QueryBuilder::<Sqlite>::new("SELECT value FROM paging_collation WHERE 1 = 1");
+            push_text_page_window(&mut query_builder, &page, "value COLLATE NOCASE");
+            let values = query_builder
+                .build_query_scalar::<String>()
+                .fetch_all(&mut *connection)
+                .await
+                .expect("collation page should load");
+            let mut continuation = None;
+            for value in values {
+                page.push(value.clone())
+                    .expect("collation value should enter the batch");
+                continuation = Some(SqliteTextPageContinuation::new(value));
+            }
+            finish_page(page, continuation).expect("collation page should finish");
+            actual.extend(batch.into_values());
+        }
+
+        assert_eq!(actual, ["a", "B", "c"]);
+        let mut rust_order = actual.clone();
+        rust_order.sort();
+        assert_ne!(
+            actual, rust_order,
+            "fixture must disagree with Rust ordering"
+        );
+    });
+}
+
+#[test]
+fn full_sqlite_page_requires_a_continuation() {
+    let transaction_id = StoreTransactionId::new_random();
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::bounded(NonZeroUsize::new(1).unwrap());
+    let mut page = cursor
+        .begin_page::<SqliteTextPageContinuation, _>(transaction_id, &mut batch)
+        .expect("SQLite page should begin");
+    page.push(1_u32).expect("record should enter the batch");
+
+    assert!(matches!(
+        finish_page(page, None),
+        Err(PageError::MissingContinuation)
+    ));
+    assert!(batch.is_empty());
+    assert!(cursor.is_failed());
 }
 
 #[test]

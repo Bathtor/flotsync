@@ -89,7 +89,7 @@ pub(super) async fn load_replication_groups_into(
     mut page: PageAttempt<
         '_,
         ReplicationGroupPredicate<'_>,
-        GroupId,
+        SqliteTextPageContinuation,
         OwnedNoMetadataPageBatch<'_, ReplicationGroupRecord>,
     >,
 ) -> Result<(), PageError> {
@@ -100,7 +100,7 @@ pub(super) async fn load_replication_groups_into(
             // No predicate is required when every group is selected.
         }
         ReplicationGroupPredicate::GroupIdIn(group_ids) if group_ids.is_empty() => {
-            return page.finish(());
+            return finish_page(page, None);
         }
         ReplicationGroupPredicate::GroupIdIn(group_ids) => {
             query_builder.push(" AND group_id IN (");
@@ -120,14 +120,19 @@ pub(super) async fn load_replication_groups_into(
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-    for raw_group_id in group_ids {
+    let continuation_index = continuation_record_index(page.limit(), group_ids.len());
+    let mut continuation = None;
+    for (index, raw_group_id) in group_ids.into_iter().enumerate() {
         let group_id = decode_group_id(&raw_group_id)?;
         let group = load_replication_group(connection, &group_id)
             .await?
             .expect("selected active group must remain present in its read transaction");
-        page.push(group_id, group)?;
+        page.push(group)?;
+        if continuation_index == Some(index) {
+            continuation = Some(SqliteTextPageContinuation::new(raw_group_id));
+        }
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn load_writable_replication_group_versions_into(
@@ -135,7 +140,7 @@ pub(super) async fn load_writable_replication_group_versions_into(
     mut page: PageAttempt<
         '_,
         (),
-        GroupId,
+        SqliteTextPageContinuation,
         OwnedNoMetadataPageBatch<'_, WritableReplicationGroupVersionRecord>,
     >,
 ) -> Result<(), PageError> {
@@ -160,7 +165,9 @@ WHERE active.lifecycle = ",
         .await
         .context(SqlxSnafu)?;
 
-    for row in rows {
+    let continuation_index = continuation_record_index(page.limit(), rows.len());
+    let mut continuation = None;
+    for (index, row) in rows.into_iter().enumerate() {
         let successor_group_id = row.get::<Option<String>, _>("successor_group_id");
         let final_versions = row.get::<Option<Vec<u8>>, _>("final_versions");
         validate_open_group_lifecycle_fields(
@@ -168,7 +175,8 @@ WHERE active.lifecycle = ",
             final_versions.as_deref(),
         )
         .map_err(|source| invalid_stored_object("replication group lifecycle", source))?;
-        let group_id = decode_group_id(&row.get::<String, _>("group_id"))?;
+        let raw_group_id = row.get::<String, _>("group_id");
+        let group_id = decode_group_id(&raw_group_id)?;
         let member_count = decode_non_zero_member_count(row.get::<i64, _>("member_count"))?;
         let version_vector =
             decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
@@ -176,9 +184,12 @@ WHERE active.lifecycle = ",
             group_id,
             version_vector,
         };
-        page.push(group_id, record)?;
+        page.push(record)?;
+        if continuation_index == Some(index) {
+            continuation = Some(SqliteTextPageContinuation::new(raw_group_id));
+        }
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn load_group_schema(

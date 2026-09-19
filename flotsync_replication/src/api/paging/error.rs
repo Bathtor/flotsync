@@ -34,17 +34,21 @@ pub enum PageError {
     /// An earlier unfinished or failed fill invalidated this cursor.
     #[snafu(display("Page cursor is invalid after an earlier unsuccessful fill."))]
     CursorFailed,
-    /// The backend supplied a key at or before the exclusive continuation.
-    #[snafu(display(
-        "Page backend returned a non-increasing continuation key in transaction {transaction_id}."
-    ))]
-    NonIncreasingKey {
-        /// Transaction whose result violated the ordering contract.
-        transaction_id: StoreTransactionId,
-    },
+    /// The backend attempted to resume a cursor with another continuation format.
+    #[snafu(display("Page cursor continuation has an incompatible backend format."))]
+    ContinuationTypeMismatch,
+    /// An unlimited fill attempted to retain a continuation for another call.
+    #[snafu(display("An unlimited page must exhaust its cursor."))]
+    UnlimitedPageContinuation,
+    /// A fill without accepted source records attempted to retain a continuation.
+    #[snafu(display("An empty page cannot retain a continuation."))]
+    EmptyPageContinuation,
     /// A page attempt or fixed-capacity batch received an input beyond its limit.
     #[snafu(display("Page record limit exceeded."))]
     PageLimitExceeded,
+    /// A full bounded page did not supply the continuation required to resume it.
+    #[snafu(display("A full bounded page must provide a continuation."))]
+    MissingContinuation,
 }
 
 impl PageError {
@@ -69,8 +73,11 @@ impl StoreErrorClassificationSource for PageError {
             Self::TransactionMismatch { .. }
             | Self::CursorExhausted
             | Self::CursorFailed
-            | Self::NonIncreasingKey { .. }
-            | Self::PageLimitExceeded => Some(
+            | Self::ContinuationTypeMismatch
+            | Self::UnlimitedPageContinuation
+            | Self::EmptyPageContinuation
+            | Self::PageLimitExceeded
+            | Self::MissingContinuation => Some(
                 StoreErrorClassification::UNKNOWN
                     .with_scope(StoreErrorScope::Operation)
                     .with_class(StoreErrorClass::Contract)

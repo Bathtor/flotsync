@@ -145,7 +145,12 @@ WHERE member_identity = ?1 AND key_fingerprint = ?2
 
 pub(super) async fn load_member_public_key_ids_into(
     connection: &mut SqliteStoreConnection,
-    mut page: PageAttempt<'_, (), MemberKeyPageKey, OwnedNoMetadataPageBatch<'_, MemberKeyId>>,
+    mut page: PageAttempt<
+        '_,
+        (),
+        MemberKeyPageContinuation,
+        OwnedNoMetadataPageBatch<'_, MemberKeyId>,
+    >,
 ) -> Result<(), PageError> {
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "SELECT member_identity, key_fingerprint FROM member_public_keys WHERE 1 = 1",
@@ -164,12 +169,19 @@ pub(super) async fn load_member_public_key_ids_into(
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-    for row in rows {
+    let continuation_index = continuation_record_index(page.limit(), rows.len());
+    let mut continuation = None;
+    for (index, row) in rows.into_iter().enumerate() {
         let key_id = decode_member_key_id(&row)?;
-        let page_key = MemberKeyPageKey::from_key_id(&key_id);
-        page.push(page_key, key_id)?;
+        let page_continuation = if continuation_index == Some(index) {
+            Some(MemberKeyPageContinuation::from_key_id(&key_id))
+        } else {
+            None
+        };
+        page.push(key_id)?;
+        continuation = page_continuation;
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn load_member_public_keys_into(
@@ -177,7 +189,7 @@ pub(super) async fn load_member_public_keys_into(
     mut page: PageAttempt<
         '_,
         MemberPublicKeyPredicate<'_>,
-        MemberKeyPageKey,
+        MemberKeyPageContinuation,
         OwnedNoMetadataPageBatch<'_, MemberPublicKeysRecord>,
     >,
 ) -> Result<(), PageError> {
@@ -211,12 +223,19 @@ pub(super) async fn load_member_public_keys_into(
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-    for row in rows {
+    let continuation_index = continuation_record_index(page.limit(), rows.len());
+    let mut continuation = None;
+    for (index, row) in rows.into_iter().enumerate() {
         let record = decode_member_public_keys_row(&row)?;
-        let page_key = MemberKeyPageKey::from_key_id(&record.key_id);
-        page.push(page_key, record)?;
+        let page_continuation = if continuation_index == Some(index) {
+            Some(MemberKeyPageContinuation::from_key_id(&record.key_id))
+        } else {
+            None
+        };
+        page.push(record)?;
+        continuation = page_continuation;
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn ensure_member_public_keys(
@@ -261,7 +280,7 @@ pub(super) async fn load_member_key_trust_evidence_into(
     mut page: PageAttempt<
         '_,
         &MemberKeyId,
-        String,
+        SqliteTextPageContinuation,
         OwnedNoMetadataPageBatch<'_, MemberKeyTrustEvidenceKind>,
     >,
 ) -> Result<(), PageError> {
@@ -281,11 +300,16 @@ pub(super) async fn load_member_key_trust_evidence_into(
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-    for raw_evidence_kind in evidence_kinds {
+    let continuation_index = continuation_record_index(page.limit(), evidence_kinds.len());
+    let mut continuation = None;
+    for (index, raw_evidence_kind) in evidence_kinds.into_iter().enumerate() {
         let evidence_kind = decode_member_key_trust_evidence_kind(&raw_evidence_kind)?;
-        page.push(raw_evidence_kind, evidence_kind)?;
+        page.push(evidence_kind)?;
+        if continuation_index == Some(index) {
+            continuation = Some(SqliteTextPageContinuation::new(raw_evidence_kind));
+        }
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn ensure_member_key_trust_evidence(
@@ -346,6 +370,24 @@ VALUES (?1)
     Ok(())
 }
 
+/// SQLite-owned continuation for its composite member-key ordering.
+pub(super) struct MemberKeyPageContinuation {
+    /// Canonical member identity text compared by SQLite.
+    member_identity: String,
+    /// Fingerprint compared after equal member identity text.
+    fingerprint: KeyFingerprint,
+}
+
+impl MemberKeyPageContinuation {
+    /// Capture the SQLite ordering values for one accepted member-key record.
+    fn from_key_id(key_id: &MemberKeyId) -> Self {
+        Self {
+            member_identity: key_id.member_id.to_string(),
+            fingerprint: key_id.fingerprint,
+        }
+    }
+}
+
 /// Decode the composite member-key identity selected by a collection query.
 fn decode_member_key_id(row: &sqlx::sqlite::SqliteRow) -> Result<MemberKeyId, StoreError> {
     let raw_member_id = row.get::<String, _>("member_identity");
@@ -375,14 +417,17 @@ fn decode_member_public_keys_row(
 }
 
 /// Add the exclusive lower bound for SQLite's composite member-key order.
-fn push_member_key_lower_bound(query_builder: &mut QueryBuilder<Sqlite>, after: &MemberKeyPageKey) {
-    let member_id = after.member_identity_text().to_owned();
+fn push_member_key_lower_bound(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    after: &MemberKeyPageContinuation,
+) {
+    let member_id = after.member_identity.clone();
     query_builder
         .push(" AND (member_identity > ")
         .push_bind(member_id.clone())
         .push(" OR (member_identity = ")
         .push_bind(member_id)
         .push(" AND key_fingerprint > ")
-        .push_bind(after.fingerprint().as_ref().to_vec())
+        .push_bind(after.fingerprint.as_ref().to_vec())
         .push("))");
 }

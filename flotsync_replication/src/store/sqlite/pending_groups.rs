@@ -93,11 +93,11 @@ pub(super) async fn load_pending_group_decisions_into(
     mut page: PageAttempt<
         '_,
         (),
-        GroupId,
+        SqliteTextPageContinuation,
         OwnedNoMetadataPageBatch<'_, PendingGroupDecisionRecord>,
     >,
 ) -> Result<(), PageError> {
-    let after = page.after().copied();
+    let after = page.after().map(SqliteTextPageContinuation::as_str);
     let limit = page.limit();
     let payloads = load_pending_group_payloads(
         connection,
@@ -106,16 +106,25 @@ pub(super) async fn load_pending_group_decisions_into(
         limit,
     )
     .await?;
-    for stored in payloads {
-        let continuation = stored.key.new_group_id;
+    let continuation_index = continuation_record_index(page.limit(), payloads.len());
+    let mut continuation = None;
+    for (index, stored) in payloads.into_iter().enumerate() {
+        let next = if continuation_index == Some(index) {
+            Some(SqliteTextPageContinuation::new(
+                stored.key.new_group_id.to_string(),
+            ))
+        } else {
+            None
+        };
         let record = decode_stored_proto(
             "pending group decision",
             decode_pending_group_decision_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
-        page.push(continuation, record)?;
+        page.push(record)?;
+        continuation = next;
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn load_pending_group_decision(
@@ -144,11 +153,11 @@ pub(super) async fn load_pending_group_activations_into(
     mut page: PageAttempt<
         '_,
         (),
-        GroupId,
+        SqliteTextPageContinuation,
         OwnedNoMetadataPageBatch<'_, PendingGroupActivationRecord>,
     >,
 ) -> Result<(), PageError> {
-    let after = page.after().copied();
+    let after = page.after().map(SqliteTextPageContinuation::as_str);
     let limit = page.limit();
     let payloads = load_pending_group_payloads(
         connection,
@@ -157,16 +166,25 @@ pub(super) async fn load_pending_group_activations_into(
         limit,
     )
     .await?;
-    for stored in payloads {
-        let continuation = stored.key.new_group_id;
+    let continuation_index = continuation_record_index(page.limit(), payloads.len());
+    let mut continuation = None;
+    for (index, stored) in payloads.into_iter().enumerate() {
+        let next = if continuation_index == Some(index) {
+            Some(SqliteTextPageContinuation::new(
+                stored.key.new_group_id.to_string(),
+            ))
+        } else {
+            None
+        };
         let record = decode_stored_proto(
             "pending group activation",
             decode_pending_group_activation_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
-        page.push(continuation, record)?;
+        page.push(record)?;
+        continuation = next;
     }
-    page.finish(())
+    finish_page(page, continuation)
 }
 
 pub(super) async fn load_pending_group_activation(
@@ -471,7 +489,7 @@ pub(super) fn validate_pending_group_payload_key(
 async fn load_pending_group_payloads(
     connection: &mut SqliteStoreConnection,
     state: PendingGroupWorkState,
-    after: Option<GroupId>,
+    after: Option<&str>,
     limit: PageLimit,
 ) -> Result<Vec<StoredPendingGroupPayload>, StoreError> {
     let mut query_builder = QueryBuilder::<Sqlite>::new(
@@ -479,7 +497,7 @@ async fn load_pending_group_payloads(
          FROM pending_group_work WHERE state = ",
     );
     query_builder.push_bind(state.as_sql());
-    push_text_window(&mut query_builder, after.as_ref(), limit, "new_group_id");
+    push_text_window(&mut query_builder, after, limit, "new_group_id");
 
     let rows = query_builder
         .build()
