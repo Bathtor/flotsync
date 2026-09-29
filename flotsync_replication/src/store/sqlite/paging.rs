@@ -12,7 +12,7 @@ use super::{
 };
 
 /// SQLite-owned continuation containing one SQL `TEXT` value.
-pub(super) struct SqliteTextPageContinuation(String);
+pub(crate) struct SqliteTextPageContinuation(String);
 
 impl SqliteTextPageContinuation {
     /// Capture the SQLite `TEXT` value of the final accepted source record.
@@ -46,11 +46,46 @@ pub(super) fn push_text_page_window<Params, Batch>(
     );
 }
 
+/// Append a `TEXT` lower bound, required ordering, and optional finite limit.
+///
+/// Use this for APIs which promise ordered results even when the caller selects
+/// an unlimited page. `column` is a trusted SQLite column expression supplied
+/// by this backend.
+pub(super) fn push_ordered_text_page_window<Params, Batch>(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
+    column: &'static str,
+) where
+    Batch: PageBatch + ?Sized,
+{
+    push_text_lower_bound(
+        query_builder,
+        page.after().map(SqliteTextPageContinuation::as_str),
+        column,
+    );
+    query_builder.push(" ORDER BY ").push(column);
+    if let PageLimit::Max(limit) = page.limit() {
+        query_builder
+            .push(" LIMIT ")
+            .push_bind(sqlite_limit_value(limit));
+    }
+}
+
 /// Append a `TEXT` lower bound and bounded ordering from borrowed page values.
 pub(super) fn push_text_window(
     query_builder: &mut QueryBuilder<Sqlite>,
     after: Option<&str>,
     limit: PageLimit,
+    column: &'static str,
+) {
+    push_text_lower_bound(query_builder, after, column);
+    push_page_order_and_limit(query_builder, limit, column);
+}
+
+/// Append one optional exclusive lower bound for a SQL `TEXT` value.
+fn push_text_lower_bound(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    after: Option<&str>,
     column: &'static str,
 ) {
     if let Some(after) = after {
@@ -60,7 +95,6 @@ pub(super) fn push_text_window(
             .push(" > ")
             .push_bind(after);
     }
-    push_page_order_and_limit(query_builder, limit, column);
 }
 
 /// Finish a SQLite page, retaining `continuation` only for a full bounded fill.
@@ -72,12 +106,25 @@ where
     Continuation: Send + 'static,
     Batch: PageBatch<Metadata = ()> + ?Sized,
 {
+    finish_page_with_metadata(page, (), continuation)
+}
+
+/// Finish a SQLite page with metadata, retaining `continuation` only for a full bounded fill.
+pub(super) fn finish_page_with_metadata<Params, Continuation, Batch>(
+    page: PageAttempt<'_, Params, Continuation, Batch>,
+    metadata: Batch::Metadata,
+    continuation: Option<Continuation>,
+) -> Result<(), PageError>
+where
+    Continuation: Send + 'static,
+    Batch: PageBatch + ?Sized,
+{
     let end = match (page.has_filled_limit(), continuation) {
         (true, Some(continuation)) => Ok(PageEnd::MayHaveMore(continuation)),
         (true, None) => Err(PageError::MissingContinuation),
         (false, _) => Ok(PageEnd::Exhausted),
     }?;
-    page.finish((), end)
+    page.finish(metadata, end)
 }
 
 /// Return the final record index when this result fills one bounded page.

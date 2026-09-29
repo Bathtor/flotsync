@@ -1,11 +1,14 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowScanPage,
+        DatasetRowPageBatch,
+        DatasetRowPageMetadata,
         DatasetRowStatePatch,
-        DatasetRowStateSlice,
-        DatasetRowStateTransitionPage,
         DatasetRowStateWrite,
+        DatasetRowTransitionPageBatch,
+        DatasetRowTransitionPageMetadata,
+        DatasetRowTransitionQuery,
+        DatasetRowsQuery,
         DatasetSchema,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
@@ -38,14 +41,17 @@ use crate::{
         ReplicationRowMetadata,
         ReplicationRowStateSnapshot,
         ReplicationStateRowBatch,
-        ReplicationStateRowTransitionBatch,
+        ReplicationStateRowSource,
+        ReplicationStateRowTransitionInput,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
+        RequestedDatasetRowInput,
+        RequestedDatasetRowPageBatch,
+        RequestedDatasetRowsQuery,
         RowKey,
-        RowKeyIterator,
         SchemaSource,
         StoreError,
         StoreSecretCryptoVersion,
@@ -104,7 +110,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     error::Error as StdError,
     fs::OpenOptions,
     num::NonZeroUsize,
@@ -763,47 +769,49 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
-        async move { load_dataset_rows(self.assert_open_connection(), dataset, row_keys).await }
-            .boxed()
-    }
-
-    fn scan_dataset_row_batch<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
+    fn load_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<RequestedDatasetRowsQuery<'query>>,
+        batch: &'call mut RequestedDatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            scan_dataset_row_batch(self.assert_open_connection(), dataset, after, limit, output)
-                .await
+            let schema = cursor.params().dataset().context().schema;
+            batch.prepare_for_schema(schema);
+            let page =
+                cursor.begin_page::<SqliteRequestedRowsContinuation, _>(transaction_id, batch)?;
+            rows::load_dataset_rows_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
 
-    fn scan_dataset_row_transition_batch<'a>(
-        &'a mut self,
-        previous_group: GroupDatasetSchemaRef<'a>,
-        current_group: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowTransitionBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
+    fn scan_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowsQuery<'query>>,
+        batch: &'call mut DatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            scan_dataset_row_transition_batch(
-                self.assert_open_connection(),
-                previous_group,
-                current_group,
-                after,
-                limit,
-                output,
-            )
-            .await
+            let schema = cursor.params().context().schema;
+            batch.prepare_for_schema(schema);
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            rows::scan_dataset_rows_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn scan_dataset_row_transitions_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowTransitionQuery<'query>>,
+        batch: &'call mut DatasetRowTransitionPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let previous_schema = cursor.params().previous().context().schema;
+            let current_schema = cursor.params().current().context().schema;
+            batch.prepare_for_schemas(previous_schema, current_schema);
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            rows::scan_dataset_row_transitions_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
@@ -1270,10 +1278,12 @@ use error::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use groups::*;
+pub(crate) use paging::SqliteTextPageContinuation;
 use paging::{
-    SqliteTextPageContinuation,
     continuation_record_index,
     finish_page,
+    finish_page_with_metadata,
+    push_ordered_text_page_window,
     push_page_order_and_limit,
     push_text_page_window,
     push_text_window,

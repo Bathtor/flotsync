@@ -3,13 +3,16 @@
 use super::*;
 use crate::api::{
     AcceptedCutRelation,
+    DatasetRowPageBatch,
+    DatasetRowTransitionPageBatch,
+    DatasetRowTransitionQuery,
+    DatasetRowsQuery,
     InMemoryStateRowView,
+    PageCursor,
     PreviousRow,
     PreviousRowCreator,
     PreviousRowEvidence,
     ReplicationRowMetadata,
-    ReplicationStateRowBatch,
-    ReplicationStateRowTransitionBatch,
     ReplicationStateRowTransitionView,
     RowChangeBatch,
     RowChangeKind,
@@ -31,12 +34,12 @@ pub(super) struct StoreActivationRowProvider {
     datasets: Vec<crate::api::DatasetSchema>,
     /// Index of the dataset currently being scanned.
     dataset_index: usize,
-    /// Exclusive lower row-key bound within the current dataset.
-    after_row_key: Option<RowKey>,
+    /// Cursor for the dataset currently being scanned.
+    dataset_cursor: Option<ActivationDatasetCursor>,
     /// Reusable storage for ordinary row scans.
-    state_rows: ReplicationStateRowBatch,
+    state_rows: DatasetRowPageBatch,
     /// Reusable storage for old-to-new row transition scans.
-    transition_rows: ReplicationStateRowTransitionBatch,
+    transition_rows: DatasetRowTransitionPageBatch,
 }
 
 impl StoreActivationRowProvider {
@@ -51,11 +54,12 @@ impl StoreActivationRowProvider {
             source: ActivationRowSource::Creation { group_id },
             datasets: group_schema.datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         }
     }
@@ -79,11 +83,12 @@ impl StoreActivationRowProvider {
             },
             datasets: group_schema.datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         }
     }
@@ -102,11 +107,12 @@ impl StoreActivationRowProvider {
             },
             datasets: group_schema.datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         }
     }
@@ -128,10 +134,10 @@ impl StoreActivationRowProvider {
         self.datasets.get(self.dataset_index)
     }
 
-    /// Advance to the next dataset and reset row-key pagination.
+    /// Advance to the next dataset and discard its exhausted cursor.
     fn finish_current_dataset(&mut self) {
         self.dataset_index += 1;
-        self.after_row_key = None;
+        self.dataset_cursor = None;
     }
 
     /// Load and translate one stored page for the current dataset.
@@ -139,9 +145,18 @@ impl StoreActivationRowProvider {
         &mut self,
         output: &mut RowChangeBatch,
     ) -> Result<(), RowProviderError> {
-        let after = self.after_row_key;
         let dataset_index = self.dataset_index;
-        let next_after = {
+        if self.dataset_cursor.is_none() {
+            let dataset_schema = self
+                .datasets
+                .get(dataset_index)
+                .expect("activation provider must have a current dataset");
+            self.dataset_cursor = Some(ActivationDatasetCursor::new(
+                &self.source,
+                dataset_schema.clone(),
+            ));
+        }
+        let has_more = {
             let dataset_schema = self
                 .datasets
                 .get(dataset_index)
@@ -153,15 +168,23 @@ impl StoreActivationRowProvider {
 
             match &self.source {
                 ActivationRowSource::Creation { group_id } => {
+                    let ActivationDatasetCursor::Rows(cursor) = self
+                        .dataset_cursor
+                        .as_mut()
+                        .expect("activation provider must initialise its dataset cursor")
+                    else {
+                        panic!("creation activation requires an ordinary row cursor");
+                    };
                     fill_creation_dataset(
                         transaction.as_mut(),
                         output,
                         *group_id,
                         dataset_schema,
-                        after,
+                        cursor,
                         &mut self.state_rows,
                     )
-                    .await?
+                    .await?;
+                    cursor.has_more()
                 }
                 ActivationRowSource::GroupReplacement {
                     migration_id,
@@ -171,6 +194,13 @@ impl StoreActivationRowProvider {
                             final_versions,
                         },
                 } => {
+                    let ActivationDatasetCursor::Transitions(cursor) = self
+                        .dataset_cursor
+                        .as_mut()
+                        .expect("activation provider must initialise its dataset cursor")
+                    else {
+                        panic!("hosted replacement requires a transition cursor");
+                    };
                     fill_hosted_replacement_dataset(
                         transaction.as_mut(),
                         output,
@@ -179,32 +209,39 @@ impl StoreActivationRowProvider {
                             dataset_schema,
                             local_member_index: *local_member_index,
                             final_versions,
-                            after,
                         },
+                        cursor,
                         &mut self.transition_rows,
                     )
-                    .await?
+                    .await?;
+                    cursor.has_more()
                 }
                 ActivationRowSource::GroupReplacement {
                     migration_id,
                     predecessor: ReplacementPredecessor::Unavailable,
                 } => {
+                    let ActivationDatasetCursor::Rows(cursor) = self
+                        .dataset_cursor
+                        .as_mut()
+                        .expect("activation provider must initialise its dataset cursor")
+                    else {
+                        panic!("unavailable replacement requires an ordinary row cursor");
+                    };
                     fill_unavailable_replacement_dataset(
                         transaction.as_mut(),
                         output,
                         migration_id.new_group_id,
                         dataset_schema,
-                        after,
+                        cursor,
                         &mut self.state_rows,
                     )
-                    .await?
+                    .await?;
+                    cursor.has_more()
                 }
             }
         };
 
-        if let Some(next_after) = next_after {
-            self.after_row_key = Some(next_after);
-        } else {
+        if !has_more {
             self.finish_current_dataset();
         }
         Ok(())
@@ -247,19 +284,14 @@ async fn fill_creation_dataset(
     output: &mut RowChangeBatch,
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
-    after: Option<RowKey>,
-    state_rows: &mut ReplicationStateRowBatch,
-) -> Result<Option<RowKey>, RowProviderError> {
-    let dataset = GroupDatasetSchemaRef {
-        group_id: &group_id,
-        dataset_id: &dataset_schema.dataset_id,
-        schema: dataset_schema.schema.as_schema(),
-    };
-    let page = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
+    cursor: &mut PageCursor<DatasetRowsQuery<'static>>,
+    batch: &mut DatasetRowPageBatch,
+) -> Result<(), RowProviderError> {
+    transaction
+        .scan_dataset_rows_into(cursor, batch)
         .await
-        .map_err(RowProviderError::from_store_error)?;
-    for current in state_rows.rows() {
+        .map_err(|source| RowProviderError::from_store_error(source.into()))?;
+    for current in batch.rows().rows() {
         append_creation_row(
             output,
             group_id,
@@ -268,7 +300,7 @@ async fn fill_creation_dataset(
             &current,
         )?;
     }
-    Ok(page.next_after)
+    Ok(())
 }
 
 /// Inputs which identify one page of a hosted old-to-new dataset comparison.
@@ -281,8 +313,6 @@ struct HostedReplacementDatasetScan<'a> {
     local_member_index: MemberIndex,
     /// Accepted previous-group frontier.
     final_versions: &'a VersionVector,
-    /// Exclusive lower row-key bound for this page.
-    after: Option<RowKey>,
 }
 
 /// Load one committed replacement page with a locally hosted predecessor.
@@ -290,37 +320,20 @@ async fn fill_hosted_replacement_dataset(
     transaction: &mut dyn ReplicationStoreReadTransaction,
     output: &mut RowChangeBatch,
     scan: HostedReplacementDatasetScan<'_>,
-    transition_rows: &mut ReplicationStateRowTransitionBatch,
-) -> Result<Option<RowKey>, RowProviderError> {
+    cursor: &mut PageCursor<DatasetRowTransitionQuery<'static>>,
+    batch: &mut DatasetRowTransitionPageBatch,
+) -> Result<(), RowProviderError> {
     let HostedReplacementDatasetScan {
         migration_id,
         dataset_schema,
         local_member_index,
         final_versions,
-        after,
     } = scan;
-    let schema = dataset_schema.schema.as_schema();
-    let previous_group = GroupDatasetSchemaRef {
-        group_id: &migration_id.old_group_id,
-        dataset_id: &dataset_schema.dataset_id,
-        schema,
-    };
-    let current_group = GroupDatasetSchemaRef {
-        group_id: &migration_id.new_group_id,
-        dataset_id: &dataset_schema.dataset_id,
-        schema,
-    };
-    let batch = transaction
-        .scan_dataset_row_transition_batch(
-            previous_group,
-            current_group,
-            after,
-            ACTIVATION_ROWS_PER_BATCH,
-            transition_rows,
-        )
+    transaction
+        .scan_dataset_row_transitions_into(cursor, batch)
         .await
-        .map_err(RowProviderError::from_store_error)?;
-    for transition in transition_rows.rows() {
+        .map_err(|source| RowProviderError::from_store_error(source.into()))?;
+    for transition in batch.transitions().rows() {
         append_hosted_transition(
             output,
             migration_id,
@@ -331,7 +344,7 @@ async fn fill_hosted_replacement_dataset(
             transition,
         )?;
     }
-    Ok(batch.next_after)
+    Ok(())
 }
 
 /// Load one committed replacement page whose predecessor is unavailable locally.
@@ -340,20 +353,15 @@ async fn fill_unavailable_replacement_dataset(
     output: &mut RowChangeBatch,
     group_id: GroupId,
     dataset_schema: &crate::api::DatasetSchema,
-    after: Option<RowKey>,
-    state_rows: &mut ReplicationStateRowBatch,
-) -> Result<Option<RowKey>, RowProviderError> {
+    cursor: &mut PageCursor<DatasetRowsQuery<'static>>,
+    batch: &mut DatasetRowPageBatch,
+) -> Result<(), RowProviderError> {
     let schema = dataset_schema.schema.as_schema();
-    let dataset = GroupDatasetSchemaRef {
-        group_id: &group_id,
-        dataset_id: &dataset_schema.dataset_id,
-        schema,
-    };
-    let page = transaction
-        .scan_dataset_row_batch(dataset, after, ACTIVATION_ROWS_PER_BATCH, state_rows)
+    transaction
+        .scan_dataset_rows_into(cursor, batch)
         .await
-        .map_err(RowProviderError::from_store_error)?;
-    for current in state_rows.rows() {
+        .map_err(|source| RowProviderError::from_store_error(source.into()))?;
+    for current in batch.rows().rows() {
         append_unavailable_current(
             output,
             group_id,
@@ -362,7 +370,7 @@ async fn fill_unavailable_replacement_dataset(
             &current,
         )?;
     }
-    Ok(page.next_after)
+    Ok(())
 }
 
 /// Translate one raw hosted row transition into an application-visible operation.
@@ -679,6 +687,39 @@ fn changed_value_fields(
     differences.into_boxed_slice()
 }
 
+/// Retained page cursor selected by one activation lineage.
+enum ActivationDatasetCursor {
+    /// Ordinary rows from one dataset occurrence.
+    Rows(PageCursor<DatasetRowsQuery<'static>>),
+    /// Aligned old-to-new row transitions.
+    Transitions(PageCursor<DatasetRowTransitionQuery<'static>>),
+}
+
+impl ActivationDatasetCursor {
+    /// Build the cursor required by `source` for one owned dataset schema.
+    fn new(source: &ActivationRowSource, dataset: crate::api::DatasetSchema) -> Self {
+        match source {
+            ActivationRowSource::Creation { group_id } => {
+                Self::Rows(PageCursor::new(DatasetRowsQuery::owned(*group_id, dataset)))
+            }
+            ActivationRowSource::GroupReplacement {
+                migration_id,
+                predecessor: ReplacementPredecessor::Hosted { .. },
+            } => Self::Transitions(PageCursor::new(DatasetRowTransitionQuery::new(
+                DatasetRowsQuery::owned(migration_id.old_group_id, dataset.clone()),
+                DatasetRowsQuery::owned(migration_id.new_group_id, dataset),
+            ))),
+            ActivationRowSource::GroupReplacement {
+                migration_id,
+                predecessor: ReplacementPredecessor::Unavailable,
+            } => Self::Rows(PageCursor::new(DatasetRowsQuery::owned(
+                migration_id.new_group_id,
+                dataset,
+            ))),
+        }
+    }
+}
+
 /// Store projection used to build one activation event.
 enum ActivationRowSource {
     /// Ordinary rows introduced by a creation-sourced activation.
@@ -710,8 +751,10 @@ mod tests {
     use super::*;
     use crate::{
         api::{
-            DatasetRowScanPage,
+            DatasetRowPageMetadata,
             PreviousRowAbsence,
+            ReplicationStateRowBatch,
+            ReplicationStateRowTransitionBatch,
             SchemaSource,
             StoreErrorClassification,
             StoreErrorClassificationSource as _,
@@ -807,14 +850,14 @@ mod tests {
         next_after: Option<RowKey>,
     ) -> ProviderTestRowScanResult {
         ProviderTestRowScanResult {
-            page: DatasetRowScanPage {
+            metadata: DatasetRowPageMetadata {
                 group_id: TEST_MIGRATION_ID.new_group_id,
                 dataset_id: DatasetId::try_from_static(dataset_id)
                     .expect("test dataset id must be valid"),
                 dataset_exists: true,
-                next_after,
             },
             rows,
+            next_after,
         }
     }
 
@@ -945,11 +988,12 @@ mod tests {
             },
             datasets: group_schema(["beta", "alpha"]).datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         };
 
@@ -1001,8 +1045,27 @@ mod tests {
     }
 
     #[test]
-    fn creation_provider_propagates_scan_failure_and_drops_transaction() {
-        let (transaction, state) = provider_test_read_transaction([Err(test_store_error())], []);
+    fn creation_provider_propagates_later_page_failure_and_drops_transaction() {
+        let versions =
+            VersionVector::initial(NonZeroUsize::new(2).expect("test group must have members"));
+        let first_key = RowKey(Uuid::from_u128(1));
+        let (transaction, state) = provider_test_read_transaction(
+            [
+                Ok(row_batch(
+                    "docs",
+                    vec![stored_row(
+                        1,
+                        "hidden",
+                        true,
+                        Some(UpdateId::INITIAL_STATE_ORIGIN),
+                        versions,
+                    )],
+                    Some(first_key),
+                )),
+                Err(test_store_error()),
+            ],
+            [],
+        );
         let mut provider = StoreActivationRowProvider {
             transaction: Some(transaction),
             source: ActivationRowSource::Creation {
@@ -1010,11 +1073,12 @@ mod tests {
             },
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         };
 
@@ -1034,7 +1098,9 @@ mod tests {
             .expect("test transaction state mutex must not be poisoned");
         assert_eq!(state.release_count, 0);
         assert_eq!(state.drop_count, 1);
-        assert_eq!(state.row_requests.len(), 1);
+        assert_eq!(state.row_requests.len(), 2);
+        assert_eq!(state.row_requests[0].after, None);
+        assert_eq!(state.row_requests[1].after, Some(first_key));
     }
 
     #[test]
@@ -1049,11 +1115,12 @@ mod tests {
             },
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         };
 
@@ -1076,11 +1143,12 @@ mod tests {
             },
             datasets: group_schema(["docs"]).datasets(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         };
 
@@ -1113,11 +1181,12 @@ mod tests {
             },
             datasets: Vec::new(),
             dataset_index: 0,
-            after_row_key: None,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
-            transition_rows: ReplicationStateRowTransitionBatch::new(
+            dataset_cursor: None,
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), ACTIVATION_ROWS_PER_BATCH),
+            transition_rows: DatasetRowTransitionPageBatch::bounded(
                 &Schema::empty(),
                 &Schema::empty(),
+                ACTIVATION_ROWS_PER_BATCH,
             ),
         };
 

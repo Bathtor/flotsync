@@ -1,234 +1,160 @@
 //! SQLite persistence for dataset row snapshots and patches.
 
 use super::*;
-use flotsync_utils::option_when;
 
-pub(super) async fn load_dataset_rows(
+/// Load one page of a fixed requested-row selection.
+pub(super) async fn load_dataset_rows_into(
     connection: &mut SqliteStoreConnection,
-    dataset: GroupDatasetSchemaRef<'_>,
-    row_keys: &mut RowKeyIterator<'_>,
-) -> Result<DatasetRowStateSlice, StoreError> {
-    let group_id = dataset.group_id;
-    let dataset_id = dataset.dataset_id;
-    let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
-    let mut row_keys = row_keys.peekable();
-    let mut state_rows = ReplicationStateRowBatch::new(dataset.schema);
-    if row_keys.peek().is_none() {
-        return Ok(DatasetRowStateSlice {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-            dataset_exists,
-            state_rows,
-            missing_row_keys: HashSet::new(),
-        });
-    }
-    let mut missing_row_keys = row_keys.copied().collect::<HashSet<_>>();
-    if !dataset_exists {
-        return Ok(DatasetRowStateSlice {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-            dataset_exists,
-            state_rows,
-            missing_row_keys,
-        });
+    mut page: PageAttempt<
+        '_,
+        RequestedDatasetRowsQuery<'_>,
+        SqliteRequestedRowsContinuation,
+        RequestedDatasetRowPageBatch,
+    >,
+) -> Result<(), PageError> {
+    let start = page
+        .after()
+        .map_or(0, |continuation| continuation.next_index);
+    let maximum = page
+        .limit()
+        .into_option()
+        .map_or(usize::MAX, NonZeroUsize::get);
+    let row_key_count = page.params().row_keys().len();
+    let end = start.saturating_add(maximum).min(row_key_count);
+    let selected_row_keys = page.params().row_keys()[start..end].to_vec();
+    let dataset = page.params().dataset().context();
+    let group_id = *dataset.group_id;
+    let dataset_id = dataset.dataset_id.clone();
+    let dataset_exists = dataset_exists_in_group(connection, &group_id, &dataset_id).await?;
+    let metadata = DatasetRowPageMetadata {
+        group_id,
+        dataset_id: dataset_id.clone(),
+        dataset_exists,
+    };
+    if selected_row_keys.is_empty() {
+        return page.finish(metadata, PageEnd::Exhausted);
     }
 
-    let member_count = load_group_member_count(connection, group_id).await?;
-    let mut query_builder = QueryBuilder::<Sqlite>::new(
-        "
-SELECT row_key,
-       row_snapshot,
-       row_tombstoned,
-       row_created_by_node_index,
-       row_created_by_version,
-       row_last_changed_versions
-FROM dataset_rows
-WHERE group_id = ",
-    );
-    query_builder.push_bind(group_id.to_string());
-    query_builder.push(" AND dataset_id = ");
-    query_builder.push_bind(dataset_id.as_str());
-    query_builder.push(" AND row_key IN (");
-    {
-        let mut separated = query_builder.separated(", ");
-        for row_key in &missing_row_keys {
-            separated.push_bind(row_key.to_string());
+    let mut stored_rows = if dataset_exists {
+        load_requested_dataset_rows(connection, &group_id, &dataset_id, &selected_row_keys).await?
+    } else {
+        HashMap::new()
+    };
+    let member_count = if stored_rows.is_empty() {
+        None
+    } else {
+        let member_count = load_group_member_count(connection, &group_id).await?;
+        Some(member_count)
+    };
+    page.reserve(selected_row_keys.len());
+    for row_key in selected_row_keys {
+        if let Some(row) = stored_rows.remove(&row_key) {
+            let member_count = member_count.expect("stored rows require group member metadata");
+            let mut source = decode_dataset_row_source(&row, member_count)?;
+            page.push(RequestedDatasetRowInput::Present(&mut source))?;
+        } else {
+            page.push(RequestedDatasetRowInput::Missing(row_key))?;
         }
     }
-    query_builder.push(")");
-    let stored_rows = query_builder
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .context(SqlxSnafu)?;
-    state_rows.reserve_rows(stored_rows.len());
-    for row in stored_rows {
-        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let mut row_decoder =
-            decode_dataset_row_snapshot_decoder(&row.get::<Vec<u8>, _>("row_snapshot"))?;
-        let created_by = decode_dataset_row_created_by(
-            &row,
-            row_key,
-            "row_created_by_node_index",
-            "row_created_by_version",
-            member_count,
-        )?;
-        let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
-        let metadata = ReplicationRowMetadata {
-            row_key,
-            tombstoned: row.get::<bool, _>("row_tombstoned"),
-            created_by,
-            last_changed_versions,
-        };
-        state_rows
-            .push_decoded_row(metadata, &mut row_decoder)
-            .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
-        missing_row_keys.remove(&row_key);
-    }
-    Ok(DatasetRowStateSlice {
-        group_id: *group_id,
-        dataset_id: dataset_id.clone(),
-        dataset_exists,
-        state_rows,
-        missing_row_keys,
-    })
-}
-
-/// Scan rows in lexicographic row-key order.
-///
-/// `after` is an exclusive lower bound. When the result contains exactly
-/// `limit` rows, `next_after` is set to the last returned row key so callers can
-/// continue with `row_key > next_after`.
-pub(super) async fn scan_dataset_row_batch(
-    connection: &mut SqliteStoreConnection,
-    dataset: GroupDatasetSchemaRef<'_>,
-    after: Option<RowKey>,
-    limit: NonZeroUsize,
-    output: &mut ReplicationStateRowBatch,
-) -> Result<DatasetRowScanPage, StoreError> {
-    let group_id = dataset.group_id;
-    let dataset_id = dataset.dataset_id;
-    output.reuse_for_schema(dataset.schema);
-    let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
-    if !dataset_exists {
-        return Ok(DatasetRowScanPage {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-            dataset_exists,
-            next_after: None,
-        });
-    }
-
-    let member_count = load_group_member_count(connection, group_id).await?;
-    let mut query_builder = QueryBuilder::<Sqlite>::new(
-        "
-SELECT row_key,
-       row_snapshot,
-       row_tombstoned,
-       row_created_by_node_index,
-       row_created_by_version,
-       row_last_changed_versions
-FROM dataset_rows
-WHERE group_id = ",
-    );
-    query_builder.push_bind(group_id.to_string());
-    query_builder.push(" AND dataset_id = ");
-    query_builder.push_bind(dataset_id.as_str());
-    if let Some(after) = after {
-        query_builder.push(" AND row_key > ");
-        query_builder.push_bind(after.to_string());
-    }
-    query_builder.push(" ORDER BY row_key LIMIT ");
-    query_builder.push_bind(sqlite_limit_value(limit));
-
-    let stored_rows = query_builder
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .context(SqlxSnafu)?;
-    output.reserve_rows(stored_rows.len());
-    for row in stored_rows {
-        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let mut row_decoder =
-            decode_dataset_row_snapshot_decoder(&row.get::<Vec<u8>, _>("row_snapshot"))?;
-        let created_by = decode_dataset_row_created_by(
-            &row,
-            row_key,
-            "row_created_by_node_index",
-            "row_created_by_version",
-            member_count,
-        )?;
-        let last_changed_versions = decode_dataset_row_last_changed_versions(&row, member_count)?;
-        let metadata = ReplicationRowMetadata {
-            row_key,
-            tombstoned: row.get::<bool, _>("row_tombstoned"),
-            created_by,
-            last_changed_versions,
-        };
-        output
-            .push_decoded_row(metadata, &mut row_decoder)
-            .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
-    }
-    let next_after = if output.len() == limit.get() {
-        output.rows().next_back().map(|row| row.metadata().row_key)
+    let page_end = if end < row_key_count {
+        PageEnd::MayHaveMore(SqliteRequestedRowsContinuation { next_index: end })
     } else {
-        None
+        PageEnd::Exhausted
     };
-    Ok(DatasetRowScanPage {
-        group_id: *group_id,
-        dataset_id: dataset_id.clone(),
-        dataset_exists,
-        next_after,
-    })
+    page.finish(metadata, page_end)
 }
 
-/// Scan a row-key-aligned transition page from two stored dataset occurrences.
-///
-/// The key-union page is selected before either row table is joined, so the
-/// limit applies to emitted transitions rather than to either side independently.
-pub(super) async fn scan_dataset_row_transition_batch(
+/// Scan one page of rows in SQLite `TEXT` row-key order.
+pub(super) async fn scan_dataset_rows_into(
     connection: &mut SqliteStoreConnection,
-    previous_group: GroupDatasetSchemaRef<'_>,
-    current_group: GroupDatasetSchemaRef<'_>,
-    after: Option<RowKey>,
-    limit: NonZeroUsize,
-    output: &mut ReplicationStateRowTransitionBatch,
-) -> Result<DatasetRowStateTransitionPage, StoreError> {
-    ensure_matching_transition_dataset_references(previous_group, current_group)
-        .map_err(StoreError::from_classification_source)?;
-    output.reuse_for_schemas(previous_group.schema, current_group.schema);
-    let dataset_id = previous_group.dataset_id;
-    let metadata =
-        load_transition_dataset_metadata(connection, previous_group, current_group).await?;
+    mut page: PageAttempt<
+        '_,
+        DatasetRowsQuery<'_>,
+        SqliteTextPageContinuation,
+        DatasetRowPageBatch,
+    >,
+) -> Result<(), PageError> {
+    let dataset = page.params().context();
+    let group_id = *dataset.group_id;
+    let dataset_id = dataset.dataset_id.clone();
+    let dataset_exists = dataset_exists_in_group(connection, &group_id, &dataset_id).await?;
+    let metadata = DatasetRowPageMetadata {
+        group_id,
+        dataset_id: dataset_id.clone(),
+        dataset_exists,
+    };
+    if !dataset_exists {
+        return page.finish(metadata, PageEnd::Exhausted);
+    }
+
+    let member_count = load_group_member_count(connection, &group_id).await?;
+    let mut query_builder = dataset_rows_query(&group_id, &dataset_id);
+    push_ordered_text_page_window(&mut query_builder, &page, "row_key");
+    let stored_rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    let continuation_index = continuation_record_index(page.limit(), stored_rows.len());
+    let continuation = continuation_index.map(|index| {
+        SqliteTextPageContinuation::new(stored_rows[index].get::<String, _>("row_key"))
+    });
+    page.reserve(stored_rows.len());
+    for row in stored_rows {
+        let mut source = decode_dataset_row_source(&row, member_count)?;
+        page.push(&mut source)?;
+    }
+    finish_page_with_metadata(page, metadata, continuation)
+}
+
+/// Scan one row-key-aligned transition page from two stored dataset occurrences.
+pub(super) async fn scan_dataset_row_transitions_into(
+    connection: &mut SqliteStoreConnection,
+    mut page: PageAttempt<
+        '_,
+        DatasetRowTransitionQuery<'_>,
+        SqliteTextPageContinuation,
+        DatasetRowTransitionPageBatch,
+    >,
+) -> Result<(), PageError> {
+    let (previous_group_id, current_group_id, dataset_id, metadata) = {
+        let previous_group = page.params().previous().context();
+        let current_group = page.params().current().context();
+        ensure_matching_transition_dataset_references(previous_group, current_group)
+            .map_err(StoreError::from_classification_source)?;
+        let metadata =
+            load_transition_dataset_metadata(connection, previous_group, current_group).await?;
+        (
+            *previous_group.group_id,
+            *current_group.group_id,
+            previous_group.dataset_id.clone(),
+            metadata,
+        )
+    };
+    let after = page.after().map(SqliteTextPageContinuation::as_str);
+    let limit = page.limit();
     let mut query_builder = QueryBuilder::<Sqlite>::new("WITH page_keys AS (");
-    push_dataset_row_key_select(
-        &mut query_builder,
-        previous_group.group_id,
-        dataset_id,
-        after,
-    );
+    push_dataset_row_key_select(&mut query_builder, &previous_group_id, &dataset_id, after);
     query_builder.push(" UNION ");
-    push_dataset_row_key_select(
-        &mut query_builder,
-        current_group.group_id,
-        dataset_id,
-        after,
-    );
-    query_builder.push(" ORDER BY row_key LIMIT ");
-    query_builder.push_bind(sqlite_limit_value(limit));
+    push_dataset_row_key_select(&mut query_builder, &current_group_id, &dataset_id, after);
+    query_builder.push(" ORDER BY row_key");
+    if let PageLimit::Max(limit) = limit {
+        query_builder.push(" LIMIT ");
+        query_builder.push_bind(sqlite_limit_value(limit));
+    }
     query_builder.push(") SELECT page_keys.row_key");
     push_joined_row_projection(&mut query_builder, "previous_rows");
     push_joined_row_projection(&mut query_builder, "current_rows");
     query_builder.push(
         " FROM page_keys LEFT JOIN dataset_rows AS previous_rows ON previous_rows.group_id = ",
     );
-    query_builder.push_bind(previous_group.group_id.to_string());
+    query_builder.push_bind(previous_group_id.to_string());
     query_builder.push(" AND previous_rows.dataset_id = ");
     query_builder.push_bind(dataset_id.as_str());
     query_builder.push(
         " AND previous_rows.row_key = page_keys.row_key LEFT JOIN dataset_rows AS current_rows ON current_rows.group_id = ",
     );
-    query_builder.push_bind(current_group.group_id.to_string());
+    query_builder.push_bind(current_group_id.to_string());
     query_builder.push(" AND current_rows.dataset_id = ");
     query_builder.push_bind(dataset_id.as_str());
     query_builder.push(" AND current_rows.row_key = page_keys.row_key ORDER BY page_keys.row_key");
@@ -238,27 +164,46 @@ pub(super) async fn scan_dataset_row_transition_batch(
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
-
-    decode_dataset_row_transitions(
-        stored_rows,
-        metadata.previous_member_count,
-        metadata.current_member_count,
-        output,
-    )?;
-
-    let last_row_key = output
-        .rows()
-        .next_back()
-        .map(|transition| transition.row_key());
-    let next_after = option_when!(output.len() == limit.get(), last_row_key).flatten();
-    Ok(DatasetRowStateTransitionPage {
-        previous_group_id: *previous_group.group_id,
-        current_group_id: *current_group.group_id,
-        dataset_id: dataset_id.clone(),
+    let continuation_index = continuation_record_index(limit, stored_rows.len());
+    let continuation = continuation_index.map(|index| {
+        SqliteTextPageContinuation::new(
+            stored_rows[index].get::<String, _>(JoinedRowColumnLayout::ROW_KEY_COLUMN),
+        )
+    });
+    page.reserve(stored_rows.len());
+    for row in stored_rows {
+        let row_key = decode_row_key(&row.get::<String, _>(JoinedRowColumnLayout::ROW_KEY_COLUMN))?;
+        let mut previous = decode_transition_row_source(
+            &row,
+            row_key,
+            metadata.previous_member_count,
+            JoinedRowColumnLayout::PREVIOUS,
+        )?;
+        let mut current = decode_transition_row_source(
+            &row,
+            row_key,
+            metadata.current_member_count,
+            JoinedRowColumnLayout::CURRENT,
+        )?;
+        let input = ReplicationStateRowTransitionInput::new(
+            row_key,
+            previous
+                .as_mut()
+                .map(|source| source as &mut dyn ReplicationStateRowSource),
+            current
+                .as_mut()
+                .map(|source| source as &mut dyn ReplicationStateRowSource),
+        );
+        page.push(input)?;
+    }
+    let page_metadata = DatasetRowTransitionPageMetadata {
+        previous_group_id,
+        current_group_id,
+        dataset_id,
         previous_dataset_exists: metadata.previous_dataset_exists,
         current_dataset_exists: metadata.current_dataset_exists,
-        next_after,
-    })
+    };
+    finish_page_with_metadata(page, page_metadata, continuation)
 }
 
 pub(super) async fn apply_dataset_row_patch(
@@ -377,12 +322,92 @@ WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
     Ok(row.map(|row| row.get::<bool, _>("row_tombstoned")))
 }
 
+/// SQLite continuation identifying the next index in a fixed requested-key selection.
+pub(super) struct SqliteRequestedRowsContinuation {
+    /// Index of the first requested key not emitted by the previous page.
+    next_index: usize,
+}
+
+/// Build the canonical stored-row selection for one dataset occurrence.
+fn dataset_rows_query(group_id: &GroupId, dataset_id: &DatasetId) -> QueryBuilder<Sqlite> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT row_key,
+       row_snapshot,
+       row_tombstoned,
+       row_created_by_node_index,
+       row_created_by_version,
+       row_last_changed_versions
+FROM dataset_rows
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    query_builder.push(" AND dataset_id = ");
+    query_builder.push_bind(dataset_id.as_str());
+    query_builder
+}
+
+/// Load present rows for one requested-key slice, indexed by decoded row key.
+async fn load_requested_dataset_rows(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    row_keys: &[RowKey],
+) -> Result<HashMap<RowKey, sqlx::sqlite::SqliteRow>, StoreError> {
+    let mut query_builder = dataset_rows_query(group_id, dataset_id);
+    query_builder.push(" AND row_key IN (");
+    {
+        let mut separated = query_builder.separated(", ");
+        for row_key in row_keys {
+            separated.push_bind(row_key.to_string());
+        }
+    }
+    query_builder.push(")");
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    let mut rows_by_key = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
+        rows_by_key.insert(row_key, row);
+    }
+    Ok(rows_by_key)
+}
+
+/// Decode one ordinary stored row into a temporary direct-append source.
+fn decode_dataset_row_source(
+    row: &sqlx::sqlite::SqliteRow,
+    member_count: NonZeroUsize,
+) -> Result<SqliteReplicationStateRowSource, StoreError> {
+    let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
+    let decoder = decode_dataset_row_snapshot_decoder(&row.get::<Vec<u8>, _>("row_snapshot"))?;
+    let created_by = decode_dataset_row_created_by(
+        row,
+        row_key,
+        "row_created_by_node_index",
+        "row_created_by_version",
+        member_count,
+    )?;
+    let last_changed_versions = decode_dataset_row_last_changed_versions(row, member_count)?;
+    Ok(SqliteReplicationStateRowSource {
+        metadata: Some(ReplicationRowMetadata {
+            row_key,
+            tombstoned: row.get::<bool, _>("row_tombstoned"),
+            created_by,
+            last_changed_versions,
+        }),
+        decoder,
+    })
+}
+
 /// Append one indexed dataset-row key selection to the transition CTE.
 fn push_dataset_row_key_select(
     query_builder: &mut QueryBuilder<Sqlite>,
     group_id: &GroupId,
     dataset_id: &DatasetId,
-    after: Option<RowKey>,
+    after: Option<&str>,
 ) {
     query_builder.push("SELECT row_key FROM dataset_rows WHERE group_id = ");
     query_builder.push_bind(group_id.to_string());
@@ -390,7 +415,7 @@ fn push_dataset_row_key_select(
     query_builder.push_bind(dataset_id.as_str());
     if let Some(after) = after {
         query_builder.push(" AND row_key > ");
-        query_builder.push_bind(after.to_string());
+        query_builder.push_bind(after);
     }
 }
 
@@ -503,55 +528,24 @@ WHERE active.group_id IN (?1, ?2)
     Ok((previous_member_count, current_member_count))
 }
 
-/// Decode all stored rows returned by one dataset-transition query.
-fn decode_dataset_row_transitions(
-    stored_rows: Vec<sqlx::sqlite::SqliteRow>,
-    previous_member_count: NonZeroUsize,
-    current_member_count: NonZeroUsize,
-    output: &mut ReplicationStateRowTransitionBatch,
-) -> Result<(), StoreError> {
-    output.reserve_rows(stored_rows.len());
-    for stored_row in stored_rows {
-        let row_key =
-            decode_row_key(&stored_row.get::<String, _>(JoinedRowColumnLayout::ROW_KEY_COLUMN))?;
-        let previous_index = decode_transition_row_into_batch(
-            &stored_row,
-            row_key,
-            previous_member_count,
-            JoinedRowColumnLayout::PREVIOUS,
-            output.previous_rows_mut(),
-        )?;
-        let current_index = decode_transition_row_into_batch(
-            &stored_row,
-            row_key,
-            current_member_count,
-            JoinedRowColumnLayout::CURRENT,
-            output.current_rows_mut(),
-        )?;
-        output.push_alignment(previous_index, current_index);
-    }
-    Ok(())
-}
-
 /// Decode one nullable side of a dataset-row transition query result.
 ///
 /// `None` means the corresponding side of the left join was `NULL`. A stored
 /// row always has a non-null snapshot, so the snapshot column identifies
 /// whether that side exists.
-fn decode_transition_row_into_batch(
+fn decode_transition_row_source(
     row: &sqlx::sqlite::SqliteRow,
     row_key: RowKey,
     member_count: NonZeroUsize,
     columns: JoinedRowColumnLayout,
-    output: &mut ReplicationStateRowBatch,
-) -> Result<Option<usize>, StoreError> {
+) -> Result<Option<SqliteReplicationStateRowSource>, StoreError> {
     let snapshot = row
         .try_get::<Option<Vec<u8>>, _>(columns.snapshot())
         .context(SqlxSnafu)?;
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    let mut row_decoder = decode_dataset_row_snapshot_decoder(&snapshot)?;
+    let decoder = decode_dataset_row_snapshot_decoder(&snapshot)?;
     let tombstoned = row
         .try_get::<bool, _>(columns.tombstoned())
         .context(SqlxSnafu)?;
@@ -571,17 +565,43 @@ fn decode_transition_row_into_batch(
         .try_get::<Vec<u8>, _>(columns.last_changed_versions())
         .context(SqlxSnafu)?;
     let last_changed_versions = decode_stored_version_vector(&last_changed_versions, member_count)?;
-    let metadata = ReplicationRowMetadata {
-        row_key,
-        tombstoned,
-        created_by,
-        last_changed_versions,
-    };
-    let row_index = output.len();
-    output
-        .push_decoded_row(metadata, &mut row_decoder)
-        .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
-    Ok(Some(row_index))
+    Ok(Some(SqliteReplicationStateRowSource {
+        metadata: Some(ReplicationRowMetadata {
+            row_key,
+            tombstoned,
+            created_by,
+            last_changed_versions,
+        }),
+        decoder,
+    }))
+}
+
+/// SQLite decoder and metadata for one temporary direct positional append.
+struct SqliteReplicationStateRowSource {
+    /// Metadata consumed together with the row snapshot.
+    metadata: Option<ReplicationRowMetadata>,
+    /// Protobuf-backed field-state decoder.
+    decoder: ProtoSchemaSnapshotDecoder,
+}
+
+impl ReplicationStateRowSource for SqliteReplicationStateRowSource {
+    fn row_key(&self) -> RowKey {
+        self.metadata
+            .as_ref()
+            .expect("SQLite row source cannot be inspected after it was consumed")
+            .row_key
+    }
+
+    fn append_to(&mut self, output: &mut ReplicationStateRowBatch) -> Result<(), PageError> {
+        let metadata = self
+            .metadata
+            .take()
+            .expect("SQLite row source cannot be appended twice");
+        output
+            .push_decoded_row(metadata, &mut self.decoder)
+            .map_err(|source| invalid_stored_object("dataset row snapshot", source))
+            .map_err(PageError::from_store_error)
+    }
 }
 
 /// Ordinal positions for one repeated joined-row projection.

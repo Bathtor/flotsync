@@ -14,17 +14,17 @@ use crate::api::{
     BatchProvider,
     DataChangeLineage,
     DataChangeReadPosition,
+    DatasetRowPageBatch,
+    DatasetRowsQuery,
     DatasetSchema,
-    GroupDatasetSchemaRef,
     GroupReadToken,
+    PageCursor,
     ProviderExternalSnafu,
     ProviderFailedSnafu,
-    ReplicationStateRowBatch,
     ReplicationStoreReadTransaction,
     RowChange,
     RowChangeBatch,
     RowId,
-    RowKey,
     RowProviderError,
     SnapshotRowBatch,
     StoreError,
@@ -71,7 +71,7 @@ pub(in crate::runtime) struct StoreSynchronisationProvider {
     /// Maximum rows or update records loaded by one store operation.
     max_rows_per_batch: NonZeroUsize,
     /// Reusable decoded store rows for full snapshot batches.
-    state_rows: ReplicationStateRowBatch,
+    state_rows: DatasetRowPageBatch,
 }
 
 impl StoreSynchronisationProvider {
@@ -86,7 +86,7 @@ impl StoreSynchronisationProvider {
             pending_groups,
             current_group: None,
             max_rows_per_batch,
-            state_rows: ReplicationStateRowBatch::new(&Schema::empty()),
+            state_rows: DatasetRowPageBatch::bounded(&Schema::empty(), max_rows_per_batch),
         }
     }
 
@@ -305,6 +305,22 @@ impl StoreSynchronisationProvider {
         }
     }
 
+    /// Enter the failed state and explicitly release any retained transaction.
+    ///
+    /// Release failures are logged because the original paging or projection
+    /// failure remains the actionable error returned to the caller.
+    async fn fail_and_release_transaction(&mut self) {
+        let previous =
+            std::mem::replace(&mut self.state, StoreSynchronisationProviderState::Failed);
+        if let StoreSynchronisationProviderState::Streaming(transaction) = previous
+            && let Err(source) = transaction.release().await
+        {
+            log::warn!(
+                "failed to release synchronisation transaction after provider error: {source}"
+            );
+        }
+    }
+
     /// Fill one full snapshot batch without advancing into a later group.
     ///
     /// `Ok(Batch(_))` carries visible rows and restores the updated snapshot
@@ -312,9 +328,9 @@ impl StoreSynchronisationProvider {
     /// dataset was consumed; the current entry remains absent and the retained
     /// transaction is released when no pending group remains.
     ///
-    /// A retryable store error restores the current snapshot at its previous
-    /// cursor. A terminal store or projection error leaves it absent and changes
-    /// the provider to `Failed`.
+    /// Any store or projection error invalidates the in-progress page cursor,
+    /// leaves the current snapshot absent, explicitly releases the retained
+    /// transaction, and changes the provider to `Failed`.
     async fn fill_snapshot_batch(
         &mut self,
         mut reuse: SnapshotRowBatch,
@@ -322,7 +338,7 @@ impl StoreSynchronisationProvider {
         reuse.clear();
         let current = self.current_group.take();
         let Some(ResolvedGroupSynchronisation::Snapshot(mut group)) = current else {
-            self.state = StoreSynchronisationProviderState::Failed;
+            self.fail_and_release_transaction().await;
             return ProviderFailedSnafu.fail();
         };
 
@@ -332,57 +348,54 @@ impl StoreSynchronisationProvider {
                 return Ok(CurrentBatchOutcome::GroupExhausted);
             };
             let group_id = group.group_id;
-            let after = group.after_row_key;
             let dataset_id = dataset.dataset_id.clone();
             let schema = dataset.schema.clone();
-            let dataset_ref = GroupDatasetSchemaRef {
-                group_id: &group_id,
-                dataset_id: &dataset_id,
-                schema: schema.as_schema(),
-            };
+            if group.row_cursor.is_none() {
+                group.row_cursor = Some(PageCursor::new(DatasetRowsQuery::owned(
+                    group_id,
+                    dataset.clone(),
+                )));
+            }
             let scan_result = {
                 let transaction = self.state.get_transaction()?;
+                let cursor = group
+                    .row_cursor
+                    .as_mut()
+                    .expect("snapshot group must initialise its dataset cursor");
                 transaction
-                    .scan_dataset_row_batch(
-                        dataset_ref,
-                        after,
-                        self.max_rows_per_batch,
-                        &mut self.state_rows,
-                    )
+                    .scan_dataset_rows_into(cursor, &mut self.state_rows)
                     .await
             };
-            let batch = match scan_result {
-                Ok(batch) => batch,
-                Err(source) => {
-                    let retryable = store_failure_is_retryable_in_transaction(&source);
-                    let error = RowProviderError::from_store_error(source);
-                    if retryable {
-                        self.current_group = Some(ResolvedGroupSynchronisation::Snapshot(group));
-                    } else {
-                        self.state = StoreSynchronisationProviderState::Failed;
-                    }
-                    return Err(error);
-                }
-            };
+            if let Err(source) = scan_result {
+                let error = RowProviderError::from_store_error(source.into());
+                self.fail_and_release_transaction().await;
+                return Err(error);
+            }
 
             let rows = reuse.prepare(schema, self.max_rows_per_batch.get());
-            for record in self.state_rows.rows() {
+            let mut projection_error = None;
+            for record in self.state_rows.rows().rows() {
                 let metadata = record.metadata();
                 if !metadata.tombstoned {
                     let row_id = RowId::new(group_id, dataset_id.clone(), metadata.row_key);
                     if let Err(source) = rows.push_row_read(row_id, false, &record) {
-                        let error = provider_external_error(source);
-                        self.state = StoreSynchronisationProviderState::Failed;
-                        return Err(error);
+                        projection_error = Some(provider_external_error(source));
+                        break;
                     }
                 }
             }
+            if let Some(error) = projection_error {
+                self.fail_and_release_transaction().await;
+                return Err(error);
+            }
 
-            if let Some(next_after) = batch.next_after {
-                group.after_row_key = Some(next_after);
-            } else {
+            let cursor = group
+                .row_cursor
+                .as_ref()
+                .expect("snapshot group must retain its dataset cursor after a successful page");
+            if !cursor.has_more() {
                 group.datasets.pop_front();
-                group.after_row_key = None;
+                group.row_cursor = None;
             }
         }
 
@@ -496,7 +509,7 @@ impl ReadableGroupSynchronisation {
             group_id: self.group_id,
             read_token: self.read_token,
             datasets: self.group_schema.datasets().into(),
-            after_row_key: None,
+            row_cursor: None,
         })
     }
 }
@@ -517,8 +530,8 @@ struct ResolvedGroupSnapshot {
     read_token: GroupReadToken,
     /// Datasets remaining in deterministic identifier order.
     datasets: VecDeque<DatasetSchema>,
-    /// Exclusive lower row-key bound within the current dataset.
-    after_row_key: Option<RowKey>,
+    /// Cursor over the dataset currently at the front of `datasets`.
+    row_cursor: Option<PageCursor<DatasetRowsQuery<'static>>>,
 }
 
 /// Resolved incremental change state for one group.

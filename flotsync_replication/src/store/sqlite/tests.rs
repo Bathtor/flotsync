@@ -2,8 +2,13 @@
 use super::*;
 use crate::{
     api::{
+        DatasetRowPageBatch,
         DatasetRowStatePatch,
+        DatasetRowStateSlice,
         DatasetRowStateWrite,
+        DatasetRowTransitionPageBatch,
+        DatasetRowTransitionQuery,
+        DatasetRowsQuery,
         GroupDatasetSchemaRef,
         GroupInvitation,
         GroupSchema,
@@ -19,8 +24,12 @@ use crate::{
         MigrationProposal,
         PendingGroupDecisionRecord,
         ReplicationUpdateFilter,
+        RequestedDatasetRowPageBatch,
+        RequestedDatasetRowView,
+        RequestedDatasetRowsQuery,
         SnapshotRef,
         StoreErrorClass,
+        StoreErrorClassificationSource as _,
         VecPageBatch,
         current_slice_placeholder_group_security_material,
     },
@@ -98,6 +107,70 @@ fn loaded_row_fixture(
         created_by: metadata.created_by,
         last_changed_versions: metadata.last_changed_versions.clone(),
     })
+}
+
+/// Verify requested-row outcomes and empty selections against a missing dataset.
+fn assert_requested_rows_for_missing_dataset(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    group_id: GroupId,
+    missing_dataset_id: &DatasetId,
+    schema: &Schema,
+    first_missing_row_key: RowKey,
+) {
+    let second_missing_row_key = RowKey(Uuid::from_u128(1_207));
+    let mut expected_missing_row_keys = vec![first_missing_row_key, second_missing_row_key];
+    expected_missing_row_keys.sort_unstable();
+    let mut requested_rows = RequestedDatasetRowPageBatch::unlimited(schema);
+    let mut requested_missing_cursor = PageCursor::new(RequestedDatasetRowsQuery::new(
+        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: missing_dataset_id,
+            schema,
+        }),
+        [second_missing_row_key, first_missing_row_key],
+    ));
+    wait_for_store_future(
+        transaction.load_dataset_rows_into(&mut requested_missing_cursor, &mut requested_rows),
+    )
+    .expect("requested rows from a missing dataset should load");
+    let loaded_missing_row_keys = requested_rows
+        .outcomes()
+        .map(|outcome| match outcome {
+            RequestedDatasetRowView::Missing(row_key) => row_key,
+            RequestedDatasetRowView::Present(_) => {
+                panic!("a missing dataset cannot contain requested rows")
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(loaded_missing_row_keys, expected_missing_row_keys);
+    assert!(
+        !requested_rows
+            .metadata()
+            .expect("requested missing-dataset page should retain metadata")
+            .dataset_exists
+    );
+    assert!(requested_missing_cursor.is_exhausted());
+
+    let mut empty_request_cursor = PageCursor::new(RequestedDatasetRowsQuery::new(
+        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: missing_dataset_id,
+            schema,
+        }),
+        [],
+    ));
+    wait_for_store_future(
+        transaction.load_dataset_rows_into(&mut empty_request_cursor, &mut requested_rows),
+    )
+    .expect("an empty row selection should load");
+    assert!(requested_rows.outcomes().next().is_none());
+    assert!(
+        !requested_rows
+            .metadata()
+            .expect("empty requested-row page should retain metadata")
+            .dataset_exists
+    );
+    assert!(empty_request_cursor.is_exhausted());
 }
 
 async fn apply_row_patch(
@@ -1766,6 +1839,36 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
     );
     assert!(loaded_snapshot.missing_row_keys.contains(&missing_row_key));
 
+    let query = RequestedDatasetRowsQuery::new(
+        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        }),
+        [missing_row_key, row_key, row_key],
+    );
+    let mut cursor = PageCursor::new(query);
+    let mut requested_page = RequestedDatasetRowPageBatch::bounded(
+        &schema,
+        NonZeroUsize::new(1).expect("requested-row page limit should be non-zero"),
+    );
+    wait_for_store_future(transaction.load_dataset_rows_into(&mut cursor, &mut requested_page))
+        .expect("first requested-row page should load");
+    let first_outcomes = requested_page.outcomes().collect::<Vec<_>>();
+    assert!(matches!(
+        first_outcomes.as_slice(),
+        [RequestedDatasetRowView::Present(row)] if row.metadata().row_key == row_key
+    ));
+    assert!(cursor.has_more());
+
+    wait_for_store_future(transaction.load_dataset_rows_into(&mut cursor, &mut requested_page))
+        .expect("second requested-row page should load");
+    assert!(matches!(
+        requested_page.outcomes().collect::<Vec<_>>().as_slice(),
+        [RequestedDatasetRowView::Missing(key)] if *key == missing_row_key
+    ));
+    assert!(cursor.is_exhausted());
+
     let loaded_update =
         wait_for_store_future(transaction.load_replication_update(&group_id, update.update_id))
             .expect("update should load")
@@ -2555,43 +2658,46 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
-    let first_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        None,
+    let dataset = GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    };
+    let mut cursor = PageCursor::new(DatasetRowsQuery::borrowed(dataset));
+    let mut first_page = DatasetRowPageBatch::bounded(
+        &schema,
         NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ))
-    .expect("first batch should scan");
-    let first_scanned_metadata = state_rows
+    );
+    wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut first_page))
+        .expect("first batch should scan");
+    let first_scanned_metadata = first_page
+        .rows()
         .row(0)
         .expect("first scan should return one row")
         .metadata()
         .clone();
-    let retained_capacity = state_rows.capacity();
-    let second_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        first_batch.next_after,
-        NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ))
-    .expect("second batch should scan");
-    let second_scanned_metadata = state_rows
+    assert!(cursor.has_more());
+    let mut second_page = DatasetRowPageBatch::bounded(
+        &schema,
+        NonZeroUsize::new(2).expect("rotated limit should be non-zero"),
+    );
+    wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut second_page))
+        .expect("second batch should scan");
+    let second_scanned_metadata = second_page
+        .rows()
         .row(0)
         .expect("second scan should return one row")
         .metadata()
         .clone();
+    assert!(cursor.is_exhausted());
     wait_for_store_future(transaction.release()).expect("read should release");
 
-    assert!(first_batch.dataset_exists);
+    assert!(
+        second_page
+            .metadata()
+            .expect("successful second page should retain metadata")
+            .dataset_exists
+    );
     assert_eq!(first_scanned_metadata.row_key, first_row_key);
     assert!(!first_scanned_metadata.tombstoned);
     assert_eq!(first_scanned_metadata.created_by, Some(sample_change_id()));
@@ -2599,7 +2705,6 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
         first_scanned_metadata.last_changed_versions,
         sample_last_changed_versions()
     );
-    assert_eq!(first_batch.next_after, Some(first_row_key));
     assert_eq!(second_scanned_metadata.row_key, second_row_key);
     assert!(second_scanned_metadata.tombstoned);
     assert_eq!(second_scanned_metadata.created_by, None);
@@ -2607,8 +2712,6 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
         second_scanned_metadata.last_changed_versions,
         sample_last_changed_versions()
     );
-    assert_eq!(second_batch.next_after, Some(second_row_key));
-    assert_eq!(state_rows.capacity(), retained_capacity);
 }
 
 #[test]
@@ -2644,37 +2747,44 @@ fn sqlite_store_scan_clears_reused_rows_for_missing_dataset() {
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
     let limit = NonZeroUsize::new(8).expect("limit should be non-zero");
-    wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        None,
-        limit,
-        &mut state_rows,
-    ))
+    let mut state_rows = DatasetRowPageBatch::bounded(&schema, limit);
+    let mut existing_cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    }));
+    wait_for_store_future(
+        transaction.scan_dataset_rows_into(&mut existing_cursor, &mut state_rows),
+    )
     .expect("existing dataset should scan");
-    assert_eq!(state_rows.len(), 1);
+    assert_eq!(state_rows.rows().len(), 1);
 
-    let page = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &missing_dataset_id,
-            schema: &schema,
-        },
-        None,
-        limit,
-        &mut state_rows,
-    ))
-    .expect("missing dataset should return an empty page");
+    let mut missing_cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &missing_dataset_id,
+        schema: &schema,
+    }));
+    wait_for_store_future(transaction.scan_dataset_rows_into(&mut missing_cursor, &mut state_rows))
+        .expect("missing dataset should return an empty page");
+    assert!(
+        !state_rows
+            .metadata()
+            .expect("successful missing-dataset page should retain metadata")
+            .dataset_exists
+    );
+    assert!(missing_cursor.is_exhausted());
+    assert!(state_rows.rows().is_empty());
+
+    assert_requested_rows_for_missing_dataset(
+        transaction.as_mut(),
+        group_id,
+        &missing_dataset_id,
+        &schema,
+        row_key,
+    );
+
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert!(!page.dataset_exists);
-    assert!(page.next_after.is_none());
-    assert!(state_rows.is_empty());
 }
 
 #[test]
@@ -2709,21 +2819,23 @@ fn sqlite_store_scan_rejects_malformed_row_snapshot_without_publishing_metadata(
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
-    let result = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        None,
+    let mut cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    }));
+    let mut state_rows = DatasetRowPageBatch::bounded(
+        &schema,
         NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ));
+    );
+    let result =
+        wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut state_rows));
     wait_for_store_future(transaction.release()).expect("read should release");
 
     assert!(result.is_err());
-    assert!(state_rows.is_empty());
+    assert!(state_rows.rows().is_empty());
+    assert!(state_rows.metadata().is_none());
+    assert!(cursor.is_failed());
 }
 
 #[test]
@@ -2816,17 +2928,25 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
         dataset_id: &dataset_id,
         schema: &current_schema,
     };
-    let mut transition_rows =
-        ReplicationStateRowTransitionBatch::new(&previous_schema, &current_schema);
-    let first_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        None,
+    let mut cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(previous_group),
+        DatasetRowsQuery::borrowed(current_group),
+    ));
+    let mut transition_rows = DatasetRowTransitionPageBatch::bounded(
+        &previous_schema,
+        &current_schema,
         NonZeroUsize::new(2).expect("limit should be non-zero"),
-        &mut transition_rows,
-    ))
+    );
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("first transition batch should scan");
+    let first_batch = transition_rows
+        .metadata()
+        .expect("first transition batch should retain metadata")
+        .clone();
     let first_row_presence = transition_rows
+        .transitions()
         .rows()
         .map(|transition| {
             (
@@ -2836,13 +2956,10 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
             )
         })
         .collect::<Vec<_>>();
-    let second_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        first_batch.next_after,
-        NonZeroUsize::new(2).expect("limit should be non-zero"),
-        &mut transition_rows,
-    ))
+    assert!(cursor.has_more());
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("second transition batch should scan");
     wait_for_store_future(transaction.release()).expect("read should release");
 
@@ -2855,9 +2972,11 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
         first_row_presence,
         vec![(previous_only, true, false), (current_only, false, true)]
     );
-    assert_eq!(first_batch.next_after, Some(current_only));
-    assert_eq!(transition_rows.len(), 1);
-    let transition = transition_rows.row(0).expect("transition must exist");
+    assert_eq!(transition_rows.transitions().len(), 1);
+    let transition = transition_rows
+        .transitions()
+        .row(0)
+        .expect("transition must exist");
     assert_eq!(transition.row_key(), corresponding);
     assert_eq!(
         transition.previous().map(|row| row.metadata().created_by),
@@ -2869,7 +2988,7 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
             .map(|row| (row.metadata().created_by, row.metadata().tombstoned)),
         Some((None, true))
     );
-    assert_eq!(second_batch.next_after, None);
+    assert!(cursor.is_exhausted());
 }
 
 #[test]
@@ -2921,27 +3040,29 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
     let limit = NonZeroUsize::new(1).expect("limit should be non-zero");
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut transition_rows = ReplicationStateRowTransitionBatch::new(&schema, &schema);
-    let batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let mut cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(previous_group),
+        DatasetRowsQuery::borrowed(current_group),
+    ));
+    let mut transition_rows = DatasetRowTransitionPageBatch::bounded(&schema, &schema, limit);
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("transition batch should scan");
+    let batch = transition_rows
+        .metadata()
+        .expect("successful transition batch should retain metadata")
+        .clone();
     let first_presence = transition_rows
+        .transitions()
         .row(0)
         .map(|row| (row.previous().is_some(), row.current().is_some()));
-    let exhausted = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        batch.next_after,
-        limit,
-        &mut transition_rows,
-    ))
+    assert!(cursor.has_more());
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("exhaustion batch should scan");
-    let exhausted_is_empty = transition_rows.is_empty();
+    let exhausted_is_empty = transition_rows.transitions().is_empty();
     let empty_dataset_id =
         DatasetId::try_from_static("empty").expect("empty dataset id should build");
     let empty_previous_group = GroupDatasetSchemaRef {
@@ -2954,36 +3075,45 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
         dataset_id: &empty_dataset_id,
         schema: &schema,
     };
-    let empty = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        empty_previous_group,
-        empty_current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let mut empty_cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(empty_previous_group),
+        DatasetRowsQuery::borrowed(empty_current_group),
+    ));
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut empty_cursor, &mut transition_rows),
+    )
     .expect("empty transition batch should scan");
-    let empty_is_empty = transition_rows.is_empty();
-    let mismatch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        empty_current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let empty = transition_rows
+        .metadata()
+        .expect("empty transition batch should retain metadata")
+        .clone();
+    let empty_is_empty = transition_rows.transitions().is_empty();
+    let mut mismatch_cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(previous_group),
+        DatasetRowsQuery::borrowed(empty_current_group),
+    ));
+    let mismatch = wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut mismatch_cursor, &mut transition_rows),
+    )
     .expect_err("different dataset references should be rejected");
     wait_for_store_future(transaction.release()).expect("read should release");
 
     assert!(batch.previous_dataset_exists);
     assert!(!batch.current_dataset_exists);
     assert_eq!(first_presence, Some((true, false)));
-    assert_eq!(batch.next_after, Some(row_key));
     assert!(exhausted_is_empty);
-    assert_eq!(exhausted.next_after, None);
+    assert!(cursor.is_exhausted());
     assert!(!empty.previous_dataset_exists);
     assert!(!empty.current_dataset_exists);
     assert!(empty_is_empty);
-    assert_eq!(empty.next_after, None);
-    assert_eq!(mismatch.classification().class, StoreErrorClass::Contract);
+    assert!(empty_cursor.is_exhausted());
+    assert_eq!(
+        mismatch
+            .store_error_classification()
+            .expect("query mismatch should remain classified")
+            .class,
+        StoreErrorClass::Contract
+    );
 }
 
 #[test]

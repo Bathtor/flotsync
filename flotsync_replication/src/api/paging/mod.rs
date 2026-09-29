@@ -103,6 +103,11 @@ pub trait PageBatch: Send {
     /// and configuration.
     fn clear(&mut self);
 
+    /// Reserve capacity for at least `additional` more retained results.
+    ///
+    /// Implementations without reservable storage may leave this as a no-op.
+    fn reserve(&mut self, _additional: usize) {}
+
     /// Return the number of values currently retained.
     fn len(&self) -> usize;
 
@@ -368,6 +373,14 @@ where
     #[must_use]
     pub const fn limit(&self) -> PageLimit {
         self.limit
+    }
+
+    /// Reserve batch storage for at least `additional` more source results.
+    ///
+    /// Backends should call this when a query result exposes its size before
+    /// individual records are decoded and pushed.
+    pub fn reserve(&mut self, additional: usize) {
+        self.batch.reserve(additional);
     }
 
     /// Return `true` when this fill accepted its sampled finite maximum.

@@ -38,95 +38,6 @@ pub struct DatasetRowStateSlice {
     pub missing_row_keys: HashSet<RowKey>,
 }
 
-/// Page metadata for one ordered dataset-row scan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DatasetRowScanPage {
-    /// Replication group that owns the rows written to the scan output.
-    pub group_id: GroupId,
-    /// Dataset identifier within the replication group.
-    pub dataset_id: DatasetId,
-    /// Whether this dataset already exists for `group_id`.
-    pub dataset_exists: bool,
-    /// Row key to use as the exclusive lower bound for the next batch.
-    ///
-    /// `None` means the scan is exhausted. `Some` means callers should issue a
-    /// follow-up scan when they need more rows; that follow-up may still return
-    /// an empty batch if this batch ended exactly at the stored row count.
-    pub next_after: Option<RowKey>,
-}
-
-impl DatasetRowScanPage {
-    /// Build row transitions from two ordered pages for the same dataset reference.
-    ///
-    /// `self` describes the previous group and `current_page` describes the
-    /// current group. `output` must contain the rows loaded for those pages.
-    /// Both pages must reference the same dataset.
-    ///
-    /// The result contains at most `limit` transitions in ascending row-key order.
-    /// Each key present in either input page is represented once, with the
-    /// corresponding previous and current records populated when present.
-    /// `next_after` contains the final emitted key when either input page may
-    /// have more rows, and is `None` when both inputs are exhausted. When the
-    /// combined page exceeds `limit`, input records after the final emitted key
-    /// are consumed but omitted from the result. Store-backed callers resume
-    /// their source scans after that key and may fetch those records again.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the input pages reference different datasets.
-    #[must_use]
-    pub fn transition_with_limit(
-        self,
-        current_page: &Self,
-        output: &mut ReplicationStateRowTransitionBatch,
-        limit: NonZeroUsize,
-    ) -> DatasetRowStateTransitionPage {
-        assert_eq!(
-            self.dataset_id, current_page.dataset_id,
-            "row-state transition batches must reference the same dataset"
-        );
-
-        let previous_may_continue = self.next_after.is_some();
-        let current_may_continue = current_page.next_after.is_some();
-        let has_buffered_rows = output.align_scanned_rows(limit);
-        let may_continue = has_buffered_rows || previous_may_continue || current_may_continue;
-        let last_row_key = output
-            .rows()
-            .next_back()
-            .map(|transition| transition.row_key());
-        let next_after = option_when!(may_continue, last_row_key).flatten();
-
-        DatasetRowStateTransitionPage {
-            previous_group_id: self.group_id,
-            current_group_id: current_page.group_id,
-            dataset_id: self.dataset_id,
-            previous_dataset_exists: self.dataset_exists,
-            current_dataset_exists: current_page.dataset_exists,
-            next_after,
-        }
-    }
-}
-
-/// Page metadata for one ordered batch of dataset row-state transitions.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowStateTransitionPage {
-    /// Replication group owning the previous dataset occurrence.
-    pub previous_group_id: GroupId,
-    /// Replication group owning the current dataset occurrence.
-    pub current_group_id: GroupId,
-    /// Dataset scanned in both replication groups.
-    pub dataset_id: DatasetId,
-    /// Whether the previous dataset occurrence exists in storage.
-    pub previous_dataset_exists: bool,
-    /// Whether the current dataset occurrence exists in storage.
-    pub current_dataset_exists: bool,
-    /// Exclusive lower bound for the next transition scan.
-    ///
-    /// `None` means both scans are exhausted. `Some` may lead to an empty
-    /// follow-up batch when an underlying scan ended exactly at its row count.
-    pub next_after: Option<RowKey>,
-}
-
 /// Complete row state snapshot used by replication storage.
 pub type ReplicationRowStateSnapshot = RowStateSnapshot<'static, UpdateId>;
 
@@ -322,50 +233,6 @@ impl ReplicationStateRowTransitionBatch {
             "transition rows must be appended in ascending row-key order"
         );
         self.alignments.push(alignment);
-    }
-
-    /// Align the ordered union of rows already loaded into both side batches.
-    ///
-    /// Returns true when either side contains rows omitted by `limit`.
-    fn align_scanned_rows(&mut self, limit: NonZeroUsize) -> bool {
-        self.alignments.clear();
-        self.alignments.reserve(limit.get());
-        let mut previous_index = 0;
-        let mut current_index = 0;
-        while self.alignments.len() < limit.get() {
-            let previous = self.previous_rows.row(previous_index);
-            let current = self.current_rows.row(current_index);
-            let alignment = match (previous, current) {
-                (Some(previous), Some(current)) => {
-                    match previous.metadata().row_key.cmp(&current.metadata().row_key) {
-                        std::cmp::Ordering::Less => {
-                            previous_index += 1;
-                            (Some(previous_index - 1), None)
-                        }
-                        std::cmp::Ordering::Equal => {
-                            previous_index += 1;
-                            current_index += 1;
-                            (Some(previous_index - 1), Some(current_index - 1))
-                        }
-                        std::cmp::Ordering::Greater => {
-                            current_index += 1;
-                            (None, Some(current_index - 1))
-                        }
-                    }
-                }
-                (Some(_), None) => {
-                    previous_index += 1;
-                    (Some(previous_index - 1), None)
-                }
-                (None, Some(_)) => {
-                    current_index += 1;
-                    (None, Some(current_index - 1))
-                }
-                (None, None) => break,
-            };
-            self.push_alignment(alignment.0, alignment.1);
-        }
-        previous_index < self.previous_rows.len() || current_index < self.current_rows.len()
     }
 }
 
@@ -716,6 +583,13 @@ pub trait ReplicationStoreReadTransaction: Send {
         limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>>;
 
+    /// Load requested dataset-row outcomes selected by `cursor` into `batch`.
+    fn load_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<RequestedDatasetRowsQuery<'query>>,
+        batch: &'call mut RequestedDatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
+
     /// Load the stored state for the requested dataset row keys.
     ///
     /// `dataset` must describe this group's authoritative schema for the requested dataset.
@@ -729,70 +603,49 @@ pub trait ReplicationStoreReadTransaction: Send {
         &'a mut self,
         dataset: GroupDatasetSchemaRef<'a>,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>>;
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
+        async move {
+            let query = RequestedDatasetRowsQuery::new(
+                DatasetRowsQuery::borrowed(dataset),
+                row_keys.copied(),
+            );
+            let mut cursor = PageCursor::new(query);
+            let mut batch = RequestedDatasetRowPageBatch::unlimited(dataset.schema);
+            self.load_dataset_rows_into(&mut cursor, &mut batch).await?;
+            Ok(batch.into_state_slice())
+        }
+        .boxed()
+    }
 
-    /// Scan one ordered batch of stored dataset rows.
+    /// Scan ordered stored dataset rows selected by `cursor` into `batch`.
     ///
     /// `dataset` must describe this group's authoritative schema for the requested dataset.
     /// Implementations must use its borrowed values only while executing the returned future and
     /// must not clone them into retained store state.
     ///
-    /// `after` is an exclusive lower bound over row keys. `None` starts before
-    /// the first row. Implementations must reset `output`, prepare it for
-    /// `dataset.schema`, and append at most `limit` rows ordered by row key.
-    /// `next_after` is the last emitted row key when another scan may be needed,
-    /// and `None` when this dataset scan is known to be exhausted.
-    fn scan_dataset_row_batch<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>>;
+    /// Implementations prepare `batch` for the query schema and append rows in
+    /// ascending backend row-key order.
+    fn scan_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowsQuery<'query>>,
+        batch: &'call mut DatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Scan one ordered transition batch of a dataset across two replication groups.
     ///
-    /// `previous_group` and `current_group` supply the owning group, equal
-    /// dataset references, and schema for each occurrence. `after` is an
-    /// exclusive lower bound over row keys; `None` starts before the first key.
+    /// The query supplies the owning groups, equal dataset references, and
+    /// schema for each occurrence.
     ///
-    /// `output` is reset for the two supplied schemas and receives at most
-    /// `limit` transitions in ascending row-key order.
-    /// Every key greater than `after` which is stored in either group is
-    /// represented once until the limit is reached. Each transition contains the
-    /// stored previous and current records when present, including tombstones.
+    /// `batch` receives transitions in ascending backend row-key order. Every
+    /// selected key stored in either group is represented once. Each transition
+    /// contains previous and current records when present, including tombstones.
     /// The two dataset-existence flags describe whether the dataset is stored
     /// in each group even when that occurrence contributes no rows.
-    /// `next_after` is the final emitted key when another scan may be needed,
-    /// and `None` when both occurrences are known to be exhausted.
-    ///
-    /// # Default implementation
-    ///
-    /// The default performs two ordinary scans and joins their results in
-    /// memory. Store engines should override it when they can align the two
-    /// row-key sets more efficiently within storage.
-    fn scan_dataset_row_transition_batch<'a>(
-        &'a mut self,
-        previous_group: GroupDatasetSchemaRef<'a>,
-        current_group: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowTransitionBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
-        async move {
-            ensure_matching_transition_dataset_references(previous_group, current_group)
-                .map_err(StoreError::from_classification_source)?;
-            output.reuse_for_schemas(previous_group.schema, current_group.schema);
-            let previous_batch = self
-                .scan_dataset_row_batch(previous_group, after, limit, output.previous_rows_mut())
-                .await?;
-            let current_batch = self
-                .scan_dataset_row_batch(current_group, after, limit, output.current_rows_mut())
-                .await?;
-            Ok(previous_batch.transition_with_limit(&current_batch, output, limit))
-        }
-        .boxed()
-    }
+    fn scan_dataset_row_transitions_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowTransitionQuery<'query>>,
+        batch: &'call mut DatasetRowTransitionPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Load unresolved listener-mediated group decisions into `batch`.
     fn load_pending_group_decisions_into<'a>(
@@ -1164,12 +1017,7 @@ mod tests {
         }
     }
 
-    fn batch(
-        group_id: u128,
-        dataset_id: &'static str,
-        rows: impl IntoIterator<Item = u128>,
-        next_after: Option<u128>,
-    ) -> (DatasetRowScanPage, ReplicationStateRowBatch) {
+    fn batch(rows: impl IntoIterator<Item = u128>) -> ReplicationStateRowBatch {
         let schema = Schema::empty();
         let mut state_rows = ReplicationStateRowBatch::new(&schema);
         for row in rows.into_iter().map(row) {
@@ -1184,86 +1032,14 @@ mod tests {
                 .push_decoded_row(row, &mut decoder)
                 .expect("test row must decode into the state batch");
         }
-        let page = DatasetRowScanPage {
-            group_id: GroupId(Uuid::from_u128(group_id)),
-            dataset_id: DatasetId::try_from_static(dataset_id).expect("test dataset id is valid"),
-            dataset_exists: true,
-            next_after: next_after.map(|row_key| RowKey(Uuid::from_u128(row_key))),
-        };
-        (page, state_rows)
-    }
-
-    #[test]
-    fn transition_batch_aligns_the_row_key_union() {
-        let (previous_page, previous_rows) = batch(1, "shared", [1, 3], None);
-        let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
-        let limit = NonZeroUsize::new(4).expect("test limit is non-zero");
-        let mut output = ReplicationStateRowTransitionBatch {
-            previous_rows,
-            current_rows,
-            alignments: Vec::new(),
-        };
-        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
-
-        let row_presence = output
-            .rows()
-            .map(|transition| {
-                (
-                    transition.row_key().0.as_u128(),
-                    transition.previous().is_some(),
-                    transition.current().is_some(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            row_presence,
-            vec![(1, true, false), (2, false, true), (3, true, true)]
-        );
-        assert_eq!(merged.next_after, None);
-    }
-
-    #[test]
-    fn transition_batch_pages_the_union_without_losing_buffered_keys() {
-        let (previous_page, previous_rows) = batch(1, "shared", [1, 4], None);
-        let (current_page, current_rows) = batch(2, "shared", [2, 3], None);
-        let limit = NonZeroUsize::new(2).expect("test limit is non-zero");
-        let mut output = ReplicationStateRowTransitionBatch {
-            previous_rows,
-            current_rows,
-            alignments: Vec::new(),
-        };
-        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
-
-        let row_keys = output
-            .rows()
-            .map(|transition| transition.row_key().0.as_u128())
-            .collect::<Vec<_>>();
-
-        assert_eq!(row_keys, vec![1, 2]);
-        assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(2))));
-    }
-
-    #[test]
-    fn transition_batch_preserves_underlying_exact_limit_continuation() {
-        let (previous_page, previous_rows) = batch(1, "shared", [1], Some(1));
-        let (current_page, current_rows) = batch(2, "shared", [1], Some(1));
-        let limit = NonZeroUsize::new(1).expect("test limit is non-zero");
-        let mut output = ReplicationStateRowTransitionBatch {
-            previous_rows,
-            current_rows,
-            alignments: Vec::new(),
-        };
-        let merged = previous_page.transition_with_limit(&current_page, &mut output, limit);
-
-        assert_eq!(merged.next_after, Some(RowKey(Uuid::from_u128(1))));
+        state_rows
     }
 
     #[test]
     #[should_panic(expected = "previous transition row index must be valid")]
     fn transition_batch_rejects_invalid_previous_index_on_insertion() {
-        let (_, previous_rows) = batch(1, "shared", [1], None);
-        let (_, current_rows) = batch(2, "shared", [1], None);
+        let previous_rows = batch([1]);
+        let current_rows = batch([1]);
         let mut output = ReplicationStateRowTransitionBatch {
             previous_rows,
             current_rows,
@@ -1276,8 +1052,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "current transition row index must be valid")]
     fn transition_batch_rejects_invalid_current_index_on_insertion() {
-        let (_, previous_rows) = batch(1, "shared", [1], None);
-        let (_, current_rows) = batch(2, "shared", [1], None);
+        let previous_rows = batch([1]);
+        let current_rows = batch([1]);
         let mut output = ReplicationStateRowTransitionBatch {
             previous_rows,
             current_rows,
@@ -1290,8 +1066,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "previous transition row index must be valid")]
     fn transition_batch_rejects_invalid_stored_previous_index() {
-        let (_, previous_rows) = batch(1, "shared", [1], None);
-        let (_, current_rows) = batch(2, "shared", [1], None);
+        let previous_rows = batch([1]);
+        let current_rows = batch([1]);
         let output = ReplicationStateRowTransitionBatch {
             previous_rows,
             current_rows,
@@ -1307,8 +1083,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "current transition row index must be valid")]
     fn transition_batch_rejects_invalid_stored_current_index() {
-        let (_, previous_rows) = batch(1, "shared", [1], None);
-        let (_, current_rows) = batch(2, "shared", [1], None);
+        let previous_rows = batch([1]);
+        let current_rows = batch([1]);
         let output = ReplicationStateRowTransitionBatch {
             previous_rows,
             current_rows,
