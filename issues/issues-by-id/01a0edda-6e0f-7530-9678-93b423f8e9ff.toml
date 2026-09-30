@@ -1,0 +1,13 @@
+id = "01a0edda-6e0f-7530-9678-93b423f8e9ff"
+ref = "flotsync-dj1"
+title = "Move SQLite replication store into its own crate"
+body = "Investigate moving the SQLite replication-store implementation from flotsync_replication into its own crate. The current in-crate implementation can access crate-private projection constructors that external store backends cannot, which let the public API become unusable downstream in flotsync-h3l.4. Compare a separate crate with a dedicated external-backend compile test, identify the public constructors and validation helpers the SQLite implementation would then require, and estimate dependency/API churn. Keep this as a follow-up design and extraction task; flotsync-h3l.4 must still expose a usable public construction path."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-09-29T15:48:30.351167Z"
+updated_at = "2026-09-29T15:48:38.514736Z"
+
+[[links]]
+target = "01a099f7-5f7c-7cd1-bf55-486209d43e07"
+label = "discovered from"

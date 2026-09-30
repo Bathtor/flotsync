@@ -10,7 +10,6 @@ use crate::{
         DatasetRowTransitionQuery,
         DatasetRowsQuery,
         DatasetSchema,
-        DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
@@ -47,7 +46,10 @@ use crate::{
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
         ReplicationUpdateRecord,
+        ReplicationUpdateView,
+        ReplicationUpdatesQuery,
         RequestedDatasetRowInput,
         RequestedDatasetRowPageBatch,
         RequestedDatasetRowsQuery,
@@ -62,13 +64,7 @@ use crate::{
         invalid_default_group_security_material,
     },
     codecs::{
-        messages::{
-            MemberCountContext,
-            UpdateMessage,
-            UpdateMessageProtoSource,
-            VersionVectorCodecError,
-            VersionVectorProtoCodec,
-        },
+        messages::{UpdateMessageProtoSource, VersionVectorCodecError, VersionVectorProtoCodec},
         pending_group::{
             PendingGroupPayloadKind,
             decode_pending_group_activation_payload,
@@ -90,14 +86,15 @@ use flotsync_core::{
     versions::{UpdateId, VersionVector},
 };
 use flotsync_messages::{
-    buffa::Message as _,
+    buffa::{Message as _, MessageView as _},
     codecs::datamodel::encode_row_snapshot,
     datamodel as datamodel_proto,
-    proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
+    proto::{DecodeProto, EncodeProto, ProtoInputDecodeError},
+    replication as replication_proto,
     snapshots::datamodel::ProtoSchemaSnapshotDecoder,
 };
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
-use flotsync_utils::BoxFuture;
+use flotsync_utils::{BoxError, BoxFuture};
 use futures_util::FutureExt;
 use log::warn;
 use snafu::prelude::*;
@@ -744,27 +741,30 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_replication_updates<'a>(
+    fn load_replication_updates_into<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
+        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
+        batch: &'a mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
+            let page = cursor
+                .begin_page::<updates::SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+            updates::load_replication_updates_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
 
-    fn load_replication_update_ids<'a>(
+    fn load_replication_update_ids_into<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
+        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
-                .await
+            let page = cursor
+                .begin_page::<updates::SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+            updates::load_replication_update_ids_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
@@ -1314,6 +1314,8 @@ use security::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use shared::*;
+#[cfg(test)]
+pub(crate) use updates::SqliteUpdatePageContinuation;
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."

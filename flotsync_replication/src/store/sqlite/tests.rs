@@ -1,6 +1,7 @@
 //! SQLite store tests.
 use super::*;
 use crate::{
+    MAX_VERSION_VALUE,
     api::{
         DatasetRowPageBatch,
         DatasetRowStatePatch,
@@ -9,6 +10,7 @@ use crate::{
         DatasetRowTransitionPageBatch,
         DatasetRowTransitionQuery,
         DatasetRowsQuery,
+        DatasetUpdateRecord,
         GroupDatasetSchemaRef,
         GroupInvitation,
         GroupSchema,
@@ -17,6 +19,7 @@ use crate::{
         InitialSnapshot,
         InitialSnapshotMetadata,
         InitialValueRow,
+        InlinePageBatch,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberPublicKeysRecord,
@@ -24,6 +27,9 @@ use crate::{
         MigrationProposal,
         PendingGroupDecisionRecord,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
+        ReplicationUpdateView,
+        ReplicationUpdatesQuery,
         RequestedDatasetRowPageBatch,
         RequestedDatasetRowView,
         RequestedDatasetRowsQuery,
@@ -53,6 +59,7 @@ use flotsync_data_types::{
     schema::datamodel::RowOperation,
 };
 use flotsync_messages::codecs::datamodel::encode_schema_operation;
+use flotsync_utils::BoxError;
 use futures_util::future;
 use itertools::Itertools;
 use std::{
@@ -77,6 +84,19 @@ struct ReplicationRowStateFixture {
     last_changed_versions: VersionVector,
 }
 
+/// Small retained projection used to prove update pages need not own payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedUpdateSummary {
+    /// Selected update identity.
+    update_id: UpdateId,
+    /// Dataset identifier copied from the temporary payload view.
+    dataset_id: String,
+    /// Number of borrowed operations observed without materialising them.
+    operation_count: usize,
+    /// Whether this update is already reflected in local state.
+    applied_locally: bool,
+}
+
 const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wait_for_store_future<F>(future: F) -> F::Output
@@ -88,6 +108,31 @@ where
         future,
         "timed out waiting for sqlite store future",
     )
+}
+
+/// Retain only the fields needed by the projected-update paging scenario.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_wraps,
+    reason = "page projections share the reusable fallible batch callback signature"
+)]
+fn project_update_summary(
+    update: ReplicationUpdateView<'_>,
+) -> Result<ProjectedUpdateSummary, BoxError> {
+    let mut datasets = update.dataset_updates();
+    let dataset = datasets
+        .next()
+        .expect("test updates should contain one dataset");
+    assert!(
+        datasets.next().is_none(),
+        "test updates should contain exactly one dataset"
+    );
+    Ok(ProjectedUpdateSummary {
+        update_id: update.update_id(),
+        dataset_id: dataset.dataset_id().to_owned(),
+        operation_count: dataset.operations().count(),
+        applied_locally: update.applied_locally(),
+    })
 }
 
 /// Materialise one loaded positional row for assertions which compare owned fixtures.
@@ -255,6 +300,34 @@ WHERE group_id = ?2 AND dataset_id = ?3 AND row_key = ?4
         Ok::<_, StoreError>(())
     })
     .expect("raw row snapshot should update");
+}
+
+/// Replace one stored update payload while preserving its indexed identity.
+fn replace_raw_update_message(
+    store: &SqliteReplicationStore,
+    group_id: GroupId,
+    update_id: UpdateId,
+    update_message: Vec<u8>,
+) {
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await.context(SqlxSnafu)?;
+        sqlx::query(
+            "
+UPDATE dataset_updates
+SET update_message = ?1
+WHERE group_id = ?2 AND update_node_index = ?3 AND update_version = ?4
+",
+        )
+        .bind(update_message)
+        .bind(group_id.to_string())
+        .bind(i64::from(update_id.node_index))
+        .bind(encode_update_version_sort_key_vec(update_id.version))
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+        Ok::<_, StoreError>(())
+    })
+    .expect("raw update message should update");
 }
 
 type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
@@ -1874,18 +1947,6 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
             .expect("update should load")
             .expect("update should exist");
     assert_eq!(loaded_update, update);
-    assert!(matches!(
-        wait_for_store_future(
-            transaction.load_replication_updates(
-                &group_id,
-                ReplicationUpdateFilter::PendingApply,
-                None,
-            )
-        )
-        .expect("updates should load")
-        .as_slice(),
-        [only] if only == &update
-    ));
 }
 
 #[test]
@@ -2455,48 +2516,223 @@ fn sqlite_store_roundtrips_blocked_key_fingerprints() {
     wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
 }
 
-#[test]
-fn sqlite_store_filters_replication_updates_by_producer_range() {
-    let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store = in_memory_store(local_member());
-    let group_id = GroupId(Uuid::from_u128(10_011));
-    let group = sample_group(group_id);
-    let encoded_operation = encoded_insert_snapshot("range query", &schema);
-    let update = |node_index, version, sender| ReplicationUpdateRecord {
-        group_id,
-        update_id: UpdateId {
-            node_index,
-            version,
-        },
-        sender,
-        read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
-        dataset_updates: vec![DatasetUpdateRecord {
-            dataset_id: dataset_id.clone(),
-            operations: vec![encoded_operation.clone()],
-        }],
-        applied_locally: true,
-    };
-    let alice_v1 = update(0, 1, local_member());
-    let alice_v2 = update(0, 2, local_member());
-    let alice_v3 = update(0, 3, local_member());
-    let bob_v1 = update(1, 1, remote_member());
+/// Store and records shared by one projected-update paging scenario.
+struct UpdatePagingFixture {
+    /// SQLite owner retained across committed and read transactions.
+    store: TestSqliteStore,
+    /// Group whose update log is under test.
+    group_id: GroupId,
+    /// Dataset carried by every fixture update.
+    dataset_id: DatasetId,
+    /// Expected update order: Alice 1, Bob 1, Alice 2, Alice 3, Bob maximum.
+    updates: [ReplicationUpdateRecord; 5],
+}
 
-    let mut transaction =
-        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+impl UpdatePagingFixture {
+    /// Build updates with a same-version producer tie and the maximum supported version.
+    fn new() -> Self {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(10_011));
+        let encoded_operation = encoded_insert_snapshot("range query", &schema);
+        let update = |node_index, version, sender, applied_locally| ReplicationUpdateRecord {
+            group_id,
+            update_id: UpdateId {
+                node_index,
+                version,
+            },
+            sender,
+            read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            dataset_updates: vec![DatasetUpdateRecord {
+                dataset_id: dataset_id.clone(),
+                operations: vec![encoded_operation.clone()],
+            }],
+            applied_locally,
+        };
+        let alice_v1 = update(0, 1, local_member(), false);
+        let alice_v2 = update(0, 2, local_member(), true);
+        let alice_v3 = update(0, 3, local_member(), true);
+        let bob_v1 = update(1, 1, remote_member(), true);
+        let bob_max = update(1, MAX_VERSION_VALUE, remote_member(), false);
+        Self {
+            store,
+            group_id,
+            dataset_id,
+            updates: [alice_v1, bob_v1, alice_v2, alice_v3, bob_max],
+        }
+    }
+
+    /// Return the identities in the expected composite SQL order.
+    fn expected_ids(&self) -> Vec<UpdateId> {
+        self.updates.iter().map(|update| update.update_id).collect()
+    }
+}
+
+/// Insert all fixture updates into the transaction used for the paging checks.
+fn insert_update_paging_fixture(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    fixture: &UpdatePagingFixture,
+) {
+    let group = sample_group(fixture.group_id);
     wait_for_store_future(transaction.insert_replication_group(group)).expect("group should store");
-    for update in [
-        alice_v1.clone(),
-        alice_v2.clone(),
-        alice_v3.clone(),
-        bob_v1.clone(),
-    ] {
+    for update in fixture.updates.iter().cloned() {
         wait_for_store_future(transaction.append_replication_update(update))
             .expect("update should store");
     }
+}
+
+#[test]
+fn sqlite_store_pages_projected_replication_updates_and_ids() {
+    let fixture = UpdatePagingFixture::new();
+    let mut transaction =
+        wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
+    insert_update_paging_fixture(transaction.as_mut(), &fixture);
+    assert_projected_update_pages(transaction.as_mut(), &fixture);
+    assert_bounded_update_id_pages(transaction.as_mut(), &fixture);
+    assert_update_filters_and_legacy_limit(transaction.as_mut(), &fixture);
+    wait_for_store_future(transaction.commit()).expect("commit should succeed");
+    assert_inconsistent_update_payload(&fixture);
+}
+
+/// Check inline and Vec projections, changed limits, and exact-page exhaustion.
+fn assert_projected_update_pages(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    fixture: &UpdatePagingFixture,
+) {
+    let mut projected_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+        fixture.group_id,
+        ReplicationUpdateFilter::All,
+    ));
+    let mut projected = Vec::new();
+    let mut first_batch =
+        InlinePageBatch::<ProjectedUpdateSummary, (), 1, ReplicationUpdatePageInput, _>::new_with(
+            project_update_summary,
+        );
+    wait_for_store_future(
+        transaction.load_replication_updates_into(&mut projected_cursor, &mut first_batch),
+    )
+    .expect("first projected update page should load");
+    assert_eq!(first_batch.values().len(), 1);
+    projected.extend_from_slice(first_batch.values());
+
+    let mut final_page_len = usize::MAX;
+    while projected_cursor.has_more() {
+        let mut batch =
+            VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::bounded_with(
+                NonZeroUsize::new(2).expect("two updates per page"),
+                project_update_summary,
+            );
+        wait_for_store_future(
+            transaction.load_replication_updates_into(&mut projected_cursor, &mut batch),
+        )
+        .expect("continued projected update page should load");
+        final_page_len = batch.values().len();
+        projected.extend(batch.into_values());
+    }
+    assert_eq!(
+        final_page_len, 0,
+        "an exact final page needs an empty confirmation"
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|summary| summary.update_id)
+            .collect::<Vec<_>>(),
+        fixture.expected_ids()
+    );
+    assert!(projected.iter().all(|summary| {
+        summary.dataset_id == fixture.dataset_id.as_str() && summary.operation_count == 1
+    }));
+    assert_eq!(
+        projected
+            .iter()
+            .map(|summary| summary.applied_locally)
+            .collect::<Vec<_>>(),
+        vec![false, true, true, true, false]
+    );
+}
+
+/// Check that lightweight ID reads cross the same-version producer boundary.
+fn assert_bounded_update_id_pages(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    fixture: &UpdatePagingFixture,
+) {
+    let mut ids_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+        fixture.group_id,
+        ReplicationUpdateFilter::All,
+    ));
+    let mut ids_batch =
+        VecPageBatch::<UpdateId, ()>::bounded(NonZeroUsize::new(1).expect("one update per page"));
+    let mut paged_ids = Vec::new();
+    while ids_cursor.has_more() {
+        wait_for_store_future(
+            transaction.load_replication_update_ids_into(&mut ids_cursor, &mut ids_batch),
+        )
+        .expect("update ids should load");
+        paged_ids.extend_from_slice(ids_batch.values());
+    }
+    assert!(ids_cursor.is_exhausted());
+    assert_eq!(paged_ids, fixture.expected_ids());
+}
+
+/// Compare projected adapters and ID selection for every filter and one legacy limit.
+fn assert_update_filters_and_legacy_limit(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    fixture: &UpdatePagingFixture,
+) {
+    let [alice_v1, bob_v1, alice_v2, alice_v3, bob_max] = &fixture.updates;
+    let filter_cases = [
+        (
+            ReplicationUpdateFilter::PendingApply,
+            vec![alice_v1.update_id, bob_max.update_id],
+        ),
+        (
+            ReplicationUpdateFilter::Applied,
+            vec![bob_v1.update_id, alice_v2.update_id, alice_v3.update_id],
+        ),
+        (
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(0),
+                start_version: 2,
+                end_version: 3,
+            },
+            vec![alice_v2.update_id, alice_v3.update_id],
+        ),
+        (
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(0),
+                start_version: 3,
+                end_version: 2,
+            },
+            Vec::new(),
+        ),
+    ];
+    for (filter, expected) in filter_cases {
+        let updates = wait_for_store_future(transaction.load_replication_updates(
+            &fixture.group_id,
+            filter,
+            None,
+        ))
+        .expect("filtered updates should load");
+        let ids = wait_for_store_future(transaction.load_replication_update_ids(
+            &fixture.group_id,
+            filter,
+            None,
+        ))
+        .expect("filtered update ids should load");
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.update_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(ids, expected);
+    }
 
     let limited_alice = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
+        &fixture.group_id,
         ReplicationUpdateFilter::ProducerRange {
             producer_index: MemberIndex::new(0),
             start_version: 2,
@@ -2504,44 +2740,45 @@ fn sqlite_store_filters_replication_updates_by_producer_range() {
         },
         NonZeroUsize::new(1),
     ))
-    .expect("range should load");
+    .expect("bounded compatibility query should load");
     assert_eq!(limited_alice, vec![alice_v2.clone()]);
+}
 
-    let limited_alice_ids = wait_for_store_future(transaction.load_replication_update_ids(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
-        },
-        NonZeroUsize::new(1),
+/// Confirm ID-only reads skip a corrupt payload while full reads report its mismatch.
+fn assert_inconsistent_update_payload(fixture: &UpdatePagingFixture) {
+    let [_, _, alice_v2, alice_v3, _] = &fixture.updates;
+    let mismatched_payload = UpdateMessageProtoSource::from(alice_v3).encode_proto_to_vec();
+    replace_raw_update_message(
+        &fixture.store,
+        fixture.group_id,
+        alice_v2.update_id,
+        mismatched_payload,
+    );
+    let mut transaction =
+        wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
+    let ids = wait_for_store_future(transaction.load_replication_update_ids(
+        &fixture.group_id,
+        ReplicationUpdateFilter::All,
+        None,
     ))
-    .expect("range ids should load");
-    assert_eq!(limited_alice_ids, vec![alice_v2.update_id]);
-
-    let full_alice = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
-        },
-        NonZeroUsize::new(4),
+    .expect("id-only paging should not decode an inconsistent payload");
+    assert_eq!(ids, fixture.expected_ids());
+    let error = wait_for_store_future(transaction.load_replication_updates(
+        &fixture.group_id,
+        ReplicationUpdateFilter::All,
+        None,
     ))
-    .expect("range should load");
-    assert_eq!(full_alice, vec![alice_v2, alice_v3]);
-
-    let bob = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(1),
-            start_version: 1,
-            end_version: 3,
-        },
-        NonZeroUsize::new(4),
-    ))
-    .expect("range should load");
-    assert_eq!(bob, vec![bob_v1]);
+    .expect_err("projected update paging should validate indexed payload identity");
+    assert_sqlite_store_error(&error, |error| {
+        matches!(
+            error,
+            SqliteStoreError::StoredUpdateIdMismatch {
+                expected_update_id,
+                actual_update_id,
+            } if *expected_update_id == alice_v2.update_id
+                && *actual_update_id == alice_v3.update_id
+        )
+    });
     wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
 }
 

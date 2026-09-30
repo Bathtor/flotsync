@@ -125,7 +125,9 @@ use crate::{
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
         ReplicationUpdateRecord,
+        ReplicationUpdatesQuery,
         RequestedDatasetRowPageBatch,
         RequestedDatasetRowsQuery,
         RowChange,
@@ -178,7 +180,7 @@ use crate::{
     },
     provision_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
-    store::SqliteTextPageContinuation,
+    store::{SqliteTextPageContinuation, SqliteUpdatePageContinuation},
     test_support::{
         SqliteStoreTestOwner,
         load_test_delivery_security,
@@ -904,49 +906,48 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_replication_update(group_id, update_id)
     }
 
-    fn load_replication_updates<'a>(
+    fn load_replication_updates_into<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        let injected_failure = {
+        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
+        batch: &'a mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let has_injected_failure = {
             let mut control = Self::lock_control(&self.control);
             control.replication_update_load_count += 1;
             control
                 .replication_update_load_requests
                 .push(ReplicationUpdateLoadRequest {
-                    group_id: *group_id,
-                    filter,
-                    limit,
+                    group_id: cursor.params().group_id(),
+                    filter: cursor.params().filter(),
+                    limit: batch.page_limit().into_option(),
                 });
-            control.replication_update_load_failures.pop_front()
+            !control.replication_update_load_failures.is_empty()
         };
-        match injected_failure {
-            Some(classification) => {
-                let source = std::io::Error::other(
-                    "failing store intentionally failed one update range load",
-                );
-                futures_util::future::ready(Err(StoreError::new(classification, source))).boxed()
-            }
-            None => self
-                .inner
+        if has_injected_failure {
+            let result = execute_injected_sqlite_update_page_failure(
+                self.transaction_id(),
+                cursor,
+                batch,
+                &self.control,
+            );
+            futures_util::future::ready(result).boxed()
+        } else {
+            self.inner
                 .as_mut()
                 .expect("failing store transaction must remain open during delegated reads")
-                .load_replication_updates(group_id, filter, limit),
+                .load_replication_updates_into(cursor, batch)
         }
     }
 
-    fn load_replication_update_ids<'a>(
+    fn load_replication_update_ids_into<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
+        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update_ids(group_id, filter, limit)
+            .load_replication_update_ids_into(cursor, batch)
     }
 
     fn scan_dataset_rows_into<'call, 'query: 'call>(
@@ -1745,6 +1746,25 @@ fn execute_injected_sqlite_row_scan_failure(
     )))
 }
 
+/// Inject an update-page failure after beginning the SQLite-typed attempt.
+fn execute_injected_sqlite_update_page_failure(
+    transaction_id: StoreTransactionId,
+    cursor: &mut PageCursor<ReplicationUpdatesQuery>,
+    batch: &mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    control: &Mutex<FailingStoreControlState>,
+) -> Result<(), PageError> {
+    let _page = cursor.begin_page::<SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+    let classification = FailingStore::<SqliteReplicationStore>::lock_control(control)
+        .replication_update_load_failures
+        .pop_front()
+        .expect("injected update page failure must remain configured");
+    let source = std::io::Error::other("failing store intentionally failed one update range load");
+    Err(PageError::from_store_error(StoreError::new(
+        classification,
+        source,
+    )))
+}
+
 /// Execute one deterministic transition scan through the production page contract.
 fn execute_provider_test_transition_scan(
     transaction_id: StoreTransactionId,
@@ -1894,6 +1914,35 @@ pub(in crate::runtime) struct ProviderTestTransactionState {
     pub(in crate::runtime) release_count: usize,
     /// Number of transaction values dropped.
     pub(in crate::runtime) drop_count: usize,
+}
+
+#[test]
+fn injected_update_page_failure_clears_batch_and_invalidates_cursor() {
+    let mut control_state = FailingStoreControlState::default();
+    control_state
+        .replication_update_load_failures
+        .push_back(StoreErrorClassification::UNKNOWN);
+    let control = Mutex::new(control_state);
+    let query =
+        ReplicationUpdatesQuery::new(GroupId(Uuid::from_u128(45)), ReplicationUpdateFilter::All);
+    let mut cursor = PageCursor::new(query);
+    let mut batch =
+        crate::api::VecPageBatch::<usize, (), ReplicationUpdatePageInput, _>::unlimited_with(
+            |_: crate::api::ReplicationUpdateView<'_>| Ok::<_, flotsync_utils::BoxError>(1),
+        );
+    PageBatch::set_metadata(&mut batch, ());
+
+    let error = execute_injected_sqlite_update_page_failure(
+        StoreTransactionId::new_random(),
+        &mut cursor,
+        &mut batch,
+        &control,
+    )
+    .expect_err("injected update page should fail");
+    assert!(matches!(error, PageError::Store { .. }));
+    assert!(cursor.is_failed());
+    assert!(batch.metadata().is_none());
+    assert!(batch.values().is_empty());
 }
 
 mod changes;

@@ -380,51 +380,47 @@ pub(super) fn decode_stored_version_vector(
     Ok(version_vector)
 }
 
-pub(super) fn decode_stored_update_row(
+/// Decode and validate one stored update, then synchronously project its borrowed view.
+///
+/// The generated view and its encoded payload are released before this function
+/// returns. The projection therefore cannot retain any borrow into the payload.
+///
+/// # Errors
+///
+/// Returns a classified store page error when scalar columns, the encoded
+/// payload, indexed identities, or the caller's projection fail validation.
+pub(super) fn with_stored_update_view<Value>(
     expected_group_id: &GroupId,
     member_count: NonZeroUsize,
     update_id: UpdateId,
     row: &sqlx::sqlite::SqliteRow,
-) -> Result<ReplicationUpdateRecord, StoreError> {
+    project: impl for<'record> FnOnce(ReplicationUpdateView<'record>) -> Result<Value, PageError>,
+) -> Result<Value, PageError> {
     let sender = decode_member_identity(&row.get::<String, _>("sender"))?;
     let applied_locally = row.get::<bool, _>("applied_locally");
-    let update_message = row.get::<Vec<u8>, _>("update_message");
-    let message = decode_stored_proto(
-        "update",
-        UpdateMessage::try_decode_proto_from_slice_with(
-            &update_message,
-            MemberCountContext::new(member_count),
-        ),
-    )?;
-    ensure!(
-        message.group_id == *expected_group_id,
+    let update_message = row.get::<&[u8], _>("update_message");
+    let source = replication_proto::UpdateView::decode_view(update_message)
+        .context(DecodeStoredProtoSnafu { object: "update" })
+        .map_err(StoreError::from)?;
+    let view =
+        ReplicationUpdateView::try_from_proto_view(&sender, &source, applied_locally, member_count)
+            .context(InvalidStoredObjectSnafu { object: "update" })
+            .map_err(StoreError::from)?;
+    if view.group_id() != *expected_group_id {
         StoredUpdateGroupMismatchSnafu {
             expected_group_id: *expected_group_id,
-            actual_group_id: message.group_id,
+            actual_group_id: view.group_id(),
         }
-    );
-    ensure!(
-        message.update_id == update_id,
+        .fail::<()>()?;
+    }
+    if view.update_id() != update_id {
         StoredUpdateIdMismatchSnafu {
             expected_update_id: update_id,
-            actual_update_id: message.update_id,
+            actual_update_id: view.update_id(),
         }
-    );
-    Ok(ReplicationUpdateRecord {
-        group_id: *expected_group_id,
-        update_id,
-        sender,
-        read_versions: message.read_versions,
-        dataset_updates: message
-            .dataset_updates
-            .into_iter()
-            .map(|dataset_update| DatasetUpdateRecord {
-                dataset_id: dataset_update.dataset_id,
-                operations: dataset_update.operations,
-            })
-            .collect(),
-        applied_locally,
-    })
+        .fail::<()>()?;
+    }
+    project(view)
 }
 
 pub(super) fn encode_update_version_sort_key(version: u64) -> [u8; UPDATE_VERSION_SORT_KEY_BYTES] {
@@ -593,11 +589,11 @@ pub(super) fn public_keys_from_member_record(
 
 pub(super) fn invalid_stored_object(
     object: &'static str,
-    source: impl StdError + Send + Sync + 'static,
+    source: impl Into<BoxError>,
 ) -> StoreError {
     SqliteStoreError::InvalidStoredObject {
         object,
-        source: Box::new(source),
+        source: source.into(),
     }
     .into()
 }

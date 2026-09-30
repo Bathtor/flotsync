@@ -2,37 +2,45 @@ id = "01a099f7-5f7c-7cd1-bf55-486209d43e07"
 ref = "flotsync-h3l.4"
 title = "Add projected replication update store reads"
 body = """
-Scope (AJ4)
-Implement update/ID paging and borrowed-view decoding through the store boundary. Estimate: 650-950 changed Rust LOC. Blocked by flotsync-h3l.1. Runtime conversion is split into flotsync-h3l.5 and flotsync-h3l.6.
+Scope
+Implement projected paging for replication updates and lightweight update IDs through the shared opaque-continuation paging contract. Runtime consumer conversion remains in flotsync-h3l.5 and flotsync-h3l.6. Preserve current owned loaders as temporary compatibility adapters for removal in flotsync-h3l.8. Expected size is 850-1,100 changed Rust LOC; keep the implementation cohesive because full and ID reads share one query predicate, SQLite keyset window, continuation, compatibility surface, and fixture set.
 
-Starting points
-flotsync_replication/src/api/store.rs: ReplicationUpdateRecord, DatasetUpdateRecord, ReplicationUpdateFilter and update loaders; store/sqlite/updates.rs; store/sqlite/shared.rs: decode_stored_update_row; codecs/messages/updates.rs and encoding.rs; flotsync_messages/src/proto.rs and generated update/datamodel view APIs. Inspect SQLite tests and runtime test wrappers.
+Public query and projection surface
+Add an update-paging API module. ReplicationUpdatesQuery owns the cheap GroupId and ReplicationUpdateFilter values. ReplicationUpdatePageInput supplies a borrowed ReplicationUpdateView for each source record. The view exposes validated update metadata, the decoded read-version frontier, validated dataset identities, and borrowed generated SchemaOperationView values. Borrowed values exist only during PageBatch::push.
 
-Work
-Add one object-safe full-update page method and one lightweight ID page method using common cursors/helper/batches. Deterministic ascending order is UpdateId Ord, i.e. (version, node_index), not producer-first or causal order. ProducerRange selects exactly the producer and inclusive start/end versions, irrespective of applied status; inverted ranges are empty. All/Applied/PendingApply preserve their stated semantics. Use exclusive keyset continuation and preserve full supported unsigned version ordering.
-Full-update reads decode and validate temporary record/envelope/indexed metadata, offer borrowed SchemaOperationView values, immediately project and release temporary backing buffers. Do not materialise every operation as an owned protobuf message. Use established EncodeProto/DecodeProto/contextual/borrowed-view traits and source adapters; call out any necessary deviation for approval. ID-only reads must not fetch/decode payloads.
-Audit single-update reads for the same unnecessary eager ownership boundary and offer a compatible projected-read path or shared decoding integration. Owned append input may remain. Preserve existing validation, error context and applied metadata. Keep repository buildable for old consumers until AJ5/AJ6 convert them: narrowly scoped temporary compatibility adapters are permissible, documented for removal in AJ8, without becoming a second permanent pagination design.
+Reuse the existing VecPageBatch and InlinePageBatch projection constructors. Do not add another batch implementation or a default whole-buffer batch. Projection remains one source update to one retained value; it may transform but must not filter or expand.
 
-Acceptance
-Reusable tests compare ID/full-record selection, all filters, inclusive and inverted ranges, same-version producer ties, large versions, empty/exact-multiple pages, maximum counts and advancement. Test malformed/index-inconsistent records as errors and operation-view projection lifetimes. Confirm small projections retain no whole update buffer. Add test-wrapper support for new APIs. No whole-buffer default batch and no PageQuery trait.
+Store methods and compatibility
+Add object-safe load_replication_updates_into and load_replication_update_ids_into methods adjacent to their complete-result conveniences. Both accept PageCursor<ReplicationUpdatesQuery>. Full reads accept a PageBatch whose input is ReplicationUpdatePageInput; ID reads accept owned UpdateId inputs. Page metadata is unit.
 
-Agreed context and API contract
+Keep load_replication_updates and load_replication_update_ids as temporary default adapters. A finite legacy limit performs one bounded fill and None performs one unlimited fill, preserving current behaviour while later tasks convert runtime callers. Pass a local typed closure calling ReplicationUpdateView::try_to_owned_record as the batch projection callback, because the method item does not satisfy the higher-ranked callback bound; do not add an isomorphic free-function wrapper. Mark these adapters for removal in flotsync-h3l.8. Keep load_replication_update owned and route it through the shared borrowed decoder followed by one necessary ownership projection; do not add a third projected store method.
 
-This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+Borrowed decoding and validation
+Refactor update-message decoding so owned and projected store reads share validation of group and update identity, supported version bounds, member-count-dependent read versions, non-empty update and dataset-operation collections, valid dataset identifiers, and generated protobuf view structure. Full page reads decode one temporary SQLite payload, validate its indexed columns against the payload, synchronously project borrowed operation views, and release the payload before processing the next row. Use established Buffa views and flotsync_messages protobuf traits and preserve contextual Snafu classification.
 
-Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+SQLite paging
+Use a private SQLite continuation representing UpdateId order: version first, then node index. Apply an exclusive composite lower bound, the existing ReplicationUpdateFilter predicate, unconditional ORDER BY update_version, update_node_index because this API promises deterministic order, and a conditional LIMIT from PageLimit. Preserve unsigned u64 ordering with the existing big-endian sort key. ProducerRange remains inclusive, ignores applied state, and yields an empty page when inverted. All, Applied, and PendingApply retain current semantics.
 
-ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
+The ID query selects and decodes only update_version and update_node_index. The full query additionally loads sender, applied_locally, and update_message. Both use the shared page-finishing helper and exact-size pages may require an empty confirmation fill.
 
-Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
+Wrappers and test support
+Implement the new methods in runtime test wrappers. Move update-load failure injection and request observation to page calls so compatibility adapters and future paged runtime consumers exercise the same path.
 
-Validation and delivery
+Test inventory and restraint
+Do not duplicate generic paging tests for transaction binding, cancellation, cursor failure, erased continuation typing, page-limit enforcement, or batch clearing. Reuse and extend existing SQLite update tests for current filter and round-trip behaviour. Add only uncovered cases: equivalence of full and ID selection, all filter variants, inclusive and inverted producer ranges, same-version producer ties, large supported versions, bounded advancement with changed batch limits, exact multiples and empty confirmation, Vec and inline projections, borrowed SchemaOperationView projection, and malformed or index-inconsistent records. Combine related assertions into a small number of table-driven or reusable scenarios rather than adding one test per condition. Keep the projected-update paging scenario short: build one fixture, then call focused helpers for projected pages, bounded IDs, filters and the legacy limit, and mismatched payloads. Retain the existing assertions and remove the too_many_lines allowance. Confirm a small projection retains only projected values and no update payload buffer.
 
-Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
-"""
-status = "open"
+Validation
+Run focused codec, SQLite update, paging, and wrapper tests serially, then pedantic Clippy and the complete serial flotsync_replication suite outside the sandbox where socket tests require it. Inspect touched files for duplicated decode, query, and continuation helpers before review. Compare the implementation against this plan and keep the issue open until user approval.
+
+Agreed review refinements (2026-09-29)
+The public ReplicationUpdateView construction path must be usable by downstream store backends while preserving validation and the borrowed projection lifetime. Add an external-crate boundary test. Keep the potential SQLite crate extraction separate in flotsync-dj1.
+Borrow update_message directly as &[u8] from each SQLite row while decoding and projecting, avoiding a full payload copy. Make the runtime injected update-page failure begin a correctly typed page attempt so batch clearing, binding and cursor invalidation match the production contract. Strengthen the existing SQLite fixture scenario by putting equal-version updates on opposite sides of a finite page boundary and by draining finite ID pages; reuse that test rather than duplicating paging lifecycle coverage. Decode update identity fields into named locals. Use Snafu context for new source-preserving decoder error wrapping where possible.
+Validation remains focused on the changed API boundary and SQLite update scenario, followed by pedantic Clippy and the required serial replication suite. Keep this issue in review after the fixes until the user accepts it."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
 blocks = [
     "01a099f7-5fc1-7513-a339-d390405d7581",
@@ -41,4 +49,23 @@ blocks = [
 ]
 parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
 created_at = "2026-09-13T08:52:01.020993Z"
-updated_at = "2026-09-13T08:53:12.96951Z"
+updated_at = "2026-09-30T07:46:21.027406Z"
+closed_at = "2026-09-30T07:46:21.027406Z"
+
+[[comments]]
+id = "01a0edda-c462-77a3-b3d5-96172aaac6e7"
+author = "lkroll"
+body = "Review accepted: expose a validated projection constructor to downstream backends; borrow SQLite update BLOBs; make injected page failures invalidate the cursor and clear the batch; extend the existing fixture test across equal-version and bounded-ID continuation boundaries; clean up nested ? and Snafu wrapping. Separate crate extraction is tracked as flotsync-dj1."
+created_at = "2026-09-29T15:48:52.450063Z"
+
+[[comments]]
+id = "01a0f122-aaca-72b0-aaef-6f1ad1b3f778"
+author = "lkroll"
+body = "Agreed review round R05–R06: remove the redundant owned-update projection wrapper and use ReplicationUpdateView::try_to_owned_record directly; decompose the oversized SQLite paging scenario into fixture and focused assertion helpers without changing coverage or adding tests. Preserve the user's staged review state."
+created_at = "2026-09-30T07:06:16.138513Z"
+
+[[comments]]
+id = "01a0f147-5ce3-7341-876e-25f5b35fff33"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-30T07:46:21.027406Z"
