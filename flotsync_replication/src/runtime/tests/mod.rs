@@ -27,10 +27,15 @@ use super::{
         StartupEventPolicy,
     },
     in_memory::{
+        LoadedGroupMeta,
         LocalDataset,
+        PendingUpdateSet,
+        UpdateDependency,
         apply_local_delete,
         apply_local_upsert,
         apply_rebased_local_upsert,
+        load_scheduled_pending_update,
+        load_update_dependencies,
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
@@ -360,10 +365,21 @@ enum ReadTransactionFailure {
     NextReadTransaction,
 }
 
+/// One injected outcome for an exact update-payload lookup.
+#[derive(Clone, Copy)]
+enum ExactUpdateLoadFault {
+    /// Return an access error for the selected update.
+    StoreError,
+    /// Report the selected update as absent.
+    Missing,
+}
+
 /// Shared failure controls consulted by the store and its delegated transactions.
 #[derive(Default)]
 struct FailingStoreControlState {
     fail_next_apply_dataset_row_patch: Option<DatasetId>,
+    /// Selected exact update lookup and its one-shot injected outcome.
+    exact_update_load_fault: Option<(UpdateId, ExactUpdateLoadFault)>,
     fail_next_activate_replication_group: bool,
     fail_after_next_pending_group_commit: bool,
     read_transaction_failure: ReadTransactionFailure,
@@ -414,6 +430,18 @@ impl<S> FailingStore<S> {
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
         Self::lock_control(&self.control).fail_next_apply_dataset_row_patch = Some(dataset_id);
+    }
+
+    /// Make the next exact payload lookup for this update report no record.
+    fn omit_next_exact_update_load_for(&self, update_id: UpdateId) {
+        Self::lock_control(&self.control).exact_update_load_fault =
+            Some((update_id, ExactUpdateLoadFault::Missing));
+    }
+
+    /// Make the next exact payload lookup for this update return an access error.
+    fn fail_next_exact_update_load_for(&self, update_id: UpdateId) {
+        Self::lock_control(&self.control).exact_update_load_fault =
+            Some((update_id, ExactUpdateLoadFault::StoreError));
     }
 
     fn fail_after_next_pending_group_commit(&self) {
@@ -900,17 +928,43 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update(group_id, update_id)
+        let fault = {
+            let mut control = Self::lock_control(&self.control);
+            if control
+                .exact_update_load_fault
+                .is_some_and(|(selected_id, _)| selected_id == update_id)
+            {
+                control
+                    .exact_update_load_fault
+                    .take()
+                    .map(|(_, fault)| fault)
+            } else {
+                None
+            }
+        };
+        match fault {
+            Some(ExactUpdateLoadFault::Missing) => futures_util::future::ready(Ok(None)).boxed(),
+            Some(ExactUpdateLoadFault::StoreError) => {
+                let source = std::io::Error::other("failing store rejected an exact update lookup");
+                futures_util::future::ready(Err(StoreError::new(
+                    StoreErrorClassification::UNKNOWN,
+                    source,
+                )))
+                .boxed()
+            }
+            None => self
+                .inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .load_replication_update(group_id, update_id),
+        }
     }
 
-    fn load_replication_updates_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>> {
+    fn load_replication_updates_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         let has_injected_failure = {
             let mut control = Self::lock_control(&self.control);
             control.replication_update_load_count += 1;
@@ -939,11 +993,11 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         }
     }
 
-    fn load_replication_update_ids_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>> {
+    fn load_replication_update_ids_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -1749,7 +1803,7 @@ fn execute_injected_sqlite_row_scan_failure(
 /// Inject an update-page failure after beginning the SQLite-typed attempt.
 fn execute_injected_sqlite_update_page_failure(
     transaction_id: StoreTransactionId,
-    cursor: &mut PageCursor<ReplicationUpdatesQuery>,
+    cursor: &mut PageCursor<ReplicationUpdatesQuery<'_>>,
     batch: &mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
     control: &Mutex<FailingStoreControlState>,
 ) -> Result<(), PageError> {
@@ -1914,6 +1968,175 @@ pub(in crate::runtime) struct ProviderTestTransactionState {
     pub(in crate::runtime) release_count: usize,
     /// Number of transaction values dropped.
     pub(in crate::runtime) drop_count: usize,
+}
+
+/// Build one valid stored update whose causal metadata is checked across a page boundary.
+fn dependency_page_update(
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    sender: MemberIdentity,
+    update_id: UpdateId,
+    read_versions: VersionVector,
+) -> ReplicationUpdateRecord {
+    let (_, message) = title_update_message(
+        group_id,
+        dataset_id,
+        u128::from(update_id.version),
+        "page boundary",
+        update_id,
+        read_versions.clone(),
+    );
+    ReplicationUpdateRecord {
+        group_id,
+        update_id,
+        sender,
+        read_versions,
+        dataset_updates: message
+            .dataset_updates
+            .into_iter()
+            .map(|dataset| DatasetUpdateRecord {
+                dataset_id: dataset.dataset_id,
+                operations: dataset.operations,
+            })
+            .collect(),
+        applied_locally: false,
+    }
+}
+
+/// Check that a changed exact lookup reports both projected and observed metadata.
+fn assert_scheduled_mismatch_diagnostics(
+    store: &dyn ReplicationStore,
+    group_id: GroupId,
+    scheduled: &UpdateDependency,
+    actual_read_versions: &VersionVector,
+) {
+    let error = wait_for_test_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let error = load_scheduled_pending_update(transaction.as_mut(), group_id, scheduled)
+            .await
+            .expect_err("changed causal metadata should fail exact lookup");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        error
+    });
+    assert!(matches!(
+        &error,
+        InboundDeliveryError::MismatchedScheduledUpdate { .. }
+    ));
+    let message = error.to_string();
+    assert!(message.contains(&scheduled.update_id.to_string()));
+    assert!(message.contains(&format!("at {}", scheduled.read_versions)));
+    assert!(message.contains(&format!("at {actual_read_versions}")));
+    assert!(message.contains("applied locally: false"));
+}
+
+#[test]
+fn pending_dependencies_load_once_before_causal_scheduling() {
+    let alice = alice_member();
+    let bob = bob_member();
+    let member_count = NonZeroUsize::new(2).expect("two members are non-zero");
+    let group_id = GroupId(Uuid::from_u128(50_301));
+    let dataset_id = docs_dataset_id();
+    let sqlite_store = sqlite_store(alice.clone());
+    let store = FailingStore::new(sqlite_store.clone());
+    let group = inactive_group_record(
+        group_id,
+        vec![alice.clone(), bob.clone()],
+        docs_group_schema(),
+    );
+    let group_meta = LoadedGroupMeta::from_replication_group_record(&alice, group.clone())
+        .expect("fixture group should load");
+    let dependencies = wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .insert_replication_group(group)
+            .await
+            .expect("group should store");
+        for version in 1..=2 {
+            let read_versions =
+                VersionVector::initial(member_count).with_version_at(1, version - 1);
+            let update = dependency_page_update(
+                group_id,
+                dataset_id.clone(),
+                bob.clone(),
+                UpdateId {
+                    node_index: 1,
+                    version,
+                },
+                read_versions,
+            );
+            transaction
+                .append_replication_update(update)
+                .await
+                .expect("producer update should store");
+        }
+        let later_dependency = VersionVector::initial(member_count).with_version_at(1, 2);
+        let update = dependency_page_update(
+            group_id,
+            dataset_id,
+            alice,
+            UpdateId {
+                node_index: 0,
+                version: 1,
+            },
+            later_dependency,
+        );
+        transaction
+            .append_replication_update(update)
+            .await
+            .expect("dependent update should store");
+        let dependencies = load_update_dependencies(
+            transaction.as_mut(),
+            group_id,
+            ReplicationUpdateFilter::PendingApply,
+        )
+        .await
+        .expect("unlimited dependency page should load");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+        dependencies
+    });
+
+    let requests = store.replication_update_load_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "all dependencies should load in one call"
+    );
+    for request in requests {
+        assert_eq!(request.group_id, group_id);
+        assert_eq!(request.filter, ReplicationUpdateFilter::PendingApply);
+        assert_eq!(request.limit, None);
+    }
+    let plan = PendingUpdateSet::from_updates(dependencies).plan_apply_chain(&group_meta);
+    assert!(plan.already_applied.is_empty());
+    assert!(plan.blocked_updates.is_empty());
+    assert_eq!(plan.ready_chain.len(), 3);
+    assert_eq!(plan.ready_chain[0].update_id.node_index, 1);
+    assert_eq!(plan.ready_chain[1].update_id.version, 2);
+    assert_eq!(
+        plan.ready_chain[2].update_id,
+        UpdateId {
+            node_index: 0,
+            version: 1,
+        }
+    );
+    let actual_read_versions = VersionVector::initial(member_count);
+    let scheduled = UpdateDependency {
+        update_id: plan.ready_chain[0].update_id,
+        read_versions: VersionVector::initial(member_count).with_version_at(1, 2),
+    };
+    assert_scheduled_mismatch_diagnostics(&store, group_id, &scheduled, &actual_read_versions);
 }
 
 #[test]

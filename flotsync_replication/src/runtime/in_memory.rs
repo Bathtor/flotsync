@@ -1,4 +1,5 @@
 use super::errors::{
+    ExactUpdateMismatch,
     GroupInstallError,
     InboundDeliveryError,
     InstallMissingLocalMemberSnafu,
@@ -17,15 +18,23 @@ use crate::api::{
     DatasetRowStateWrite,
     DatasetUpdateRecord,
     GroupSchema,
+    PageCursor,
     ReplicationGroupRecord,
     ReplicationRowStateSnapshot,
+    ReplicationStoreReadTransaction,
+    ReplicationUpdateFilter,
+    ReplicationUpdatePageInput,
     ReplicationUpdateRecord,
+    ReplicationUpdateView,
+    ReplicationUpdatesQuery,
     RowChange,
     RowId,
     RowKey,
     RowMutation,
     RowValuesPatch,
     SchemaSource,
+    StoreError,
+    VecPageBatch,
 };
 use flotsync_core::{
     GroupId,
@@ -43,14 +52,23 @@ use flotsync_data_types::{
     TableOperations,
     schema::datamodel::RowOperation,
 };
-use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
-use flotsync_utils::option_when;
+use flotsync_messages::codecs::datamodel::{
+    decode_schema_operation,
+    decode_schema_operation_view_row_id,
+    encode_schema_operation,
+};
+use flotsync_utils::{BoxError, option_when};
 use snafu::prelude::*;
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
 };
+
+/// Maximum selected ready updates projected in one row-scope page.
+pub(super) const READY_ROW_SCOPE_PAGE_SIZE: NonZeroUsize =
+    NonZeroUsize::new(64).expect("64 is non-zero");
 
 struct LocalStoredStateRow {
     snapshot: ReplicationRowStateSnapshot,
@@ -157,27 +175,12 @@ impl LoadedGroupMeta {
             .version_at(member_index.as_u32() as usize)
     }
 
-    /// Return the next producer version expected from the given member.
-    pub(super) fn expected_next_version(&self, member_index: MemberIndex) -> u64 {
-        self.applied_version(member_index)
-            .checked_add(1)
-            .expect("member version counter must not overflow")
-    }
-
-    /// Return `true` when `update_id` is already reflected in the durable VV.
+    /// Return `true` when `update_id` is already reflected in the group version vector.
     pub(super) fn has_applied(&self, update_id: UpdateId) -> bool {
         self.applied_version(MemberIndex::new(update_id.node_index)) >= update_id.version
     }
 
-    /// Return `true` when `update` is causally ready and is the next version
-    /// expected from its producer.
-    pub(super) fn can_apply(&self, update: &ReplicationUpdateRecord) -> bool {
-        let producer_index = MemberIndex::new(update.update_id.node_index);
-        (self.version_vector >= update.read_versions)
-            && self.expected_next_version(producer_index) == update.update_id.version
-    }
-
-    /// Advance the durable VV to reflect one update that has now applied.
+    /// Advance the group version vector to reflect one update that has now applied.
     pub(super) fn mark_applied(&mut self, update_id: UpdateId) {
         self.version_vector
             .increment_at(update_id.node_index as usize);
@@ -231,15 +234,127 @@ pub(super) enum ProducerReadCausality {
     },
 }
 
-/// Persisted-but-not-yet-applied updates loaded for one transactional
-/// causality check.
+/// Identity and causal dependencies needed to schedule one stored update.
+#[derive(Clone)]
+pub(super) struct UpdateDependency {
+    /// Producer and version of the stored update.
+    pub(super) update_id: UpdateId,
+    /// Causal position the update requires before application.
+    pub(super) read_versions: VersionVector,
+}
+
+impl UpdateDependency {
+    /// Copy scheduling data from a temporary store projection.
+    pub(super) fn from_view(view: &ReplicationUpdateView<'_>) -> Self {
+        Self {
+            update_id: view.update_id(),
+            read_versions: view.read_versions().clone(),
+        }
+    }
+
+    /// Compare candidates for historical replay by read position, then identity.
+    ///
+    /// Concurrent positions have no vector ordering and use the update ID as
+    /// the deterministic tie-breaker.
+    pub(super) fn compare_for_replay(&self, other: &Self) -> Ordering {
+        self.read_versions
+            .partial_cmp(&other.read_versions)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.update_id.cmp(&other.update_id))
+    }
+
+    /// Return `true` when all dependencies are applied and this update is the
+    /// next version of its producer; `false` means it must wait.
+    pub(super) fn is_ready_at(&self, versions: &VersionVector) -> bool {
+        if !matches!(
+            versions.partial_cmp(&self.read_versions),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
+            return false;
+        }
+        let producer = self.update_id.node_index as usize;
+        let next_version = versions
+            .version_at(producer)
+            .checked_add(1)
+            .expect("member version counter must not overflow");
+        next_version == self.update_id.version
+    }
+}
+
+/// Load one group's selected update dependencies into an unlimited projection.
+///
+/// The returned values contain no operation payloads. A store or page failure
+/// remains a classified `StoreError` for the caller's own error context.
+pub(super) async fn load_update_dependencies<Transaction>(
+    transaction: &mut Transaction,
+    group_id: GroupId,
+    filter: ReplicationUpdateFilter,
+) -> Result<Vec<UpdateDependency>, StoreError>
+where
+    Transaction: ReplicationStoreReadTransaction + ?Sized,
+{
+    let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(group_id, filter));
+    let project =
+        |view: ReplicationUpdateView<'_>| Ok::<_, BoxError>(UpdateDependency::from_view(&view));
+    let mut batch =
+        VecPageBatch::<UpdateDependency, (), ReplicationUpdatePageInput, _>::unlimited_with(
+            project,
+        );
+    transaction
+        .load_replication_updates_into(&mut cursor, &mut batch)
+        .await
+        .map_err(StoreError::from)?;
+    Ok(batch.into_values())
+}
+
+/// Load one ready update selected from projected dependencies in the same transaction.
+///
+/// An absent record or changed causal position indicates a store inconsistency.
+pub(super) async fn load_scheduled_pending_update<Transaction>(
+    transaction: &mut Transaction,
+    group_id: GroupId,
+    scheduled: &UpdateDependency,
+) -> Result<ReplicationUpdateRecord, InboundDeliveryError>
+where
+    Transaction: ReplicationStoreReadTransaction + ?Sized,
+{
+    let update = transaction
+        .load_replication_update(&group_id, scheduled.update_id)
+        .await
+        .context(inbound::StoreAccessSnafu)?
+        .context(inbound::MissingScheduledUpdateSnafu {
+            group_id,
+            update_id: scheduled.update_id,
+        })?;
+    if update.group_id == group_id
+        && update.update_id == scheduled.update_id
+        && update.read_versions == scheduled.read_versions
+        && !update.applied_locally
+    {
+        Ok(update)
+    } else {
+        inbound::MismatchedScheduledUpdateSnafu {
+            mismatch: Box::new(ExactUpdateMismatch::new(
+                group_id,
+                scheduled.update_id,
+                &scheduled.read_versions,
+                false,
+                &update,
+            )),
+        }
+        .fail()
+    }
+}
+
+/// Persisted-but-not-yet-applied update dependencies loaded for one
+/// transactional causality check.
 pub(super) struct PendingUpdateSet {
-    updates: BTreeMap<UpdateId, ReplicationUpdateRecord>,
+    updates: BTreeMap<UpdateId, UpdateDependency>,
 }
 
 impl PendingUpdateSet {
-    /// Materialise one deterministic pending-update index from store records.
-    pub(super) fn from_updates(updates: Vec<ReplicationUpdateRecord>) -> Self {
+    /// Build one deterministic pending-update index from projected dependencies.
+    pub(super) fn from_updates(updates: Vec<UpdateDependency>) -> Self {
         let updates = updates
             .into_iter()
             .map(|update| (update.update_id, update))
@@ -263,12 +378,12 @@ impl PendingUpdateSet {
             self.updates.remove(&update_id);
             already_applied.push(update_id);
         }
-        self.updates
-            .iter()
-            .find_map(|(update_id, update)| option_when!(group.can_apply(update), *update_id))
+        self.updates.iter().find_map(|(update_id, update)| {
+            option_when!(update.is_ready_at(&group.version_vector), *update_id)
+        })
     }
 
-    /// Determine which pending updates are already reflected in durable state
+    /// Determine which pending updates are already reflected in group state
     /// and which additional updates can now apply in causal order.
     pub(super) fn plan_apply_chain(&mut self, group: &LoadedGroupMeta) -> PendingApplyPlan {
         let mut already_applied = Vec::new();
@@ -297,8 +412,8 @@ impl PendingUpdateSet {
 /// One transaction-local decision about pending persisted updates.
 pub(super) struct PendingApplyPlan {
     pub(super) already_applied: Vec<UpdateId>,
-    pub(super) ready_chain: Vec<ReplicationUpdateRecord>,
-    pub(super) blocked_updates: Vec<ReplicationUpdateRecord>,
+    pub(super) ready_chain: Vec<UpdateDependency>,
+    pub(super) blocked_updates: Vec<UpdateDependency>,
 }
 
 /// One local dataset together with its current replicated in-memory contents.
@@ -440,38 +555,101 @@ pub(super) fn collect_group_row_scope(
     })
 }
 
-/// Collect the row keys touched by the given persisted updates.
+/// Copy dataset and row identities from one ready update's temporary view.
 ///
-/// Schemas are required because stored update records carry encoded schema
-/// operations rather than decoded row operations.
-pub(super) fn collect_record_row_scope(
-    updates: &[ReplicationUpdateRecord],
+/// Each dataset is checked against the current group schema before its row keys
+/// are decoded. Full operation validation still occurs before the transaction
+/// commits when the selected payload is loaded and applied.
+pub(super) fn project_update_row_scope(
+    view: &ReplicationUpdateView<'_>,
     group_schema: &GroupSchema,
-) -> Result<HashMap<DatasetId, HashSet<RowKey>>, InboundDeliveryError> {
+) -> Result<Vec<(DatasetId, Vec<RowKey>)>, InboundDeliveryError> {
+    let mut row_keys_by_dataset = Vec::new();
+    for dataset_update in view.dataset_updates() {
+        let raw_dataset_id = dataset_update.dataset_id();
+        let dataset_id =
+            DatasetId::try_from_owned(raw_dataset_id.to_owned()).with_context(|_| {
+                inbound::InvalidProjectedDatasetIdSnafu {
+                    group: view.group_id(),
+                    update: view.update_id(),
+                    dataset: raw_dataset_id.to_owned(),
+                }
+            })?;
+        ensure!(
+            group_schema.schema(&dataset_id).is_some(),
+            inbound::MissingDatasetSchemaSnafu {
+                group_id: view.group_id(),
+                dataset_id: dataset_id.clone(),
+            }
+        );
+        let mut row_keys = Vec::with_capacity(dataset_update.operations().len());
+        for operation in dataset_update.operations() {
+            let row_id = decode_schema_operation_view_row_id(operation).with_context(|_| {
+                inbound::DecodeSchemaOperationSnafu {
+                    dataset_id: dataset_id.clone(),
+                }
+            })?;
+            row_keys.push(RowKey(row_id));
+        }
+        row_keys_by_dataset.push((dataset_id, row_keys));
+    }
+    Ok(row_keys_by_dataset)
+}
+
+/// Collect row keys touched by selected ready updates without keeping their
+/// operation payloads or decoding operations from blocked updates. Every ready
+/// update must still appear in this second projected scan.
+pub(super) async fn load_ready_row_scope<Transaction>(
+    transaction: &mut Transaction,
+    group_id: GroupId,
+    group_schema: &GroupSchema,
+    ready_ids: &HashSet<UpdateId>,
+) -> Result<HashMap<DatasetId, HashSet<RowKey>>, InboundDeliveryError>
+where
+    Transaction: ReplicationStoreReadTransaction + ?Sized,
+{
+    let query = ReplicationUpdatesQuery::new(group_id, ReplicationUpdateFilter::PendingApply)
+        .with_update_ids(ready_ids);
+    let mut cursor = PageCursor::new(query);
+    let project = |view: ReplicationUpdateView<'_>| {
+        Ok::<_, BoxError>((
+            view.update_id(),
+            project_update_row_scope(&view, group_schema),
+        ))
+    };
+    let mut batch = VecPageBatch::<
+        (
+            UpdateId,
+            Result<Vec<(DatasetId, Vec<RowKey>)>, InboundDeliveryError>,
+        ),
+        (),
+        ReplicationUpdatePageInput,
+        _,
+    >::bounded_with(READY_ROW_SCOPE_PAGE_SIZE, project);
     let mut dataset_rows: HashMap<DatasetId, HashSet<RowKey>> = HashMap::new();
-    for update in updates {
-        for dataset_update in &update.dataset_updates {
-            let schema = group_schema
-                .schema(&dataset_update.dataset_id)
-                .expect("touched inbound dataset schemas must be pre-loaded");
-            for operation in &dataset_update.operations {
-                let operation = decode_update_schema_operation(
-                    update,
-                    dataset_update,
-                    operation.clone(),
-                    schema.as_schema(),
-                )?;
-                let row_key = match operation.operation {
-                    RowOperation::Insert { row_id, .. }
-                    | RowOperation::Update { row_id, .. }
-                    | RowOperation::Delete { row_id } => RowKey(row_id),
-                };
-                dataset_rows
-                    .entry(dataset_update.dataset_id.clone())
-                    .or_default()
-                    .insert(row_key);
+    let mut seen_ready_ids = HashSet::new();
+    while cursor.has_more() {
+        transaction
+            .load_replication_updates_into(&mut cursor, &mut batch)
+            .await
+            .map_err(StoreError::from)
+            .context(inbound::StoreAccessSnafu)?;
+        for (update_id, row_keys_result) in batch.values_mut().drain(..) {
+            seen_ready_ids.insert(update_id);
+            let row_keys_by_dataset = row_keys_result?;
+            for (dataset_id, row_keys) in row_keys_by_dataset {
+                dataset_rows.entry(dataset_id).or_default().extend(row_keys);
             }
         }
+    }
+    for update_id in ready_ids {
+        ensure!(
+            seen_ready_ids.contains(update_id),
+            inbound::MissingScheduledUpdateSnafu {
+                group_id,
+                update_id: *update_id,
+            }
+        );
     }
     Ok(dataset_rows)
 }

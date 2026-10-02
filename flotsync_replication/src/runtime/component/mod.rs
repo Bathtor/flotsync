@@ -48,7 +48,9 @@ use super::{
         TouchedGroupRows,
         apply_one_update,
         collect_group_row_scope,
-        collect_record_row_scope,
+        load_ready_row_scope,
+        load_scheduled_pending_update,
+        load_update_dependencies,
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
@@ -3065,10 +3067,13 @@ impl ReplicationRuntimeComponent {
                 .context(inbound::StoreAccessSnafu)?;
         }
 
-        let pending_updates = transaction
-            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply, None)
-            .await
-            .context(inbound::StoreAccessSnafu)?;
+        let pending_updates = load_update_dependencies(
+            transaction.as_mut(),
+            group_id,
+            ReplicationUpdateFilter::PendingApply,
+        )
+        .await
+        .context(inbound::StoreAccessSnafu)?;
         let mut observed_available = vec![incoming_available_range];
         observed_available.extend(
             pending_updates
@@ -3088,7 +3093,7 @@ impl ReplicationRuntimeComponent {
             for blocked_update in &apply_plan.blocked_updates {
                 let blocked_ranges = Self::missing_ranges_for_update_frontier(
                     &local_group.version_vector,
-                    blocked_update.group_id,
+                    group_id,
                     blocked_update.update_id,
                     &blocked_update.read_versions,
                 )?;
@@ -3105,23 +3110,18 @@ impl ReplicationRuntimeComponent {
             });
         }
 
-        let touched_dataset_ids = apply_plan
+        let ready_ids = apply_plan
             .ready_chain
             .iter()
-            .flat_map(|update| update.dataset_updates.iter())
-            .map(|dataset_update| dataset_update.dataset_id.clone())
+            .map(|update| update.update_id)
             .collect::<HashSet<_>>();
-        for dataset_id in touched_dataset_ids {
-            ensure!(
-                group_schema.schema(&dataset_id).is_some(),
-                inbound::MissingDatasetSchemaSnafu {
-                    group_id,
-                    dataset_id,
-                }
-            );
-        }
-        let touched_dataset_rows =
-            collect_record_row_scope(&apply_plan.ready_chain, group_schema.as_ref())?;
+        let touched_dataset_rows = load_ready_row_scope(
+            transaction.as_mut(),
+            group_id,
+            group_schema.as_ref(),
+            &ready_ids,
+        )
+        .await?;
         let touched_dataset_slices = replay::load_touched_dataset_slices(
             transaction.as_mut(),
             group_schema.as_ref(),
@@ -3133,9 +3133,12 @@ impl ReplicationRuntimeComponent {
         let mut working_datasets =
             replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
         let mut event_batches = ListenerDataChangeBatches::new();
-        for ready_update in &apply_plan.ready_chain {
+        for scheduled_update in &apply_plan.ready_chain {
+            let ready_update =
+                load_scheduled_pending_update(transaction.as_mut(), group_id, scheduled_update)
+                    .await?;
             let applied_batch =
-                apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
+                apply_one_update(&mut local_group, &mut working_datasets, &ready_update)?;
             if lifecycle.emits_data_changes() && !applied_batch.row_changes.is_empty() {
                 let read_token = GroupReadToken::from_group_version(
                     group_id,
@@ -3154,14 +3157,14 @@ impl ReplicationRuntimeComponent {
             .await
             .context(inbound::StoreAccessSnafu)?;
             transaction
-                .mark_replication_update_applied(&group_id, ready_update.update_id)
+                .mark_replication_update_applied(&group_id, scheduled_update.update_id)
                 .await
                 .context(inbound::StoreAccessSnafu)?;
         }
         for blocked_update in &apply_plan.blocked_updates {
             let blocked_ranges = Self::missing_ranges_for_update_frontier(
                 &local_group.version_vector,
-                blocked_update.group_id,
+                group_id,
                 blocked_update.update_id,
                 &blocked_update.read_versions,
             )?;

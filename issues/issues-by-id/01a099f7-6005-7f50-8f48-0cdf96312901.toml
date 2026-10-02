@@ -3,38 +3,57 @@ ref = "flotsync-h3l.6"
 title = "Schedule causal updates without retaining payloads"
 body = """
 Scope (AJ6)
-Separate replay/pending-application scheduling metadata from operation payloads. Estimate: 650-950 changed Rust LOC. Blocked by flotsync-h3l.4; shared foundation is transitive.
+Separate causal scheduling for historical replay and pending application from operation payloads. Use the projected update paging API established by flotsync-h3l.4. Keep causal replay and pending application in this child; leave compatibility-adapter removal to flotsync-h3l.8. Work on the current branch, without switching or creating a branch. Implement as two independently buildable review slices: shared scheduling plus historical replay, then pending application. Estimate 840-1,180 changed Rust LOC (shared metadata/readiness 140-200; replay 220-300; pending application 300-420; focused tests and harness 180-260). If this grows beyond 1,000 LOC, consider splitting those two slices into separate child issues rather than widening one review.
 
-Starting points
-flotsync_replication/src/runtime/in_memory.rs: PendingUpdateSet, PendingApplyPlan, LoadedGroupMeta::can_apply; runtime/replay.rs: load_publish_dataset_state, replay_datasets_at_versions, included_updates/find_ready_update_index; runtime/component/mod.rs pending-apply flow around load_replication_updates(PendingApply); related replay/runtime delivery tests.
+Current paging contract
+Use PageCursor<ReplicationUpdatesQuery> and load_replication_updates_into with PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>. The cursor owns an opaque backend continuation; no Rust ordering key or PageQuery trait is involved. Use one unlimited VecPageBatch when the caller needs every compact dependency for causal planning. The SQLite projected-update reader must stream source rows so that it does not hold every encoded operation payload in memory before projection. Other bounded consumers keep normal continuation handling; exact-size final pages may need an empty confirmation. The SQLite update reader orders bounded pages by its stable composite key but does not request ORDER BY for unlimited pages, whose result order is unspecified. An optional borrowed update-ID set on ReplicationUpdatesQuery selects ready updates without cloning the set; backend implementations choose how to apply that predicate. The borrowed ReplicationUpdateView exposes validated group ID, update ID, read_versions, applied_locally and temporary dataset/operation views. Project one compact owned value per source record, without keeping operation payloads in scheduling collections. Preserve PageError classification when converting to the runtime's contextual store error. The existing load_replication_update(group_id, update_id) provides exact-ID payload lookup in the same read-your-own-writes transaction.
 
-Work
-Project stored updates into lightweight IDs plus dependency frontiers (read_versions), with any small validation metadata genuinely required. Determine ready/already-applied/blocked IDs without retaining operations or full encoded buffers. UpdateId alone is insufficient for cross-producer dependencies; preserve read_versions checks and expected next producer version.
-After scheduling, fetch and process ready payloads in bounded groups within the same transaction. Preserve historical target-version filtering, deterministic ready selection, touched-dataset/row preparation, schema validation, blocked-range derivation, already-applied handling, event semantics, atomic commit/rollback and incomplete-replay errors. Avoid simply collecting projected full payloads across all pages.
-Use common one-to-one batches and projected store reads. Bound transient ready payload retention even when ready chains are large; lightweight dependency metadata may grow with history. Audit duplicate validation/scheduling helpers in touched files and share narrowly where appropriate.
+Shared causal scheduling
+Define a small internal update-dependency value with UpdateId and VersionVector (and group ID only if a caller needs it). Share the readiness predicate: a producer's version must be the next expected one and its read_versions must be no later than the simulated group position. Keep the two selection policies distinct: pending application chooses the smallest ready UpdateId from its BTreeMap; historical replay preserves its current read-frontier comparator, then UpdateId tie-break. PendingApplyPlan should contain ready IDs, already-applied IDs and compact blocked dependency values, with no full ReplicationUpdateRecord. Preserve blocked-range derivation and stale/already-applied handling.
 
-Acceptance
-Tests include dependencies crossing page boundaries, an earlier sorted ID depending on a later sorted ID, missing dependencies, multiple producers, already-applied updates, replay at historical frontiers, malformed frontiers, and failure while loading/applying a later payload group. Verify equivalent final state/events and rollback semantics, with no eager full-history operation retention. Remove superseded owned-payload scheduling paths once no callers need them.
+Historical replay slice
+In runtime/replay.rs, load Applied updates into one unlimited compact dependency batch, filter candidates against the historical target vector, and compute the same deterministic causal order. Keep the replay-specific read-frontier comparator as a method on UpdateDependency, without defining a global Ord policy. Report incomplete history if candidates cannot all be scheduled; reject malformed target/frontier metadata with contextual Snafu errors rather than panicking. Fetch each selected payload by exact ID, replay only requested rows, and drop the payload before fetching the next. A one-payload bound is intentional: the existing exact-ID API does one lookup per update, so buffering multiple complete payloads would not reduce store calls. A scheduled ID absent on exact lookup is a store inconsistency, not a snapshot fallback. Update the pure replay tests to exercise the scheduling helper or an appropriate store-backed path; do not keep a parallel production path that takes a Vec of complete updates solely for tests.
 
-Agreed context and API contract
+Pending application slice
+In runtime/component/mod.rs and runtime/in_memory.rs, load PendingApply updates (including the inbound update appended in the same transaction) into one unlimited compact dependency batch; plan already-applied, ready and blocked IDs without keeping payloads. Preserve observed availability and bound missing ranges to the lifecycle final frontier. Before application, make a second bounded projected pass to collect touched datasets and row keys for ready IDs only. Carry a borrowed ready-ID selection in the query. The SQLite backend checks each indexed ID before decoding its payload and pushes only selected updates; it scans past unselected rows so bounded pages and continuation remain correct. Other backends may apply this predicate using their own facilities. Do not add a SQLite SQL IN-list, JSON expansion, or chunking. Do not decode blocked operations. Preload the touched row slices as today, then fetch, validate, apply and drop each ready payload by exact ID. Preserve schema/operation validation, listener event ordering, group-version updates, atomic commit or rollback, and existing contextual errors. Treat a missing or mismatched exact-ID payload as a contextual inconsistency. Avoid accumulating complete payloads across a ready chain.
 
-This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+Validation
+Re-use existing replay row-scope, unsorted-input, delivery buffering, restart, duplicate and rollback tests. Use existing focused tests for changed behaviour: shrink the former 66-update page-boundary fixture to three causal updates that verify one unlimited request and causal order, and augment existing tests only where selection-before-decoding or bounded selected continuation otherwise lacks coverage. Do not add new tests or duplicate generic paging coverage. Verify final rows/events, blocked and already-applied state, historical replay, and rollback. Extend the existing failing-store test wrapper narrowly for exact-load failure observation. Do not duplicate generic paging-contract tests. Run focused and serial replication tests, formatting and pedantic Clippy, and inspect touched files for newly duplicated helpers. Keep the issue open and set status_reason to in review for handover; close only after user agreement.
 
-Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
+Review refinements (agreed 2026-10-02)
+R01: Earlier review exercised the bounded dependency loader at its 64-record boundary. S01 supersedes that limit: the existing store-backed fixture now uses three causally related updates and verifies one unlimited request and the same scheduling policy.
+R02: Group projected row keys by dataset, validate each dataset against the schema before decoding operations, and merge row sets per dataset. This avoids per-operation dataset-name clones and repeated lookups, at the cost of one small row-key Vec per dataset entry.
+R03: Make exact-load mismatch errors report observed identity, frontier, and applied state where relevant; allocate extra diagnostic values only on the error path and test through existing focused cases where practical.
+M01: Extract fallible row-key results before iteration to keep `?` out of the `for` expression.
+Estimated review delta: roughly 140-270 Rust LOC (R01 80-140, R02 20-45, R03 35-80, M01 under 5). This keeps the full task estimate near or above 1,000 changed LOC; the replay and pending slices are already implemented, so these are focused review corrections rather than a new broad slice.
 
-ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
-
-Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
-
-Validation and delivery
-
-Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+Second review refinements (agreed 2026-10-02)
+S01: Replace bounded dependency loading and accumulation with one unlimited projected batch. Stream SQLite source rows instead of fetch_all so encoded payloads are not all resident at once. Shrink the obsolete 66-record boundary fixture while retaining its causal-order check.
+S02: Carry an optional borrowed ready-ID set in ReplicationUpdatesQuery. In SQLite, check the indexed ID during streamed row decoding before parsing an unselected payload; preserve bounded paging semantics by scanning past unselected rows. Leave SQL IN-list and JSON approaches out of scope. Simplify the runtime projector and preserve missing-ID checks. Backend selection strategy remains implementation-specific. Unlimited update pages have no ordering guarantee.
+S03: Leave the replay mismatch branch's fail::<()>().context(...) unchanged at the user's request.
+S04: Move the replay-only comparator to UpdateDependency; preserve its read-frontier comparison and ID tie-break without implementing Ord.
+Validation remains within existing tests, with augmentation only where new behaviour otherwise lacks coverage. Estimated second-round delta: 170-300 Rust LOC; the cumulative task may exceed 1,000 LOC, so keep the current change reviewable and avoid widening scope.
 """
-status = "open"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 blocked_by = ["01a099f7-5f7c-7cd1-bf55-486209d43e07"]
 blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
 parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
 created_at = "2026-09-13T08:52:01.157979Z"
-updated_at = "2026-09-13T08:53:13.105311Z"
+updated_at = "2026-10-02T15:44:53.553368Z"
+closed_at = "2026-10-02T15:44:53.553368Z"
+
+[[comments]]
+id = "01a0fd3f-6f67-7fa1-88fa-8f2e1ca56319"
+author = "lkroll"
+body = "Second review round implemented: S01 loads compact dependencies in one unlimited batch while SQLite streams encoded rows; S02 carries a borrowed ready-ID set in the query and SQLite filters indexed IDs before payload decoding, including correct bounded continuation; S03 remains unchanged by request; S04 moves replay comparison onto UpdateDependency. Unlimited update reads no longer request ORDER BY. Existing tests were augmented, with the obsolete 66-record boundary fixture reduced to three causal updates. Validation: 419 serial replication library tests, focused SQLite paging test after the final assertion edit, pedantic Clippy, rustfmt and git diff --check passed. No staging or unstaging was performed."
+created_at = "2026-10-02T15:33:08.07101Z"
+
+[[comments]]
+id = "01a0fd4a-3331-7840-94e3-460d5bbfec3a"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-02T15:44:53.553368Z"

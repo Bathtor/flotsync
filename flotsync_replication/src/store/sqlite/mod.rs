@@ -741,11 +741,11 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_replication_updates_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>> {
+    fn load_replication_updates_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         let transaction_id = self.transaction_id;
         async move {
             let page = cursor
@@ -755,11 +755,11 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_replication_update_ids_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>> {
+    fn load_replication_update_ids_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         let transaction_id = self.transaction_id;
         async move {
             let page = cursor

@@ -564,13 +564,18 @@ pub trait ReplicationStoreReadTransaction: Send {
     ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
 
     /// Load persisted replication updates selected by the cursor into `batch`.
-    fn load_replication_updates_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>>;
+    ///
+    /// A bounded batch uses the backend's stable paging order. An unlimited
+    /// batch has no ordering guarantee.
+    fn load_replication_updates_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Load persisted replication updates for one group using the given filter and optional limit.
+    ///
+    /// Results without a limit have no ordering guarantee.
     ///
     /// TODO(flotsync-h3l.8): Remove this compatibility adapter after every
     /// runtime consumer uses projected update pages directly.
@@ -597,17 +602,19 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load persisted replication update ids selected by the cursor into `batch`.
     ///
     /// Implementations must not fetch or decode update payloads for this method.
-    fn load_replication_update_ids_into<'a>(
-        &'a mut self,
-        cursor: &'a mut PageCursor<ReplicationUpdatesQuery>,
-        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
-    ) -> BoxFuture<'a, Result<(), PageError>>;
+    /// A bounded batch uses the backend's stable paging order; an unlimited
+    /// batch has no ordering guarantee.
+    fn load_replication_update_ids_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>>;
 
     /// Load only persisted replication update ids for one group.
     ///
     /// This is for availability/frontier checks that must not decode full
-    /// update payloads. Returned ids follow the same ordering and filtering
-    /// rules as [`Self::load_replication_updates`].
+    /// update payloads. A finite limit uses the backend's paging order;
+    /// unlimited results have no ordering guarantee.
     ///
     /// TODO(flotsync-h3l.8): Remove this compatibility adapter after every
     /// runtime consumer uses update-id pages directly.

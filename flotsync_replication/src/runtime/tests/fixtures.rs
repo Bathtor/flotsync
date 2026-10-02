@@ -993,6 +993,38 @@ pub(super) fn title_update_message(
     (row_id, message)
 }
 
+/// Build two successive updates to one title row with matching causal frontiers.
+pub(super) fn consecutive_title_update_messages(
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    row_raw: u128,
+) -> (RowId, UpdateMessage, UpdateMessage) {
+    let row_id = test_row_id(group_id, dataset_id, row_raw);
+    let mut source_dataset = LocalDataset::new(title_schema_static());
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let first = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "first",
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        VersionVector::initial(member_count),
+    );
+    let second = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "second",
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+        VersionVector::initial(member_count).with_version_at(0, 1),
+    );
+    (row_id, first, second)
+}
+
 pub(super) fn title_update_message_for_row(
     source_dataset: &mut LocalDataset,
     row_id: &RowId,

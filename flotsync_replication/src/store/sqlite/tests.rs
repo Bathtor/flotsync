@@ -2651,6 +2651,33 @@ fn assert_projected_update_pages(
             .collect::<Vec<_>>(),
         vec![false, true, true, true, false]
     );
+
+    let selected_ids = HashSet::from([fixture.updates[2].update_id, fixture.updates[4].update_id]);
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
+        .with_update_ids(&selected_ids);
+    let mut selected_cursor = PageCursor::new(query);
+    let mut selected_batch =
+        VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::bounded_with(
+            NonZeroUsize::new(1).expect("one update per page"),
+            project_update_summary,
+        );
+    let mut selected = Vec::new();
+    while selected_cursor.has_more() {
+        wait_for_store_future(
+            transaction.load_replication_updates_into(&mut selected_cursor, &mut selected_batch),
+        )
+        .expect("selected update page should load");
+        selected.extend(
+            selected_batch
+                .values()
+                .iter()
+                .map(|summary| summary.update_id),
+        );
+    }
+    assert_eq!(
+        selected,
+        vec![fixture.updates[2].update_id, fixture.updates[4].update_id]
+    );
 }
 
 /// Check that lightweight ID reads cross the same-version producer boundary.
@@ -2674,6 +2701,16 @@ fn assert_bounded_update_id_pages(
     }
     assert!(ids_cursor.is_exhausted());
     assert_eq!(paged_ids, fixture.expected_ids());
+
+    let selected_ids = HashSet::from([fixture.updates[2].update_id]);
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
+        .with_update_ids(&selected_ids);
+    let mut selected_cursor = PageCursor::new(query);
+    wait_for_store_future(
+        transaction.load_replication_update_ids_into(&mut selected_cursor, &mut ids_batch),
+    )
+    .expect("selected update id should load");
+    assert_eq!(ids_batch.values(), &[fixture.updates[2].update_id]);
 }
 
 /// Compare projected adapters and ID selection for every filter and one legacy limit.
@@ -2721,14 +2758,16 @@ fn assert_update_filters_and_legacy_limit(
             None,
         ))
         .expect("filtered update ids should load");
+        let update_ids = updates
+            .iter()
+            .map(|update| update.update_id)
+            .sorted()
+            .collect::<Vec<_>>();
         assert_eq!(
-            updates
-                .iter()
-                .map(|update| update.update_id)
-                .collect::<Vec<_>>(),
-            expected
+            update_ids,
+            expected.iter().copied().sorted().collect::<Vec<_>>()
         );
-        assert_eq!(ids, expected);
+        assert_eq!(ids.into_iter().sorted().collect::<Vec<_>>(), update_ids);
     }
 
     let limited_alice = wait_for_store_future(transaction.load_replication_updates(
@@ -2762,7 +2801,34 @@ fn assert_inconsistent_update_payload(fixture: &UpdatePagingFixture) {
         None,
     ))
     .expect("id-only paging should not decode an inconsistent payload");
-    assert_eq!(ids, fixture.expected_ids());
+    assert_eq!(
+        ids.into_iter().sorted().collect::<Vec<_>>(),
+        fixture
+            .expected_ids()
+            .into_iter()
+            .sorted()
+            .collect::<Vec<_>>()
+    );
+    let selected_ids = HashSet::from([alice_v3.update_id]);
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
+        .with_update_ids(&selected_ids);
+    let mut selected_cursor = PageCursor::new(query);
+    let mut selected_batch =
+        VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::unlimited_with(
+            project_update_summary,
+        );
+    wait_for_store_future(
+        transaction.load_replication_updates_into(&mut selected_cursor, &mut selected_batch),
+    )
+    .expect("an unselected inconsistent payload should not be decoded");
+    assert_eq!(
+        selected_batch
+            .values()
+            .iter()
+            .map(|summary| summary.update_id)
+            .collect::<Vec<_>>(),
+        vec![alice_v3.update_id]
+    );
     let error = wait_for_store_future(transaction.load_replication_updates(
         &fixture.group_id,
         ReplicationUpdateFilter::All,

@@ -15,22 +15,38 @@ use flotsync_core::{
 };
 use flotsync_messages::{datamodel::SchemaOperationView, replication as replication_proto};
 use flotsync_utils::BoxError;
-use std::num::NonZeroUsize;
+use std::{collections::HashSet, num::NonZeroUsize};
 
 /// Immutable selection for one pageable replication-update query.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ReplicationUpdatesQuery {
+///
+/// A selected ID set is borrowed for the cursor's lifetime. Store backends may
+/// apply that selection using their own data layout or query facilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationUpdatesQuery<'a> {
     /// Group whose update log is selected.
     group_id: GroupId,
     /// Predicate applied to the group's update log.
     filter: ReplicationUpdateFilter,
+    /// Optional exact update identities included in the selection.
+    update_ids: Option<&'a HashSet<UpdateId>>,
 }
 
-impl ReplicationUpdatesQuery {
+impl<'a> ReplicationUpdatesQuery<'a> {
     /// Build one update-log selection.
     #[must_use]
     pub const fn new(group_id: GroupId, filter: ReplicationUpdateFilter) -> Self {
-        Self { group_id, filter }
+        Self {
+            group_id,
+            filter,
+            update_ids: None,
+        }
+    }
+
+    /// Intersect the update filter with these exact identities for this cursor.
+    #[must_use]
+    pub const fn with_update_ids(mut self, update_ids: &'a HashSet<UpdateId>) -> Self {
+        self.update_ids = Some(update_ids);
+        self
     }
 
     /// Return the selected replication group.
@@ -43,6 +59,15 @@ impl ReplicationUpdatesQuery {
     #[must_use]
     pub const fn filter(&self) -> ReplicationUpdateFilter {
         self.filter
+    }
+
+    /// Return the optional exact-identity selection.
+    ///
+    /// `Some` restricts results to the supplied identities, including an empty
+    /// set that selects no updates. `None` applies only the update filter.
+    #[must_use]
+    pub const fn update_ids(&self) -> Option<&'a HashSet<UpdateId>> {
+        self.update_ids
     }
 }
 

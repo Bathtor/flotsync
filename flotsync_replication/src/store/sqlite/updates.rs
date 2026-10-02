@@ -1,6 +1,8 @@
 //! SQLite persistence for replication updates.
 
 use super::*;
+use futures_util::TryStreamExt as _;
+use std::collections::HashSet;
 
 pub(super) async fn load_replication_update(
     connection: &mut SqliteStoreConnection,
@@ -36,33 +38,35 @@ WHERE group_id = ?1
 
 pub(super) async fn load_replication_updates_into<Batch>(
     connection: &mut SqliteStoreConnection,
-    mut page: PageAttempt<'_, ReplicationUpdatesQuery, SqliteUpdatePageContinuation, Batch>,
+    mut page: PageAttempt<'_, ReplicationUpdatesQuery<'_>, SqliteUpdatePageContinuation, Batch>,
 ) -> Result<(), PageError>
 where
     Batch: PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()> + ?Sized,
 {
+    let selected_ids = page.params().update_ids();
+    if selected_ids.is_some_and(HashSet::is_empty) {
+        return finish_page(page, None);
+    }
     let group_id = page.params().group_id();
     let member_count = load_group_member_count(connection, &group_id).await?;
     let mut query_builder = build_replication_update_page_query(
         &page,
         "update_node_index, update_version, sender, applied_locally, update_message",
     );
-    let rows = query_builder
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .context(SqlxSnafu)?;
-
-    let continuation_index = continuation_record_index(page.limit(), rows.len());
-    page.reserve(rows.len());
+    let query = query_builder.build();
+    let mut rows = query.fetch(&mut *connection);
     let mut continuation = None;
-    for (index, row) in rows.into_iter().enumerate() {
+    while let Some(row) = rows.try_next().await.context(SqlxSnafu)? {
         let update_id = decode_stored_update_id(&row)?;
+        if selected_ids.is_some_and(|ids| !ids.contains(&update_id)) {
+            continue;
+        }
         with_stored_update_view(&group_id, member_count, update_id, &row, |view| {
             page.push(view)
         })?;
-        if continuation_index == Some(index) {
-            continuation = Some(SqliteUpdatePageContinuation::new(update_id));
+        continuation = Some(SqliteUpdatePageContinuation::new(update_id));
+        if page.has_filled_limit() {
+            break;
         }
     }
     finish_page(page, continuation)
@@ -70,27 +74,29 @@ where
 
 pub(super) async fn load_replication_update_ids_into<Batch>(
     connection: &mut SqliteStoreConnection,
-    mut page: PageAttempt<'_, ReplicationUpdatesQuery, SqliteUpdatePageContinuation, Batch>,
+    mut page: PageAttempt<'_, ReplicationUpdatesQuery<'_>, SqliteUpdatePageContinuation, Batch>,
 ) -> Result<(), PageError>
 where
     Batch: PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()> + ?Sized,
 {
+    let selected_ids = page.params().update_ids();
+    if selected_ids.is_some_and(HashSet::is_empty) {
+        return finish_page(page, None);
+    }
     let mut query_builder =
         build_replication_update_page_query(&page, "update_node_index, update_version");
-    let rows = query_builder
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .context(SqlxSnafu)?;
-
-    let continuation_index = continuation_record_index(page.limit(), rows.len());
-    page.reserve(rows.len());
+    let query = query_builder.build();
+    let mut rows = query.fetch(&mut *connection);
     let mut continuation = None;
-    for (index, row) in rows.into_iter().enumerate() {
+    while let Some(row) = rows.try_next().await.context(SqlxSnafu)? {
         let update_id = decode_stored_update_id(&row)?;
+        if selected_ids.is_some_and(|ids| !ids.contains(&update_id)) {
+            continue;
+        }
         page.push(update_id)?;
-        if continuation_index == Some(index) {
-            continuation = Some(SqliteUpdatePageContinuation::new(update_id));
+        continuation = Some(SqliteUpdatePageContinuation::new(update_id));
+        if page.has_filled_limit() {
+            break;
         }
     }
     finish_page(page, continuation)
@@ -141,9 +147,12 @@ impl SqliteUpdatePageContinuation {
     }
 }
 
-/// Build the common ordered update-log query for projected records or ids.
+/// Build the common update-log query for projected records or ids.
+///
+/// Bounded pages need the backend's stable composite order. An unlimited page
+/// needs neither an ordering step nor an output limit.
 fn build_replication_update_page_query<Batch>(
-    page: &PageAttempt<'_, ReplicationUpdatesQuery, SqliteUpdatePageContinuation, Batch>,
+    page: &PageAttempt<'_, ReplicationUpdatesQuery<'_>, SqliteUpdatePageContinuation, Batch>,
     selected_columns: &'static str,
 ) -> QueryBuilder<Sqlite>
 where
@@ -166,11 +175,14 @@ where
             .push_bind(i64::from(after.update_id.node_index))
             .push("))");
     }
-    query_builder.push(" ORDER BY update_version, update_node_index");
     if let PageLimit::Max(limit) = page.limit() {
-        query_builder
-            .push(" LIMIT ")
-            .push_bind(sqlite_limit_value(limit));
+        query_builder.push(" ORDER BY update_version, update_node_index");
+        // SQL LIMIT would count excluded IDs and could end a selected page early.
+        if page.params().update_ids().is_none() {
+            query_builder
+                .push(" LIMIT ")
+                .push_bind(sqlite_limit_value(limit));
+        }
     }
     query_builder
 }

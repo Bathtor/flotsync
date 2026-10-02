@@ -3,6 +3,7 @@ use crate::{
         DatasetId,
         ListenerError,
         ReplicationGroupLifecycle,
+        ReplicationUpdateRecord,
         RowId,
         StoreError,
         StoreErrorClassification,
@@ -16,7 +17,7 @@ use flotsync_core::{
     MemberIdentity,
     MemberIndex,
     membership::GroupMembersError,
-    versions::UpdateId,
+    versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{
     InMemoryValueDataError,
@@ -26,10 +27,65 @@ use flotsync_data_types::{
 use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;
 use snafu::{Location, prelude::*};
+use std::fmt;
 use uuid::Uuid;
 
 /// Boxed source for errors that do not expose a useful typed runtime boundary.
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Expected scheduling metadata and the payload observed by an exact store lookup.
+///
+/// This is boxed in mismatch variants so ordinary runtime errors remain small.
+#[derive(Debug)]
+pub(crate) struct ExactUpdateMismatch {
+    expected_group_id: GroupId,
+    expected_update_id: UpdateId,
+    expected_read_versions: VersionVector,
+    expected_applied_locally: bool,
+    actual_group_id: GroupId,
+    actual_update_id: UpdateId,
+    actual_read_versions: VersionVector,
+    actual_applied_locally: bool,
+}
+
+impl ExactUpdateMismatch {
+    /// Copy details only after an exact lookup has been found inconsistent.
+    pub(crate) fn new(
+        expected_group_id: GroupId,
+        expected_update_id: UpdateId,
+        expected_read_versions: &VersionVector,
+        expected_applied_locally: bool,
+        actual: &ReplicationUpdateRecord,
+    ) -> Self {
+        Self {
+            expected_group_id,
+            expected_update_id,
+            expected_read_versions: expected_read_versions.clone(),
+            expected_applied_locally,
+            actual_group_id: actual.group_id,
+            actual_update_id: actual.update_id,
+            actual_read_versions: actual.read_versions.clone(),
+            actual_applied_locally: actual.applied_locally,
+        }
+    }
+}
+
+impl fmt::Display for ExactUpdateMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "expected update {} in group {} at {} (applied locally: {}), but loaded update {} in group {} at {} (applied locally: {})",
+            self.expected_update_id,
+            self.expected_group_id,
+            self.expected_read_versions,
+            self.expected_applied_locally,
+            self.actual_update_id,
+            self.actual_group_id,
+            self.actual_read_versions,
+            self.actual_applied_locally,
+        )
+    }
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(group_lifecycle))]
@@ -566,10 +622,36 @@ impl StoreErrorClassificationSource for PublishChangesError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(replay))]
 pub(crate) enum ReplayError {
+    /// Requested historical frontier has a different group member count.
+    #[snafu(display(
+        "Replay for group {group_id} expected {expected} target versions, but received {actual}."
+    ))]
+    InvalidTargetVersions {
+        group_id: GroupId,
+        expected: usize,
+        actual: usize,
+    },
+    /// A stored update has a producer or causal frontier outside this group.
+    #[snafu(display(
+        "Replay for group {group_id} found invalid causal metadata in update {update_id}."
+    ))]
+    InvalidUpdateDependencies {
+        group_id: GroupId,
+        update_id: UpdateId,
+    },
     #[snafu(display(
         "Replay for group {group_id} could not resolve a causal order up to the target read token."
     ))]
     Incomplete { group_id: GroupId },
+    /// A scheduled update disappeared from the same store transaction.
+    #[snafu(display("Replay for group {group_id} could not load scheduled update {update_id}."))]
+    MissingUpdate {
+        group_id: GroupId,
+        update_id: UpdateId,
+    },
+    /// An exact lookup disagreed with the selected applied update's identity or causal position.
+    #[snafu(display("Replay loaded inconsistent update metadata: {mismatch}."))]
+    MismatchedUpdate { mismatch: Box<ExactUpdateMismatch> },
     #[snafu(display("Decoding replay operation for dataset '{dataset_id}' failed: {source}"))]
     DecodeOperation {
         dataset_id: DatasetId,
@@ -686,6 +768,25 @@ pub(crate) enum InboundDeliveryError {
         group_id: GroupId,
         dataset_id: DatasetId,
     },
+    /// A dataset identifier from a projected update could not be converted.
+    #[snafu(display(
+        "Could not convert dataset id {dataset} from update {update} in group {group}: {source}"
+    ))]
+    InvalidProjectedDatasetId {
+        group: GroupId,
+        update: UpdateId,
+        dataset: String,
+        source: crate::api::DatasetIdError,
+    },
+    /// A scheduled update was absent from the same transaction's projected scan or exact lookup.
+    #[snafu(display("Scheduled update {update_id} in group {group_id} disappeared from storage."))]
+    MissingScheduledUpdate {
+        group_id: GroupId,
+        update_id: UpdateId,
+    },
+    /// An exact lookup disagreed with the scheduling projection or was already applied.
+    #[snafu(display("Scheduled update lookup returned inconsistent metadata: {mismatch}."))]
+    MismatchedScheduledUpdate { mismatch: Box<ExactUpdateMismatch> },
     #[snafu(display(
         "Inbound update for group {group_id} came from sender {sender}, which is not a group member.",
     ))]
@@ -777,6 +878,9 @@ impl StoreErrorClassificationSource for InboundDeliveryError {
             | Self::InvalidPendingGroupMembers { .. }
             | Self::PendingGroupMissingLocalMember { .. }
             | Self::MissingDatasetSchema { .. }
+            | Self::InvalidProjectedDatasetId { .. }
+            | Self::MissingScheduledUpdate { .. }
+            | Self::MismatchedScheduledUpdate { .. }
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
             | Self::UpdateProducerIndexNotInGroup { .. }
@@ -811,7 +915,9 @@ impl InboundDeliveryError {
             | Self::PendingGroupActivation { .. }
             | Self::CompleteProcessedPromise { .. }
             | Self::NotifyPendingGroupDecision { .. }
-            | Self::NotifyListener { .. } => InboundFailureAction::Fatal,
+            | Self::NotifyListener { .. }
+            | Self::MissingScheduledUpdate { .. }
+            | Self::MismatchedScheduledUpdate { .. } => InboundFailureAction::Fatal,
             Self::DecodeMessage { .. }
             | Self::GroupSetupSecurity { .. }
             | Self::UnexpectedReliableMessage
@@ -827,6 +933,7 @@ impl InboundDeliveryError {
             | Self::InvalidPendingGroupMembers { .. }
             | Self::PendingGroupMissingLocalMember { .. }
             | Self::MissingDatasetSchema { .. }
+            | Self::InvalidProjectedDatasetId { .. }
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
             | Self::UpdateProducerIndexNotInGroup { .. }
