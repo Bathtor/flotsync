@@ -177,6 +177,25 @@ impl<'record> ReplicationUpdateView<'record> {
     /// be materialised, or a dataset-id error if the earlier validation and
     /// ownership conversion disagree.
     pub(crate) fn try_to_owned_record(self) -> Result<ReplicationUpdateRecord, BoxError> {
+        let dataset_updates = self.try_to_owned_dataset_updates()?;
+        Ok(ReplicationUpdateRecord {
+            group_id: self.group_id,
+            update_id: self.update_id,
+            sender: self.sender.clone(),
+            read_versions: self.read_versions,
+            dataset_updates,
+            applied_locally: self.applied_locally,
+        })
+    }
+
+    /// Materialise dataset operations for a retained update or catch-up message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid dataset id or generated-view ownership error.
+    pub(crate) fn try_to_owned_dataset_updates(
+        &self,
+    ) -> Result<Vec<DatasetUpdateRecord>, BoxError> {
         let mut dataset_updates = Vec::with_capacity(self.source.dataset_updates.len());
         for dataset_update in self.dataset_updates() {
             let dataset_id = DatasetId::try_from_owned(dataset_update.dataset_id().to_owned())?;
@@ -189,14 +208,7 @@ impl<'record> ReplicationUpdateView<'record> {
                 operations,
             });
         }
-        Ok(ReplicationUpdateRecord {
-            group_id: self.group_id,
-            update_id: self.update_id,
-            sender: self.sender.clone(),
-            read_versions: self.read_versions,
-            dataset_updates,
-            applied_locally: self.applied_locally,
-        })
+        Ok(dataset_updates)
     }
 }
 

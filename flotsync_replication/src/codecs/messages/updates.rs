@@ -164,6 +164,29 @@ impl From<ReplicationUpdateRecord> for UpdateMessage {
     }
 }
 
+impl UpdateMessage {
+    /// Own the wire-relevant fields of one validated temporary store view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership or dataset-id error from the borrowed projection.
+    pub(crate) fn try_from_view(
+        view: &crate::api::ReplicationUpdateView<'_>,
+    ) -> Result<Self, flotsync_utils::BoxError> {
+        let owned_dataset_updates = view.try_to_owned_dataset_updates()?;
+        let dataset_updates = owned_dataset_updates
+            .into_iter()
+            .map(DatasetUpdateMessage::from)
+            .collect();
+        Ok(Self {
+            group_id: view.group_id(),
+            update_id: view.update_id(),
+            read_versions: view.read_versions().clone(),
+            dataset_updates,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryRequestMessage {
     pub(crate) group_id: GroupId,

@@ -324,13 +324,13 @@ pub(in crate::runtime) struct DatasetRowStateTransitionPageFixture {
 
 /// One retained-history query observed by the failure-injecting store wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReplicationUpdateLoadRequest {
+pub(super) struct ReplicationUpdateLoadRequest {
     /// Group whose update history was queried.
     group_id: GroupId,
     /// History subset requested by the caller.
     filter: ReplicationUpdateFilter,
     /// Maximum records requested from the store.
-    limit: Option<NonZeroUsize>,
+    pub(super) limit: Option<NonZeroUsize>,
 }
 
 struct RuntimeFixture<S> {
@@ -379,7 +379,7 @@ struct FailingStoreControlState {
 
 /// Test-only store wrapper that can fail selected future writes while
 /// delegating all stored state to the wrapped `SQLite` store.
-struct FailingStore<S> {
+pub(super) struct FailingStore<S> {
     inner: Arc<S>,
     /// Whether delegated read transactions should hide all local-private key records.
     hide_local_private_keys: bool,
@@ -397,7 +397,7 @@ impl<S> FailingStore<S> {
             .expect("failing store mutex must not be poisoned")
     }
 
-    fn new(inner: Arc<S>) -> Self {
+    pub(super) fn new(inner: Arc<S>) -> Self {
         Self {
             inner,
             hide_local_private_keys: false,
@@ -461,7 +461,7 @@ impl<S> FailingStore<S> {
     }
 
     /// Return every retained-history query observed by this wrapper.
-    fn replication_update_load_requests(&self) -> Vec<ReplicationUpdateLoadRequest> {
+    pub(super) fn replication_update_load_requests(&self) -> Vec<ReplicationUpdateLoadRequest> {
         Self::lock_control(&self.control)
             .replication_update_load_requests
             .clone()

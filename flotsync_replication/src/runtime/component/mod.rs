@@ -88,6 +88,8 @@ use crate::{
         MigrationId,
         MigrationProposal,
         MigrationProposalResponder,
+        OwnedPageBatchInput,
+        PageCursor,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
@@ -107,6 +109,7 @@ use crate::{
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
+        ReplicationUpdatesQuery,
         RowChange,
         RowId,
         RowKey,
@@ -116,6 +119,7 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
+        VecPageBatch,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
         security::{
@@ -171,6 +175,7 @@ use flotsync_data_types::schema::datamodel::SchemaSource;
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
+    BoxError,
     BoxFuture,
     KClaimablePromise,
     OptionExt as _,
@@ -3455,13 +3460,22 @@ impl ReplicationRuntimeComponent {
         else {
             return Ok(None);
         };
-        let pending_update_ids = transaction
-            .load_replication_update_ids(
-                &summary.group_id,
-                ReplicationUpdateFilter::PendingApply,
-                None,
-            )
+        let mut pending_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+            summary.group_id,
+            ReplicationUpdateFilter::PendingApply,
+        ));
+        let mut pending_batch = VecPageBatch::<
+            UpdateRangeMessage,
+            (),
+            OwnedPageBatchInput<UpdateId>,
+            _,
+        >::unlimited_with(|update_id| {
+            Ok::<_, BoxError>(UpdateRangeMessage::from(update_id))
+        });
+        transaction
+            .load_replication_update_ids_into(&mut pending_cursor, &mut pending_batch)
             .await
+            .map_err(StoreError::from)
             .context(inbound::StoreAccessSnafu)?;
         let lifecycle = persisted_group.lifecycle.clone();
         let bounded_summary_versions = lifecycle.bound_versions(&summary.has_versions);
@@ -3476,11 +3490,7 @@ impl ReplicationRuntimeComponent {
             .into_iter()
             .map(UpdateRangeMessage::from)
             .collect_vec();
-        let observed_available = pending_update_ids
-            .into_iter()
-            .map(UpdateRangeMessage::from)
-            .collect_vec();
-        let observed_available = Self::bound_update_ranges(&lifecycle, observed_available);
+        let observed_available = Self::bound_update_ranges(&lifecycle, pending_batch.into_values());
         let needed_ranges = subtract_available_ranges(&summary_needed_ranges, &observed_available);
         Ok(Some(SummaryCatchUpObservation {
             group_id: summary.group_id,

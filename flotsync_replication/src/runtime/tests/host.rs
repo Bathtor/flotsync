@@ -510,31 +510,20 @@ fn incremental_history_loads_complete_ranges_for_multiple_producers() {
     drop(changes);
 
     let requests = store.replication_update_load_requests();
-    // TODO(flotsync-h3l): Expect reusable-batch page requests once the store
-    // exposes an explicit pagination contract.
-    assert_eq!(
-        &requests[requests_before..],
-        &[
-            ReplicationUpdateLoadRequest {
-                group_id,
-                filter: ReplicationUpdateFilter::ProducerRange {
-                    producer_index: MemberIndex::new(1),
-                    start_version: 1,
-                    end_version: 2,
-                },
-                limit: None,
+    let page_requests = &requests[requests_before..];
+    assert_eq!(page_requests.len(), 6);
+    for (producer_index, producer_pages) in [1, 2].into_iter().zip(page_requests.chunks(3)) {
+        let expected = ReplicationUpdateLoadRequest {
+            group_id,
+            filter: ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(producer_index),
+                start_version: 1,
+                end_version: 2,
             },
-            ReplicationUpdateLoadRequest {
-                group_id,
-                filter: ReplicationUpdateFilter::ProducerRange {
-                    producer_index: MemberIndex::new(2),
-                    start_version: 1,
-                    end_version: 2,
-                },
-                limit: None,
-            },
-        ]
-    );
+            limit: NonZeroUsize::new(1),
+        };
+        assert!(producer_pages.iter().all(|request| *request == expected));
+    }
     let runtime = wait_for_test_reply(synchronisation.complete())
         .expect("multi-producer reconciliation should activate the runtime");
     wait_for_test_reply(runtime.shutdown()).expect("multi-producer runtime should shut down");

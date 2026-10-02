@@ -188,7 +188,7 @@ impl LoadedGroupMeta {
 pub(super) fn validate_inbound_update_read_versions(
     update: &ReplicationUpdateRecord,
 ) -> Result<(), InboundDeliveryError> {
-    match classify_producer_read_causality(update) {
+    match classify_producer_read_causality(update.update_id, &update.read_versions) {
         ProducerReadCausality::PrecedesUpdate => Ok(()),
         ProducerReadCausality::IncludesUpdate {
             producer_read_version,
@@ -206,12 +206,11 @@ pub(super) fn validate_inbound_update_read_versions(
 /// The caller must first establish that the producer index is present in the
 /// update's read-version vector.
 pub(super) fn classify_producer_read_causality(
-    update: &ReplicationUpdateRecord,
+    update_id: UpdateId,
+    read_versions: &VersionVector,
 ) -> ProducerReadCausality {
-    let producer_read_version = update
-        .read_versions
-        .version_at(update.update_id.node_index as usize);
-    if producer_read_version < update.update_id.version {
+    let producer_read_version = read_versions.version_at(update_id.node_index as usize);
+    if producer_read_version < update_id.version {
         ProducerReadCausality::PrecedesUpdate
     } else {
         ProducerReadCausality::IncludesUpdate {

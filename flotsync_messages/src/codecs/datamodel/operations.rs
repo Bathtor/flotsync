@@ -188,6 +188,33 @@ pub fn decode_schema_operation_row_id(operation: &proto::SchemaOperation) -> Ope
     decode_row_id(row_id)
 }
 
+/// Decode the row identity addressed by one borrowed protobuf operation.
+///
+/// This inspects the generated view without materialising its schema-dependent
+/// payload. It applies the same missing-variant and UUID validation as the
+/// owned operation decoder.
+///
+/// # Errors
+///
+/// See [`OperationCodecError`] for missing operation data or an invalid row id.
+pub fn decode_schema_operation_view_row_id(
+    operation: &proto::SchemaOperationView<'_>,
+) -> OperationResult<Uuid> {
+    let operation = operation
+        .operation
+        .as_ref()
+        .context(MissingOneofSnafu {
+            name: "SchemaOperation.operation",
+        })
+        .context(CodecSnafu)?;
+    let row_id = match operation {
+        proto::schema_operation::OperationView::Insert(operation) => operation.row_id,
+        proto::schema_operation::OperationView::Update(operation) => operation.row_id,
+        proto::schema_operation::OperationView::Delete(operation) => operation.row_id,
+    };
+    decode_row_id(row_id)
+}
+
 /// Encode one row snapshot into its protobuf transport form.
 ///
 /// # Errors
@@ -739,7 +766,10 @@ fn ensure_non_empty_batch<T>(values: &[T]) -> OperationResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Uuid;
+    use crate::{
+        Uuid,
+        buffa::{Message, MessageView},
+    };
     use flotsync_data_types::{
         schema::{
             Direction,
@@ -872,6 +902,28 @@ mod tests {
                     name: "SchemaOperation.operation"
                 }
             }
+        );
+    }
+
+    #[test]
+    fn borrowed_operation_row_id_decoder_keeps_payload_borrowed() {
+        let expected = row_id(304);
+        let encoded = wrong_field_variant_schema_operation(expected).encode_to_vec();
+        let view = proto::SchemaOperationView::decode_view(&encoded)
+            .expect("the stored operation view should decode");
+        assert_eq!(
+            decode_schema_operation_view_row_id(&view).unwrap(),
+            expected
+        );
+
+        let missing = proto::SchemaOperationView::default();
+        assert_matches!(
+            decode_schema_operation_view_row_id(&missing),
+            Err(OperationCodecError::Codec {
+                source: CodecError::MissingOneof {
+                    name: "SchemaOperation.operation"
+                }
+            })
         );
     }
 

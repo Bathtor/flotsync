@@ -1,4 +1,4 @@
-//! Retained-history validation and current-row projection for incremental startup work.
+//! Stored update validation and current-row projection for incremental startup work.
 
 use super::super::{
     super::in_memory::{ProducerReadCausality, classify_producer_read_causality},
@@ -6,24 +6,33 @@ use super::super::{
 };
 use crate::api::{
     DatasetId,
+    DatasetIdError,
     DatasetSchema,
     GroupDatasetSchemaRef,
+    PageCursor,
     ReplicationStoreReadTransaction,
     ReplicationUpdateFilter,
+    ReplicationUpdatePageInput,
+    ReplicationUpdateView,
+    ReplicationUpdatesQuery,
     RowChange,
     RowId,
     RowKey,
     RowValues,
     StoreError,
+    VecPageBatch,
 };
 use flotsync_core::{
     GroupId,
     MemberIndex,
     versions::{UpdateId, VersionVector, VersionVectorGap},
 };
-use flotsync_messages::codecs::datamodel::{OperationCodecError, decode_schema_operation_row_id};
+use flotsync_messages::codecs::datamodel::{
+    OperationCodecError,
+    decode_schema_operation_view_row_id,
+};
 use flotsync_utils::BoxError;
-use snafu::ResultExt as _;
+use snafu::{OptionExt as _, ResultExt as _};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -37,14 +46,14 @@ pub(super) type AffectedRows = BTreeMap<DatasetId, BTreeSet<RowKey>>;
 /// Prepare all coalesced current changes for one incremental candidate.
 ///
 /// `Complete` carries the group-local changes. `SnapshotRequired` means
-/// retained history or row-creation provenance is legitimately unavailable,
+/// stored update history or row-creation provenance is legitimately unavailable,
 /// so the same group must instead be exposed as a complete snapshot.
 pub(super) async fn prepare_incremental_group(
     transaction: &mut dyn ReplicationStoreReadTransaction,
     candidate: &IncrementalCandidate,
     batch_size: NonZeroUsize,
 ) -> Result<IncrementalEvidence<Vec<RowChange>>, IncrementalPreparationError> {
-    match load_affected_rows(transaction, candidate).await? {
+    match load_affected_rows(transaction, candidate, batch_size).await? {
         IncrementalEvidence::Complete(affected_rows) => {
             load_current_changes(transaction, candidate, affected_rows, batch_size).await
         }
@@ -52,111 +61,150 @@ pub(super) async fn prepare_incremental_group(
     }
 }
 
-/// Validate the complete result returned for one missing producer range.
-///
-/// `Complete` preserves the validated updates. `SnapshotRequired` means the
-/// result has a gap or ends before the inclusive requested range. Records
-/// outside the requested filter or in an invalid order are errors.
-pub(super) fn validate_retained_update_range(
-    candidate: &IncrementalCandidate,
-    range: VersionVectorGap,
-    updates: Vec<crate::api::ReplicationUpdateRecord>,
-) -> Result<
-    IncrementalEvidence<Vec<crate::api::ReplicationUpdateRecord>>,
-    IncrementalPreparationError,
-> {
-    let producer_index = MemberIndex::try_from(range.member_index)
-        .expect("version-vector member positions fit in MemberIndex");
-    let mut next_version = Some(range.start_version);
-    let mut snapshot_required = updates.is_empty();
-    for update in &updates {
-        if !snapshot_required {
-            let expected_version = match next_version {
-                Some(expected_version) => expected_version,
-                None => incremental_preparation_error::UnexpectedUpdateSnafu {
-                    expected_group: candidate.group.group_id,
-                    expected_update: UpdateId {
-                        node_index: producer_index.as_u32(),
-                        version: range.end_version,
-                    },
-                    actual_group: update.group_id,
-                    actual_update: update.update_id,
-                }
-                .fail()?,
-            };
-            let expected_id = UpdateId {
-                node_index: producer_index.as_u32(),
-                version: expected_version,
-            };
-            if update.group_id != candidate.group.group_id
-                || update.update_id.node_index != producer_index.as_u32()
-                || update.update_id.version < expected_version
-                || update.update_id.version > range.end_version
-            {
-                incremental_preparation_error::UnexpectedUpdateSnafu {
-                    expected_group: candidate.group.group_id,
-                    expected_update: expected_id,
-                    actual_group: update.group_id,
-                    actual_update: update.update_id,
-                }
-                .fail()?;
-            }
-            if update.update_id.version > expected_version {
-                snapshot_required = true;
-            } else {
-                validate_retained_update(candidate, update)?;
-                next_version = if expected_version == range.end_version {
-                    None
-                } else {
-                    Some(expected_version + 1)
-                };
-            }
+/// Position of one record within a requested producer range.
+pub(super) enum UpdateRangePosition {
+    /// This is the exact next producer version expected by reconciliation.
+    Expected,
+    /// At least one earlier producer version is missing from stored history.
+    Gap,
+}
+
+/// Expected producer and version carried across every page of one range.
+pub(super) struct UpdateRangeProgress {
+    /// Group whose update log is being reconciled.
+    group_id: GroupId,
+    /// Producer whose inclusive version interval was requested.
+    producer_index: MemberIndex,
+    /// Final inclusive version requested from that producer.
+    end_version: u64,
+    /// Next required version; `None` means the final version was accepted.
+    next_version: Option<u64>,
+}
+
+impl UpdateRangeProgress {
+    /// Start validating one inclusive producer range.
+    pub(super) fn new(group_id: GroupId, range: VersionVectorGap) -> Self {
+        Self {
+            group_id,
+            producer_index: MemberIndex::try_from(range.member_index)
+                .expect("version-vector member positions fit in MemberIndex"),
+            end_version: range.end_version,
+            next_version: Some(range.start_version),
         }
     }
-    if snapshot_required || next_version.is_some() {
-        Ok(IncrementalEvidence::SnapshotRequired)
-    } else {
-        Ok(IncrementalEvidence::Complete(updates))
+
+    /// Accept an exact next record, report missing history, or reject a store inconsistency.
+    pub(super) fn accept(
+        &mut self,
+        actual_group: GroupId,
+        actual_update: UpdateId,
+    ) -> Result<UpdateRangePosition, IncrementalPreparationError> {
+        let expected_version =
+            self.next_version
+                .context(incremental_preparation_error::UnexpectedUpdateSnafu {
+                    expected_group: self.group_id,
+                    expected_update: UpdateId {
+                        node_index: self.producer_index.as_u32(),
+                        version: self.end_version,
+                    },
+                    actual_group,
+                    actual_update,
+                })?;
+        let expected_update = UpdateId {
+            node_index: self.producer_index.as_u32(),
+            version: expected_version,
+        };
+        if actual_group != self.group_id
+            || actual_update.node_index != self.producer_index.as_u32()
+            || actual_update.version < expected_version
+            || actual_update.version > self.end_version
+        {
+            incremental_preparation_error::UnexpectedUpdateSnafu {
+                expected_group: self.group_id,
+                expected_update,
+                actual_group,
+                actual_update,
+            }
+            .fail()
+        } else if actual_update.version > expected_version {
+            Ok(UpdateRangePosition::Gap)
+        } else {
+            self.next_version = if expected_version == self.end_version {
+                None
+            } else {
+                Some(expected_version + 1)
+            };
+            Ok(UpdateRangePosition::Expected)
+        }
+    }
+
+    /// Return `true` only after the inclusive final version was accepted.
+    pub(super) fn is_complete(&self) -> bool {
+        self.next_version.is_none()
     }
 }
 
-/// Collect the affected row identities named by one retained update.
-///
-/// Success adds every decoded identity to the ordered, deduplicating collection.
-/// An unknown dataset or invalid operation row id returns a contextual error.
-pub(super) fn collect_affected_row_ids(
+/// Check that a stored update references an authoritative group dataset.
+pub(super) fn ensure_known_dataset(
     candidate: &IncrementalCandidate,
-    affected_rows: &mut AffectedRows,
-    update: crate::api::ReplicationUpdateRecord,
+    dataset_id: &DatasetId,
+    update_id: UpdateId,
 ) -> Result<(), IncrementalPreparationError> {
-    for dataset_update in update.dataset_updates {
-        if candidate
-            .group
-            .group_schema
-            .schema(&dataset_update.dataset_id)
-            .is_none()
-        {
-            return incremental_preparation_error::UnknownDatasetSnafu {
-                group: candidate.group.group_id,
-                dataset: dataset_update.dataset_id,
-                update: update.update_id,
-            }
-            .fail();
+    if candidate.group.group_schema.schema(dataset_id).is_none() {
+        incremental_preparation_error::UnknownDatasetSnafu {
+            group: candidate.group.group_id,
+            dataset: dataset_id.clone(),
+            update: update_id,
         }
-        let dataset_id = dataset_update.dataset_id;
-        let dataset_rows = affected_rows.entry(dataset_id.clone()).or_default();
-        for operation in dataset_update.operations {
-            let row_id = decode_schema_operation_row_id(&operation).context(
-                incremental_preparation_error::DecodeOperationSnafu {
-                    group: candidate.group.group_id,
-                    dataset: dataset_id.clone(),
-                    update: update.update_id,
-                },
-            )?;
-            dataset_rows.insert(RowKey(row_id));
+        .fail()
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate metadata for an update used to reconstruct current row changes.
+///
+/// The update must already be applied locally. Its read versions must have the
+/// same member count as the target group version and be no later than that
+/// target. The producer's own read version must precede this update's version.
+pub(super) fn validate_update_metadata(
+    candidate: &IncrementalCandidate,
+    group_id: GroupId,
+    update_id: UpdateId,
+    read_versions: &VersionVector,
+    applied_locally: bool,
+) -> Result<(), IncrementalPreparationError> {
+    let target_versions = candidate.group.read_token.version();
+    if !applied_locally {
+        incremental_preparation_error::UpdateNotAppliedSnafu {
+            group: group_id,
+            update: update_id,
+        }
+        .fail()
+    } else if read_versions.num_members() != target_versions.num_members()
+        || !matches!(
+            read_versions.partial_cmp(target_versions),
+            Some(Ordering::Less | Ordering::Equal)
+        )
+    {
+        incremental_preparation_error::InvalidUpdateReadVersionsSnafu {
+            group: group_id,
+            update: update_id,
+        }
+        .fail()
+    } else {
+        match classify_producer_read_causality(update_id, read_versions) {
+            ProducerReadCausality::PrecedesUpdate => Ok(()),
+            ProducerReadCausality::IncludesUpdate {
+                producer_read_version,
+            } => incremental_preparation_error::SelfDependentReadVersionsSnafu {
+                group: group_id,
+                update: update_id,
+                producer_read_version,
+            }
+            .fail(),
         }
     }
-    Ok(())
 }
 
 /// Validate the store row-slice contract required by current-row projection.
@@ -253,7 +301,7 @@ pub(super) enum CreationAtPosition {
     Included,
     /// The row was created after the supplied position.
     NotIncluded,
-    /// Optional store metadata did not retain the creating update.
+    /// Optional store metadata did not include the creating update.
     Unknown,
 }
 
@@ -266,7 +314,7 @@ pub(super) enum IncrementalPreparationError {
     Store { source: StoreError },
     /// A producer-range query returned a record outside its requested identity.
     #[snafu(display(
-        "Expected retained update {expected_update} in group {expected_group}, but the store returned {actual_update} in group {actual_group}."
+        "Expected update {expected_update} in group {expected_group}, but the store returned {actual_update} in group {actual_group}."
     ))]
     UnexpectedUpdate {
         expected_group: GroupId,
@@ -275,32 +323,30 @@ pub(super) enum IncrementalPreparationError {
         actual_update: UpdateId,
     },
     /// An update inside the current applied frontier is not reflected in row state.
-    #[snafu(display("Retained update {update} in group {group} is not applied locally."))]
+    #[snafu(display("Update {update} in group {group} is not applied locally."))]
     UpdateNotApplied { group: GroupId, update: UpdateId },
-    /// A retained update's producer dependency includes its own or a later version.
+    /// An update's producer dependency includes its own or a later version.
     #[snafu(display(
-        "Retained update {update} in group {group} carries producer read version {producer_read_version}, which does not precede the update."
+        "Update {update} in group {group} carries producer read version {producer_read_version}, which does not precede the update."
     ))]
     SelfDependentReadVersions {
         group: GroupId,
         update: UpdateId,
         producer_read_version: u64,
     },
-    /// Retained causal metadata is incompatible with the current store cut.
+    /// Stored causal metadata is incompatible with the current group position.
     #[snafu(display(
-        "Retained update {update} in group {group} has read versions incompatible with the current group position."
+        "Update {update} in group {group} has read versions incompatible with the current group position."
     ))]
     InvalidUpdateReadVersions { group: GroupId, update: UpdateId },
-    /// Retained history references a dataset absent from the authoritative schema.
-    #[snafu(display(
-        "Retained update {update} in group {group} references unknown dataset {dataset}."
-    ))]
+    /// A stored update references a dataset absent from the authoritative schema.
+    #[snafu(display("Update {update} in group {group} references unknown dataset {dataset}."))]
     UnknownDataset {
         group: GroupId,
         dataset: DatasetId,
         update: UpdateId,
     },
-    /// One retained operation has no valid row identity.
+    /// One stored operation has no valid row identity.
     #[snafu(display(
         "Could not decode a row identity from update {update} in group {group}, dataset {dataset}: {source}"
     ))]
@@ -309,6 +355,16 @@ pub(super) enum IncrementalPreparationError {
         dataset: DatasetId,
         update: UpdateId,
         source: OperationCodecError,
+    },
+    /// A dataset identifier from a borrowed update could not be converted.
+    #[snafu(display(
+        "Could not convert dataset id {dataset} from update {update} in group {group}: {source}"
+    ))]
+    InvalidProjectedDatasetId {
+        group: GroupId,
+        update: UpdateId,
+        dataset: String,
+        source: DatasetIdError,
     },
     /// A row lookup returned metadata for another group or dataset.
     #[snafu(display(
@@ -323,7 +379,7 @@ pub(super) enum IncrementalPreparationError {
     /// An authoritative current dataset is absent from storage.
     #[snafu(display("Current dataset {dataset} is absent from group {group}."))]
     MissingCurrentDataset { group: GroupId, dataset: DatasetId },
-    /// Affected rows are absent even though store tombstones retain row identities.
+    /// Affected rows are absent even though store tombstones preserve row identities.
     #[snafu(display(
         "Current dataset {dataset} in group {group} is missing affected rows {row_keys:?}."
     ))]
@@ -364,7 +420,7 @@ pub(super) enum IncrementalPreparationError {
         member_count: usize,
     },
     /// Affected dataset identities remained after every authoritative schema was visited.
-    #[snafu(display("Group {group} retained affected rows for unknown datasets {datasets:?}."))]
+    #[snafu(display("Group {group} has affected rows for unknown datasets {datasets:?}."))]
     UnexpectedAffectedDatasets {
         group: GroupId,
         datasets: Vec<DatasetId>,
@@ -374,11 +430,12 @@ pub(super) enum IncrementalPreparationError {
 /// Discover every row identity touched between the supplied and current positions.
 ///
 /// `Complete` contains the ordered, deduplicated identities. `SnapshotRequired`
-/// means at least one expected retained update is no longer available. Actual
+/// means at least one expected update is no longer available. Actual
 /// store or metadata inconsistencies are returned as errors.
 async fn load_affected_rows(
     transaction: &mut dyn ReplicationStoreReadTransaction,
     candidate: &IncrementalCandidate,
+    batch_size: NonZeroUsize,
 ) -> Result<IncrementalEvidence<AffectedRows>, IncrementalPreparationError> {
     let mut affected_rows = AffectedRows::new();
     let target_versions = candidate.group.read_token.version();
@@ -387,11 +444,17 @@ async fn load_affected_rows(
         .missing_version_ranges_to(target_versions);
     let mut snapshot_required = false;
     'ranges: for range in missing_ranges {
-        match load_retained_update_range(transaction, candidate, range).await? {
-            IncrementalEvidence::Complete(updates) => {
-                for update in updates {
-                    collect_affected_row_ids(candidate, &mut affected_rows, update)?;
-                }
+        let range_evidence = load_update_range(
+            transaction,
+            candidate,
+            range,
+            batch_size,
+            &mut affected_rows,
+        )
+        .await?;
+        match range_evidence {
+            IncrementalEvidence::Complete(()) => {
+                // This range's rows were already merged into affected_rows.
             }
             IncrementalEvidence::SnapshotRequired => {
                 snapshot_required = true;
@@ -408,34 +471,128 @@ async fn load_affected_rows(
 
 /// Load and validate one complete missing producer range.
 ///
-/// `Complete` contains every update in the inclusive range in version order.
-/// `SnapshotRequired` means at least one expected update is no longer retained.
+/// `Complete` means every update in the inclusive range was folded into
+/// `affected_rows` in version order.
+/// `SnapshotRequired` means at least one expected update is absent from storage.
 /// Malformed returned records are errors rather than snapshot fallback.
-async fn load_retained_update_range(
+async fn load_update_range(
     transaction: &mut dyn ReplicationStoreReadTransaction,
     candidate: &IncrementalCandidate,
     range: VersionVectorGap,
-) -> Result<
-    IncrementalEvidence<Vec<crate::api::ReplicationUpdateRecord>>,
-    IncrementalPreparationError,
-> {
+    batch_size: NonZeroUsize,
+    affected_rows: &mut AffectedRows,
+) -> Result<IncrementalEvidence<()>, IncrementalPreparationError> {
     let producer_index = MemberIndex::try_from(range.member_index)
         .expect("version-vector member positions fit in MemberIndex");
-    // TODO(flotsync-h3l): Load this range through the store's reusable-batch
-    // pagination API once that contract exists.
-    let updates = transaction
-        .load_replication_updates(
-            &candidate.group.group_id,
-            ReplicationUpdateFilter::ProducerRange {
-                producer_index,
-                start_version: range.start_version,
-                end_version: range.end_version,
-            },
-            None,
-        )
-        .await
-        .context(incremental_preparation_error::StoreSnafu)?;
-    validate_retained_update_range(candidate, range, updates)
+    let query = ReplicationUpdatesQuery::new(
+        candidate.group.group_id,
+        ReplicationUpdateFilter::ProducerRange {
+            producer_index,
+            start_version: range.start_version,
+            end_version: range.end_version,
+        },
+    );
+    let mut cursor = PageCursor::new(query);
+    let project =
+        |view: ReplicationUpdateView<'_>| Ok::<_, BoxError>(project_update_row_keys(&view));
+    let mut batch =
+        VecPageBatch::<ProjectedUpdate, (), ReplicationUpdatePageInput, _>::bounded_with(
+            batch_size, project,
+        );
+    let mut progress = UpdateRangeProgress::new(candidate.group.group_id, range);
+    while cursor.has_more() {
+        transaction
+            .load_replication_updates_into(&mut cursor, &mut batch)
+            .await
+            .map_err(StoreError::from)
+            .context(incremental_preparation_error::StoreSnafu)?;
+        for projected in batch.values_mut().drain(..) {
+            let position = progress.accept(projected.group_id, projected.update_id)?;
+            if matches!(position, UpdateRangePosition::Gap) {
+                return Ok(IncrementalEvidence::SnapshotRequired);
+            }
+            validate_update_metadata(
+                candidate,
+                projected.group_id,
+                projected.update_id,
+                &projected.read_versions,
+                projected.applied_locally,
+            )?;
+            let row_keys_by_dataset = projected.row_keys_result?;
+            for (dataset_id, row_keys) in row_keys_by_dataset {
+                ensure_known_dataset(candidate, &dataset_id, projected.update_id)?;
+                affected_rows
+                    .entry(dataset_id)
+                    .or_default()
+                    .extend(row_keys);
+            }
+        }
+    }
+    if progress.is_complete() {
+        Ok(IncrementalEvidence::Complete(()))
+    } else {
+        Ok(IncrementalEvidence::SnapshotRequired)
+    }
+}
+
+/// Owned scalar metadata and affected row identities from one borrowed update.
+///
+/// Decoding failures travel as values so the caller can attach the established
+/// incremental error after the page fill rather than losing it in a batch error.
+struct ProjectedUpdate {
+    /// Group whose update log supplied this record.
+    group_id: GroupId,
+    /// Producer and version selected from the store.
+    update_id: UpdateId,
+    /// Causal position carried by the update.
+    read_versions: VersionVector,
+    /// Whether current row state incorporates this update.
+    applied_locally: bool,
+    /// Decoded dataset and row identities, or their contextual decoding error.
+    row_keys_result: Result<Vec<(DatasetId, Vec<RowKey>)>, IncrementalPreparationError>,
+}
+
+/// Project update identity, causal metadata, and affected row keys from a temporary view.
+fn project_update_row_keys(view: &ReplicationUpdateView<'_>) -> ProjectedUpdate {
+    let row_keys_result = decode_update_row_keys(view);
+    ProjectedUpdate {
+        group_id: view.group_id(),
+        update_id: view.update_id(),
+        read_versions: view.read_versions().clone(),
+        applied_locally: view.applied_locally(),
+        row_keys_result,
+    }
+}
+
+/// Decode affected row identities without owning stored operation payloads.
+fn decode_update_row_keys(
+    view: &ReplicationUpdateView<'_>,
+) -> Result<Vec<(DatasetId, Vec<RowKey>)>, IncrementalPreparationError> {
+    let mut datasets = Vec::new();
+    for dataset_update in view.dataset_updates() {
+        let raw_dataset_id = dataset_update.dataset_id();
+        let dataset_id =
+            DatasetId::try_from_owned(raw_dataset_id.to_owned()).with_context(|_| {
+                incremental_preparation_error::InvalidProjectedDatasetIdSnafu {
+                    group: view.group_id(),
+                    update: view.update_id(),
+                    dataset: raw_dataset_id.to_owned(),
+                }
+            })?;
+        let mut row_keys = Vec::with_capacity(dataset_update.operations().len());
+        for operation in dataset_update.operations() {
+            let row_id = decode_schema_operation_view_row_id(operation).with_context(|_| {
+                incremental_preparation_error::DecodeOperationSnafu {
+                    group: view.group_id(),
+                    dataset: dataset_id.clone(),
+                    update: view.update_id(),
+                }
+            })?;
+            row_keys.push(RowKey(row_id));
+        }
+        datasets.push((dataset_id, row_keys));
+    }
+    Ok(datasets)
 }
 
 /// Materialise current values or deletions for one deduplicated affected-row set.
@@ -580,44 +737,6 @@ fn project_current_row(
             row_id,
             Arc::new(values),
         )))
-    }
-}
-
-/// Validate causal metadata which must hold for one retained applied update.
-fn validate_retained_update(
-    candidate: &IncrementalCandidate,
-    update: &crate::api::ReplicationUpdateRecord,
-) -> Result<(), IncrementalPreparationError> {
-    let target_versions = candidate.group.read_token.version();
-    if !update.applied_locally {
-        incremental_preparation_error::UpdateNotAppliedSnafu {
-            group: update.group_id,
-            update: update.update_id,
-        }
-        .fail()
-    } else if update.read_versions.num_members() != target_versions.num_members()
-        || !matches!(
-            update.read_versions.partial_cmp(target_versions),
-            Some(Ordering::Less | Ordering::Equal)
-        )
-    {
-        incremental_preparation_error::InvalidUpdateReadVersionsSnafu {
-            group: update.group_id,
-            update: update.update_id,
-        }
-        .fail()
-    } else {
-        match classify_producer_read_causality(update) {
-            ProducerReadCausality::PrecedesUpdate => Ok(()),
-            ProducerReadCausality::IncludesUpdate {
-                producer_read_version,
-            } => incremental_preparation_error::SelfDependentReadVersionsSnafu {
-                group: update.group_id,
-                update: update.update_id,
-                producer_read_version,
-            }
-            .fail(),
-        }
     }
 }
 
