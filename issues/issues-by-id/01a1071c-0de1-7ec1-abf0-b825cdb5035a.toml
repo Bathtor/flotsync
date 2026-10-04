@@ -16,7 +16,14 @@ Existing bounded activation batches, hosted/unavailable predecessor lineage, acc
 
 Review and size
 200-300 edited/new LOC, 300-450 relocated. Separate movement from necessary error/result changes. Follow parent validation and duplication checks, stage nothing and close only after acceptance.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Activation is a write/checkpoint phase followed by projection publication and a listener row-provider read boundary. A successful commit atomically activates the successor, closes the hosted predecessor and removes pending activation. Opening the provider after that commit can fail fatally: accepted work is no longer resumable through the removed pending record, so preserve restart/application-resynchronisation semantics.
+
+The provider may retain a read transaction until exhaustion/drop. Expose its token/lineage and release lifetime through the narrow boundary without materialising all rows. Transaction creation alone does not establish the SQLite read snapshot; exact rows/token/lineage consistency and repeat validation belong to .16. Keep existing activation provider coverage in place and separate write rollback, post-commit provider-open failure and caller-specific listener failure."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071b-cba3-7891-bead-8461d5d2b369"]
 blocks = ["01a1071c-0f0c-7612-b9e0-391c0f016207"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:41.50534Z"
-updated_at = "2026-10-04T13:30:42.020383Z"
+updated_at = "2026-10-04T14:22:21.493067Z"

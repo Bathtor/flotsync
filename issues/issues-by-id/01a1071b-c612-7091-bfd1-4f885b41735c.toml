@@ -15,12 +15,72 @@ Acceptance and validation
 The tables identify all production block_on/spawn_local paths and proposed ownership intervals. Controlled tests can stop at transaction/listener boundaries without sleeps or a full network simulator. Public APIs and production behaviour remain unchanged. Any docs/ work follows the local OKF skill. Use existing test helpers and socket reservations; run relevant tests serially in the sandbox and pedantic Clippy for Rust edits.
 
 Review and size
-250-400 new/edited LOC including fixtures/tests/documentation; no bulk relocation. Follow parent review rules: no staging, no branch switching, no unsolicited API changes. Record test coverage and remaining contract questions; do not close until user acceptance.
-"""
-status = "open"
+340-480 new/edited LOC including fixtures/tests/documentation; no bulk relocation. Follow parent review rules: no staging, no branch switching, no unsolicited API changes. Record test coverage and remaining contract questions; do not close until user acceptance.
+
+Agreed execution for flotsync-zop.01; authorised by the user on 2026-10-04
+
+X01. Establish an auditable inventory and coverage map.
+Read component/mod.rs, handle.rs, host.rs, group_state.rs, component/activation_provider.rs, API store/listener contracts, and current runtime tests. Record every production block_on/spawn_local path, including summary/security paths, all actor/port/startup inputs, transactions, public reply and reliable processed-promise boundaries. Distinguish test-only handlers. Link each promised behaviour to a test or mark a gap. Existing delivery tests cover partial batch failure/retry and causal-chain rollback; groups tests cover accepted activation restart, failed activation publication, and fatal post-commit provider failure. Reuse them.
+
+X02. Produce docs/replication_runtime_flow_contracts.md using the project OKF skill.
+Use State Machine frontmatter and draft status; distinguish current implemented ordering from the agreed target scheduler. Link existing inline migration and delivery contracts, and generate the docs index. Document publication, single/batch apply, pending decisions, activation, creation, membership replacement and recovery; include summary/security adapters in the coverage inventory. Table columns: input/current phase, owned fields/partition keys, transaction and affected records, permitted private inconsistency and excluded consumers, published/external views, next event/effect, and success/failure restoration. Identify concrete current field uses rather than treating the entire store/security Arc as a lock. Note external aliases and actual isolation assumptions; detailed revalidation implementation stays in .16.
+Publication example: validate and acquire group interval; transactional row/update/version writes; commit; outbound submit and catch-up notification; listener completion; reply and safe partition return. Batch example: retain group ownership through every per-input transaction and listener callback; flush accumulated catch-up observations on success or failure. Activation example: acceptance checkpoint leaves predecessor read-only and pending activation; activation commit closes predecessor, activates successor and removes pending; projection publication and post-commit row provider; post-commit provider failure faults runtime. Human decisions wait between finite flows in stored pending work.
+Specify full-map ProjectionWriter ownership across read/build/commit/publication; immutable group projection contains group metadata, not rows or version vectors. Private temporary inconsistency is permitted inside an owned interval; externally visible committed records must remain safe for independent consumers. Ownership is restored only after consistency is established or explicit cleanup; otherwise mark faulted, never unlock merely because a future was dropped.
+
+X03. Specify the shared-mailbox scheduler and its progress cases in that document.
+Only the actual head can start a new flow, with its complete required partition set available. Existing finite flows may consume their first matching event from anywhere. Give worked traces for blocked head plus later active-flow completion, conflicting head plus otherwise compatible later request (intentional head-of-line blocking), and stale/orphan/unsupported head disposal. Identify concrete response/promise/event dispositions and reserve completion capacity before submitting effects. For each domain, identify the events needed to finish and verify none require starting a later head-blocked flow. No scheduler implementation in .01; its executable coverage belongs to .18-.23. Document bounded fair active-flow turns and finite timeout/failure/cancellation outcomes without assuming cancellation rolls back committed work.
+
+X04. Add a narrow deterministic listener-completion gate and only missing tests.
+Extend the existing ListenerStub in runtime/tests/mod.rs with an opt-in gate for the next DataChanged callback. After provider rows and positions have been captured, send an entered signal, take the release future out of the mutex, drop the guard, and await release before on_event completes. Use existing Kompact promises and channel timeout conventions; no sleeps, mutex across await, generic effect interpreter, or full network simulator. Release all gates before shutdown. Keep default listener behaviour identical.
+Strengthen publish_changes_emits_local_data_changed_event_before_reply in changes.rs: while listener completion is gated, inspect rows, update record and group version via an independent store transaction and assert the API future remains pending; release gate and check the receipt/token. This proves committed data is available to the callback and the reply waits for callback completion.
+Add update_batch_waits_for_listener_before_committing_next_input in delivery.rs, reusing consecutive_title_update_messages. Gate the first callback, assert first update/row/version are committed and second update is absent; release and verify final version and ordered, non-duplicated callbacks. Add a small cfg(test) batch-submission helper in handle.rs returning the reply future; keep the existing synchronous helper delegating to it. Avoid a new production API or a thread-based test coordinator. Existing partial-failure tests remain the failure/retry evidence.
+Separate contract assertions that must survive the refactor from incidental current block_on behaviour. Do not add assertions that prevent compatible cross-group concurrency later.
+
+X05. Validate and hand over one bounded review unit.
+Run focused publication and batch tests, then the runtime test selection serially in the sandbox. Run formatting and pedantic Clippy for the touched Rust test/support code. Generate and check the OKF index. Inspect touched files for duplicated helpers and verify every production asynchronous entry is represented in the inventory. Report existing versus new coverage and unresolved future design questions. Set status_reason to in review; leave changes unstaged and do not close until user acceptance.
+
+Size and review boundaries
+Contract document/index: 180-240 LOC. Listener gate: 60-90 LOC. Test-only batch submission helper: 15-25 LOC. Two test changes: 80-120 LOC. Total approximately 340-480 new/edited LOC; this refines the original 250-400 estimate after inspecting the fixture design. No bulk relocation or domain FSM implementation. Keep docs and test changes separately explainable in the review. If additional missing behaviour pushes this beyond 600 substantive LOC, identify a separate follow-up instead of broadening silently. The overall 24-child conversion remains approximately 6900-11100 LOC and will be reviewed child by child.
+
+Execution across the conversion
+Proceed in the existing dependency order. Before each child, show and claim it, refresh current sources and capture any review delta, then align on its concrete execution plan. Implement only that child; report behavioural changes, evidence and LOC before user review. Do not stage/commit without the user's request; do not close or begin the next dependent child until acceptance. Keep mechanical moves separate from behavioural changes with source-to-destination maps. Final concurrency semantics remain mandatory in .21-.24.
+
+Review hand-over for flotsync-zop.01
+
+Implemented docs/replication_runtime_flow_contracts.md and generated the OKF index. The document inventories all ten production block_on and four spawn_local paths, synchronous/host/manager boundaries, actual field use sets and aliases, and phase/ownership/transaction/restoration tables for every agreed domain. It distinguishes implemented ordering from target partition and selective-mailbox machinery, includes worked head-only admission traces, and maps guarantees to existing or newly strengthened tests.
+
+Added an opt-in DataChangeCompletionGate to the existing ListenerStub. It pauses after rows/position are captured, outside the mutex, and releases during unwinding even before callback entry. Strengthened the existing publication test to inspect independently committed rows/update/vector while the listener is paused and confirm the reply awaits release. Added a batch test proving the next input is not committed before the first listener callback completes, then checking final vector/rows and ordered non-duplicated callbacks. A cfg(test) submission helper is shared by paused and synchronous batch tests. Public APIs and production behaviour remain unchanged; rustfmt also reformatted one existing cfg_select test branch.
+
+Validation: focused publication and batch tests passed; all 171 runtime tests passed serially. After refining gate cleanup, an 18-test before_ selection including both gated cases passed. Rustfmt checks and the OKF checker passed. Pedantic Clippy completed with existing warnings; no diagnostics on changed lines. Duplication inspection found one shared gate and submission helper, reusing existing update/store fixtures. Scenario setup and assertions stay inline so each test's independent boundary observations remain readable.
+
+Remaining contracts are already assigned to children: exact backend isolation/revalidation and activation provider cut (.16), bounded reliable ingress/API overflow (.20), concrete overlap/callback wait-cycle coverage (.22), and finite-flow cancellation/shutdown (.23). Outbound submission ordering is source-traced here, not separately observed by the new tests. Reliable Summary processed completion belongs to the separate summary manager via the shared claimable promise; the runtime's advisory path must not duplicate it. No new bug or additional implementation scope is inferred from that fan-out.
+
+The document is approximately 293 LOC; Rust/support/index changes are approximately 240 inserted/edited LOC. The roughly 530-line substantive review is above the 340-480 estimate because the field/entry-point inventories are more explicit, but below the agreed 600-line split threshold. The user accepted this child on 2026-10-04 and requested propagation of its findings to sibling tasks followed by a commit. Implementation and validation are complete. The findings are integrated into the full plans for .02-.24, with backend isolation/provider-cut work in .16, bounded ingress in .20, concurrency/wait-cycle evidence in .22 and cancellation/shutdown in .23. Close this child as completed before committing; .02 becomes the next ready review unit but is not claimed or started by this hand-over."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 blocks = ["01a1071b-c69e-7381-b14a-0c11abb589c0"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:23.122193Z"
-updated_at = "2026-10-04T13:30:23.402876Z"
+updated_at = "2026-10-04T14:23:07.338467Z"
+closed_at = "2026-10-04T14:23:07.338467Z"
+
+[[comments]]
+id = "01a1073a-b385-7333-8d64-3fd0bd14d35a"
+author = "codex"
+body = "Completed the agreed X01-X05 review unit: flow-contract document and generated index, shared listener-completion gate, strengthened publication test, batch hand-off test and shared test-only submit helper. All 171 runtime tests passed; the final gate cleanup also passed an 18-test focused selection. Rustfmt/OKF checks pass; pedantic Clippy has existing warnings only. Approximately 530 substantive lines, above estimate but below the 600-line split threshold. Remaining isolation/provider, capacity, overlap and shutdown contracts stay in flotsync-zop.16/.20/.22/.23. Source inspection confirms reliable Summary processed completion is owned by the separate summary manager, preserving single completion across port fan-out. Unstaged and uncommitted; awaiting user review, not closing or starting .02."
+created_at = "2026-10-04T14:04:09.98959Z"
+
+[[comments]]
+id = "01a1074c-0e0a-7243-9ce1-2529e8a8fce7"
+author = "codex"
+body = "User accepted the completed contract and characterisation review on 2026-10-04. Propagated source-verified ownership, transaction/listener ordering, store aliases, reliable completion ownership and evidence limits into all 23 sibling plans, preserving scope and dependencies. Detailed isolation/provider-cut, capacity, overlap and shutdown work remains in .16/.20/.22/.23. Closing as completed and committing the accepted work with these tracking updates; .02 becomes ready but is not claimed or started."
+created_at = "2026-10-04T14:23:07.27472Z"
+
+[[comments]]
+id = "01a1074c-0e4a-7872-92fb-d1be8122f1ac"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T14:23:07.338467Z"

@@ -2,15 +2,13 @@ id = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 ref = "flotsync-zop"
 title = "Decompose replication runtime component"
 body = """
-[1 of 2] Compiling Main             ( /var/folders/x3/qpzz4tg52s184853zgyn3j180000gn/T/hsbox-lkroll/build/ccd0d886796d6e837239007d59974d9a635f6ef9adde6045b8ffd71329d20ad7/Main.hs, /var/folders/x3/qpzz4tg52s184853zgyn3j180000gn/T/hsbox-lkroll/build/ccd0d886796d6e837239007d59974d9a635f6ef9adde6045b8ffd71329d20ad7/Main.o )
-[2 of 2] Linking /var/folders/x3/qpzz4tg52s184853zgyn3j180000gn/T/hsbox-lkroll/build/ccd0d886796d6e837239007d59974d9a635f6ef9adde6045b8ffd71329d20ad7/Main.wasm
 Goal
 
 Decompose ReplicationRuntimeComponent and its service/topology setup into explicit, maintainable state ownership and workflow boundaries, ending with explicit concurrent execution and local input deferral. Preserve correctness guarantees and application startup synchronisation; change scheduling in separately reviewed steps after behaviour-preserving extraction. Design for approximately twice the current runtime functionality without requiring one large code review.
 
 Status
 
-Plan agreed by the user on 2026-10-04. Concurrent execution is required by the end of this task; blocking is an intermediate implementation only. Flows own state partitions across complete consistency intervals, permitting private temporary inconsistency. One shared selective mailbox retains events; only its head can start a new flow, while existing finite flows may scan for matching progress events. Intentional head-of-line blocking replaces bypass admission and age-based reservation machinery. Branch: codex/decompose-replication-runtime-component-flotsync-zop. Claimed by codex; status_reason is plan agreed. Detailed child issues below define the review sequence. This tracking update does not start production implementation.
+Plan agreed by the user on 2026-10-04. Concurrent execution is required by the end of this task; blocking is an intermediate implementation only. Flows own state partitions across complete consistency intervals, permitting private temporary inconsistency. One shared selective mailbox retains events; only its head can start a new flow, while existing finite flows may scan for matching progress events. Intentional head-of-line blocking replaces bypass admission and age-based reservation machinery. Branch: codex/decompose-replication-runtime-component-flotsync-zop. Claimed by codex; status_reason is plan agreed. Detailed child issues below define the review sequence. flotsync-zop.01 was accepted on 2026-10-04: docs/replication_runtime_flow_contracts.md records the source-verified contracts and evidence; the controlled publication and batch listener tests establish the current hand-off boundaries. Its findings are integrated into .02-.24. The .01 child is completed; .02 is the next ready review unit and remains unclaimed. The parent stays in progress until all conversion and concurrency acceptance criteria are satisfied.
 
 Evidence
 
@@ -174,8 +172,7 @@ Execution instructions for every child
 X01. Parent architecture is agreed. Read the child, parent and current code before work; do not overwrite manual changes. Claim only the selected child and do not create/switch branches without explicit permission. Keep all changes unstaged for review and close only after user acceptance.
 X02. Each child body supplies scope, exclusions, validation and size. Give source-to-destination maps for mechanical moves and separate them from semantics. Aim for 300-800 substantive review lines; split over 1000 including tests/glue. If implementation uncovers extra required work, add linked gitrack work and update the holistic parent rather than hiding a TODO.
 X03. Preserve Snafu error classification, Kompact message documentation, protobuf conversion traits and existing paging/provider contracts. Use rustfmt and pedantic Clippy, meaningful focused tests, serial sandbox cargo tests and socket reservations as required. Inspect touched files for newly duplicated helpers. PR validation describes coverage, not local command lists.
-X04. References to source methods/modules are investigation anchors, not fixed line numbers; locate them in the current checkout. Implementation can make routine local choices within the agreed design. Per-input overflow/public API details and backend contracts must be made concrete before enabling their behaviour; material changes require renewed alignment, not an automatic architecture restart.
-"""
+X04. References to source methods/modules are investigation anchors, not fixed line numbers; locate them in the current checkout. Implementation can make routine local choices within the agreed design. Per-input overflow/public API details and backend contracts must be made concrete before enabling their behaviour; material changes require renewed alignment, not an automatic architecture restart."""
 status = "in-progress"
 status_reason = "plan agreed"
 type = "task"
@@ -208,7 +205,7 @@ children = [
     "01a1071c-6752-77e1-b939-6ff6c711399e",
 ]
 created_at = "2026-09-01T18:52:17.43323Z"
-updated_at = "2026-10-04T13:32:25.063643Z"
+updated_at = "2026-10-04T14:23:07.483108Z"
 
 [[comments]]
 id = "01a106d2-868c-7f30-9214-1cff929b62d7"
@@ -235,3 +232,9 @@ id = "01a1071d-a267-7970-8894-81ccc84b19f6"
 author = "codex"
 body = "Plan agreed by the user. Created 24 detailed priority-1 children, flotsync-zop.01 through flotsync-zop.24, with scope, exclusions, acceptance/validation, review instructions and LOC estimates. All are linked to this parent and form a deliberate sequential review dependency chain; only .01 is ready. Final admission rule is head-only new-flow starts with selective receive for existing finite flows; bypass admission and age-based reservations are excluded. Verified all 24 saved bodies against the authored instructions, parent/reverse dependency links, open/unassigned state and readiness with no skipped inventory entries. Detailed cumulative estimate is 6900-11100 edited/new LOC including tests/docs; each child is estimated at 150-700, with code moves counted separately. No production implementation, staging or commit performed."
 created_at = "2026-10-04T13:32:25.063643Z"
+
+[[comments]]
+id = "01a1074c-0edb-7ac1-9c6e-66ab61506aa3"
+author = "codex"
+body = "Accepted and completed flotsync-zop.01 on 2026-10-04. The flow-contract document and controlled listener tests establish the baseline; all 23 sibling plans now include relevant findings and remaining validation obligations. Reliable Summary response completion remains summary-manager-owned, store aliases require more than disjoint component fields, and concurrent safety still needs .16/.20/.22/.23 coverage. Dependency ordering is unchanged. .02 is ready but remains unclaimed; the parent stays in progress. Removed two accidentally captured compiler-output lines from the issue body while updating this progress record."
+created_at = "2026-10-04T14:23:07.483108Z"

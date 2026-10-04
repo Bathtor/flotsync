@@ -16,7 +16,14 @@ Exercise A owning projection, head B needing projection, younger independent C a
 
 Review and size
 250-450 edited/new LOC including tests. Integrate with simulated completions while production remains serial. Follow parent validation and review/no-staging rules.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Turn the accepted trace into a scheduler test: active A owns projection; head B needs it; younger independent C cannot start; A's completion behind both is selectable; after A restores ownership B starts before C. A second publish request is new work even when its group matches A. Rotate active receivers with bounded scan/transition budgets and reconsider the actual head after progress.
+
+Finite flows alone do not prove unconditional fairness: effects must complete or reach a safe timeout/fault outcome, and no owner can depend on starting a new request behind a blocked head. Listener re-entry must hand off work rather than await a conflicting operation. Unsupported/stale/orphan head inputs need explicit terminal handling. Keep lifecycle control and reserved effect completions able to progress when ordinary ingress is full; do not solve pressure by bypassing older new work."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-60ae-7462-90b1-4604ff307d51"]
 blocks = ["01a1071c-62e5-7350-9c88-31f940812104"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:02.985807Z"
-updated_at = "2026-10-04T13:31:03.474216Z"
+updated_at = "2026-10-04T14:22:30.204186Z"

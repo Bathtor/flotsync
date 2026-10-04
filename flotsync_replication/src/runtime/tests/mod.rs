@@ -223,6 +223,7 @@ use flotsync_security::{
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
+use kompact::prelude::{Fulfillable, KFuture, KPromise, promise};
 use snafu::ResultExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -1453,6 +1454,47 @@ struct ListenerStubState {
     reject_pending_group_events: bool,
     rejected_pending_group_event_count: usize,
     buffered_events: mpsc::Receiver<CapturedDataChange>,
+    /// One opt-in pause after capturing the next data change, before its callback completes.
+    next_data_change_completion: Option<PendingDataChangeCompletion>,
+}
+
+/// Listener-owned half of a single callback-completion pause.
+struct PendingDataChangeCompletion {
+    /// Signals that provider rows and the callback position have been captured.
+    entered: mpsc::Sender<()>,
+    /// Awaited outside the listener mutex until the test releases its gate.
+    release: KFuture<()>,
+}
+
+/// Test-owned gate which releases the callback even if an assertion unwinds.
+struct DataChangeCompletionGate {
+    /// Receipt confirms that the callback has reached its completion boundary.
+    entered: mpsc::Receiver<()>,
+    /// Taken exactly once when the gate is released or dropped during cleanup.
+    release: Option<KPromise<()>>,
+}
+
+impl DataChangeCompletionGate {
+    /// Wait for the listener to capture the data change, with the usual test timeout.
+    fn wait_until_entered(&self) {
+        self.entered
+            .recv_timeout(TEST_WAIT_TIMEOUT)
+            .expect("listener should reach its gated completion boundary");
+    }
+
+    /// Allow the paused callback to complete before awaiting its operation or shutdown.
+    fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for DataChangeCompletionGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            // A failed callback may already have dropped the receiver; cleanup must not panic.
+            let _released = release.fulfil(());
+        }
+    }
 }
 
 struct ListenerStub {
@@ -1474,6 +1516,7 @@ impl Default for ListenerStub {
                 reject_pending_group_events: false,
                 rejected_pending_group_event_count: 0,
                 buffered_events,
+                next_data_change_completion: None,
             }),
             buffered_event_tx,
         }
@@ -1481,6 +1524,28 @@ impl Default for ListenerStub {
 }
 
 impl ListenerStub {
+    /// Pause only the next data-change callback; ordinary captures remain available while paused.
+    fn gate_next_data_change_completion(&self) -> DataChangeCompletionGate {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_future) = promise();
+        let mut state = self
+            .state
+            .lock()
+            .expect("listener state mutex must not be poisoned");
+        assert!(
+            state.next_data_change_completion.is_none(),
+            "a next-callback gate must not replace an existing gate"
+        );
+        state.next_data_change_completion = Some(PendingDataChangeCompletion {
+            entered: entered_tx,
+            release: release_future,
+        });
+        DataChangeCompletionGate {
+            entered,
+            release: Some(release),
+        }
+    }
+
     fn drain_buffered_events(&self) {
         let mut state = self
             .state
@@ -1613,7 +1678,7 @@ impl ReplicationEventListener for ListenerStub {
                     .await
                     .boxed()
                     .context(ListenerExternalSnafu)?;
-                    {
+                    let completion = {
                         let mut state = self
                             .state
                             .lock()
@@ -1621,12 +1686,21 @@ impl ReplicationEventListener for ListenerStub {
                         state.data_change_batch_sizes.push(batch_sizes);
                         state.data_change_read_tokens.push(read_token);
                         state.data_change_lineages.push(lineage);
-                    }
+                        state.next_data_change_completion.take()
+                    };
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,
                         })
                         .expect("listener event channel must remain open while tests are running");
+                    if let Some(completion) = completion {
+                        // The test may have dropped its gate while unwinding before entry.
+                        let _entered = completion.entered.send(());
+                        completion
+                            .release
+                            .await
+                            .expect("test gate should release the callback before shutdown");
+                    }
                 }
                 ReplicationEvent::GroupInvitation {
                     invitation,

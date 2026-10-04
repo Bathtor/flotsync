@@ -16,7 +16,14 @@ Controlled futures demonstrate real progress of an independent admitted operatio
 
 Review and size
 350-550 edited/new LOC including tests; split operation-family enablement into separate review patches if necessary. Removing block_on alone is not acceptance. Follow parent Rust/no-staging rules and user-reviewed closure.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Compatibility must combine owned field/record intervals with aliases, database isolation/revalidation, logical order, notification capacity, retained readers and absence of wait cycles. SecurityStore shares the backend; different group ids do not by themselves prove database independence. SQLite's single writer is a throughput constraint, not a reason for a blanket runtime database reader/writer gate. Demonstrate useful progress while an admitted operation waits, in both completion orders.
+
+Start with compatible read/security/preparation work while preserving group/DecisionSet boundaries, whole-map writer ownership and one listener lane. Batches retain their group/lane through all callbacks. An activation provider can retain a read transaction and wait for a listener already occupied by work awaiting a store writer; reserve the lane before opening the provider where needed to exclude that cycle. Callback re-entry must not await a conflicting new flow. .01's tests characterise current blocking order only: add positive overlap, conflicting deferral, head fairness, provider/writer waits and failure-at-commit/publication/listener tests without claiming the existing gates alone prove concurrency."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-63fc-7301-abda-8e9449035063"]
 blocks = ["01a1071c-6637-7470-bd1d-f64411ba59f0"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:03.833158Z"
-updated_at = "2026-10-04T13:31:04.330104Z"
+updated_at = "2026-10-04T14:22:32.832469Z"

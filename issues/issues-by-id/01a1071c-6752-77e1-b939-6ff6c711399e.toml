@@ -16,11 +16,18 @@ The final matrix demonstrates compatible overlap, conflict exclusion, callback/c
 
 Review and size
 150-250 edited/new LOC including focused tests/docs; no bulk moves. Every child and the parent remain subject to user completion acceptance. Stage nothing and do not create an aggregate mega-PR.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Use the accepted ten-blocking/four-spawned inventory plus synchronous, host, test-only and separate-manager boundaries as the final completeness matrix. Refresh field-use/alias tables to the actual extracted code, preserving the distinction between flow-owned private inconsistency and externally safe committed states. Retain DataChangeCompletionGate and shared batch submission support as useful regression seams, while removing obsolete conversion adapters.
+
+The baseline new tests establish publication commit/listener/reply and per-input batch transaction/callback order. Existing suites cover partial-prefix retry, ready-chain rollback, accepted-work restart and fatal provider failure. Outbound operation-specific order was source-traced in .01 and requires the later effect/port evidence; concurrency, isolation, capacity and shutdown acceptance are supplied by .16/.20/.22/.23, not implied by the 171 baseline runtime tests. Cross-check those outcomes before parent closure, document remaining limitations and linked future work, and keep the already accepted child reviews independently assessable."""
 status = "open"
 type = "task"
 priority = 1
 blocked_by = ["01a1071c-6637-7470-bd1d-f64411ba59f0"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:04.402532Z"
-updated_at = "2026-10-04T13:31:04.61226Z"
+updated_at = "2026-10-04T14:22:34.566975Z"

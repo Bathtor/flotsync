@@ -16,7 +16,14 @@ Fill the queue while active completions still arrive; prove they are admitted an
 
 Review and size
 450-700 edited/new LOC including tests excluding separately split transport work. Follow parent contract/review rules, relevant tests/Clippy and no staging. Record actual coverage and remaining linked work before closure.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Source inspection establishes a precise reliable-delivery fact: dropping the final uncompleted KClaimablePromise clone makes the delivery await fail, removes its accepted inbound copy and withholds the recipient acknowledgement, leaving the sender able to retry. Port fan-out means dropping just the runtime clone is not necessarily final. Reliable Summary response completion belongs to SummaryRequestManagerComponent; runtime-owned invitation/proposal and SummaryRequest obligations have different success points. This evidence does not establish a bounded producer deferral/backpressure contract; specify and test the actual hand-off before relying on rejection.
+
+Reserve completion capacity before starting effects and a notification lane/output capacity before event-producing writes. Batches reserve before their first input transaction, preserving contiguous callbacks. Include payload bytes, in-flight effects, accumulated batch observations and retained provider resources in accounting; one queue-entry limit is insufficient. Empty activation/creation notifications still consume output capacity. Local limits do not bound Kompact's upstream queues. Concrete API overload, reliable retry and callback re-entry policies remain required acceptance work here, with separately linked/estimated delivery changes if needed."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-61c9-7cc3-818c-9aa5544e6fdc"]
 blocks = ["01a1071c-63fc-7301-abda-8e9449035063"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:03.269813Z"
-updated_at = "2026-10-04T13:31:03.761188Z"
+updated_at = "2026-10-04T14:22:31.07184Z"

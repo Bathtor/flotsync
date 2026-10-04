@@ -753,6 +753,97 @@ fn inbound_update_with_out_of_range_producer_index_is_rejected() {
 }
 
 #[test]
+fn update_batch_waits_for_listener_before_committing_next_input() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
+    let group_id = GroupId(Uuid::from_u128(22_221));
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let (row_id, first_update, second_update) =
+        consecutive_title_update_messages(group_id, dataset_id.clone(), 22_222);
+    let first_update_id = first_update.update_id;
+    let second_update_id = second_update.update_id;
+    let gate = fixture.listener.gate_next_data_change_completion();
+    let mut reply = fixture
+        .runtime
+        .submit_update_batch_for_test(
+            alice_member,
+            UpdateBatchMessage {
+                group_id,
+                updates: vec![first_update, second_update],
+            },
+        )
+        .boxed();
+    gate.wait_until_entered();
+
+    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(persisted_group.version_vector.version_at(0), 1);
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, first_update_id)
+            .expect("first input should be committed before its callback")
+            .applied_locally
+    );
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, second_update_id).is_none(),
+        "second input must wait for the first callback to complete"
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "first"
+    );
+    assert!(reply.as_mut().now_or_never().is_none());
+    gate.release();
+    wait_for_test_reply(reply)
+        .expect("runtime should answer the batch")
+        .expect("batch should complete after listener release");
+
+    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(persisted_group.version_vector.version_at(0), 2);
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "second"
+    );
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: row_id.clone(),
+                    title: "first".to_owned(),
+                }],
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "second".to_owned(),
+                }],
+            },
+        ]
+    );
+}
+
+#[test]
 fn update_batch_failure_after_first_update_keeps_first_notifications() {
     let alice_member = alice_member();
     let bob_member = bob_member();

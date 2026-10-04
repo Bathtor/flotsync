@@ -16,7 +16,14 @@ Test head/middle/tail removal, first-match arrival order, no match, append durin
 
 Review and size
 250-400 edited/new LOC including tests. Keep this runtime-local and do not build a generic Erlang mailbox library. Follow parent checks/no-staging policy and user-reviewed closure.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Retain one shared arrival-ordered mailbox; only its actual head can supply new-flow admission and only existing flows selectively receive elsewhere. Do not add framework-local queues or transfer messages on flow activation. Pure matching needs operation/phase correlation and explicit classification of new work, continuations, replay/stale/orphan input; a second same-group publish is new work.
+
+An arrival-linked slot arena gives constant-time removal once matched, while scans remain bounded/resumable. Preserve first-match order for a flow, invalidate saved cursors when a receive pattern changes, and protect against slot reuse/removal by other flows. Keep completion-capacity reservation hooks distinct from ordinary ingress limits and lifecycle control. The accepted head-blocked traces are executable fixture candidates, not yet implementation evidence."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-5f8e-7110-9a0d-c80ffd2f3325"]
 blocks = ["01a1071c-61c9-7cc3-818c-9aa5544e6fdc"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:02.702588Z"
-updated_at = "2026-10-04T13:31:03.197448Z"
+updated_at = "2026-10-04T14:22:29.335735Z"

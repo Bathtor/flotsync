@@ -16,7 +16,14 @@ Prove that a second projection writer cannot build/publish during the first owne
 
 Review and size
 200-400 edited/new LOC including tests. Follow parent Rust validation, touched-file duplication and no-staging rules. Close only after review.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+RuntimeGroupStateSnapshot publishes group id, name, members, resolved schema and lifecycle, with no rows or version vectors. Preserve whole-map replacement. The writer must be acquired before the snapshot-building database read and held through commit/replace, including creation, acceptance, activation and recovery/replay refresh. Private DatabaseCommittedButProjectionPending belongs to the owning flow; it is not a second mutable database mirror.
+
+The existing coherent Arc can remain visible while stale, but each delivery/security/host consumer must be audited for whether that is acceptable. Operations requiring current consistency cannot bypass the owner by cloning a writer/service handle. Test writer exclusion across a delayed completion and repair/fault without unsafe ownership return. Unrelated work may overlap if it needs neither that writer nor affected records; per-group projection deltas remain deferred."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-15b2-7d43-a152-720069e3e5b6"]
 blocks = ["01a1071c-60ae-7462-90b1-4604ff307d51"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:02.414547Z"
-updated_at = "2026-10-04T13:31:02.914494Z"
+updated_at = "2026-10-04T14:22:28.468622Z"

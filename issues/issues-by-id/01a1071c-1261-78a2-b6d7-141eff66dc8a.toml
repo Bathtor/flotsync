@@ -16,7 +16,14 @@ Existing startup replay, accepted activation restart, queued inbound delivery, l
 
 Review and size
 350-550 edited/new LOC including tests, 200-350 moved. Avoid moving the entire topology file. Follow parent checks and no-staging policy; retain flotsync-5ou/sae/3ht/gxo boundaries and close after review.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Recovery replays pending decisions before accepted activation, using the same finite domain machines and caller-specific failure rules. Preserve the host's application synchronisation/startup hand-off before normal component operation; host group_state, diagnostic, peer_routes and shutdown entry points are separate audited boundaries, not automatically runtime-mailbox inputs.
+
+Use the ten blocking/four spawned-entry inventory as the coverage checklist when narrowing dependencies. Recovery metadata refresh is also a projection writer, owning the whole-map build/read through publication. SecurityStore and catch-up/delivery/application handles can alias the runtime store, so dependency narrowing must make those aliases visible without declaring every cloned store handle exclusive. Existing startup/restart and fatal provider-failure tests supply checkpoint evidence; do not duplicate a topology-wide rewrite."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-1144-76f3-b850-24a2404c2d38"]
 blocks = ["01a1071c-137e-72c1-b577-8fa871767244"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:42.657848Z"
-updated_at = "2026-10-04T13:30:43.154666Z"
+updated_at = "2026-10-04T14:22:24.985868Z"

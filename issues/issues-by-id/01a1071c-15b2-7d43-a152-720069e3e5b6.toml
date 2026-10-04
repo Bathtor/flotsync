@@ -16,7 +16,14 @@ Controlled tests exercise competing acceptance, stale work between phases, confl
 
 Review and size
 150-350 edited/new LOC including tests; split newly discovered backend work if it threatens 1000 LOC rather than hiding it in this child. Follow parent validation/no-staging policy and user acceptance before closure.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+The generic store interface establishes read-your-own-writes, rollback-on-drop and consistent pagination, but does not fully specify cross-transaction conflict/lost-update guarantees. SQLite uses BEGIN IMMEDIATE writes, BEGIN reads and a pool of eight; one writer can limit throughput, and beginning a read transaction is not necessarily snapshot establishment. SecurityStore and other components may alias that backend, so runtime partition ownership is not isolation for external consumers.
+
+Make concrete the identified repeat-validation points: membership preparation -> acceptance (source lifecycle/final cut/schema/key evidence), group setup validation -> persistence, accepted-work reload -> activation (selected successor/cut/material/schema/lifecycle and completion/supersession), and provider rows -> token/lineage at one established read cut. Missing pending activation alone cannot prove success. Intermediate accepted and activated commits must remain valid externally. Existing checkpoint tests and .01's independent committed-data reads are baseline evidence, not competing-transaction conformance tests; add focused conflict and provider-cut coverage without broadening into the entire flotsync-uvo project."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-1499-7af1-bfe0-7ce5bb415139"]
 blocks = ["01a1071c-5f8e-7110-9a0d-c80ffd2f3325"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:43.50604Z"
-updated_at = "2026-10-04T13:31:02.627452Z"
+updated_at = "2026-10-04T14:22:27.601354Z"

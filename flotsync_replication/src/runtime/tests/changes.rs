@@ -211,18 +211,46 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
         fixture.listener.captured_data_changes(),
         vec![CapturedDataChange { rows: Vec::new() }]
     );
-    let row_id = test_row_id(group_id, dataset_id, 39);
+    let row_id = test_row_id(group_id, dataset_id.clone(), 39);
 
     let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
-    publish_changes(
-        fixture.runtime.as_ref(),
+    let gate = fixture.listener.gate_next_data_change_completion();
+    let mut reply = fixture.runtime.publish_changes(PublishChangesRequest {
         read_token,
-        vec![RowMutation::Upsert {
+        changes: vec![RowMutation::Upsert {
             row_id: row_id.clone(),
             row: crate::row_values! {
                 "title" => "local event",
             },
         }],
+    });
+    gate.wait_until_entered();
+
+    // Independent store transactions observe committed state before the callback completes.
+    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(persisted_group.version_vector.version_at(0), 1);
+    let update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, update_id)
+            .expect("listener data must refer to a committed update")
+            .applied_locally
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "local event"
+    );
+    assert!(
+        reply.as_mut().now_or_never().is_none(),
+        "publication must await listener completion before replying"
     );
 
     assert_eq!(
@@ -236,6 +264,13 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
                 }],
             },
         ]
+    );
+    gate.release();
+    let receipt = wait_for_test_reply(reply).expect("publication should complete after release");
+    assert_eq!(receipt.update_id, update_id);
+    assert_eq!(
+        receipt.read_token.version(),
+        &persisted_group.version_vector
     );
 }
 

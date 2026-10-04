@@ -16,7 +16,14 @@ Exercise stopping while writing, after commit before publication, during listene
 
 Review and size
 250-450 edited/new LOC including tests; split if timeout/host integration exceeds 800 substantive lines. Follow parent validation/no-staging and user acceptance before closure.
-"""
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Finite ownership is conditional on effect completion or a defined safe timeout/fault policy; arbitrary store/listener futures cannot be assumed cancellable. Distinguish pre-commit rollback, accepted pending work left resumable, activation committed with projection pending, fatal provider-open failure after pending removal, and caller-specific post-commit listener failures. Keep partitions owned/faulted while an in-flight effect may still mutate them; lost reply does not restore consistency.
+
+Stopping must leave active completions selectable even behind queued new work or at ordinary capacity. Reliable terminal handling uses the .20 verified processed/retry contract and Summary manager's separate response ownership, not unconditional acknowledgements. Reuse gate cleanup's assertion-unwind release for test hygiene, but do not treat it as production cancellation evidence. Cover retained provider release, hung listener escalation, callback re-entry, late completions and repeated host shutdown; use scheduled timer UUIDs rather than additional timer-generation counters."""
 status = "open"
 type = "task"
 priority = 1
@@ -24,4 +31,4 @@ blocked_by = ["01a1071c-6519-7f02-99ed-8b6b477df51f"]
 blocks = ["01a1071c-6752-77e1-b939-6ff6c711399e"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:04.119746Z"
-updated_at = "2026-10-04T13:31:04.61226Z"
+updated_at = "2026-10-04T14:22:33.699467Z"

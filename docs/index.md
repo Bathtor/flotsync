@@ -38,6 +38,7 @@ Do not edit it directly.
 
 - [GroupBroadcast Queue Model](group_broadcast_queue_model.md) - Specifies GroupBroadcast queue ownership, route states, transitions, and completion rules.
 - [Inline Migration Policy Flow](inline_migration_policy_flow.md) - Defines validation, policy, persistence, activation, and restart behaviour for inline membership migration work.
+- [Replication Runtime Flow Contracts](replication_runtime_flow_contracts.md) - Defines runtime flow ownership, observable transaction boundaries, listener ordering, and selective admission for the component decomposition.
 
 ## Testing Guide
 

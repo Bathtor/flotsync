@@ -1005,10 +1005,9 @@ async fn load_replication_runtime_typed_with_security(
     };
     let host_result = cfg_select! {
         test => match runtime_host_test_support {
-            Some(test_support) => DeliveryRuntimeHost::prepare_with_test_support(
-                host_args,
-                test_support,
-            ).await,
+            Some(test_support) => {
+                DeliveryRuntimeHost::prepare_with_test_support(host_args, test_support).await
+            }
             None => DeliveryRuntimeHost::prepare(host_args).await,
         },
         _ => DeliveryRuntimeHost::prepare(host_args).await,
@@ -1433,19 +1432,32 @@ impl ReplicationRuntime {
         }
     }
 
+    /// Submit a batch without waiting, so tests can inspect a paused listener boundary.
+    ///
+    /// The future contains the handler result; a dropped promise means the component stopped.
+    #[cfg(test)]
+    pub(super) fn submit_update_batch_for_test(
+        &self,
+        sender: MemberIdentity,
+        message: UpdateBatchMessage,
+    ) -> KFuture<Result<(), InboundDeliveryError>> {
+        let runtime_ref = self
+            .runtime_ref("injecting test batch")
+            .expect("replication runtime lifecycle should be readable during test batch injection")
+            .expect("replication runtime should be live during test batch injection");
+        runtime_ref.ask_with(|promise| {
+            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
+        })
+    }
+
+    /// Submit a test batch and wait for its listener callbacks and handler result.
     #[cfg(test)]
     pub(super) fn apply_update_batch_for_test(
         &self,
         sender: MemberIdentity,
         message: UpdateBatchMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let runtime_ref = self
-            .runtime_ref("injecting test batch")
-            .expect("replication runtime lifecycle should be readable during test batch injection")
-            .expect("replication runtime should be live during test batch injection");
-        let future = runtime_ref.ask_with(|promise| {
-            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
-        });
+        let future = self.submit_update_batch_for_test(sender, message);
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
             Err(error) => {
