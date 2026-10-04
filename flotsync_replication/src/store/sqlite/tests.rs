@@ -604,6 +604,8 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     wait_for_store_future(store.store_reliable_delivery_work(earlier.clone()))
         .expect("earlier work should store");
 
+    assert_delivery_metadata_pages(store.as_ref(), &earlier.metadata, &later.metadata);
+
     let mut metadata = wait_for_store_future(store.load_reliable_delivery_work_metadata())
         .expect("metadata should load");
     metadata.sort_by_key(|item| (item.first_submitted_at, item.message_id));
@@ -627,8 +629,195 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     assert_eq!(
         wait_for_store_future(store.load_reliable_delivery_work_metadata())
             .expect("remaining metadata should load"),
-        vec![later.metadata]
+        vec![later.metadata.clone()]
     );
+    wait_for_store_future(store.remove_reliable_delivery_work(later.metadata.message_id))
+        .expect("final work should remove");
+    assert_empty_delivery_metadata_page(store.as_ref());
+}
+
+/// Check bounded continuation, session binding, and exact-size exhaustion.
+fn assert_delivery_metadata_pages(
+    store: &SqliteReplicationStore,
+    earlier: &StoredReliableDeliveryWorkMetadata,
+    later: &StoredReliableDeliveryWorkMetadata,
+) {
+    let mut session = wait_for_store_future(store.begin_read_session())
+        .expect("delivery metadata session should start");
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(1).expect("page size is non-zero"),
+    );
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("first metadata page should load");
+    assert_eq!(batch.values(), std::slice::from_ref(earlier));
+    let mut other_session = wait_for_store_future(store.begin_read_session())
+        .expect("second delivery metadata session should start");
+    assert!(matches!(
+        load_delivery_metadata_page(other_session.as_mut(), &mut cursor, &mut batch),
+        Err(PageError::TransactionMismatch { .. })
+    ));
+    wait_for_store_future(other_session.release()).expect("second session should release");
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("second metadata page should load");
+    assert_eq!(batch.values(), std::slice::from_ref(later));
+    assert!(cursor.has_more(), "an exact-size page needs confirmation");
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("empty confirmation page should load");
+    assert!(batch.values().is_empty());
+    assert!(cursor.is_exhausted());
+    wait_for_store_future(session.release()).expect("metadata session should release");
+}
+
+/// Check that an empty read session exhausts the cursor in one fill.
+fn assert_empty_delivery_metadata_page(store: &SqliteReplicationStore) {
+    let mut empty_session = wait_for_store_future(store.begin_read_session())
+        .expect("empty delivery metadata session should start");
+    let mut empty_cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(1).expect("page size is non-zero"),
+    );
+    load_delivery_metadata_page(empty_session.as_mut(), &mut empty_cursor, &mut batch)
+        .expect("empty metadata page should load");
+    assert!(batch.values().is_empty());
+    assert!(empty_cursor.is_exhausted());
+    wait_for_store_future(empty_session.release()).expect("empty session should release");
+}
+
+#[test]
+fn reliable_delivery_metadata_pages_keep_one_read_view() {
+    let path = std::env::temp_dir().join(format!(
+        "flotsync-delivery-paging-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::create_file(&path))
+        .expect("file provisioner should build");
+    wait_for_store_future(async {
+        let mut connection = provisioner.pool.connections.acquire().await?;
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut *connection)
+            .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("file store should allow concurrent readers and writers");
+    wait_for_store_future(provision_local_identity(
+        &provisioner,
+        local_member(),
+        &test_replication_security_secrets(),
+    ))
+    .expect("identity should provision");
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("file store should activate");
+    let store = SqliteStoreTestOwner::from_store(Arc::new(store));
+    let first = reliable_delivery_work(801);
+    let removed = reliable_delivery_work(803);
+    let inserted = reliable_delivery_work(802);
+    wait_for_store_future(store.store_reliable_delivery_work(first.clone()))
+        .expect("first work should store");
+    wait_for_store_future(store.store_reliable_delivery_work(removed.clone()))
+        .expect("later work should store");
+
+    let mut session = wait_for_store_future(store.begin_read_session())
+        .expect("metadata read session should start");
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(1).expect("page size is non-zero"),
+    );
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("first metadata page should load");
+    assert_eq!(batch.values(), std::slice::from_ref(&first.metadata));
+
+    wait_for_store_future(store.store_reliable_delivery_work(inserted.clone()))
+        .expect("new work should store during the read session");
+    wait_for_store_future(store.remove_reliable_delivery_work(removed.metadata.message_id))
+        .expect("old work should remove during the read session");
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("second metadata page should load from the original read view");
+    assert_eq!(batch.values(), &[removed.metadata]);
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("empty page should confirm the end of the original read view");
+    assert!(cursor.is_exhausted());
+    wait_for_store_future(session.release()).expect("metadata read session should release");
+
+    let mut current = wait_for_store_future(store.load_reliable_delivery_work_metadata())
+        .expect("new read view should load");
+    current.sort_by_key(|metadata| metadata.message_id);
+    assert_eq!(current, vec![first.metadata, inserted.metadata]);
+    drop(store);
+    std::fs::remove_file(path).expect("test database should be removed");
+}
+
+#[test]
+fn failed_reliable_delivery_metadata_page_clears_output_and_releases_on_drop() {
+    let store = in_memory_store(local_member());
+    let valid = reliable_delivery_work(811);
+    wait_for_store_future(store.store_reliable_delivery_work(valid.clone()))
+        .expect("valid work should store");
+    let invalid_id = Uuid::from_u128(812).to_string();
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await?;
+        sqlx::query(
+            "INSERT INTO reliable_delivery_work (message_id, recipient, first_submitted_at, encoded_envelope) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&invalid_id)
+        .bind("bad!")
+        .bind("1970-01-01T00:00:00Z")
+        .bind(b"invalid".as_slice())
+        .execute(&mut *connection)
+        .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("malformed metadata fixture should store");
+
+    let mut session = wait_for_store_future(store.begin_read_session())
+        .expect("metadata read session should start");
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(2).expect("page size is non-zero"),
+    );
+    assert!(matches!(
+        load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch),
+        Err(PageError::Store { .. })
+    ));
+    assert!(batch.values().is_empty());
+    assert!(cursor.is_failed());
+    drop(session);
+
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await?;
+        sqlx::query("DELETE FROM reliable_delivery_work WHERE message_id = ?1")
+            .bind(&invalid_id)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("dropped failed session should release the database read view");
+    assert_eq!(
+        wait_for_store_future(store.load_reliable_delivery_work_metadata())
+            .expect("valid metadata should load after failed session cleanup"),
+        vec![valid.metadata]
+    );
+}
+
+/// Build one stored sender-work record for metadata page tests.
+fn reliable_delivery_work(message_id: u128) -> StoredReliableDeliveryWork {
+    StoredReliableDeliveryWork {
+        metadata: StoredReliableDeliveryWorkMetadata {
+            message_id: MessageId(Uuid::from_u128(message_id)),
+            recipient: remote_member(),
+            first_submitted_at: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        },
+        encoded_envelope: Bytes::from_static(b"stored envelope"),
+    }
+}
+
+/// Drive one metadata page through the same public session boundary as callers.
+fn load_delivery_metadata_page(
+    session: &mut dyn ReliableDeliveryReadSession,
+    cursor: &mut PageCursor<()>,
+    batch: &mut VecPageBatch<StoredReliableDeliveryWorkMetadata, ()>,
+) -> Result<(), PageError> {
+    wait_for_store_future(session.load_reliable_delivery_work_metadata_into(cursor, batch))
 }
 
 fn insert_raw_local_member(

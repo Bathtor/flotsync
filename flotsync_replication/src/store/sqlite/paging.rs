@@ -28,7 +28,8 @@ impl SqliteTextPageContinuation {
 
 /// Append a `TEXT` lower bound and the bounded ordering window.
 ///
-/// `column` is a trusted SQLite column expression supplied by this backend. An
+/// The query must already contain a `WHERE` predicate. `column` is a trusted
+/// SQLite column expression supplied by this backend. An
 /// unlimited page adds only an existing lower bound and does not request an
 /// ordering or limit.
 pub(super) fn push_text_page_window<Params, Batch>(
@@ -46,11 +47,32 @@ pub(super) fn push_text_page_window<Params, Batch>(
     );
 }
 
+/// Append a first `TEXT` predicate and the bounded ordering window.
+///
+/// The query must not yet contain a `WHERE` clause. A continuation adds
+/// `WHERE column > continuation`; a fresh cursor adds no predicate. `column`
+/// is a trusted SQLite expression. Unlimited pages request no ordering or limit.
+pub(super) fn push_initial_text_page_window<Params, Batch>(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
+    column: &'static str,
+) where
+    Batch: PageBatch + ?Sized,
+{
+    push_text_lower_bound(
+        query_builder,
+        page.after().map(SqliteTextPageContinuation::as_str),
+        column,
+        " WHERE ",
+    );
+    push_page_order_and_limit(query_builder, page.limit(), column);
+}
+
 /// Append a `TEXT` lower bound, required ordering, and optional finite limit.
 ///
 /// Use this for APIs which promise ordered results even when the caller selects
-/// an unlimited page. `column` is a trusted SQLite column expression supplied
-/// by this backend.
+/// an unlimited page. The query must already contain a `WHERE` predicate.
+/// `column` is a trusted SQLite column expression supplied by this backend.
 pub(super) fn push_ordered_text_page_window<Params, Batch>(
     query_builder: &mut QueryBuilder<Sqlite>,
     page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
@@ -62,6 +84,7 @@ pub(super) fn push_ordered_text_page_window<Params, Batch>(
         query_builder,
         page.after().map(SqliteTextPageContinuation::as_str),
         column,
+        " AND ",
     );
     query_builder.push(" ORDER BY ").push(column);
     if let PageLimit::Max(limit) = page.limit() {
@@ -72,25 +95,31 @@ pub(super) fn push_ordered_text_page_window<Params, Batch>(
 }
 
 /// Append a `TEXT` lower bound and bounded ordering from borrowed page values.
+///
+/// The query must already contain a `WHERE` predicate.
 pub(super) fn push_text_window(
     query_builder: &mut QueryBuilder<Sqlite>,
     after: Option<&str>,
     limit: PageLimit,
     column: &'static str,
 ) {
-    push_text_lower_bound(query_builder, after, column);
+    push_text_lower_bound(query_builder, after, column, " AND ");
     push_page_order_and_limit(query_builder, limit, column);
 }
 
 /// Append one optional exclusive lower bound for a SQL `TEXT` value.
+///
+/// `predicate_prefix` is trusted SQL: ` WHERE ` for the first predicate or
+/// ` AND ` when the query already contains a predicate.
 fn push_text_lower_bound(
     query_builder: &mut QueryBuilder<Sqlite>,
     after: Option<&str>,
     column: &'static str,
+    predicate_prefix: &'static str,
 ) {
     if let Some(after) = after {
         query_builder
-            .push(" AND ")
+            .push(predicate_prefix)
             .push(column)
             .push(" > ")
             .push_bind(after);

@@ -74,6 +74,7 @@ use crate::{
         },
     },
     delivery::contracts::{
+        ReliableDeliveryReadSession,
         ReliableDeliveryStore,
         StoredReliableDeliveryWork,
         StoredReliableDeliveryWorkMetadata,
@@ -351,35 +352,21 @@ impl ReplicationStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
         let pool = &self.pool;
         async move {
-            pool.ensure_open()?;
-            let connection = pool
-                .connections
-                .begin_with("BEGIN")
-                .await
-                .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
-            Ok(Box::new(SqliteReplicationStoreTransaction::new(
-                connection,
-                SqliteReplicationTransactionKind::Read,
-                pool.next_transaction_id(),
-            )) as Box<dyn ReplicationStoreReadTransaction>)
+            let transaction = pool.begin_read_transaction().await?;
+            Ok(Box::new(transaction) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
     }
 }
 
 impl ReliableDeliveryStore for SqliteReplicationStore {
-    fn load_reliable_delivery_work_metadata(
+    fn begin_read_session(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
+    ) -> BoxFuture<'_, Result<Box<dyn ReliableDeliveryReadSession>, StoreError>> {
         let pool = &self.pool;
         async move {
-            pool.ensure_open()?;
-            let mut connection = pool
-                .connections
-                .acquire()
-                .await
-                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
-            load_reliable_delivery_work_metadata(&mut connection).await
+            let transaction = pool.begin_read_transaction().await?;
+            Ok(Box::new(transaction) as Box<dyn ReliableDeliveryReadSession>)
         }
         .boxed()
     }
@@ -433,6 +420,29 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
             remove_reliable_delivery_work(&mut connection, message_id).await
         }
         .boxed()
+    }
+}
+
+impl ReliableDeliveryReadSession for SqliteReplicationStoreTransaction {
+    fn load_reliable_delivery_work_metadata_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, StoredReliableDeliveryWorkMetadata>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            reliable_delivery::load_reliable_delivery_work_metadata_into(
+                self.assert_open_connection(),
+                page,
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        ReplicationStoreReadTransaction::release(self)
     }
 }
 
@@ -494,6 +504,23 @@ impl SqliteStorePool {
     fn next_transaction_id(&self) -> StoreTransactionId {
         let transaction_id = allocate_sequence_id(&self.next_transaction_id);
         StoreTransactionId::from_uuid(Uuid::from_u64_pair(self.pool_id, transaction_id))
+    }
+
+    /// Start one read transaction shared by the replication and delivery views.
+    async fn begin_read_transaction(
+        &self,
+    ) -> Result<SqliteReplicationStoreTransaction, StoreError> {
+        self.ensure_open()?;
+        let connection = self
+            .connections
+            .begin_with("BEGIN")
+            .await
+            .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
+        Ok(SqliteReplicationStoreTransaction::new(
+            connection,
+            SqliteReplicationTransactionKind::Read,
+            self.next_transaction_id(),
+        ))
     }
 
     /// Close every connection and publish completed closure.
@@ -1283,6 +1310,7 @@ use paging::{
     continuation_record_index,
     finish_page,
     finish_page_with_metadata,
+    push_initial_text_page_window,
     push_ordered_text_page_window,
     push_page_order_and_limit,
     push_text_page_window,
@@ -1295,7 +1323,6 @@ use paging::{
 use pending_groups::*;
 use reliable_delivery::{
     load_reliable_delivery_work,
-    load_reliable_delivery_work_metadata,
     remove_reliable_delivery_work,
     store_reliable_delivery_work,
 };

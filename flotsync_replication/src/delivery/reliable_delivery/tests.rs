@@ -2063,6 +2063,7 @@ fn acknowledgement_cleanup_waits_for_the_blocking_envelope_load() {
 fn restart_restores_metadata_and_reuses_the_stored_envelope_after_route_discovery() {
     let alice = member_identity(&["alice"]);
     let bob = member_identity(&["bob"]);
+    let charlie = member_identity(&["charlie"]);
     let (security, sqlite_store) = test_delivery_security_and_store(&alice);
     let message_id = MessageId(Uuid::from_u128(413));
 
@@ -2083,6 +2084,18 @@ fn restart_restores_metadata_and_reuses_the_stored_envelope_after_route_discover
     let original_envelope = first_sender.wait_for_stored_envelope(message_id);
     first_sender.shutdown_for_restart();
 
+    let waiting_message_id = MessageId(Uuid::from_u128(500));
+    let waiting_work = StoredReliableDeliveryWork {
+        metadata: StoredReliableDeliveryWorkMetadata {
+            message_id: waiting_message_id,
+            recipient: charlie,
+            first_submitted_at: SystemTime::UNIX_EPOCH,
+        },
+        encoded_envelope: Bytes::from_static(b"unselected envelope"),
+    };
+    block_on(sqlite_store.store_reliable_delivery_work(waiting_work))
+        .expect("additional sender work should persist before restart");
+
     let observed_store = Arc::new(ControlledStore::new(sqlite_store.clone()));
     let reliable_store: Arc<dyn ReliableDeliveryStore> = observed_store.clone();
     let restarted_sender = FullStackHarness::with_system_security_and_store(
@@ -2093,12 +2106,14 @@ fn restart_restores_metadata_and_reuses_the_stored_envelope_after_route_discover
         reliable_store,
         None,
     );
-    restarted_sender.wait_for_sender_route_state(
-        message_id,
-        &RouteActiveState::WaitingForRoute {
-            reason: PendingRouteReason::RecoveredAfterRestart,
-        },
-    );
+    for recovered_id in [message_id, waiting_message_id] {
+        restarted_sender.wait_for_sender_route_state(
+            recovered_id,
+            &RouteActiveState::WaitingForRoute {
+                reason: PendingRouteReason::RecoveredAfterRestart,
+            },
+        );
+    }
     assert!(observed_store.full_loads().is_empty());
 
     let receiver = FullStackHarness::new(bob.clone());

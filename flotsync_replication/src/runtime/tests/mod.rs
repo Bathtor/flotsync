@@ -176,9 +176,9 @@ use crate::{
     },
     delivery::{
         contracts::{
+            ReliableDeliveryReadSession,
             ReliableDeliveryStore,
             StoredReliableDeliveryWork,
-            StoredReliableDeliveryWorkMetadata,
         },
         security::{DeliverySecurity, DeliverySecurityError},
         shared::MessageId,
@@ -580,10 +580,10 @@ impl<S> ReliableDeliveryStore for FailingStore<S>
 where
     S: ReplicationStore + 'static,
 {
-    fn load_reliable_delivery_work_metadata(
+    fn begin_read_session(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
-        self.inner.load_reliable_delivery_work_metadata()
+    ) -> BoxFuture<'_, Result<Box<dyn ReliableDeliveryReadSession>, StoreError>> {
+        self.inner.begin_read_session()
     }
 
     fn load_reliable_delivery_work(
