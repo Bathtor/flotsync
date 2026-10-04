@@ -6,6 +6,7 @@
 
 use crate::api::{
     DatasetId,
+    PageError,
     RowKey,
     StoreError,
     StoreErrorClass,
@@ -423,6 +424,12 @@ impl StoreErrorClassificationSource for SqliteStoreError {
 impl From<SqliteStoreError> for StoreError {
     fn from(value: SqliteStoreError) -> Self {
         StoreError::from_classification_source(value)
+    }
+}
+
+impl From<SqliteStoreError> for PageError {
+    fn from(error: SqliteStoreError) -> Self {
+        Self::from_store_error(error.into())
     }
 }
 

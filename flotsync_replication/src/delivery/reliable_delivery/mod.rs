@@ -30,11 +30,13 @@ use super::{
     },
 };
 use crate::api::{
+    PageCursor,
     StoreErrorClass,
     StoreErrorClassification,
     StoreErrorClassificationSource,
     StoreErrorResolution,
     StoreErrorScope,
+    VecPageBatch,
 };
 use bytes::Bytes;
 use flotsync_core::{MemberIdentity, member::TrieMap};
@@ -1211,15 +1213,26 @@ impl ComponentLifecycle for ReliableDeliveryComponent {
     fn on_start(&mut self) -> HandlerResult {
         self.config = Config::load(self.ctx.config(), self.log());
         Handled::block_on(self, async move |mut async_self| {
-            let stored_metadata = async_self
+            let mut session = async_self
                 .outbound
                 .store
-                .load_reliable_delivery_work_metadata()
+                .begin_read_session()
                 .await
                 .whatever_unrecoverable(
                     "Reliable delivery failed to restore outbound sender work",
                 )?;
-            for metadata in stored_metadata {
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::unlimited();
+            session
+                .load_reliable_delivery_work_metadata_into(&mut cursor, &mut batch)
+                .await
+                .whatever_unrecoverable(
+                    "Reliable delivery failed to restore outbound sender work",
+                )?;
+            session.release().await.whatever_unrecoverable(
+                "Reliable delivery failed to release outbound sender work read session",
+            )?;
+            for metadata in batch.into_values() {
                 let message_id = metadata.message_id;
                 async_self.outbound.work_items.insert(
                     message_id,

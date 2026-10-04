@@ -27,10 +27,15 @@ use super::{
         StartupEventPolicy,
     },
     in_memory::{
+        LoadedGroupMeta,
         LocalDataset,
+        PendingUpdateSet,
+        UpdateDependency,
         apply_local_delete,
         apply_local_upsert,
         apply_rebased_local_upsert,
+        load_scheduled_pending_update,
+        load_update_dependencies,
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
@@ -49,10 +54,14 @@ use crate::{
         CreateGroupRequest,
         DataChangeLineage,
         DatasetId,
-        DatasetRowScanPage,
+        DatasetRowPageBatch,
+        DatasetRowPageMetadata,
         DatasetRowStatePatch,
         DatasetRowStateSlice,
-        DatasetRowStateTransitionPage,
+        DatasetRowTransitionPageBatch,
+        DatasetRowTransitionPageMetadata,
+        DatasetRowTransitionQuery,
+        DatasetRowsQuery,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupDatasetSchemaRef,
@@ -81,10 +90,17 @@ use crate::{
         MemberKeyTrustEvidenceRecord,
         MemberKeyTrustEvidenceSet,
         MemberKeyTrustRequirement,
+        MemberPublicKeyPredicate,
         MemberPublicKeysRecord,
         MigrationId,
         MigrationProposal,
         MigrationProposalResponder,
+        OwnedPageBatchInput,
+        PageBatch,
+        PageCursor,
+        PageEnd,
+        PageError,
+        PageLimit,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
@@ -100,6 +116,7 @@ use crate::{
         ReplicationEventListener,
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
+        ReplicationGroupPredicate,
         ReplicationGroupRecord,
         ReplicationGroupSnapshot,
         ReplicationGroupView,
@@ -107,18 +124,22 @@ use crate::{
         ReplicationRowStateSnapshot,
         ReplicationSecuritySecrets,
         ReplicationStateRowBatch,
-        ReplicationStateRowTransitionBatch,
+        ReplicationStateRowSource,
+        ReplicationStateRowTransitionInput,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
         ReplicationUpdateRecord,
+        ReplicationUpdatesQuery,
+        RequestedDatasetRowPageBatch,
+        RequestedDatasetRowsQuery,
         RowChange,
         RowChangeBatch,
         RowChangeKind,
         RowId,
         RowKey,
-        RowKeyIterator,
         RowMutation,
         RowProviderError,
         STORE_EXTERNAL_UNCLASSIFIED_SNAFU,
@@ -131,6 +152,7 @@ use crate::{
         StoreErrorScope,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        StoreTransactionId,
         SummaryRequest,
         TrustPolicy,
         WritableReplicationGroupVersionRecord,
@@ -154,15 +176,16 @@ use crate::{
     },
     delivery::{
         contracts::{
+            ReliableDeliveryReadSession,
             ReliableDeliveryStore,
             StoredReliableDeliveryWork,
-            StoredReliableDeliveryWorkMetadata,
         },
         security::{DeliverySecurity, DeliverySecurityError},
         shared::MessageId,
     },
     provision_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
+    store::{SqliteTextPageContinuation, SqliteUpdatePageContinuation},
     test_support::{
         SqliteStoreTestOwner,
         load_test_delivery_security,
@@ -306,13 +329,13 @@ pub(in crate::runtime) struct DatasetRowStateTransitionPageFixture {
 
 /// One retained-history query observed by the failure-injecting store wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReplicationUpdateLoadRequest {
+pub(super) struct ReplicationUpdateLoadRequest {
     /// Group whose update history was queried.
     group_id: GroupId,
     /// History subset requested by the caller.
     filter: ReplicationUpdateFilter,
     /// Maximum records requested from the store.
-    limit: Option<NonZeroUsize>,
+    pub(super) limit: Option<NonZeroUsize>,
 }
 
 struct RuntimeFixture<S> {
@@ -342,17 +365,27 @@ enum ReadTransactionFailure {
     NextReadTransaction,
 }
 
+/// One injected outcome for an exact update-payload lookup.
+#[derive(Clone, Copy)]
+enum ExactUpdateLoadFault {
+    /// Return an access error for the selected update.
+    StoreError,
+    /// Report the selected update as absent.
+    Missing,
+}
+
 /// Shared failure controls consulted by the store and its delegated transactions.
 #[derive(Default)]
 struct FailingStoreControlState {
     fail_next_apply_dataset_row_patch: Option<DatasetId>,
+    /// Selected exact update lookup and its one-shot injected outcome.
+    exact_update_load_fault: Option<(UpdateId, ExactUpdateLoadFault)>,
     fail_next_activate_replication_group: bool,
     fail_after_next_pending_group_commit: bool,
     read_transaction_failure: ReadTransactionFailure,
     fail_next_read_release: bool,
     read_release_count: usize,
     snapshot_scan_failures: VecDeque<StoreErrorClassification>,
-    snapshot_scan_requests: Vec<ProviderTestScanRequest>,
     replication_update_load_failures: VecDeque<StoreErrorClassification>,
     replication_update_load_count: usize,
     replication_update_load_requests: Vec<ReplicationUpdateLoadRequest>,
@@ -362,7 +395,7 @@ struct FailingStoreControlState {
 
 /// Test-only store wrapper that can fail selected future writes while
 /// delegating all stored state to the wrapped `SQLite` store.
-struct FailingStore<S> {
+pub(super) struct FailingStore<S> {
     inner: Arc<S>,
     /// Whether delegated read transactions should hide all local-private key records.
     hide_local_private_keys: bool,
@@ -380,7 +413,7 @@ impl<S> FailingStore<S> {
             .expect("failing store mutex must not be poisoned")
     }
 
-    fn new(inner: Arc<S>) -> Self {
+    pub(super) fn new(inner: Arc<S>) -> Self {
         Self {
             inner,
             hide_local_private_keys: false,
@@ -397,6 +430,18 @@ impl<S> FailingStore<S> {
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
         Self::lock_control(&self.control).fail_next_apply_dataset_row_patch = Some(dataset_id);
+    }
+
+    /// Make the next exact payload lookup for this update report no record.
+    fn omit_next_exact_update_load_for(&self, update_id: UpdateId) {
+        Self::lock_control(&self.control).exact_update_load_fault =
+            Some((update_id, ExactUpdateLoadFault::Missing));
+    }
+
+    /// Make the next exact payload lookup for this update return an access error.
+    fn fail_next_exact_update_load_for(&self, update_id: UpdateId) {
+        Self::lock_control(&self.control).exact_update_load_fault =
+            Some((update_id, ExactUpdateLoadFault::StoreError));
     }
 
     fn fail_after_next_pending_group_commit(&self) {
@@ -444,16 +489,9 @@ impl<S> FailingStore<S> {
     }
 
     /// Return every retained-history query observed by this wrapper.
-    fn replication_update_load_requests(&self) -> Vec<ReplicationUpdateLoadRequest> {
+    pub(super) fn replication_update_load_requests(&self) -> Vec<ReplicationUpdateLoadRequest> {
         Self::lock_control(&self.control)
             .replication_update_load_requests
-            .clone()
-    }
-
-    /// Return every ordinary snapshot scan request observed by this wrapper.
-    fn snapshot_scan_requests(&self) -> Vec<ProviderTestScanRequest> {
-        Self::lock_control(&self.control)
-            .snapshot_scan_requests
             .clone()
     }
 
@@ -485,6 +523,7 @@ where
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
+                standalone_transaction_id: StoreTransactionId::new_random(),
                 inner: Some(FailingStoreTransactionInner::Write(inner)),
                 control,
                 hide_local_private_keys,
@@ -524,6 +563,7 @@ where
         async move {
             let inner = inner.begin_read_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
+                standalone_transaction_id: StoreTransactionId::new_random(),
                 inner: Some(FailingStoreTransactionInner::Read(inner)),
                 hide_local_private_keys,
                 control,
@@ -540,10 +580,10 @@ impl<S> ReliableDeliveryStore for FailingStore<S>
 where
     S: ReplicationStore + 'static,
 {
-    fn load_reliable_delivery_work_metadata(
+    fn begin_read_session(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
-        self.inner.load_reliable_delivery_work_metadata()
+    ) -> BoxFuture<'_, Result<Box<dyn ReliableDeliveryReadSession>, StoreError>> {
+        self.inner.begin_read_session()
     }
 
     fn load_reliable_delivery_work(
@@ -624,6 +664,8 @@ impl std::ops::DerefMut for FailingStoreTransactionInner {
 
 /// Read or write transaction wrapper sharing the store's failure controls.
 struct FailingStoreTransaction {
+    /// Identity for tests without an underlying transaction.
+    standalone_transaction_id: StoreTransactionId,
     /// Actual store transaction, absent only in deterministic provider unit tests.
     inner: Option<FailingStoreTransactionInner>,
     /// Whether this transaction emulates an absent local-private key record.
@@ -665,6 +707,14 @@ impl FailingStoreTransaction {
 }
 
 impl ReplicationStoreReadTransaction for FailingStoreTransaction {
+    fn transaction_id(&self) -> StoreTransactionId {
+        self.inner
+            .as_ref()
+            .map_or(self.standalone_transaction_id, |inner| {
+                inner.transaction_id()
+            })
+    }
+
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -673,6 +723,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_group(group_id)
+    }
+
+    fn load_replication_groups_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<ReplicationGroupRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_groups_into(cursor, batch)
     }
 
     fn load_replication_groups(
@@ -688,6 +749,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_groups()
+    }
+
+    fn load_writable_replication_group_versions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<WritableReplicationGroupVersionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_writable_replication_group_versions_into(cursor, batch)
     }
 
     fn load_writable_replication_group_versions(
@@ -752,6 +827,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_member_public_keys(key_id)
     }
 
+    fn load_member_public_key_ids_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut dyn PageBatch<Input = OwnedPageBatchInput<MemberKeyId>, Metadata = ()>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_key_ids_into(cursor, batch)
+    }
+
     fn load_member_public_key_ids(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
@@ -759,6 +845,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_member_public_key_ids()
+    }
+
+    fn load_member_public_keys_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<MemberPublicKeysRecord>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_keys_into(cursor, batch)
     }
 
     fn load_member_public_keys_for_member<'a>(
@@ -781,6 +878,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_member_public_keys_for_fingerprint(fingerprint)
     }
 
+    fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId>,
+        batch: &'call mut dyn PageBatch<
+            Input = OwnedPageBatchInput<MemberKeyTrustEvidenceKind>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_key_trust_evidence_into(cursor, batch)
+    }
+
     fn load_member_key_trust_evidence<'a>(
         &'a mut self,
         key_id: &'a MemberKeyId,
@@ -801,15 +912,15 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .is_key_fingerprint_blocked(fingerprint)
     }
 
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
+    fn load_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<RequestedDatasetRowsQuery<'query>>,
+        batch: &'call mut RequestedDatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .load_dataset_rows(dataset, row_keys)
+            .load_dataset_rows_into(cursor, batch)
     }
 
     fn load_replication_update<'a>(
@@ -817,189 +928,156 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update(group_id, update_id)
-    }
-
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        let injected_failure = {
+        let fault = {
             let mut control = Self::lock_control(&self.control);
-            control.replication_update_load_count += 1;
-            control
-                .replication_update_load_requests
-                .push(ReplicationUpdateLoadRequest {
-                    group_id: *group_id,
-                    filter,
-                    limit,
-                });
-            control.replication_update_load_failures.pop_front()
+            if control
+                .exact_update_load_fault
+                .is_some_and(|(selected_id, _)| selected_id == update_id)
+            {
+                control
+                    .exact_update_load_fault
+                    .take()
+                    .map(|(_, fault)| fault)
+            } else {
+                None
+            }
         };
-        match injected_failure {
-            Some(classification) => {
-                let source = std::io::Error::other(
-                    "failing store intentionally failed one update range load",
-                );
-                futures_util::future::ready(Err(StoreError::new(classification, source))).boxed()
+        match fault {
+            Some(ExactUpdateLoadFault::Missing) => futures_util::future::ready(Ok(None)).boxed(),
+            Some(ExactUpdateLoadFault::StoreError) => {
+                let source = std::io::Error::other("failing store rejected an exact update lookup");
+                futures_util::future::ready(Err(StoreError::new(
+                    StoreErrorClassification::UNKNOWN,
+                    source,
+                )))
+                .boxed()
             }
             None => self
                 .inner
                 .as_mut()
                 .expect("failing store transaction must remain open during delegated reads")
-                .load_replication_updates(group_id, filter, limit),
+                .load_replication_update(group_id, update_id),
         }
     }
 
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update_ids(group_id, filter, limit)
-    }
-
-    fn scan_dataset_row_batch<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
-        let injected_failure = {
+    fn load_replication_updates_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let has_injected_failure = {
             let mut control = Self::lock_control(&self.control);
+            control.replication_update_load_count += 1;
             control
-                .snapshot_scan_requests
-                .push(ProviderTestScanRequest {
-                    dataset_id: dataset.dataset_id.clone(),
-                    after,
-                    limit,
+                .replication_update_load_requests
+                .push(ReplicationUpdateLoadRequest {
+                    group_id: cursor.params().group_id(),
+                    filter: cursor.params().filter(),
+                    limit: batch.page_limit().into_option(),
                 });
-            control.snapshot_scan_failures.pop_front()
+            !control.replication_update_load_failures.is_empty()
         };
-        if let Some(classification) = injected_failure {
-            let source =
-                std::io::Error::other("failing store intentionally failed one snapshot scan");
-            return futures_util::future::ready(Err(StoreError::new(classification, source)))
-                .boxed();
+        if has_injected_failure {
+            let result = execute_injected_sqlite_update_page_failure(
+                self.transaction_id(),
+                cursor,
+                batch,
+                &self.control,
+            );
+            futures_util::future::ready(result).boxed()
+        } else {
+            self.inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .load_replication_updates_into(cursor, batch)
         }
-        if let Some(provider_scan) = self.provider_scan.as_mut() {
-            provider_scan
-                .state
-                .lock()
-                .expect("provider transaction state mutex must not be poisoned")
-                .row_requests
-                .push(ProviderTestScanRequest {
-                    dataset_id: dataset.dataset_id.clone(),
-                    after,
-                    limit,
-                });
-            let result = provider_scan
-                .row_results
-                .pop_front()
-                .expect("provider test must supply one result per ordinary scan");
-            let result = result.map(|result| {
-                output.reuse_for_schema(dataset.schema);
-                output.reserve_rows(result.rows.len());
-                for row in result.rows {
-                    let encoded = flotsync_messages::codecs::datamodel::encode_row_snapshot(
-                        &row.snapshot,
-                        dataset.schema,
-                    )
-                    .expect("provider test row must encode against its dataset schema");
-                    let mut decoder =
-                        flotsync_messages::snapshots::datamodel::ProtoSchemaSnapshotDecoder::new(
-                            encoded,
-                        )
-                        .expect("provider test row must create a snapshot decoder");
-                    output
-                        .push_decoded_row(
-                            ReplicationRowMetadata {
-                                row_key: row.row_id,
-                                tombstoned: row.tombstoned,
-                                created_by: row.created_by,
-                                last_changed_versions: row.last_changed_versions,
-                            },
-                            &mut decoder,
-                        )
-                        .expect("provider test row must decode into the reusable batch");
-                }
-                result.page
-            });
-            return futures_util::future::ready(result).boxed();
-        }
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .scan_dataset_row_batch(dataset, after, limit, output)
     }
 
-    fn scan_dataset_row_transition_batch<'a>(
-        &'a mut self,
-        previous_group: GroupDatasetSchemaRef<'a>,
-        current_group: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowTransitionBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
-        if let Some(provider_scan) = self.provider_scan.as_mut() {
-            assert_eq!(previous_group.dataset_id, current_group.dataset_id);
-            provider_scan
-                .state
-                .lock()
-                .expect("provider transaction state mutex must not be poisoned")
-                .transition_requests
-                .push(ProviderTestScanRequest {
-                    dataset_id: previous_group.dataset_id.clone(),
-                    after,
-                    limit,
-                });
-            let result = provider_scan
-                .transition_results
-                .pop_front()
-                .expect("provider test must supply one result per transition scan");
-            let result = result.map(|result| {
-                output.reuse_for_schemas(previous_group.schema, current_group.schema);
-                output.reserve_rows(result.rows.len());
-                for transition in result.rows {
-                    let previous_index = transition.previous.map(|row| {
-                        assert_eq!(row.row_id, transition.row_key);
-                        push_provider_test_row(
-                            output.previous_rows_mut(),
-                            previous_group.schema,
-                            row,
-                        )
-                    });
-                    let current_index = transition.current.map(|row| {
-                        assert_eq!(row.row_id, transition.row_key);
-                        push_provider_test_row(output.current_rows_mut(), current_group.schema, row)
-                    });
-                    output.push_alignment(previous_index, current_index);
-                }
-                DatasetRowStateTransitionPage {
-                    previous_group_id: result.previous_group_id,
-                    current_group_id: result.current_group_id,
-                    dataset_id: result.dataset_id,
-                    previous_dataset_exists: result.previous_dataset_exists,
-                    current_dataset_exists: result.current_dataset_exists,
-                    next_after: result.next_after,
-                }
-            });
-            return futures_util::future::ready(result).boxed();
-        }
+    fn load_replication_update_ids_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .scan_dataset_row_transition_batch(previous_group, current_group, after, limit, output)
+            .load_replication_update_ids_into(cursor, batch)
+    }
+
+    fn scan_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowsQuery<'query>>,
+        batch: &'call mut DatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id();
+        if self.provider_scan.is_none() {
+            let has_injected_failure = !Self::lock_control(&self.control)
+                .snapshot_scan_failures
+                .is_empty();
+            if has_injected_failure {
+                let result = execute_injected_sqlite_row_scan_failure(
+                    transaction_id,
+                    cursor,
+                    batch,
+                    &self.control,
+                );
+                return futures_util::future::ready(result).boxed();
+            }
+            return self
+                .inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .scan_dataset_rows_into(cursor, batch);
+        }
+
+        let result = execute_provider_test_row_scan(
+            transaction_id,
+            cursor,
+            batch,
+            self.provider_scan
+                .as_mut()
+                .expect("provider scan presence was checked"),
+        );
+        futures_util::future::ready(result).boxed()
+    }
+
+    fn scan_dataset_row_transitions_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowTransitionQuery<'query>>,
+        batch: &'call mut DatasetRowTransitionPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        if self.provider_scan.is_none() {
+            return self
+                .inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .scan_dataset_row_transitions_into(cursor, batch);
+        }
+
+        let transaction_id = self.transaction_id();
+        let result = execute_provider_test_transition_scan(
+            transaction_id,
+            cursor,
+            batch,
+            self.provider_scan
+                .as_mut()
+                .expect("provider scan presence was checked"),
+        );
+        futures_util::future::ready(result).boxed()
+    }
+
+    fn load_pending_group_decisions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupDecisionRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_decisions_into(cursor, batch)
     }
 
     fn load_pending_group_decisions(
@@ -1019,6 +1097,20 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_pending_group_decision(group_id)
+    }
+
+    fn load_pending_group_activations_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<PendingGroupActivationRecord>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_activations_into(cursor, batch)
     }
 
     fn load_pending_group_activations(
@@ -1598,9 +1690,198 @@ struct ProviderTestScanBehaviour {
 /// One deterministic ordinary scan page and the fixtures decoded into its output batch.
 pub(in crate::runtime) struct ProviderTestRowScanResult {
     /// Page metadata returned by the test transaction.
-    pub(in crate::runtime) page: DatasetRowScanPage,
+    pub(in crate::runtime) metadata: DatasetRowPageMetadata,
     /// Stored-row fixtures decoded into the caller-owned state batch.
     pub(in crate::runtime) rows: Vec<ReplicationRowStateFixture>,
+    /// Exclusive lower bound retained when another page may remain.
+    pub(in crate::runtime) next_after: Option<RowKey>,
+}
+
+/// Test-backend continuation for one ordered row scan.
+#[derive(Clone, Copy)]
+struct ProviderTestRowContinuation(RowKey);
+
+/// Temporary fixture adapter accepted by the production positional page batch.
+struct ProviderTestRowSource<'a> {
+    /// Schema used to encode and decode the fixture snapshot.
+    schema: &'a Schema,
+    /// Fixture consumed when the page batch accepts this source.
+    row: Option<ReplicationRowStateFixture>,
+}
+
+impl<'a> ProviderTestRowSource<'a> {
+    /// Wrap one fixture for synchronous insertion into a page batch.
+    fn new(schema: &'a Schema, row: ReplicationRowStateFixture) -> Self {
+        Self {
+            schema,
+            row: Some(row),
+        }
+    }
+}
+
+impl ReplicationStateRowSource for ProviderTestRowSource<'_> {
+    fn row_key(&self) -> RowKey {
+        self.row
+            .as_ref()
+            .expect("provider test row source must not be consumed twice")
+            .row_id
+    }
+
+    fn append_to(&mut self, output: &mut ReplicationStateRowBatch) -> Result<(), PageError> {
+        let row = self
+            .row
+            .take()
+            .expect("provider test row source must not be consumed twice");
+        push_provider_test_row(output, self.schema, row);
+        Ok(())
+    }
+}
+
+/// Execute one deterministic ordinary scan through the production page contract.
+fn execute_provider_test_row_scan(
+    transaction_id: StoreTransactionId,
+    cursor: &mut PageCursor<DatasetRowsQuery<'_>>,
+    batch: &mut DatasetRowPageBatch,
+    provider_scan: &mut ProviderTestScanBehaviour,
+) -> Result<(), PageError> {
+    let dataset = cursor.params().context();
+    let dataset_id = dataset.dataset_id.clone();
+    let schema = dataset.schema.clone();
+    batch.prepare_for_schema(&schema);
+    let mut page = cursor.begin_page::<ProviderTestRowContinuation, _>(transaction_id, batch)?;
+    let after = page.after().map(|continuation| continuation.0);
+    let PageLimit::Max(limit) = page.limit() else {
+        panic!("provider traversal tests use bounded row pages");
+    };
+
+    provider_scan
+        .state
+        .lock()
+        .expect("provider transaction state mutex must not be poisoned")
+        .row_requests
+        .push(ProviderTestScanRequest {
+            dataset_id,
+            after,
+            limit,
+        });
+    let result = provider_scan
+        .row_results
+        .pop_front()
+        .expect("provider test must supply one result per ordinary scan")
+        .map_err(PageError::from_store_error)?;
+    for row in result.rows {
+        let mut source = ProviderTestRowSource::new(&schema, row);
+        page.push(&mut source)?;
+    }
+    let end = result.next_after.map_or(PageEnd::Exhausted, |row_key| {
+        PageEnd::MayHaveMore(ProviderTestRowContinuation(row_key))
+    });
+    page.finish(result.metadata, end)
+}
+
+/// Inject one SQLite scan failure after beginning the correctly typed page attempt.
+fn execute_injected_sqlite_row_scan_failure(
+    transaction_id: StoreTransactionId,
+    cursor: &mut PageCursor<DatasetRowsQuery<'_>>,
+    batch: &mut DatasetRowPageBatch,
+    control: &Mutex<FailingStoreControlState>,
+) -> Result<(), PageError> {
+    let schema = cursor.params().context().schema.clone();
+    batch.prepare_for_schema(&schema);
+    let _page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+    let classification = FailingStore::<SqliteReplicationStore>::lock_control(control)
+        .snapshot_scan_failures
+        .pop_front()
+        .expect("injected SQLite row scan failure must remain configured");
+    let source = std::io::Error::other("failing store intentionally failed one snapshot scan");
+    Err(PageError::from_store_error(StoreError::new(
+        classification,
+        source,
+    )))
+}
+
+/// Inject an update-page failure after beginning the SQLite-typed attempt.
+fn execute_injected_sqlite_update_page_failure(
+    transaction_id: StoreTransactionId,
+    cursor: &mut PageCursor<ReplicationUpdatesQuery<'_>>,
+    batch: &mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    control: &Mutex<FailingStoreControlState>,
+) -> Result<(), PageError> {
+    let _page = cursor.begin_page::<SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+    let classification = FailingStore::<SqliteReplicationStore>::lock_control(control)
+        .replication_update_load_failures
+        .pop_front()
+        .expect("injected update page failure must remain configured");
+    let source = std::io::Error::other("failing store intentionally failed one update range load");
+    Err(PageError::from_store_error(StoreError::new(
+        classification,
+        source,
+    )))
+}
+
+/// Execute one deterministic transition scan through the production page contract.
+fn execute_provider_test_transition_scan(
+    transaction_id: StoreTransactionId,
+    cursor: &mut PageCursor<DatasetRowTransitionQuery<'_>>,
+    batch: &mut DatasetRowTransitionPageBatch,
+    provider_scan: &mut ProviderTestScanBehaviour,
+) -> Result<(), PageError> {
+    let previous = cursor.params().previous().context();
+    let current = cursor.params().current().context();
+    assert_eq!(previous.dataset_id, current.dataset_id);
+    let dataset_id = previous.dataset_id.clone();
+    let previous_schema = previous.schema.clone();
+    let current_schema = current.schema.clone();
+    batch.prepare_for_schemas(&previous_schema, &current_schema);
+    let mut page = cursor.begin_page::<ProviderTestRowContinuation, _>(transaction_id, batch)?;
+    let after = page.after().map(|continuation| continuation.0);
+    let PageLimit::Max(limit) = page.limit() else {
+        panic!("provider traversal tests use bounded transition pages");
+    };
+    provider_scan
+        .state
+        .lock()
+        .expect("provider transaction state mutex must not be poisoned")
+        .transition_requests
+        .push(ProviderTestScanRequest {
+            dataset_id,
+            after,
+            limit,
+        });
+    let result = provider_scan
+        .transition_results
+        .pop_front()
+        .expect("provider test must supply one result per transition scan")
+        .map_err(PageError::from_store_error)?;
+    let metadata = DatasetRowTransitionPageMetadata {
+        previous_group_id: result.previous_group_id,
+        current_group_id: result.current_group_id,
+        dataset_id: result.dataset_id,
+        previous_dataset_exists: result.previous_dataset_exists,
+        current_dataset_exists: result.current_dataset_exists,
+    };
+    for transition in result.rows {
+        let mut previous = transition
+            .previous
+            .map(|row| ProviderTestRowSource::new(&previous_schema, row));
+        let mut current = transition
+            .current
+            .map(|row| ProviderTestRowSource::new(&current_schema, row));
+        let input = ReplicationStateRowTransitionInput::new(
+            transition.row_key,
+            previous
+                .as_mut()
+                .map(|source| source as &mut dyn ReplicationStateRowSource),
+            current
+                .as_mut()
+                .map(|source| source as &mut dyn ReplicationStateRowSource),
+        );
+        page.push(input)?;
+    }
+    let end = result.next_after.map_or(PageEnd::Exhausted, |row_key| {
+        PageEnd::MayHaveMore(ProviderTestRowContinuation(row_key))
+    });
+    page.finish(metadata, end)
 }
 
 /// Decode one owned provider fixture into a reusable positional row batch.
@@ -1650,6 +1931,7 @@ pub(in crate::runtime) fn provider_test_read_transaction(
 ) {
     let state = Arc::new(Mutex::new(ProviderTestTransactionState::default()));
     let transaction = FailingStoreTransaction {
+        standalone_transaction_id: StoreTransactionId::new_random(),
         inner: None,
         hide_local_private_keys: false,
         control: Arc::new(Mutex::new(FailingStoreControlState::default())),
@@ -1686,6 +1968,204 @@ pub(in crate::runtime) struct ProviderTestTransactionState {
     pub(in crate::runtime) release_count: usize,
     /// Number of transaction values dropped.
     pub(in crate::runtime) drop_count: usize,
+}
+
+/// Build one valid stored update whose causal metadata is checked across a page boundary.
+fn dependency_page_update(
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    sender: MemberIdentity,
+    update_id: UpdateId,
+    read_versions: VersionVector,
+) -> ReplicationUpdateRecord {
+    let (_, message) = title_update_message(
+        group_id,
+        dataset_id,
+        u128::from(update_id.version),
+        "page boundary",
+        update_id,
+        read_versions.clone(),
+    );
+    ReplicationUpdateRecord {
+        group_id,
+        update_id,
+        sender,
+        read_versions,
+        dataset_updates: message
+            .dataset_updates
+            .into_iter()
+            .map(|dataset| DatasetUpdateRecord {
+                dataset_id: dataset.dataset_id,
+                operations: dataset.operations,
+            })
+            .collect(),
+        applied_locally: false,
+    }
+}
+
+/// Check that a changed exact lookup reports both projected and observed metadata.
+fn assert_scheduled_mismatch_diagnostics(
+    store: &dyn ReplicationStore,
+    group_id: GroupId,
+    scheduled: &UpdateDependency,
+    actual_read_versions: &VersionVector,
+) {
+    let error = wait_for_test_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let error = load_scheduled_pending_update(transaction.as_mut(), group_id, scheduled)
+            .await
+            .expect_err("changed causal metadata should fail exact lookup");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        error
+    });
+    assert!(matches!(
+        &error,
+        InboundDeliveryError::MismatchedScheduledUpdate { .. }
+    ));
+    let message = error.to_string();
+    assert!(message.contains(&scheduled.update_id.to_string()));
+    assert!(message.contains(&format!("at {}", scheduled.read_versions)));
+    assert!(message.contains(&format!("at {actual_read_versions}")));
+    assert!(message.contains("applied locally: false"));
+}
+
+#[test]
+fn pending_dependencies_load_once_before_causal_scheduling() {
+    let alice = alice_member();
+    let bob = bob_member();
+    let member_count = NonZeroUsize::new(2).expect("two members are non-zero");
+    let group_id = GroupId(Uuid::from_u128(50_301));
+    let dataset_id = docs_dataset_id();
+    let sqlite_store = sqlite_store(alice.clone());
+    let store = FailingStore::new(sqlite_store.clone());
+    let group = inactive_group_record(
+        group_id,
+        vec![alice.clone(), bob.clone()],
+        docs_group_schema(),
+    );
+    let group_meta = LoadedGroupMeta::from_replication_group_record(&alice, group.clone())
+        .expect("fixture group should load");
+    let dependencies = wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .insert_replication_group(group)
+            .await
+            .expect("group should store");
+        for version in 1..=2 {
+            let read_versions =
+                VersionVector::initial(member_count).with_version_at(1, version - 1);
+            let update = dependency_page_update(
+                group_id,
+                dataset_id.clone(),
+                bob.clone(),
+                UpdateId {
+                    node_index: 1,
+                    version,
+                },
+                read_versions,
+            );
+            transaction
+                .append_replication_update(update)
+                .await
+                .expect("producer update should store");
+        }
+        let later_dependency = VersionVector::initial(member_count).with_version_at(1, 2);
+        let update = dependency_page_update(
+            group_id,
+            dataset_id,
+            alice,
+            UpdateId {
+                node_index: 0,
+                version: 1,
+            },
+            later_dependency,
+        );
+        transaction
+            .append_replication_update(update)
+            .await
+            .expect("dependent update should store");
+        let dependencies = load_update_dependencies(
+            transaction.as_mut(),
+            group_id,
+            ReplicationUpdateFilter::PendingApply,
+        )
+        .await
+        .expect("unlimited dependency page should load");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+        dependencies
+    });
+
+    let requests = store.replication_update_load_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "all dependencies should load in one call"
+    );
+    for request in requests {
+        assert_eq!(request.group_id, group_id);
+        assert_eq!(request.filter, ReplicationUpdateFilter::PendingApply);
+        assert_eq!(request.limit, None);
+    }
+    let plan = PendingUpdateSet::from_updates(dependencies).plan_apply_chain(&group_meta);
+    assert!(plan.already_applied.is_empty());
+    assert!(plan.blocked_updates.is_empty());
+    assert_eq!(plan.ready_chain.len(), 3);
+    assert_eq!(plan.ready_chain[0].update_id.node_index, 1);
+    assert_eq!(plan.ready_chain[1].update_id.version, 2);
+    assert_eq!(
+        plan.ready_chain[2].update_id,
+        UpdateId {
+            node_index: 0,
+            version: 1,
+        }
+    );
+    let actual_read_versions = VersionVector::initial(member_count);
+    let scheduled = UpdateDependency {
+        update_id: plan.ready_chain[0].update_id,
+        read_versions: VersionVector::initial(member_count).with_version_at(1, 2),
+    };
+    assert_scheduled_mismatch_diagnostics(&store, group_id, &scheduled, &actual_read_versions);
+}
+
+#[test]
+fn injected_update_page_failure_clears_batch_and_invalidates_cursor() {
+    let mut control_state = FailingStoreControlState::default();
+    control_state
+        .replication_update_load_failures
+        .push_back(StoreErrorClassification::UNKNOWN);
+    let control = Mutex::new(control_state);
+    let query =
+        ReplicationUpdatesQuery::new(GroupId(Uuid::from_u128(45)), ReplicationUpdateFilter::All);
+    let mut cursor = PageCursor::new(query);
+    let mut batch =
+        crate::api::VecPageBatch::<usize, (), ReplicationUpdatePageInput, _>::unlimited_with(
+            |_: crate::api::ReplicationUpdateView<'_>| Ok::<_, flotsync_utils::BoxError>(1),
+        );
+    PageBatch::set_metadata(&mut batch, ());
+
+    let error = execute_injected_sqlite_update_page_failure(
+        StoreTransactionId::new_random(),
+        &mut cursor,
+        &mut batch,
+        &control,
+    )
+    .expect_err("injected update page should fail");
+    assert!(matches!(error, PageError::Store { .. }));
+    assert!(cursor.is_failed());
+    assert!(batch.metadata().is_none());
+    assert!(batch.values().is_empty());
 }
 
 mod changes;

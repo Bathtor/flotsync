@@ -48,7 +48,9 @@ use super::{
         TouchedGroupRows,
         apply_one_update,
         collect_group_row_scope,
-        collect_record_row_scope,
+        load_ready_row_scope,
+        load_scheduled_pending_update,
+        load_update_dependencies,
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
@@ -88,6 +90,8 @@ use crate::{
         MigrationId,
         MigrationProposal,
         MigrationProposalResponder,
+        OwnedPageBatchInput,
+        PageCursor,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
@@ -107,6 +111,7 @@ use crate::{
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
+        ReplicationUpdatesQuery,
         RowChange,
         RowId,
         RowKey,
@@ -116,6 +121,7 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
+        VecPageBatch,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
         security::{
@@ -171,6 +177,7 @@ use flotsync_data_types::schema::datamodel::SchemaSource;
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
+    BoxError,
     BoxFuture,
     KClaimablePromise,
     OptionExt as _,
@@ -3060,10 +3067,13 @@ impl ReplicationRuntimeComponent {
                 .context(inbound::StoreAccessSnafu)?;
         }
 
-        let pending_updates = transaction
-            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply, None)
-            .await
-            .context(inbound::StoreAccessSnafu)?;
+        let pending_updates = load_update_dependencies(
+            transaction.as_mut(),
+            group_id,
+            ReplicationUpdateFilter::PendingApply,
+        )
+        .await
+        .context(inbound::StoreAccessSnafu)?;
         let mut observed_available = vec![incoming_available_range];
         observed_available.extend(
             pending_updates
@@ -3083,7 +3093,7 @@ impl ReplicationRuntimeComponent {
             for blocked_update in &apply_plan.blocked_updates {
                 let blocked_ranges = Self::missing_ranges_for_update_frontier(
                     &local_group.version_vector,
-                    blocked_update.group_id,
+                    group_id,
                     blocked_update.update_id,
                     &blocked_update.read_versions,
                 )?;
@@ -3100,23 +3110,18 @@ impl ReplicationRuntimeComponent {
             });
         }
 
-        let touched_dataset_ids = apply_plan
+        let ready_ids = apply_plan
             .ready_chain
             .iter()
-            .flat_map(|update| update.dataset_updates.iter())
-            .map(|dataset_update| dataset_update.dataset_id.clone())
+            .map(|update| update.update_id)
             .collect::<HashSet<_>>();
-        for dataset_id in touched_dataset_ids {
-            ensure!(
-                group_schema.schema(&dataset_id).is_some(),
-                inbound::MissingDatasetSchemaSnafu {
-                    group_id,
-                    dataset_id,
-                }
-            );
-        }
-        let touched_dataset_rows =
-            collect_record_row_scope(&apply_plan.ready_chain, group_schema.as_ref())?;
+        let touched_dataset_rows = load_ready_row_scope(
+            transaction.as_mut(),
+            group_id,
+            group_schema.as_ref(),
+            &ready_ids,
+        )
+        .await?;
         let touched_dataset_slices = replay::load_touched_dataset_slices(
             transaction.as_mut(),
             group_schema.as_ref(),
@@ -3128,9 +3133,12 @@ impl ReplicationRuntimeComponent {
         let mut working_datasets =
             replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
         let mut event_batches = ListenerDataChangeBatches::new();
-        for ready_update in &apply_plan.ready_chain {
+        for scheduled_update in &apply_plan.ready_chain {
+            let ready_update =
+                load_scheduled_pending_update(transaction.as_mut(), group_id, scheduled_update)
+                    .await?;
             let applied_batch =
-                apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
+                apply_one_update(&mut local_group, &mut working_datasets, &ready_update)?;
             if lifecycle.emits_data_changes() && !applied_batch.row_changes.is_empty() {
                 let read_token = GroupReadToken::from_group_version(
                     group_id,
@@ -3149,14 +3157,14 @@ impl ReplicationRuntimeComponent {
             .await
             .context(inbound::StoreAccessSnafu)?;
             transaction
-                .mark_replication_update_applied(&group_id, ready_update.update_id)
+                .mark_replication_update_applied(&group_id, scheduled_update.update_id)
                 .await
                 .context(inbound::StoreAccessSnafu)?;
         }
         for blocked_update in &apply_plan.blocked_updates {
             let blocked_ranges = Self::missing_ranges_for_update_frontier(
                 &local_group.version_vector,
-                blocked_update.group_id,
+                group_id,
                 blocked_update.update_id,
                 &blocked_update.read_versions,
             )?;
@@ -3455,13 +3463,22 @@ impl ReplicationRuntimeComponent {
         else {
             return Ok(None);
         };
-        let pending_update_ids = transaction
-            .load_replication_update_ids(
-                &summary.group_id,
-                ReplicationUpdateFilter::PendingApply,
-                None,
-            )
+        let mut pending_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+            summary.group_id,
+            ReplicationUpdateFilter::PendingApply,
+        ));
+        let mut pending_batch = VecPageBatch::<
+            UpdateRangeMessage,
+            (),
+            OwnedPageBatchInput<UpdateId>,
+            _,
+        >::unlimited_with(|update_id| {
+            Ok::<_, BoxError>(UpdateRangeMessage::from(update_id))
+        });
+        transaction
+            .load_replication_update_ids_into(&mut pending_cursor, &mut pending_batch)
             .await
+            .map_err(StoreError::from)
             .context(inbound::StoreAccessSnafu)?;
         let lifecycle = persisted_group.lifecycle.clone();
         let bounded_summary_versions = lifecycle.bound_versions(&summary.has_versions);
@@ -3476,11 +3493,7 @@ impl ReplicationRuntimeComponent {
             .into_iter()
             .map(UpdateRangeMessage::from)
             .collect_vec();
-        let observed_available = pending_update_ids
-            .into_iter()
-            .map(UpdateRangeMessage::from)
-            .collect_vec();
-        let observed_available = Self::bound_update_ranges(&lifecycle, observed_available);
+        let observed_available = Self::bound_update_ranges(&lifecycle, pending_batch.into_values());
         let needed_ranges = subtract_available_ranges(&summary_needed_ranges, &observed_available);
         Ok(Some(SummaryCatchUpObservation {
             group_id: summary.group_id,

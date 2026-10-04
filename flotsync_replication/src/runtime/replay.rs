@@ -1,12 +1,14 @@
 use super::{
-    errors::{PublishChangesError, ReplayError, publish, replay},
+    errors::{ExactUpdateMismatch, PublishChangesError, ReplayError, publish, replay},
     in_memory::{
         AppliedLocalOperation,
         LocalDataset,
+        UpdateDependency,
         apply_local_delete,
         apply_local_upsert,
         apply_rebased_local_delete,
         apply_rebased_local_upsert,
+        load_update_dependencies,
     },
 };
 use crate::api::{
@@ -158,19 +160,15 @@ pub(super) async fn load_publish_dataset_state(
     let latest_datasets = materialise_dataset_slices(group_schema, latest_slices);
     let mut replayed_read_base_datasets = HashMap::new();
     if !dataset_ids_that_require_replay.is_empty() {
-        let applied_updates = transaction
-            .load_replication_updates(&group_id, ReplicationUpdateFilter::Applied, None)
-            .await
-            .context(publish::StoreAccessSnafu)?;
         let replayed_datasets = replay_datasets_at_versions(
+            transaction,
             group_id,
             member_count,
             group_schema,
-            applied_updates,
             read_versions,
             &dataset_rows,
         )
-        .context(publish::ReplaySnafu)?;
+        .await?;
 
         for dataset_id in dataset_ids_that_require_replay {
             let schema = group_schema
@@ -191,33 +189,54 @@ pub(super) async fn load_publish_dataset_state(
 
 /// Reconstruct selected dataset rows at one historical read token.
 ///
-/// The first implementation replays applied updates from the zero vector up to
-/// `target_versions`. It is intentionally simple; future slices can add durable
-/// checkpoints without changing the publish path.
-pub(super) fn replay_datasets_at_versions(
+/// Read compact causal positions, then load and apply one selected payload at a time.
+async fn replay_datasets_at_versions(
+    transaction: &mut dyn ReplicationStoreTransaction,
     group_id: GroupId,
     member_count: NonZeroUsize,
     group_schema: &GroupSchema,
-    updates: Vec<ReplicationUpdateRecord>,
     target_versions: &VersionVector,
     row_scope: &HashMap<DatasetId, HashSet<RowKey>>,
-) -> Result<HashMap<DatasetId, LocalDataset>, ReplayError> {
+) -> Result<HashMap<DatasetId, LocalDataset>, PublishChangesError> {
+    let dependencies =
+        load_update_dependencies(transaction, group_id, ReplicationUpdateFilter::Applied)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+    let ordered_updates = plan_replay_order(group_id, member_count, dependencies, target_versions)
+        .context(publish::ReplaySnafu)?;
     let mut datasets = HashMap::new();
-    let mut simulated_versions = VersionVector::initial(member_count);
-    let mut pending_updates = included_updates(updates, target_versions);
-
-    // Repeatedly select the next causally ready update because the store does
-    // not guarantee topological ordering for applied-update replay.
-    while let Some(update_index) = find_ready_update_index(&pending_updates, &simulated_versions) {
-        let update = pending_updates.remove(update_index);
-        replay_one_update(group_id, group_schema, row_scope, &mut datasets, &update)?;
-        simulated_versions.increment_at(update.update_id.node_index as usize);
+    for scheduled in ordered_updates {
+        let update_id = scheduled.update_id;
+        let update = transaction
+            .load_replication_update(&group_id, update_id)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        let update = update
+            .context(replay::MissingUpdateSnafu {
+                group_id,
+                update_id,
+            })
+            .context(publish::ReplaySnafu)?;
+        if update.group_id != group_id
+            || update.update_id != update_id
+            || update.read_versions != scheduled.read_versions
+            || !update.applied_locally
+        {
+            replay::MismatchedUpdateSnafu {
+                mismatch: Box::new(ExactUpdateMismatch::new(
+                    group_id,
+                    update_id,
+                    &scheduled.read_versions,
+                    true,
+                    &update,
+                )),
+            }
+            .fail::<()>()
+            .context(publish::ReplaySnafu)?;
+        }
+        replay_one_update(group_id, group_schema, row_scope, &mut datasets, &update)
+            .context(publish::ReplaySnafu)?;
     }
-
-    ensure!(
-        pending_updates.is_empty(),
-        replay::IncompleteSnafu { group_id }
-    );
     Ok(datasets)
 }
 
@@ -232,10 +251,31 @@ fn row_slice_needs_replay(slice: &DatasetRowStateSlice, read_versions: &VersionV
     })
 }
 
-fn included_updates(
-    updates: Vec<ReplicationUpdateRecord>,
+/// Select a deterministic causal order using only identities and read frontiers.
+fn plan_replay_order(
+    group_id: GroupId,
+    member_count: NonZeroUsize,
+    updates: Vec<UpdateDependency>,
     target_versions: &VersionVector,
-) -> Vec<ReplicationUpdateRecord> {
+) -> Result<Vec<UpdateDependency>, ReplayError> {
+    ensure!(
+        target_versions.num_members() == member_count,
+        replay::InvalidTargetVersionsSnafu {
+            group_id,
+            expected: member_count.get(),
+            actual: target_versions.num_members().get(),
+        }
+    );
+    for update in &updates {
+        ensure!(
+            (update.update_id.node_index as usize) < member_count.get()
+                && update.read_versions.num_members() == member_count,
+            replay::InvalidUpdateDependenciesSnafu {
+                group_id,
+                update_id: update.update_id,
+            }
+        );
+    }
     let mut updates = updates
         .into_iter()
         .filter(|update| {
@@ -243,40 +283,25 @@ fn included_updates(
             target_versions.version_at(producer_index) >= update.update_id.version
         })
         .collect::<Vec<_>>();
-    updates.sort_by(compare_replay_candidates);
-    updates
-}
-
-fn compare_replay_candidates(
-    left: &ReplicationUpdateRecord,
-    right: &ReplicationUpdateRecord,
-) -> cmp::Ordering {
-    left.read_versions
-        .partial_cmp(&right.read_versions)
-        .unwrap_or(cmp::Ordering::Equal)
-        .then_with(|| left.update_id.cmp(&right.update_id))
+    updates.sort_by(UpdateDependency::compare_for_replay);
+    let mut simulated_versions = VersionVector::initial(member_count);
+    let mut ordered_updates = Vec::with_capacity(updates.len());
+    while let Some(update_index) = find_ready_update_index(&updates, &simulated_versions) {
+        let update = updates.remove(update_index);
+        simulated_versions.increment_at(update.update_id.node_index as usize);
+        ordered_updates.push(update);
+    }
+    ensure!(updates.is_empty(), replay::IncompleteSnafu { group_id });
+    Ok(ordered_updates)
 }
 
 fn find_ready_update_index(
-    pending_updates: &[ReplicationUpdateRecord],
+    pending_updates: &[UpdateDependency],
     simulated_versions: &VersionVector,
 ) -> Option<usize> {
     pending_updates
         .iter()
-        .position(|update| replay_ready(simulated_versions, update))
-}
-
-fn replay_ready(simulated_versions: &VersionVector, update: &ReplicationUpdateRecord) -> bool {
-    if update.read_versions <= *simulated_versions {
-        let producer_position = update.update_id.node_index as usize;
-        let expected_next_version = simulated_versions
-            .version_at(producer_position)
-            .checked_add(1)
-            .expect("member version counter must not overflow");
-        expected_next_version == update.update_id.version
-    } else {
-        false
-    }
+        .position(|update| update.is_ready_at(simulated_versions))
 }
 
 fn replay_one_update(
@@ -493,15 +518,9 @@ mod tests {
         );
         let row_scope = HashMap::from([(dataset_id.clone(), HashSet::from([scoped_row_key]))]);
 
-        let replayed = replay_datasets_at_versions(
-            group_id,
-            member_count,
-            &schemas,
-            vec![update],
-            &read_versions.with_update_applied(update_id),
-            &row_scope,
-        )
-        .expect("scoped replay should succeed");
+        let mut replayed = HashMap::new();
+        replay_one_update(group_id, &schemas, &row_scope, &mut replayed, &update)
+            .expect("scoped replay should succeed");
 
         let dataset = replayed
             .get(&dataset_id)
@@ -552,20 +571,94 @@ mod tests {
         );
         let row_scope = HashMap::from([(dataset_id.clone(), HashSet::from([replayed_row_key]))]);
 
-        let replayed = replay_datasets_at_versions(
+        let target = after_first.with_update_applied(second_update_id);
+        let ordered_updates = plan_replay_order(
             group_id,
             member_count,
-            &schemas,
-            vec![second_update, first_update],
-            &after_first.with_update_applied(second_update_id),
-            &row_scope,
+            vec![
+                UpdateDependency {
+                    update_id: second_update.update_id,
+                    read_versions: second_update.read_versions.clone(),
+                },
+                UpdateDependency {
+                    update_id: first_update.update_id,
+                    read_versions: first_update.read_versions.clone(),
+                },
+            ],
+            &target,
         )
-        .expect("out-of-order replay should succeed");
+        .expect("out-of-order updates should have a causal order");
+        let ready_ids = ordered_updates
+            .into_iter()
+            .map(|update| update.update_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ready_ids, [first_update_id, second_update_id]);
+        let historical_ids = plan_replay_order(
+            group_id,
+            member_count,
+            vec![
+                UpdateDependency {
+                    update_id: second_update.update_id,
+                    read_versions: second_update.read_versions.clone(),
+                },
+                UpdateDependency {
+                    update_id: first_update.update_id,
+                    read_versions: first_update.read_versions.clone(),
+                },
+            ],
+            &after_first,
+        )
+        .expect("historical target should select only its included update");
+        assert_eq!(historical_ids.len(), 1);
+        assert_eq!(historical_ids[0].update_id, first_update_id);
+        let mut replayed = HashMap::new();
+        for update_id in ready_ids {
+            let update = if update_id == first_update_id {
+                &first_update
+            } else {
+                &second_update
+            };
+            replay_one_update(group_id, &schemas, &row_scope, &mut replayed, update)
+                .expect("ordered replay should succeed");
+        }
 
         let dataset = replayed
             .get(&dataset_id)
             .expect("replayed dataset should be materialised");
         assert_eq!(row_title(dataset, replayed_row_key), "second");
+    }
+
+    #[test]
+    fn replay_reports_missing_dependencies_and_malformed_frontiers() {
+        let group_id = GroupId(Uuid::from_u128(40_004));
+        let one_member = NonZeroUsize::MIN;
+        let two_members = NonZeroUsize::new(2).expect("two members are non-zero");
+        let second_update = UpdateDependency {
+            update_id: update_id(2),
+            read_versions: VersionVector::initial(one_member).with_version_at(0, 1),
+        };
+        let target = VersionVector::initial(one_member).with_version_at(0, 2);
+        assert!(matches!(
+            plan_replay_order(group_id, one_member, vec![second_update.clone()], &target),
+            Err(ReplayError::Incomplete { .. })
+        ));
+        assert!(matches!(
+            plan_replay_order(
+                group_id,
+                one_member,
+                vec![second_update.clone()],
+                &VersionVector::initial(two_members),
+            ),
+            Err(ReplayError::InvalidTargetVersions { .. })
+        ));
+        let malformed_update = UpdateDependency {
+            read_versions: VersionVector::initial(two_members),
+            ..second_update
+        };
+        assert!(matches!(
+            plan_replay_order(group_id, one_member, vec![malformed_update], &target),
+            Err(ReplayError::InvalidUpdateDependencies { .. })
+        ));
     }
 
     #[test]

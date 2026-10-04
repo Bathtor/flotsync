@@ -1,0 +1,232 @@
+id = "01a0a36d-6908-7213-936e-f0ef7b3daa00"
+ref = "flotsync-o3o"
+title = "Make paging continuations backend-opaque"
+body = """
+# Make paging continuations backend-opaque
+
+## Status and decision
+
+Plan agreed by the user on 2026-09-17: implement O01 (typed, erased continuation) together with O04 (continuation supplied at page completion) and H02 (no public ordering-hint type parameter).
+
+This issue is the authoritative implementation handover. The current request only authorises recording the agreed plan; do not start implementation in the task-update turn. On a subsequent implementation request, follow this plan and re-read the current code and applicable AGENTS.md instructions first.
+
+Parent: flotsync-h3l. Discovered during flotsync-h3l.2, now completed. The earlier research comment preserves the alternatives and sources; its standalone O01 per-record continuation description is superseded by the combined design below.
+
+## Problem and outcome
+
+PageCursor<Params, Key> currently requires a Rust Key: Clone + Ord whose comparison reproduces the database order. Collations, composite index semantics and engine-native continuation tokens invalidate that assumption. The public MemberKeyPageKey is a concrete example of SQLite representation leaking into the API.
+
+After this change, callers construct PageCursor<Params> and pass it to the existing load_*_into methods. Only the backend knows its continuation representation and ordering. Shared machinery manages transaction association, source-record limits, lifecycle, batch clearing and cancellation; it does not compare continuations.
+
+## Required contracts
+
+C01. Bounded traversal uses a deterministic total order supplied by the backend within the bound transaction. The backend applies its own comparisons, collation and tie-breakers consistently when selecting and resuming records.
+
+C02. A successful continuation resumes after the final successfully accepted source record in backend order. Source acceptance is a successful PageBatch::push, not an increase in output length: custom batches may retain a different number of values.
+
+C03. Continuation state is opaque to ordinary callers, owned and Send + 'static. It must not borrow the transaction between calls. Query parameters may still borrow caller-owned data and must not acquire a 'static requirement.
+
+C04. Preserve object-safe store traits, interchangeable batches, page-limit changes between calls, borrowed predicates, complete-result conveniences and wrapper forwarding. Preserve the existing separate call and predicate lifetimes; mutable cursor invariance was already investigated and accepted.
+
+C05. Preserve transaction mismatch recovery, failed-cursor rejection and exhausted-cursor rejection. Re-submitting an exhausted cursor remains an error, not a successful empty page. Starting a call clears prior batch values and metadata, including when validation rejects it.
+
+C06. Errors after an active attempt begins, including batch failure and dropped/cancelled futures, clear partial output and metadata and invalidate the cursor. No pending continuation is committed on an unsuccessful fill.
+
+C07. A continuation format/type mismatch is a contextual contract error, not a panic or a silent restart. Reject it before consuming valid cursor state so the cursor remains usable with its original format and transaction. This check identifies representation compatibility, not query identity.
+
+C08. Do not reintroduce PageOperationId, public per-query cursor aliases/newtypes, or type-level enforcement that a cursor belongs to a specific operation. Reusing the same private continuation type does not prove operation identity; do not document it as doing so.
+
+C09. Unlimited fills consume the entire remaining selection and finish Exhausted. They still apply any existing continuation predicate, but require no ORDER BY unless the operation independently promises ordered results. A bounded-to-unlimited transition must not repeat previously accepted records.
+
+C10. Page completion keeps cancellation cleanup active until metadata installation and cursor-state commit both succeed. If a custom metadata setter panics, unwinding clears the batch and invalidates the cursor. Once an attempt has failed, every finish form reports CursorFailed before validating its completion value.
+
+C11. A full bounded SQLite page must produce its backend continuation. Missing continuation state is an internal contract error which invalidates the cursor; it must not silently truncate the result by reporting exhaustion.
+
+C12. PageAttempt::finish consumes the attempt. Completed is therefore observable only by Drop while suppressing cleanup; every other PageAttempt method treats Completed as unreachable rather than returning an ordinary failed-state value.
+
+## Agreed API shape
+
+The following sketches describe API roles, not complete compilable declarations:
+
+    pub struct PageCursor<Params> { /* parameters, binding, erased continuation, lifecycle */ }
+
+    pub enum PageEnd<C> {
+        MayHaveMore(C),
+        Exhausted,
+    }
+
+    cursor.begin_page::<SqliteContinuation, _>(transaction_id, batch)?
+        -> PageAttempt<'call, Params, SqliteContinuation, Batch>
+
+    page.after() -> Option<&SqliteContinuation>
+    page.push(input) -> Result<(), PageError>
+    page.finish(metadata, PageEnd::MayHaveMore(next)) -> Result<(), PageError>
+
+A backend selects C: Send + 'static at begin_page. Do not require Clone, Ord, Eq or serialisation. Publicly expose the generic support needed by downstream backend implementations, while actual SQLite continuation types stay private to SQLite.
+
+PageEnd::MayHaveMore(C) means another call may be needed and commits C for that call. It does not promise that another record actually exists. PageEnd::Exhausted means the backend established that no selected records remain; it installs successful metadata and discards continuation storage.
+
+PageAttempt::push receives only the input record. It checks the sampled source limit, calls the batch and counts successful source acceptance. The backend supplies one next continuation when finishing the whole page, after all accepted records succeeded. Shared code must not reconstruct traversal state from projected output.
+
+Store only the erased continuation value in the cursor; its Any runtime identity is the continuation-format identity. Do not store a parallel TypeId. A fresh cursor has no continuation, while begin_page validates the concrete type of any stored continuation before constructing an attempt. Distinguish absence from a wrong type and preserve mismatch recovery. Keep lifecycle named and explicit.
+
+Avoid per-record boxing, downcasting or cloning. Keep candidate continuation typed in backend/attempt-local state and erase only at successful page completion. The previous continuation may be owned by the active attempt or accessed through its borrowed cursor; either implementation must require no Clone and must preserve rejection recovery and cancellation cleanup.
+
+Keep the attempt guard active until successful completion has installed metadata and committed state. Invalid completion, such as MayHaveMore for an Unlimited attempt, must follow the normal contract-error cleanup path. Shared code cannot establish semantic advancement by inspecting opaque C; backend selection and tests carry that responsibility.
+
+## Concrete implementation sequence
+
+I01. Inspect api/paging/mod.rs, error.rs and tests.rs. Replace PageCursor<Params, Key> with PageCursor<Params>; introduce PageEnd<C> and typed begin/resume over erased storage. Remove PageKeyProgress and NonIncreasingKey plus their obsolete shared validation. Retain source-limit, binding and lifecycle checks, using Snafu errors consistent with existing classification.
+
+I02. Update the paging module documentation and examples to show caller construction, backend typed begin, record-only push and explicit finish outcome. Document all fresh/resumed/exhausted/failed outcomes, continuation-format mismatch recovery and MayHaveMore semantics. Explain that opaque tokens may use database order without any Rust comparison equivalent, and qualify deterministic backend traversal as a bounded-page requirement.
+
+I03. Update all seven metadata methods in api/store.rs and their implementations/forwarders:
+- replication groups;
+- writable replication-group versions;
+- member public-key ids;
+- member public keys;
+- member-key trust evidence;
+- pending group decisions;
+- pending group activations.
+
+Remove only the public continuation type arguments. Preserve predicate borrowing, method names ending in _into, inferred batch constructors, object safety, and adjacency of complete-result conveniences to their corresponding methods. Search all call sites rather than assuming this list is exhaustive.
+
+I04. Keep begin_page at the SQLite transaction API boundary in store/sqlite/mod.rs. Query implementations in groups.rs, security.rs and pending_groups.rs continue accepting prepared attempts. Retain the narrow SQLite-owned no-metadata batch alias.
+
+I05. Introduce private SQLite continuation representations for group ids, composite member identity/fingerprint positions and trust-evidence positions as appropriate. Move the necessary canonical textual member identity representation out of api/security_material.rs; delete public MemberKeyPageKey and its reexports after adapting references. A private representation may use ordinary Rust values; its SQL comparison semantics must not become a shared Ord contract.
+
+I06. Adapt store/sqlite/paging.rs helpers to typed opaque continuations without Ord/Clone bounds. Preserve shared conditional lower-bound binding and conditional ordering/limit construction. Describe scalar SQLite continuation values using their SQL type, such as TEXT, and reserve expression terminology for SQL fragments. Bind borrowed continuation text directly where SQLx immediately encodes it into the owned SQLite argument buffer; do not add a redundant caller-side clone. Composite SQL comparisons must use the same fields and collation as their ORDER BY. Do not add unnecessary ordering to unlimited queries.
+
+I07. Each SQLite query tracks enough backend-local information to finish after successful pushes. For an exactly full bounded page, return MayHaveMore(last accepted position); for a shorter page or an unlimited fill, return Exhausted. Treat a full bounded page without a continuation as an internal paging contract error. The subsequent empty confirmation after an exact-size page remains valid. No lookahead, count query or extra ordering is required. Missing/empty filters finish Exhausted with successful metadata. Do not base completion on batch.len().
+
+I08. Where traversal naturally produces keys per row, retain only the final required candidate and construct it once from the last accepted backend record, and only when a full bounded page needs it. Do not allocate, format, box or encode continuation values for every row, for unlimited pages or for short pages. Ensure a rejected record never advances the committed cursor. Avoid borrowing a whole non-Sync PageAttempt across helper futures unnecessarily; preserve existing ownership discipline.
+
+I09. Update test_support/metadata_paging.rs and SQLite scenarios. Keep the helper decomposition from the reviewed implementation and multiplicity-sensitive unordered comparison helper. Keep the agreed fixed 64-call test-only bound on paging loops so a broken backend fails rather than hanging; revisit it only if real fixtures reach that limit. Resolve TODO(flotsync-o3o) notes only where this change actually resolves the concern; do not remove unrelated follow-ups.
+
+## Ordering hints and exclusions
+
+H02 is the selected direction: no phantom OrderHint generic parameter and no runtime ordering-preference API in this task. Document that the engine defines traversal order; logical field preferences, where useful, are method documentation rather than a promise of Rust ordering.
+
+Not selected: O02 byte codecs/transportable tokens; O03a backend-owned lifecycle facade; O03b executable backend cursors/transaction factories. Do not refactor transaction connection ownership, introduce a shared transaction executor, add serialisation, add offset pagination or introduce a pagination dependency.
+
+Custom collection batches are separate follow-up work; this task preserves existing batch projection behaviour and does not address their allocation strategy.
+
+## Validation and acceptance
+
+V01. Shared tests use continuation types with neither Ord nor Clone; verify fresh installation, exact typed resumption, successful replacement and disposal at exhaustion. Verify incompatible type rejection preserves original usable state.
+
+V02. Cover source limit violations, arbitrary output cardinality, successful metadata installation, batch failure, unfinished drop and cancellation. Cover panic unwinding from a custom metadata setter and both completion values after a prior attempt failure. A failed finish or fill must leave no committed next token and no partial output.
+
+V03. Retain exhausted-cursor errors, transaction mismatch recovery, failed-cursor errors, exact-size bounded pages followed by empty confirmation, rotated batches and changed limits. Cover bounded-to-unlimited resumption and Unlimited finishing Exhausted.
+
+V04. Preserve borrowed predicate use through public trait objects and forwarding wrappers. Ensure external backend implementations can use the generic paging support without accessing private SQLite types.
+
+V05. Backend tests assert bounded termination, completeness and absence of duplicates without deriving expected traversal order from Rust Ord. Retain composite member-key tie coverage and the existing structured-versus-text identity regression.
+
+V06. Add an actual SQLite collation-order regression whose SQL order differs from Rust lexical order. A focused test-only table/query is sufficient; do not change production schema semantics solely to manufacture the case. Exercise multiple pages and prove complete, nonduplicated traversal using backend continuation predicates.
+
+V07. Run focused paging and SQLite tests, the full replication library suite, documentation tests, rustfmt and all-target pedantic Clippy. Follow sandbox test-thread rules and never run cargo commands concurrently. Inspect touched files for newly duplicated helpers before handover.
+
+V08. Confirm no public continuation Key or Ord assumption remains in the paging contract, no operation-specific cursor restriction was introduced, and unlimited unordered queries did not gain ORDER BY. Report any remaining limitation against these criteria before requesting review.
+
+## Size and work boundaries
+
+Estimate: core contract 150-250 changed LOC; API/SQLite/forwarding 150-250; tests/docs 200-350; page-completion protocol another 80-150, partly offset by simpler push code. Overall approximately 580-1000 changed LOC. This replaces the old optimistic estimate made before metadata paging existed.
+
+Do not implement the alternative designs. If actual scope materially exceeds 1000 LOC, propose a split around the core contract/backend integration and additional backend contract coverage rather than broadening into transaction architecture.
+
+Keep this issue body as the holistic current plan; use comments for subsequent progress/review history. Set status_reason to in review only after implementation and checks. Close only after user acceptance.
+
+Do not stage, unstage, commit, create/switch branches or otherwise alter the Git index as part of implementation or task updates. The user's staging is review progress. A later explicit commit request authorises committing the worktree under the applicable instructions.
+
+## Research references
+
+SeaORM: https://docs.rs/sea-orm/latest/sea_orm/struct.Cursor.html
+Diesel: https://diesel.rs/guides/extending-diesel.html
+RBatis: https://docs.rs/rbatis/latest/rbatis/macro.pysql_select_page.html
+paginator-rs: https://github.com/maulanasdqn/paginator-rs
+page-turner: https://docs.rs/page-turner/latest/page_turner/
+
+The research and rejected alternatives remain in comment 01a0ade6-1020-7113-ad7a-d28d2ef3a53e. The agreed design above supersedes the earlier exploratory issue body.
+"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-15T04:57:31.656937Z"
+updated_at = "2026-09-19T12:10:13.039793Z"
+closed_at = "2026-09-19T12:10:13.039793Z"
+
+[[links]]
+target = "01a099f7-5ef6-7451-b756-e6f2a0fca0fb"
+label = "discovered from"
+
+[[comments]]
+id = "01a0ade6-1020-7113-ad7a-d28d2ef3a53e"
+author = "codex"
+body = """
+Planning research, 2026-09-17. Alternatives for alignment; no implementation agreed or started.
+
+Current-state constraints: seven metadata into methods, borrowed predicates with separate call/predicate lifetimes, transaction binding, exhausted-cursor errors, cancellation clearing, arbitrary batch projections, unlimited unordered reads, and complete-result wrappers must survive. Remove the public SQLite-shaped MemberKeyPageKey and shared Ord checking. Continuation format identity must not be presented as operation identity or reintroduce public query-specific cursor types.
+
+Research:
+- SeaORM Cursor uses query order columns and IntoValueTuple bounds, with before/after, first/last, ascending/descending, and ConnectionTrait execution. Comparison is expressed in SQL. https://docs.rs/sea-orm/latest/sea_orm/struct.Cursor.html
+- Diesel official pagination extension wraps a query in Paginated<T> and implements PostgreSQL QueryFragment using LIMIT/OFFSET plus a window count. It illustrates backend-specific query generation, not an opaque keyset contract. https://diesel.rs/guides/extending-diesel.html
+- RBatis pysql_select_page uses page number/size and a count switch to generate paginated SQL. https://docs.rs/rbatis/latest/rbatis/macro.pysql_select_page.html
+- paginator-rs has common parameters and separate SQLx/SeaORM/SurrealDB integrations, field/value cursor input, encoded cursor transport, and next/previous cursor response metadata. https://github.com/maulanasdqn/paginator-rs
+- page-turner (general paginated APIs, not a database abstraction) separates page items from next-request state using TurnedPage::next/last. https://docs.rs/page-turner/latest/page_turner/
+
+O01: PageCursor<Params> keeps lifecycle/transaction binding and an erased Box<dyn Any + Send>. Backend begin selects C: Send + static and checks format type before resuming; PageAttempt exposes Option<&C>. Use private SQLite continuation types without Clone/Ord; move state into attempt and commit only on success. Hold candidate C unboxed within attempt and erase only at page boundary to avoid per-record box allocations. Retain borrowed Params outside erased state. Existing per-record push records C after successful batch acceptance. Estimated 500-850 changed LOC including all call sites/tests/docs.
+
+O02: Same public PageCursor<Params>, owned opaque bytes internally. Define explicit backend format discriminator plus checked private codec; encode pending continuation at page boundary, decode once at begin. No public import/export or serialisation guarantee merely because representation is bytes. Preserve all lifecycle semantics. Estimated 600-950 changed LOC; extra codecs/errors provide little benefit for transaction-local cursors.
+
+O03a: Lazy public cursor facade retains borrowed Params, but boxed backend state owns continuation and lifecycle via a small object-safe internal/backend interface. Shared guard enforces limit/clearing/cancellation. This hides more state but needs virtual lifecycle access; erasing borrowed Params themselves with Any is not possible. Keeping Params outside static erased state is the practical variant and converges on O01 with richer state. Estimated 700-1100 changed LOC.
+
+O03b: Transaction factory returns Box<dyn GroupPages + predicate> whose load_into method accepts rotating batches and owns a shared transaction executor handle, not a transaction borrow. Backend object holds predicate and state; shared guard still handles cancellation. Requires serialised shared connection ownership and explicit transaction close/commit/release behaviour so an outstanding cursor cannot prolong transaction validity. Wrappers decorate/forward factory objects. Strongest backend ownership, but changes transaction architecture and adds result-specific cursor interfaces. Estimated 1400-2200 changed LOC; split executor lifecycle work from paging conversion if chosen.
+
+O04 (additional, orthogonal): Separate record acceptance from page continuation. PageAttempt::push(input); finish(metadata, PageEnd<C>) where PageEnd is MayHaveMore(C) or Exhausted. Backend builds one next token after successful records, or uses its native page token. It can conservatively return MayHaveMore for exact-size pages, preserving existing empty confirmation, without forcing lookahead. This combines with O01 or O02; does not require new dependencies. Unlimited fills must finish Exhausted and retain existing lower-bound filtering without forced ORDER BY. Estimated +80-150 LOC beyond O01, potentially offset by simpler per-record code.
+
+H01: Phantom logical field hint is possible without Ord but provides no runtime choice and adds type distinctions. H02 (preferred): omit hint parameter, document engine-defined stable order and method-level preferred fields. H03: if caller-selected preference is actually needed, immutable value-level order hint in Params; backend owns collation/tie-breakers. Optional advisory preferences must be distinguished from guaranteed result sorting. No new ordering overhead for unordered unlimited calls.
+
+Validation: preserve exact-size/empty confirmation, exhausted reuse error, mismatch recovery, batch failure, cancellation, rotated batches/limits, borrowed parameters and trait-object forwarding. Add a non-Ord/non-Clone continuation and type mismatch tests, bounded termination checks and duplicate-sensitive completeness assertions. Add actual SQLite collation-order regression deliberately disagreeing with Rust lexical order. Run paging/SQLite and complete replication tests, docs, formatting and pedantic Clippy after implementation.
+
+Proposed direction: O01 plus O04, H02. Retain all existing contracts unless explicitly changed during alignment. Estimates replace the optimistic earlier 180-300 LOC figure now that metadata call sites and tests exist. No Git index changes."""
+created_at = "2026-09-17T05:45:30.912108Z"
+
+[[comments]]
+id = "01a0afab-8c68-7b51-ae59-4d1bf4524ee7"
+author = "codex"
+body = "Implemented the agreed O01 + O04 + H02 design: PageCursor<Params> now erases a Send + static backend continuation; PageEnd commits continuation or exhaustion once per page; paging no longer requires Clone, Ord, or caller-visible continuation keys; source-record accounting is independent of batch output cardinality; SQLite owns private text and composite continuation types; the public MemberKeyPageKey was removed; unlimited SQLite reads remain unordered; contract loops are bounded; and a NOCASE regression covers backend-defined collation. Validation completed: cargo check for all flotsync_replication targets, rustfmt check, all-target Clippy with pedantic warnings, cargo doc, stale-assumption search, and diff whitespace check. Unit and paging doctest execution is blocked on this machine because the Xcode licence is not accepted; linking exits with status 69 before test execution. The compile-fail doctest passed."
+created_at = "2026-09-17T14:00:50.536309Z"
+
+[[comments]]
+id = "01a0afd0-810c-7d81-8cab-74923b0b26d7"
+author = "codex"
+body = "Review delta agreed on 2026-09-17: keep the completion guard active through metadata installation and cursor commit; construct SQLite continuations only once for the final row of a full bounded page; preserve CursorFailed precedence for failed attempts; reject a full bounded SQLite page that lacks a continuation; and clarify public continuation-format and bounded-order documentation. The fixed 64-call test-only termination ceiling is intentionally retained per user direction."
+created_at = "2026-09-17T14:41:12.460723Z"
+
+[[comments]]
+id = "01a0afd8-7ab9-7922-9502-c7490efeb4cd"
+author = "codex"
+body = "Addressed the agreed review findings. Page completion now keeps cleanup active through metadata installation and gives CursorFailed precedence after failure. SQLite continuation values are created only for the final accepted row of a full bounded page, and a missing required continuation now returns PageError::MissingContinuation and invalidates the attempt. Public docs distinguish bounded deterministic traversal and document continuation-format mismatch recovery. Added panic-cleanup, failed-completion, and missing-continuation regressions. The fixed 64-call test ceiling remains unchanged by agreement. Validation passes: 17 paging tests, 50 SQLite tests, all 415 replication library tests, both doctests, rustfmt, all-target pedantic Clippy, and diff whitespace checks."
+created_at = "2026-09-17T14:49:55.12999Z"
+
+[[comments]]
+id = "01a0b982-2ba6-7083-b56c-23533a84e466"
+author = "codex"
+body = "Review delta agreed on 2026-09-19: make Completed unreachable outside Drop; remove the parallel TypeId and validate the erased Any value directly; describe SQLite continuation values as SQL TEXT; and borrow pending-group continuation text into SQLx query construction without an explicit pre-query clone."
+created_at = "2026-09-19T11:51:50.950431Z"
+
+[[comments]]
+id = "01a0b98c-c43a-7ed2-8914-ad820df577df"
+author = "codex"
+body = "Addressed R05-R10. Completed is unreachable outside Drop, erased continuation storage now relies on Any without a parallel TypeId, SQLite docs use SQL TEXT terminology, and pending-group queries borrow continuation text directly into SQLx binding. Validation passes: 20 paging tests, 50 SQLite tests, all 415 replication library tests, both doctests, rustfmt, all-target pedantic Clippy, and diff whitespace checks. The complete suite ran outside the sandbox because socket-reserving tests require localhost UDP binding."
+created_at = "2026-09-19T12:03:25.370125Z"
+
+[[comments]]
+id = "01a0b992-fcaf-7ed0-bbf5-f104f99615f8"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-19T12:10:13.039793Z"

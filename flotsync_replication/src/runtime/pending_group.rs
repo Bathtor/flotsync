@@ -6,21 +6,24 @@ use super::{
 };
 use crate::api::{
     DatasetId,
+    DatasetRowPageBatch,
     DatasetRowStatePatch,
     DatasetRowStateWrite,
+    DatasetRowsQuery,
     GroupDatasetSchemaRef,
     GroupSchema,
     InitialDatasetValueRows,
     InitialGroupValueRows,
     InitialSnapshot,
     InitialValueRow,
-    ReplicationStateRowBatch,
+    PageCursor,
     ReplicationStoreReadTransaction,
     ReplicationStoreTransaction,
     RowId,
     RowKey,
     RowValueRead,
     RowValues,
+    StoreError,
 };
 use flotsync_core::{
     GroupId,
@@ -55,31 +58,32 @@ pub(super) async fn build_inline_initial_snapshot(
 ) -> Result<InitialSnapshot, ChangeGroupMembershipError> {
     let mut datasets = Vec::new();
     let mut total_rows = 0usize;
-    // TODO(flotsync-git-qsg): once the Metadata path is supported, use the
-    // inline threshold as this scan limit so snapshot preparation still needs a
-    // single storage roundtrip when it decides to embed inline state.
-    let row_limit = NonZeroUsize::new(usize::MAX).expect("row scan limit must be non-zero");
-
     for dataset_schema in group_schema.datasets() {
         let dataset = GroupDatasetSchemaRef {
             group_id: &group_id,
             dataset_id: &dataset_schema.dataset_id,
             schema: dataset_schema.schema.as_schema(),
         };
-        let mut state_rows = ReplicationStateRowBatch::new(dataset.schema);
-        let page = transaction
-            .scan_dataset_row_batch(dataset, None, row_limit, &mut state_rows)
+        let mut cursor = PageCursor::new(DatasetRowsQuery::borrowed(dataset));
+        // TODO(flotsync-git-qsg): once the Metadata path is supported, use the
+        // inline threshold as this batch limit so snapshot preparation still
+        // needs a single storage roundtrip when it decides to embed inline state.
+        let mut batch = DatasetRowPageBatch::unlimited(dataset.schema);
+        transaction
+            .scan_dataset_rows_into(&mut cursor, &mut batch)
             .await
+            .map_err(StoreError::from)
             .context(change_membership::StoreAccessSnafu)?;
         ensure!(
-            page.next_after.is_none(),
+            cursor.is_exhausted(),
             change_membership::IncompleteInitialSnapshotScanSnafu {
                 group_id,
                 dataset_id: dataset_schema.dataset_id.clone(),
             }
         );
 
-        let rows = state_rows
+        let rows = batch
+            .rows()
             .rows()
             .filter(|row| !row.metadata().tombstoned)
             .map(|row| {

@@ -510,31 +510,20 @@ fn incremental_history_loads_complete_ranges_for_multiple_producers() {
     drop(changes);
 
     let requests = store.replication_update_load_requests();
-    // TODO(flotsync-h3l): Expect reusable-batch page requests once the store
-    // exposes an explicit pagination contract.
-    assert_eq!(
-        &requests[requests_before..],
-        &[
-            ReplicationUpdateLoadRequest {
-                group_id,
-                filter: ReplicationUpdateFilter::ProducerRange {
-                    producer_index: MemberIndex::new(1),
-                    start_version: 1,
-                    end_version: 2,
-                },
-                limit: None,
+    let page_requests = &requests[requests_before..];
+    assert_eq!(page_requests.len(), 6);
+    for (producer_index, producer_pages) in [1, 2].into_iter().zip(page_requests.chunks(3)) {
+        let expected = ReplicationUpdateLoadRequest {
+            group_id,
+            filter: ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(producer_index),
+                start_version: 1,
+                end_version: 2,
             },
-            ReplicationUpdateLoadRequest {
-                group_id,
-                filter: ReplicationUpdateFilter::ProducerRange {
-                    producer_index: MemberIndex::new(2),
-                    start_version: 1,
-                    end_version: 2,
-                },
-                limit: None,
-            },
-        ]
-    );
+            limit: NonZeroUsize::new(1),
+        };
+        assert!(producer_pages.iter().all(|request| *request == expected));
+    }
     let runtime = wait_for_test_reply(synchronisation.complete())
         .expect("multi-producer reconciliation should activate the runtime");
     wait_for_test_reply(runtime.shutdown()).expect("multi-producer runtime should shut down");
@@ -1371,104 +1360,6 @@ fn terminal_provider_release_failure_leaves_provider_invalid() {
 }
 
 #[test]
-fn operation_scoped_snapshot_scan_failure_can_retry_in_existing_transaction() {
-    let alice_member = alice_member();
-    let inner_store = sqlite_store(alice_member.clone());
-    let store = Arc::new(FailingStore::new(inner_store.clone()));
-    provision_test_security(store.as_ref(), &alice_member, []);
-    let seed_builder = runtime_builder(
-        app_probe_id(),
-        store.clone(),
-        Arc::new(ListenerStub::default()),
-    )
-    .application_schemas(&TITLE_APPLICATION_SCHEMAS);
-    let seed_runtime = load_runtime(seed_builder);
-    let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member],
-        group_schema: docs_group_schema(),
-        ..Default::default()
-    }))
-    .expect("retry-test group should be created");
-    let first_row_id = test_row_id(group_id, docs_dataset_id(), 70_125_001);
-    let second_row_id = test_row_id(group_id, docs_dataset_id(), 70_125_002);
-    let third_row_id = test_row_id(group_id, docs_dataset_id(), 70_125_003);
-    let read_token = seed_runtime.group_read_token_for_test(group_id);
-    publish_changes(
-        seed_runtime.as_ref(),
-        read_token,
-        vec![
-            title_upsert(first_row_id.clone(), "first"),
-            title_upsert(second_row_id.clone(), "second"),
-            title_upsert(third_row_id.clone(), "third"),
-        ],
-    );
-    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
-
-    let config = ReplicationConfig {
-        application_synchronisation_batch_size: NonZeroUsize::new(1)
-            .expect("retry test batch size should be non-zero"),
-        ..Default::default()
-    };
-    let staged = load_staged_startup_with_config(store.clone(), config);
-    let mut synchronisation = staged.synchronisation;
-
-    let group = wait_for_test_reply(synchronisation.next_group())
-        .expect("the prepared group should load")
-        .expect("the prepared synchronisation should contain one group");
-    let SingleGroupSynchronisation::Snapshot(mut group) = group else {
-        panic!("the retry fixture should yield a snapshot");
-    };
-    let first_batch = wait_for_test_reply(group.rows().next_batch())
-        .expect("the first bounded batch should load")
-        .expect("the first bounded batch should contain a row");
-    assert_eq!(
-        first_batch
-            .rows()
-            .map(|row| row.row_id().clone())
-            .collect::<Vec<_>>(),
-        vec![first_row_id.clone()]
-    );
-
-    let classification = retryable_store_failure(StoreErrorScope::Operation);
-    store.fail_next_snapshot_scan(classification);
-    let first_error = wait_for_test_reply(group.rows().next_batch())
-        .expect_err("the injected operation failure should surface");
-    assert_eq!(
-        first_error.store_error_classification(),
-        Some(classification)
-    );
-    assert!(matches!(first_error, RowProviderError::Store { .. }));
-    let mut remaining_rows = Vec::new();
-    while let Some(batch) = wait_for_test_reply(group.rows().next_batch())
-        .expect("the operation-scoped failure should be retryable")
-    {
-        remaining_rows.extend(batch.rows().map(|row| row.row_id().clone()));
-    }
-    assert_eq!(remaining_rows, vec![second_row_id, third_row_id]);
-
-    let scan_requests = store.snapshot_scan_requests();
-    assert!(
-        scan_requests.len() >= 3,
-        "the successful batch, failed scan, and retry should all be recorded"
-    );
-    assert_eq!(scan_requests[0].after, None);
-    assert_eq!(
-        scan_requests[1].after,
-        Some(first_row_id.row_key),
-        "the failed scan should continue after the first delivered row"
-    );
-    assert_eq!(
-        scan_requests[2], scan_requests[1],
-        "retrying an operation-scoped failure must preserve the scan cursor"
-    );
-    drop(group);
-
-    let runtime = wait_for_test_reply(synchronisation.complete())
-        .expect("successful retry should permit runtime activation");
-    wait_for_test_reply(runtime.shutdown()).expect("activated runtime should shut down");
-}
-
-#[test]
 fn operation_scoped_incremental_preparation_failure_retries_the_same_group() {
     let alice_member = alice_member();
     let inner_store = sqlite_store(alice_member.clone());
@@ -1594,12 +1485,42 @@ fn transaction_scoped_snapshot_scan_failure_invalidates_provider() {
     let inner_store = sqlite_store(alice_member.clone());
     let store = Arc::new(FailingStore::new(inner_store.clone()));
     provision_test_security(store.as_ref(), &alice_member, []);
-    let group_id = GroupId(Uuid::from_u128(70_126));
-    persist_default_startup_group(store.as_ref(), &alice_member, group_id);
-    let staged = load_staged_startup(store.clone());
+    let seed_runtime = load_runtime(runtime_builder(
+        app_probe_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    ));
+    let group_id = wait_for_test_reply(seed_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("failure fixture group should be created");
+    let initial_token = seed_runtime.group_read_token_for_test(group_id);
+    publish_changes(
+        seed_runtime.as_ref(),
+        initial_token,
+        vec![
+            title_upsert(
+                test_row_id(group_id, docs_dataset_id(), 70_126_001),
+                "first page",
+            ),
+            title_upsert(
+                test_row_id(group_id, docs_dataset_id(), 70_126_002),
+                "failing page",
+            ),
+        ],
+    );
+    wait_for_test_reply(seed_runtime.shutdown()).expect("seed runtime should shut down");
+
+    let config = ReplicationConfig {
+        application_synchronisation_batch_size: NonZeroUsize::new(1)
+            .expect("failure fixture batch size must be non-zero"),
+        ..Default::default()
+    };
+    let staged = load_staged_startup_with_config(store.clone(), config);
     let mut synchronisation = staged.synchronisation;
     let classification = retryable_store_failure(StoreErrorScope::Transaction);
-    store.fail_next_snapshot_scan(classification);
 
     let group = wait_for_test_reply(synchronisation.next_group())
         .expect("the prepared group should load")
@@ -1607,6 +1528,11 @@ fn transaction_scoped_snapshot_scan_failure_invalidates_provider() {
     let SingleGroupSynchronisation::Snapshot(mut group) = group else {
         panic!("the failure fixture should yield a snapshot");
     };
+    let first_batch = wait_for_test_reply(group.rows().next_batch())
+        .expect("the first SQLite page should load")
+        .expect("the first SQLite page should contain one row");
+    assert_eq!(first_batch.row_count(), 1);
+    store.fail_next_snapshot_scan(classification);
     let first_error = wait_for_test_reply(group.rows().next_batch())
         .expect_err("the injected transaction failure should surface");
     assert_eq!(

@@ -1,0 +1,21 @@
+id = "01a0b9a1-b6e6-7a93-b1b4-924c2d152888"
+ref = "flotsync-mzc"
+title = "Support composable backend cursor continuations"
+body = """
+Problem
+The current opaque backend continuation design lets one store operation choose one private continuation type, but a generic default implementation cannot compose two independently pageable operations and retain both child cursor states inside one outer cursor. flotsync-h3l.3 exposes this when considering a generic row-transition fallback over two ordinary row scans.
+
+Explore
+Investigate whether the paging contract can safely support backend-independent cursor composition without reintroducing assumptions about backend ordering or exposing continuations to callers. Consider nested PageCursor state, continuation envelopes owned by the paging layer, typed composition adapters, and transaction-binding rules for child cursors. Preserve opaque backend ordering, cancellation cleanup, cursor failure semantics, object-safe store traits, and the ability for storage-native implementations to use a more efficient query.
+
+Acceptance
+Document the viable designs and trade-offs, select an API direction, and demonstrate it with a generic two-source merge or transition pager alongside a storage-native implementation. Confirm how exhaustion, exact-boundary pages, rotated batches, continuation type validation, and transaction identity behave for every child cursor. This is a standalone P3 design follow-up and must not block flotsync-h3l.3."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-09-19T12:26:18.214259Z"
+updated_at = "2026-09-19T12:26:24.453231Z"
+
+[[links]]
+target = "01a099f7-5f38-7b23-afbd-f06add65c741"
+label = "discovered from"

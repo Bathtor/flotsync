@@ -1,0 +1,71 @@
+id = "01a099f7-5f7c-7cd1-bf55-486209d43e07"
+ref = "flotsync-h3l.4"
+title = "Add projected replication update store reads"
+body = """
+Scope
+Implement projected paging for replication updates and lightweight update IDs through the shared opaque-continuation paging contract. Runtime consumer conversion remains in flotsync-h3l.5 and flotsync-h3l.6. Preserve current owned loaders as temporary compatibility adapters for removal in flotsync-h3l.8. Expected size is 850-1,100 changed Rust LOC; keep the implementation cohesive because full and ID reads share one query predicate, SQLite keyset window, continuation, compatibility surface, and fixture set.
+
+Public query and projection surface
+Add an update-paging API module. ReplicationUpdatesQuery owns the cheap GroupId and ReplicationUpdateFilter values. ReplicationUpdatePageInput supplies a borrowed ReplicationUpdateView for each source record. The view exposes validated update metadata, the decoded read-version frontier, validated dataset identities, and borrowed generated SchemaOperationView values. Borrowed values exist only during PageBatch::push.
+
+Reuse the existing VecPageBatch and InlinePageBatch projection constructors. Do not add another batch implementation or a default whole-buffer batch. Projection remains one source update to one retained value; it may transform but must not filter or expand.
+
+Store methods and compatibility
+Add object-safe load_replication_updates_into and load_replication_update_ids_into methods adjacent to their complete-result conveniences. Both accept PageCursor<ReplicationUpdatesQuery>. Full reads accept a PageBatch whose input is ReplicationUpdatePageInput; ID reads accept owned UpdateId inputs. Page metadata is unit.
+
+Keep load_replication_updates and load_replication_update_ids as temporary default adapters. A finite legacy limit performs one bounded fill and None performs one unlimited fill, preserving current behaviour while later tasks convert runtime callers. Pass a local typed closure calling ReplicationUpdateView::try_to_owned_record as the batch projection callback, because the method item does not satisfy the higher-ranked callback bound; do not add an isomorphic free-function wrapper. Mark these adapters for removal in flotsync-h3l.8. Keep load_replication_update owned and route it through the shared borrowed decoder followed by one necessary ownership projection; do not add a third projected store method.
+
+Borrowed decoding and validation
+Refactor update-message decoding so owned and projected store reads share validation of group and update identity, supported version bounds, member-count-dependent read versions, non-empty update and dataset-operation collections, valid dataset identifiers, and generated protobuf view structure. Full page reads decode one temporary SQLite payload, validate its indexed columns against the payload, synchronously project borrowed operation views, and release the payload before processing the next row. Use established Buffa views and flotsync_messages protobuf traits and preserve contextual Snafu classification.
+
+SQLite paging
+Use a private SQLite continuation representing UpdateId order: version first, then node index. Apply an exclusive composite lower bound, the existing ReplicationUpdateFilter predicate, unconditional ORDER BY update_version, update_node_index because this API promises deterministic order, and a conditional LIMIT from PageLimit. Preserve unsigned u64 ordering with the existing big-endian sort key. ProducerRange remains inclusive, ignores applied state, and yields an empty page when inverted. All, Applied, and PendingApply retain current semantics.
+
+The ID query selects and decodes only update_version and update_node_index. The full query additionally loads sender, applied_locally, and update_message. Both use the shared page-finishing helper and exact-size pages may require an empty confirmation fill.
+
+Wrappers and test support
+Implement the new methods in runtime test wrappers. Move update-load failure injection and request observation to page calls so compatibility adapters and future paged runtime consumers exercise the same path.
+
+Test inventory and restraint
+Do not duplicate generic paging tests for transaction binding, cancellation, cursor failure, erased continuation typing, page-limit enforcement, or batch clearing. Reuse and extend existing SQLite update tests for current filter and round-trip behaviour. Add only uncovered cases: equivalence of full and ID selection, all filter variants, inclusive and inverted producer ranges, same-version producer ties, large supported versions, bounded advancement with changed batch limits, exact multiples and empty confirmation, Vec and inline projections, borrowed SchemaOperationView projection, and malformed or index-inconsistent records. Combine related assertions into a small number of table-driven or reusable scenarios rather than adding one test per condition. Keep the projected-update paging scenario short: build one fixture, then call focused helpers for projected pages, bounded IDs, filters and the legacy limit, and mismatched payloads. Retain the existing assertions and remove the too_many_lines allowance. Confirm a small projection retains only projected values and no update payload buffer.
+
+Validation
+Run focused codec, SQLite update, paging, and wrapper tests serially, then pedantic Clippy and the complete serial flotsync_replication suite outside the sandbox where socket tests require it. Inspect touched files for duplicated decode, query, and continuation helpers before review. Compare the implementation against this plan and keep the issue open until user approval.
+
+Agreed review refinements (2026-09-29)
+The public ReplicationUpdateView construction path must be usable by downstream store backends while preserving validation and the borrowed projection lifetime. Add an external-crate boundary test. Keep the potential SQLite crate extraction separate in flotsync-dj1.
+Borrow update_message directly as &[u8] from each SQLite row while decoding and projecting, avoiding a full payload copy. Make the runtime injected update-page failure begin a correctly typed page attempt so batch clearing, binding and cursor invalidation match the production contract. Strengthen the existing SQLite fixture scenario by putting equal-version updates on opposite sides of a finite page boundary and by draining finite ID pages; reuse that test rather than duplicating paging lifecycle coverage. Decode update identity fields into named locals. Use Snafu context for new source-preserving decoder error wrapping where possible.
+Validation remains focused on the changed API boundary and SQLite update scenario, followed by pedantic Clippy and the required serial replication suite. Keep this issue in review after the fixes until the user accepts it."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
+blocks = [
+    "01a099f7-5fc1-7513-a339-d390405d7581",
+    "01a099f7-6005-7f50-8f48-0cdf96312901",
+    "01a099f7-6090-7ee3-9045-a9a997904a48",
+]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.020993Z"
+updated_at = "2026-09-30T07:46:21.027406Z"
+closed_at = "2026-09-30T07:46:21.027406Z"
+
+[[comments]]
+id = "01a0edda-c462-77a3-b3d5-96172aaac6e7"
+author = "lkroll"
+body = "Review accepted: expose a validated projection constructor to downstream backends; borrow SQLite update BLOBs; make injected page failures invalidate the cursor and clear the batch; extend the existing fixture test across equal-version and bounded-ID continuation boundaries; clean up nested ? and Snafu wrapping. Separate crate extraction is tracked as flotsync-dj1."
+created_at = "2026-09-29T15:48:52.450063Z"
+
+[[comments]]
+id = "01a0f122-aaca-72b0-aaef-6f1ad1b3f778"
+author = "lkroll"
+body = "Agreed review round R05–R06: remove the redundant owned-update projection wrapper and use ReplicationUpdateView::try_to_owned_record directly; decompose the oversized SQLite paging scenario into fixture and focused assertion helpers without changing coverage or adding tests. Preserve the user's staged review state."
+created_at = "2026-09-30T07:06:16.138513Z"
+
+[[comments]]
+id = "01a0f147-5ce3-7341-876e-25f5b35fff33"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-30T07:46:21.027406Z"

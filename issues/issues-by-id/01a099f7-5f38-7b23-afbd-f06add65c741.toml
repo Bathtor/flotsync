@@ -1,0 +1,76 @@
+id = "01a099f7-5f38-7b23-afbd-f06add65c741"
+ref = "flotsync-h3l.3"
+title = "Unify row and transition store paging"
+body = """
+Scope
+Convert dataset row scans, row transitions, and requested-row loading to the shared opaque-continuation paging protocol while preserving direct positional decoding and reusable allocations. Implement the complete conversion in this task without tracked implementation children. Expected size is 1,250-1,850 changed Rust LOC; keep intermediate edits internally staged so the crate remains buildable while the API, backend, consumers, and tests move together.
+
+Current paging contract
+Use the current `PageCursor<Params>` contract. Query parameters are immutable and the continuation is backend-owned, type-erased, and bound to one transaction instance. A store transaction begins the page, selects its private continuation type, and passes a typed `PageAttempt` into the backend implementation. `PageBatch` owns the sampled `PageLimit`, reusable output, and successful-fill metadata. The backend supplies `PageEnd`, and failed or cancelled attempts clear partial output and invalidate the cursor.
+
+Query parameters
+Add `DatasetRowsQuery<'a>`, `DatasetRowTransitionQuery<'a>`, and `RequestedDatasetRowsQuery<'a>`. Dataset context must support borrowed `GroupDatasetSchemaRef` values for one-shot calls and cheaply owned `GroupId`/`DatasetSchema` values for providers which retain cursors without creating self-references. Expose accessors required by downstream store implementations. Requested-row query construction owns, sorts, and deduplicates its keys once so every page observes one fixed selection in deterministic key order.
+
+Shared positional batches
+Use one generic `PositionalPageBatch<Storage, Metadata>` envelope containing the storage, `PageLimit`, and optional successful-fill metadata. Give this envelope the sole `PageBatch` implementation through a narrow storage trait supplying the input family, clear, length, and push operations. Expose descriptive row, transition, and requested-row batch aliases with specialised constructors and accessors.
+
+Ordinary row pages directly reuse `ReplicationStateRowBatch`. Transition pages directly reuse `ReplicationStateRowTransitionBatch`. Requested-row pages add only a small ordered outcome sidecar around `ReplicationStateRowBatch`; do not duplicate row storage or general paging logic. Add a public backend-facing borrowed row-source abstraction so stores can append decoded rows directly into positional storage without allocating an intermediate owned row. Transition input supplies optional previous/current row sources for one union key. Requested input explicitly supplies either one present row source or one missing key. Preserve one logical page input per ordinary row, transition union key, or requested key.
+
+Metadata and public store surface
+Store successful-fill metadata on the specialised batches, including empty pages. Ordinary/requested metadata names the group, dataset, and dataset-existence state. Transition metadata names both groups, their dataset-existence states, and the shared dataset. Replace `DatasetRowScanPage` and `DatasetRowStateTransitionPage` continuation fields with cursor state.
+
+Place paged and complete-result operations next to one another. Add `load_dataset_rows_into` over `PageCursor<RequestedDatasetRowsQuery<'_>>` and implement `load_dataset_rows` as its unlimited complete-result adapter returning `DatasetRowStateSlice`. Add `scan_dataset_rows_into` and `scan_dataset_row_transitions_into` for their query cursors and specialised batches. Use separate query and call lifetimes because `PageCursor` is invariant over retained parameter lifetimes. Remove the superseded explicit `after`/`limit` scan methods and page-result types after all callers are converted.
+
+Transition implementation policy
+Require a backend transition implementation for this task. The current opaque continuation cannot generically retain and coordinate two independently pageable child cursors. SQLite keeps its efficient ordered-union query. This design limitation is recorded separately as standalone P3 task `flotsync-mzc`, linked as discovered from this task, and does not block this implementation.
+
+SQLite implementation
+Begin row page attempts in the SQLite transaction facade and pass typed attempts into `store/sqlite/rows.rs`. Ordinary scans and transition scans use a private raw SQLite `TEXT` continuation so continuation comparison follows SQLite ordering rather than Rust `Ord`. Preserve row-key ordering promised by these APIs. Apply limits through `PageLimit`, report successful metadata on empty and non-empty fills, and retain the existing exact-boundary empty follow-up behaviour where the query cannot prove exhaustion.
+
+Requested-row paging uses a private selection-index continuation. Each page selects at most the sampled number of normalised requested keys, fetches present rows with `IN`, and emits present or missing outcomes in the query's key order. An absent dataset emits a missing outcome for every selected key without querying row storage. Empty selections finish successfully with metadata. Because the selection length is known, the backend should report exhaustion on an exact final requested page without requiring an empty confirmation call.
+
+Consumers and cleanup
+Replace raw `after_row_key` state in activation and synchronisation providers with retained owned query cursors. Reuse positional page batches between fills and derive dataset completion from cursor state. Pending-group snapshot construction uses an unlimited row page. Replay and incremental requested-row consumers may continue through the complete-result adapter, whose implementation now uses requested-row paging. Adapt runtime test doubles to the same cursor and batch contracts. Remove old continuation helpers and obsolete in-memory transition composition once unused.
+
+Test reuse and acceptance
+Do not duplicate generic paging coverage already present in `api/paging/tests.rs`: transaction binding, rotated generic limits, cancellation, failure cleanup, erased continuation validation, exact-boundary follow-up, exhausted-cursor rejection, and metadata clearing remain covered there.
+
+Adapt existing SQLite row tests for ordered scans, missing datasets, reused output, malformed snapshots, ordered/asymmetric transition unions, exact-limit exhaustion, absent transition sides, dataset-reference mismatch, and stored creator validation. Adapt existing `api/store.rs` transition tests for alignment integrity and allocation/schema reuse. Adapt existing activation and synchronisation provider tests for cursor ownership, failure propagation, transaction release, and provider exhaustion. Extend the existing ordered scan scenario to rotate distinct specialised batches and limits rather than adding a duplicate test.
+
+Add only the currently uncovered requested-row scenarios: duplicate-key normalisation, deterministic requested-key order, explicit ordered present/missing outcomes across bounded pages, empty requested selection with metadata, and absent-dataset missing outcomes. Preserve direct malformed-row error classification and verify failed fills publish neither output nor metadata. Compare implementation and tests against this inventory before adding any new test.
+
+Validation and delivery
+Keep Rust formatting and pedantic clippy clean. Run focused paging, store API, SQLite row, activation-provider, and synchronisation-provider tests serially, then the relevant replication crate test selection with `-- --test-threads=1`. Inspect touched files for newly duplicated helpers before review. Update issue progress before handover and do not close without user agreement.
+
+
+Review corrections
+Preserve backend continuation typing in runtime test doubles when injecting failures after a successful page, and cover this with the existing synchronisation failure scenario. Restore known-size capacity reservation through the shared positional storage contract before SQLite decodes fetched ordinary, transition, or requested rows. Add focused transition-input guard tests for empty inputs and mismatched source keys, including cleanup after a previous side was appended. Apply the repository conformance fixes for empty control-flow branches, nested fallible expressions, and public outcome/single-use documentation. Re-run focused serial tests, pedantic Clippy, and the full serial replication suite before returning to review."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
+blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:00.952625Z"
+updated_at = "2026-09-29T14:59:12.315919Z"
+closed_at = "2026-09-29T14:59:12.315919Z"
+
+[[comments]]
+id = "01a0b9d1-8f5d-7ec0-b056-282cf8ed57ff"
+author = "codex"
+body = "Review round: fix later-page failure injection so it preserves continuation typing; restore known-size positional reservations; cover empty and mismatched transition inputs; and apply the three repository conformance corrections for control flow, nested fallibility, and documentation."
+created_at = "2026-09-19T13:18:33.821952Z"
+
+[[comments]]
+id = "01a0b9df-0aaa-7e12-8089-a87fc7b4e563"
+author = "lkroll"
+body = "Review fixes complete: continuation-compatible later-page failure injection, positional reservation forwarding, transition guard tests, and mandatory style/documentation corrections are implemented. Focused tests and pedantic Clippy pass. A clean full serial replication run passed 413 unit tests, two boundary tests, and both doctests; the first full run hit an unrelated suite-level abort whose named test passed immediately in isolation."
+created_at = "2026-09-19T13:33:17.35447Z"
+
+[[comments]]
+id = "01a0edad-4b3b-7d31-a89b-9cb26f58d692"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-29T14:59:12.315919Z"

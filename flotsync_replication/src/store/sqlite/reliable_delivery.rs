@@ -3,23 +3,36 @@
 use super::*;
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::TryStreamExt as _;
 use sqlx::sqlite::SqliteRow;
 use std::time::SystemTime;
 
-/// Load all pending metadata without reading any encoded envelope blobs.
-pub(super) async fn load_reliable_delivery_work_metadata(
+/// Fill one metadata page without reading any encoded envelope blobs.
+pub(super) async fn load_reliable_delivery_work_metadata_into(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT message_id, recipient, first_submitted_at
-FROM reliable_delivery_work
-",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-    rows.iter().map(decode_reliable_work_metadata).collect()
+    mut page: PageAttempt<
+        '_,
+        (),
+        SqliteTextPageContinuation,
+        OwnedNoMetadataPageBatch<'_, StoredReliableDeliveryWorkMetadata>,
+    >,
+) -> Result<(), PageError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT message_id, recipient, first_submitted_at FROM reliable_delivery_work",
+    );
+    push_initial_text_page_window(&mut query_builder, &page, "message_id");
+    let query = query_builder.build();
+    let mut rows = query.fetch(&mut *connection);
+    let mut continuation = None;
+    while let Some(row) = rows.try_next().await.context(SqlxSnafu)? {
+        let metadata = decode_reliable_work_metadata(&row)?;
+        page.push(metadata)?;
+        if page.has_filled_limit() {
+            let raw_message_id = row.try_get::<String, _>("message_id").context(SqlxSnafu)?;
+            continuation = Some(SqliteTextPageContinuation::new(raw_message_id));
+        }
+    }
+    finish_page(page, continuation)
 }
 
 /// Load one complete envelope after the scheduler selected its recipient route.

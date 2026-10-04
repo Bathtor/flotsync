@@ -1,0 +1,89 @@
+id = "01a099f7-5eae-7053-a262-906777e464d2"
+ref = "flotsync-h3l.1"
+title = "Implement shared store paging foundation"
+body = """
+Scope
+Implement the reusable paging foundation and transaction identity plumbing. The child remains larger than 1000 LOC because it establishes the common contract, two reusable batch implementations, transaction integration, documentation, and contract tests. Keep the work reviewable as the common contract and errors, concrete batches and tests, then transaction identity plumbing.
+
+Starting points
+Work from the current unstaged changes in flotsync_replication/src/api/paging/, api/store.rs, api/mod.rs, store/sqlite/mod.rs, store/sqlite/tests.rs, and runtime/tests/mod.rs. Preserve manual changes. Leave every touched file unstaged so staging remains the user review marker. Keep the existing application-facing ProviderBatch and BatchProvider contracts functional.
+
+Paging ownership
+PageCursor<Params, Key> owns immutable query parameters, an exclusive continuation, and cursor lifecycle. On first use it binds to one StoreTransactionId. Compatible cursor types may be supplied to different pageable operations; their interpretation belongs to those APIs. No transaction borrow survives a page call.
+
+PageBatch is the single object-safe consumer-owned page contract. It has an associated input family for temporary borrowed inputs and associated metadata. It exposes the sampled page limit, clearing, output length and emptiness, fallible input acceptance, successful-fill metadata completion, and metadata access. Concrete batch implementations expose typed retained-value access. Paging counts successful source-record pushes independently of batch output length; custom batches may choose their own output cardinality.
+
+PageLimit is Max(NonZeroUsize) or Unlimited and converts to Option<NonZeroUsize> through into_option(). A maximum is sampled once per fill. Different batch instances, acceptance callbacks, and limits may be used on successive calls. Clearing removes prior values and metadata while retaining reusable allocation and configuration.
+
+Successful page methods return Result<(), PageError>. Metadata belongs to the batch; continuation, possible remaining records, exhaustion, and failure belong to the cursor. Exact-size final pages may require one empty follow-up to establish exhaustion. Exhaustion is permanent.
+
+Public store flow
+Custom store implementations begin a fill through PageCursor::begin_page(transaction_id, batch). The returned public PageAttempt exposes query parameters, the exclusive lower-bound key, the sampled limit, exhaustion state, fallible push, and finish. PageAttempt construction itself is private so the cursor is the discoverable entry point.
+
+PageAttempt centralises transaction binding, clearing, source-record limits, strictly increasing key sequences, continuation, completion, and failed or cancelled cleanup. Its private lifecycle enum represents filling, already exhausted, failed, and completed states. A successful push advances the pending source-record count and key; continuation is committed only by finish. Errors and cancellation clear partial output and metadata and fail the cursor. External callback effects cannot be rolled back.
+
+Batch implementations
+Keep paging/mod.rs for the common contract, paging/error.rs for common errors, paging/vec_batch.rs for VecPageBatch, paging/inline_batch.rs for InlinePageBatch, and paging/tests.rs for shared contract tests. Keep implementation-specific tests beside their implementations.
+
+Provide OwnedPageBatchInput<T> as the default input family for owned values. Reorder and default concrete batch parameters so the common identity case needs no callback: VecPageBatch<Value, Metadata>::bounded(limit), VecPageBatch<Value, Metadata>::unlimited(), and InlinePageBatch<Value, Metadata, N>::new(). Provide explicit bounded_with, unlimited_with, and new_with constructors for transforming or borrowed inputs. Use flotsync_utils::NonOwningPhantomData for type-level input-family markers. Downstream stores may implement PageBatchInput for their own local borrowed-input family types.
+
+VecPageBatch and InlinePageBatch retain one output value for every successful push. This is their implementation behaviour rather than a global paging invariant. InlinePageBatch has a compile-time non-zero-capacity assertion evaluated when construction is instantiated. Its direct push rejects values beyond N with the common PageLimitExceeded error and never spills.
+
+Errors
+Keep Snafu-derived contextual errors and StoreError classification. Backend access failures preserve their original classification. Batch callback failures remain distinct from paging contract failures. Transaction mismatch, failed cursor, non-increasing key sequence, limit exceeded, and record after exhaustion are operation-scoped contract errors. Remove batch-cardinality, invalid-inline-limit, and separate inline-full errors. PageBatch::push returns PageError so supplied implementations can translate callback failures to BatchPush and inline overflow can return PageLimitExceeded directly.
+
+Transaction identity
+StoreTransactionId remains UUID-backed and provides from_uuid plus new_random for the straightforward backend default. SQLite allocates pool identifiers from a process-wide AtomicU64 and transaction identifiers from a per-pool AtomicU64, then constructs each UUID from the two halves. Both counters use relaxed wrapping allocation. Practical uniqueness assumes no object carrying an earlier identifier survives a complete u64 allocation cycle. Do not add an active-pool registry or identifier reclamation. Runtime wrappers of existing transactions forward their identity; standalone wrappers create their own identity. Tests describe transaction identity as a top-level concept.
+
+Documentation and acceptance
+Document the expected high-level paging flow in the module with an example covering cursor construction, begin_page, params, after, limit, push, finish, batch inspection, and cursor state. Describe inputs as successive records whose keys form a strictly increasing sequence.
+
+Tests cover exclusive advancement, equal and non-increasing keys, over-limit backend input, empty and exact-multiple results, permanent exhaustion, wrong transaction, failed batch push, classified store failure, cancelled fill, cleared partial output and metadata, rotated batches and changed limits or callbacks, inline non-spilling capacity, unlimited traversal, identity-default constructors, compile-time rejection of zero inline capacity where rustdoc supports it, and higher-ranked borrowed inputs through a dyn PageBatch. SQLite tests cover stable identity within a transaction and distinct identity across transactions and pools.
+
+Validation and delivery
+Run rustfmt, focused paging and transaction tests serially as required, broader relevant flotsync_replication tests, and all-target pedantic Clippy. Inspect touched files for newly duplicated helpers. Compare the result against review rounds R2 and R3 in .agent_local_docs/tmp/flotsync-h3l.1-review-2026-09-14.md. Set the issue to in review for handover, leave all changes unstaged, and do not close the issue without user agreement."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocks = [
+    "01a099f7-5ef6-7451-b756-e6f2a0fca0fb",
+    "01a099f7-5f38-7b23-afbd-f06add65c741",
+    "01a099f7-5f7c-7cd1-bf55-486209d43e07",
+    "01a099f7-604c-7293-bc3f-0ba12773e3e7",
+]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:00.814322Z"
+updated_at = "2026-09-14T11:20:23.33111Z"
+closed_at = "2026-09-14T11:20:23.33111Z"
+
+[[comments]]
+id = "01a09a0a-b7dd-76d3-88f1-9e98233e5134"
+author = "codex"
+body = "Implemented the shared paging foundation. Added generic query-bound PageCursor state, UUID transaction and operation identities, batch-owned bounded/unlimited policies, Vec and compile-time SmallVec projection batches, one-to-one borrowed-view projection, explicit page metadata/status, and a shared PageAttempt lifecycle helper. The helper enforces transaction/operation binding, exclusive key advancement, limits and projection cardinality; unfinished, cancelled, store-failed, projection-failed and contract-failed attempts clear partial output and invalidate the cursor. Added transaction identity plumbing for SQLite and test wrappers plus coverage for identity stability/distinctness and higher-ranked trait-object projection. Validation: all 404 flotsync_replication library tests passed; focused paging tests passed; cargo fmt check passed; all-target pedantic clippy passed without warnings. Touched-file duplicate audit found no duplicate paging implementation; PageBatch remains separate from the application-facing ProviderBatch because paging projections may borrow caller context and do not satisfy ProviderBatch static ownership."
+created_at = "2026-09-13T09:13:08.829157Z"
+
+[[comments]]
+id = "01a09a36-7195-75c1-8021-4a5535490570"
+author = "codex"
+body = "Resolved review findings M01, M02, B01, and S01. Reordered the paging module to the repository's public/private/test grouping, documented cursor and attempt lifecycle fields, replaced the synthetic store-error drop with a backend-shaped early-return test, and added transaction/operation identifiers to backend-contract errors. Focused paging and transaction tests pass (12 tests), cargo fmt check passes, and all-target pedantic clippy passes without warnings."
+created_at = "2026-09-13T10:00:54.421426Z"
+
+[[comments]]
+id = "01a09f2d-1b3c-7d92-bcd6-e14d43d6ecc0"
+author = "codex"
+body = "Resolved review round R2-01 through R2-20. Paging now uses one object-safe PageBatch with an associated borrowed-input family and batch-owned metadata; PageResult, PageStatus, ProjectionBatch, PageOperationId, and projection vocabulary are removed. PageAttempt uses an explicit lifecycle enum and documents its ordering, limit, cardinality, cleanup, and continuation invariants. The code is split into common, error, Vec batch, inline batch, and test modules. SQLite transaction identities now combine a process-wide AtomicU64 pool id with a per-pool AtomicU64 transaction id, and StoreTransactionId provides new_random for other backends. Validation: 12 focused paging tests passed, the cross-pool SQLite identity test passed, all 405 flotsync_replication library tests passed, rustfmt check passed, and all-target pedantic Clippy passed without warnings."
+created_at = "2026-09-14T09:08:48.572926Z"
+
+[[comments]]
+id = "01a09f8c-97d0-7493-8d16-6f0bd43ac66e"
+author = "lkroll"
+body = "Resolved review round 3: exposed PageCursor::begin_page, added the module flow example, removed runtime batch-cardinality enforcement and redundant errors, made inline zero capacity a compile-time failure, added default owned-input constructors with shared identity acceptance and NonOwningPhantomData, and documented wrapping SQLite identity sequences. Formatting, doctests, 12 paging tests, the SQLite identity test, all 405 library tests, and pedantic Clippy pass."
+created_at = "2026-09-14T10:53:06.384091Z"
+
+[[comments]]
+id = "01a09fa5-9223-7812-b1b6-24c9e6c54904"
+author = "lkroll"
+body = "completed"
+created_at = "2026-09-14T11:20:23.33111Z"

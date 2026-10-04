@@ -1,13 +1,15 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowScanPage,
+        DatasetRowPageBatch,
+        DatasetRowPageMetadata,
         DatasetRowStatePatch,
-        DatasetRowStateSlice,
-        DatasetRowStateTransitionPage,
         DatasetRowStateWrite,
+        DatasetRowTransitionPageBatch,
+        DatasetRowTransitionPageMetadata,
+        DatasetRowTransitionQuery,
+        DatasetRowsQuery,
         DatasetSchema,
-        DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
@@ -19,41 +21,50 @@ use crate::{
         MemberKeyId,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
-        MemberKeyTrustEvidenceSet,
+        MemberPublicKeyPredicate,
         MemberPublicKeysRecord,
+        OwnedPageBatchInput,
+        PageAttempt,
+        PageBatch,
+        PageCursor,
+        PageEnd,
+        PageError,
+        PageLimit,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
+        ReplicationGroupPredicate,
         ReplicationGroupRecord,
         ReplicationRowMetadata,
         ReplicationRowStateSnapshot,
         ReplicationStateRowBatch,
-        ReplicationStateRowTransitionBatch,
+        ReplicationStateRowSource,
+        ReplicationStateRowTransitionInput,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
         ReplicationUpdateRecord,
+        ReplicationUpdateView,
+        ReplicationUpdatesQuery,
+        RequestedDatasetRowInput,
+        RequestedDatasetRowPageBatch,
+        RequestedDatasetRowsQuery,
         RowKey,
-        RowKeyIterator,
         SchemaSource,
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        StoreTransactionId,
         WritableReplicationGroupVersionRecord,
         ensure_matching_transition_dataset_references,
         invalid_default_group_security_material,
     },
     codecs::{
-        messages::{
-            MemberCountContext,
-            UpdateMessage,
-            UpdateMessageProtoSource,
-            VersionVectorCodecError,
-            VersionVectorProtoCodec,
-        },
+        messages::{UpdateMessageProtoSource, VersionVectorCodecError, VersionVectorProtoCodec},
         pending_group::{
             PendingGroupPayloadKind,
             decode_pending_group_activation_payload,
@@ -63,6 +74,7 @@ use crate::{
         },
     },
     delivery::contracts::{
+        ReliableDeliveryReadSession,
         ReliableDeliveryStore,
         StoredReliableDeliveryWork,
         StoredReliableDeliveryWorkMetadata,
@@ -75,14 +87,15 @@ use flotsync_core::{
     versions::{UpdateId, VersionVector},
 };
 use flotsync_messages::{
-    buffa::Message as _,
+    buffa::{Message as _, MessageView as _},
     codecs::datamodel::encode_row_snapshot,
     datamodel as datamodel_proto,
-    proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
+    proto::{DecodeProto, EncodeProto, ProtoInputDecodeError},
+    replication as replication_proto,
     snapshots::datamodel::ProtoSchemaSnapshotDecoder,
 };
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
-use flotsync_utils::BoxFuture;
+use flotsync_utils::{BoxError, BoxFuture};
 use futures_util::FutureExt;
 use log::warn;
 use snafu::prelude::*;
@@ -95,7 +108,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     error::Error as StdError,
     fs::OpenOptions,
     num::NonZeroUsize,
@@ -103,7 +116,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -111,6 +124,12 @@ use uuid::Uuid;
 
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Next process-wide numeric identity assigned to a SQLite pool.
+///
+/// The sequence wraps after every `u64` value has been used. Pool identity
+/// uniqueness therefore assumes that no pool survives a complete sequence
+/// cycle, which would require creating `2^64` later pools in one process.
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// SQLite store handle used before a local identity has been provisioned.
 ///
@@ -265,6 +284,7 @@ impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 SqliteReplicationTransactionKind::Write,
+                pool.next_transaction_id(),
             )) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -321,6 +341,7 @@ impl ReplicationStore for SqliteReplicationStore {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 SqliteReplicationTransactionKind::Write,
+                pool.next_transaction_id(),
             )) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -331,34 +352,21 @@ impl ReplicationStore for SqliteReplicationStore {
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
         let pool = &self.pool;
         async move {
-            pool.ensure_open()?;
-            let connection = pool
-                .connections
-                .begin_with("BEGIN")
-                .await
-                .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
-            Ok(Box::new(SqliteReplicationStoreTransaction::new(
-                connection,
-                SqliteReplicationTransactionKind::Read,
-            )) as Box<dyn ReplicationStoreReadTransaction>)
+            let transaction = pool.begin_read_transaction().await?;
+            Ok(Box::new(transaction) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
     }
 }
 
 impl ReliableDeliveryStore for SqliteReplicationStore {
-    fn load_reliable_delivery_work_metadata(
+    fn begin_read_session(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
+    ) -> BoxFuture<'_, Result<Box<dyn ReliableDeliveryReadSession>, StoreError>> {
         let pool = &self.pool;
         async move {
-            pool.ensure_open()?;
-            let mut connection = pool
-                .connections
-                .acquire()
-                .await
-                .context(SQLX_ACQUIRE_CONNECTION_SNAFU)?;
-            load_reliable_delivery_work_metadata(&mut connection).await
+            let transaction = pool.begin_read_transaction().await?;
+            Ok(Box::new(transaction) as Box<dyn ReliableDeliveryReadSession>)
         }
         .boxed()
     }
@@ -415,6 +423,29 @@ impl ReliableDeliveryStore for SqliteReplicationStore {
     }
 }
 
+impl ReliableDeliveryReadSession for SqliteReplicationStoreTransaction {
+    fn load_reliable_delivery_work_metadata_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, StoredReliableDeliveryWorkMetadata>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            reliable_delivery::load_reliable_delivery_work_metadata_into(
+                self.assert_open_connection(),
+                page,
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        ReplicationStoreReadTransaction::release(self)
+    }
+}
+
 impl Drop for SqliteReplicationStore {
     fn drop(&mut self) {
         // A destructor panic during unwinding aborts the process and masks the
@@ -429,20 +460,67 @@ impl Drop for SqliteReplicationStore {
     }
 }
 
+/// Take the current sequence value and advance it with wrapping arithmetic.
+///
+/// Callers rely on no object carrying an earlier value surviving the complete
+/// `u64` allocation cycle. Tracking live identities would add coordination for
+/// a collision that requires `2^64` intervening allocations.
+fn allocate_sequence_id(sequence: &AtomicU64) -> u64 {
+    sequence.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Transferable owner of one SQLite connection pool and its orderly-shutdown state.
 struct SqliteStorePool {
     connections: Arc<SqlitePool>,
     /// Monotonic application-owned state shared by every activated-store `Arc` handle.
     state: AtomicU8,
+    /// Process-wide sequence value allocated to this concrete pool.
+    pool_id: u64,
+    /// Next sequence value available to a transaction created from this pool.
+    ///
+    /// A value can repeat only after this pool creates `2^64` transactions. The
+    /// identity scheme assumes no transaction or cursor survives that cycle.
+    next_transaction_id: AtomicU64,
 }
 
 impl SqliteStorePool {
     /// Build one open pool resource.
     fn new(connections: SqlitePool) -> Self {
+        let pool_id = allocate_sequence_id(&NEXT_POOL_ID);
         Self {
             connections: Arc::new(connections),
             state: AtomicU8::new(SqliteStoreState::Open as u8),
+            pool_id,
+            next_transaction_id: AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a practically unique identity among transactions created by
+    /// SQLite pools in this process.
+    ///
+    /// The pool and transaction halves may each wrap. Reuse requires a complete
+    /// `u64` allocation cycle while an object carrying the original pair remains
+    /// available.
+    fn next_transaction_id(&self) -> StoreTransactionId {
+        let transaction_id = allocate_sequence_id(&self.next_transaction_id);
+        StoreTransactionId::from_uuid(Uuid::from_u64_pair(self.pool_id, transaction_id))
+    }
+
+    /// Start one read transaction shared by the replication and delivery views.
+    async fn begin_read_transaction(
+        &self,
+    ) -> Result<SqliteReplicationStoreTransaction, StoreError> {
+        self.ensure_open()?;
+        let connection = self
+            .connections
+            .begin_with("BEGIN")
+            .await
+            .context(SQLX_BEGIN_TRANSACTION_SNAFU)?;
+        Ok(SqliteReplicationStoreTransaction::new(
+            connection,
+            SqliteReplicationTransactionKind::Read,
+            self.next_transaction_id(),
+        ))
     }
 
     /// Close every connection and publish completed closure.
@@ -512,13 +590,20 @@ impl SqliteStoreState {
 /// open transaction lets `SQLx` queue a rollback before returning the connection
 /// to the pool.
 struct SqliteReplicationStoreTransaction {
+    /// Stable identity of this transaction instance.
+    transaction_id: StoreTransactionId,
     connection: Option<SqliteStoreTransaction>,
     kind: SqliteReplicationTransactionKind,
 }
 
 impl SqliteReplicationStoreTransaction {
-    fn new(connection: SqliteStoreTransaction, kind: SqliteReplicationTransactionKind) -> Self {
+    fn new(
+        connection: SqliteStoreTransaction,
+        kind: SqliteReplicationTransactionKind,
+        transaction_id: StoreTransactionId,
+    ) -> Self {
         Self {
+            transaction_id,
             connection: Some(connection),
             kind,
         }
@@ -550,6 +635,10 @@ enum SqliteReplicationTransactionKind {
 }
 
 impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
+    fn transaction_id(&self) -> StoreTransactionId {
+        self.transaction_id
+    }
+
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -557,25 +646,34 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
-    fn load_replication_groups(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
+    fn load_replication_groups_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationGroupPredicate<'predicate>>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, ReplicationGroupRecord>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            groups::load_replication_groups_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
     }
 
-    fn load_writable_replication_group_versions(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>> {
-        async move { load_writable_replication_group_versions(self.assert_open_connection()).await }
-            .boxed()
-    }
-
-    fn load_replication_groups_for_ids<'a>(
+    fn load_writable_replication_group_versions_into<'a>(
         &'a mut self,
-        group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
-            .boxed()
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, WritableReplicationGroupVersionRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            groups::load_writable_replication_group_versions_into(
+                self.assert_open_connection(),
+                page,
+            )
+            .await
+        }
+        .boxed()
     }
 
     fn load_group_dataset_schema<'a>(
@@ -610,37 +708,45 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
     }
 
-    fn load_member_public_key_ids(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
-        async move { load_member_public_key_ids(self.assert_open_connection()).await }.boxed()
-    }
-
-    fn load_member_public_keys_for_member<'a>(
+    fn load_member_public_key_ids_into<'a>(
         &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
-        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
-            .boxed()
-    }
-
-    fn load_member_public_keys_for_fingerprint<'a>(
-        &'a mut self,
-        fingerprint: &'a KeyFingerprint,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, MemberKeyId>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_member_public_keys_for_fingerprint(self.assert_open_connection(), fingerprint)
-                .await
+            let page = cursor
+                .begin_page::<security::MemberKeyPageContinuation, _>(transaction_id, batch)?;
+            security::load_member_public_key_ids_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
 
-    fn load_member_key_trust_evidence<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
-        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
-            .boxed()
+    fn load_member_public_keys_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<MemberPublicKeyPredicate<'predicate>>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, MemberPublicKeysRecord>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor
+                .begin_page::<security::MemberKeyPageContinuation, _>(transaction_id, batch)?;
+            security::load_member_public_keys_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn load_member_key_trust_evidence_into<'call, 'predicate: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<&'predicate MemberKeyId>,
+        batch: &'call mut OwnedNoMetadataPageBatch<'call, MemberKeyTrustEvidenceKind>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            security::load_member_key_trust_evidence_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
     }
 
     fn is_key_fingerprint_blocked<'a>(
@@ -662,80 +768,93 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
+    fn load_replication_updates_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
+            let page = cursor
+                .begin_page::<updates::SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+            updates::load_replication_updates_into(self.assert_open_connection(), page).await
         }
         .boxed()
     }
 
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+    fn load_replication_update_ids_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
+        batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
         async move {
-            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
+            let page = cursor
+                .begin_page::<updates::SqliteUpdatePageContinuation, _>(transaction_id, batch)?;
+            updates::load_replication_update_ids_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn load_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<RequestedDatasetRowsQuery<'query>>,
+        batch: &'call mut RequestedDatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let schema = cursor.params().dataset().context().schema;
+            batch.prepare_for_schema(schema);
+            let page =
+                cursor.begin_page::<SqliteRequestedRowsContinuation, _>(transaction_id, batch)?;
+            rows::load_dataset_rows_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn scan_dataset_rows_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowsQuery<'query>>,
+        batch: &'call mut DatasetRowPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let schema = cursor.params().context().schema;
+            batch.prepare_for_schema(schema);
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            rows::scan_dataset_rows_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn scan_dataset_row_transitions_into<'call, 'query: 'call>(
+        &'call mut self,
+        cursor: &'call mut PageCursor<DatasetRowTransitionQuery<'query>>,
+        batch: &'call mut DatasetRowTransitionPageBatch,
+    ) -> BoxFuture<'call, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let previous_schema = cursor.params().previous().context().schema;
+            let current_schema = cursor.params().current().context().schema;
+            batch.prepare_for_schemas(previous_schema, current_schema);
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            rows::scan_dataset_row_transitions_into(self.assert_open_connection(), page).await
+        }
+        .boxed()
+    }
+
+    fn load_pending_group_decisions_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, PendingGroupDecisionRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            pending_groups::load_pending_group_decisions_into(self.assert_open_connection(), page)
                 .await
         }
         .boxed()
-    }
-
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
-        async move { load_dataset_rows(self.assert_open_connection(), dataset, row_keys).await }
-            .boxed()
-    }
-
-    fn scan_dataset_row_batch<'a>(
-        &'a mut self,
-        dataset: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowScanPage, StoreError>> {
-        async move {
-            scan_dataset_row_batch(self.assert_open_connection(), dataset, after, limit, output)
-                .await
-        }
-        .boxed()
-    }
-
-    fn scan_dataset_row_transition_batch<'a>(
-        &'a mut self,
-        previous_group: GroupDatasetSchemaRef<'a>,
-        current_group: GroupDatasetSchemaRef<'a>,
-        after: Option<RowKey>,
-        limit: NonZeroUsize,
-        output: &'a mut ReplicationStateRowTransitionBatch,
-    ) -> BoxFuture<'a, Result<DatasetRowStateTransitionPage, StoreError>> {
-        async move {
-            scan_dataset_row_transition_batch(
-                self.assert_open_connection(),
-                previous_group,
-                current_group,
-                after,
-                limit,
-                output,
-            )
-            .await
-        }
-        .boxed()
-    }
-
-    fn load_pending_group_decisions(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
-        async move { load_pending_group_decisions(self.assert_open_connection()).await }.boxed()
     }
 
     fn load_pending_group_decision<'a>(
@@ -746,10 +865,18 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_pending_group_activations(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
-        async move { load_pending_group_activations(self.assert_open_connection()).await }.boxed()
+    fn load_pending_group_activations_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut OwnedNoMetadataPageBatch<'a, PendingGroupActivationRecord>,
+    ) -> BoxFuture<'a, Result<(), PageError>> {
+        let transaction_id = self.transaction_id;
+        async move {
+            let page = cursor.begin_page::<SqliteTextPageContinuation, _>(transaction_id, batch)?;
+            pending_groups::load_pending_group_activations_into(self.assert_open_connection(), page)
+                .await
+        }
+        .boxed()
     }
 
     fn load_pending_group_activation<'a>(
@@ -981,6 +1108,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 
 type SqliteStoreConnection = SqliteConnection;
 type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
+/// Page batch shape used by SQLite metadata queries which accept owned records
+/// and produce no query-specific metadata.
+type OwnedNoMetadataPageBatch<'a, Record> =
+    dyn PageBatch<Input = OwnedPageBatchInput<Record>, Metadata = ()> + 'a;
 
 const GROUP_LIFECYCLE_OPEN_SQL: &str = "open";
 const GROUP_LIFECYCLE_READ_ONLY_SQL: &str = "read_only";
@@ -1156,6 +1287,7 @@ async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(),
 
 mod error;
 mod groups;
+mod paging;
 mod pending_groups;
 mod reliable_delivery;
 mod rows;
@@ -1173,6 +1305,17 @@ use error::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use groups::*;
+pub(crate) use paging::SqliteTextPageContinuation;
+use paging::{
+    continuation_record_index,
+    finish_page,
+    finish_page_with_metadata,
+    push_initial_text_page_window,
+    push_ordered_text_page_window,
+    push_page_order_and_limit,
+    push_text_page_window,
+    push_text_window,
+};
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
@@ -1180,7 +1323,6 @@ use groups::*;
 use pending_groups::*;
 use reliable_delivery::{
     load_reliable_delivery_work,
-    load_reliable_delivery_work_metadata,
     remove_reliable_delivery_work,
     store_reliable_delivery_work,
 };
@@ -1199,6 +1341,8 @@ use security::*;
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
 )]
 use shared::*;
+#[cfg(test)]
+pub(crate) use updates::SqliteUpdatePageContinuation;
 #[allow(
     clippy::wildcard_imports,
     reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."

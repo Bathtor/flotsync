@@ -1,0 +1,69 @@
+id = "01a099f7-604c-7293-bc3f-0ba12773e3e7"
+ref = "flotsync-h3l.7"
+title = "Page reliable delivery metadata"
+body = """
+Scope (AJ7)
+Expose reliable-delivery scheduling metadata through the shared paging contract within one consistent read session. Keep this delivery-specific capability independent of unrelated replication-state reads. Work on the current branch; do not create or switch branches. Agreed original estimate: 460–730 changed Rust LOC (session API 100–150; SQLite 130–200; startup and wrappers 100–160; focused verification 130–220). Latest review delta is roughly 45–85 LOC, and the overall task remains below 1,000 LOC. Blocked-by flotsync-h3l.1 is closed.
+
+Current code and paging contract
+ReliableDeliveryStore opens a narrow read session and retains a complete-result convenience. The shared PageCursor<Params> owns immutable parameters and an erased backend continuation; PageAttempt and PageBatch handle lifecycle, limits, cleanup and projection. SQLite reuses pool-owned StoreTransactionId allocation and its existing read-transaction guard. The backend defines ordering and continuation; the public cursor does not expose MessageId ordering. Bounded exact-size results may require an empty confirmation page. Unlimited reads need no ORDER BY unless the API explicitly promises ordered output. The earlier PageCursor<Params, Key> and Rust key-comparison sketches are obsolete.
+
+Implementation
+1. ReliableDeliveryReadSession provides load_reliable_delivery_work_metadata_into using PageCursor<()> and a PageBatch accepting owned StoredReliableDeliveryWorkMetadata with unit metadata, plus release(self: Box<Self>). ReliableDeliveryStore::begin_read_session creates this view. Keep load_reliable_delivery_work_metadata as a complete-result convenience using one unlimited VecPageBatch and explicit release. Store and page failures preserve classification.
+2. SQLite implements the session using its read transaction and existing pool identity. Stream only message_id, recipient and first_submitted_at. Bounded pages use the stored SQL TEXT message_id as their opaque exclusive continuation and ORDER BY message_id LIMIT; unlimited fresh reads have no ordering or limit. Obtain the extra owned continuation only after the record that fills a bounded page, avoiding an extra String allocation for every row. Remove WHERE 1 = 1: add a narrow first-predicate variant of the shared TEXT page-window helper, emitting WHERE only if continuation exists and sharing the lower-bound and ordering/limit code with existing helpers. Document the existing helpers' requirement for a preceding WHERE predicate. Explicitly release after success and rely on rollback-on-drop after failure/cancellation. The session view is fixed from its first SQLite read; later pages cannot gain inserted rows or lose deleted rows from that view. Full-envelope reads remain separate.
+3. Startup fills one unlimited metadata batch in one session call because every item ultimately enters the scheduling map and outbound work starts after the scan. Release the read session immediately after filling, then consume the batch into the map, place items by route, and select/load outbound attempts. Remove the recovery page-size constant and loop. The batch holds only compact metadata, never encoded envelopes. Preserve acknowledgement, deletion, retry and eligible-load behaviour. ControlledStore and FailingStore delegate the narrow session.
+4. Reuse the existing SQLite and restart tests rather than adding further tests or duplicating the generic paging suite. SQLite tests cover bounded/multi-page, empty and exact-size scans, session mismatch, concurrent view stability, explicit release and failure cleanup. Simplify the earlier 65-item restart fixture to a few items for distinct recipients now that recovery is unlimited; preserve restoration of all items, no full-envelope reads before route eligibility, and original envelope reuse after discovery. Check touched files for duplicated helpers. Run focused serial tests, rustfmt and pedantic Clippy.
+
+Acceptance
+One consistent delivery metadata scan uses shared paging semantics and caller-owned output storage. Startup uses one unlimited fill before constructing its scheduling state. SQLite preserves bounded pagination for other callers, using its own deterministic ordering and opaque continuation. Metadata queries exclude envelope bytes and unnecessary predicates/order/limits. Full envelopes load only for eligible work. Session resources are released promptly on success and failure/cancellation. Existing delivery behaviour remains covered. Do not close this issue until user review confirms completion.
+
+Context and explicit deferrals
+This is an implementation child of flotsync-h3l. Preserve manual changes and the user's staged review state, follow AGENTS.md, and leave compatibility-adapter removal to flotsync-h3l.8. R03 replaces the earlier bounded-startup plan and its 65-item component page-boundary fixture; SQLite bounded-page coverage remains. R01's allocation improvement remains applicable to bounded callers. Chronological review history stays in issue comments and the local working note.
+"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["01a099f7-5eae-7053-a262-906777e464d2"]
+blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.228116Z"
+updated_at = "2026-10-04T08:38:25.671228Z"
+closed_at = "2026-10-04T08:38:25.671228Z"
+
+[[comments]]
+id = "01a0fd5e-9ee9-7371-84ce-c06d1ddb1acb"
+author = "lkroll"
+body = "Implemented the agreed delivery metadata paging contract. ReliableDeliveryStore opens a narrow read session; SQLite reuses its read-transaction setup and pool identity, streams only metadata columns, and uses an opaque TEXT continuation with ordering only for bounded pages. Recovery consumes a reusable bounded batch and releases the session before selected envelope loads. Existing wrapper implementations delegate the session. Tests added/extended for bounded and empty pages, exact-size confirmation, session mismatch, snapshot stability under concurrent insertion/removal in WAL mode, failure cleanup on drop, and existing restart behaviour without early envelope loads. Validation: 421 serial replication library tests, 46 delivery-related tests after the final shared-startup refactor, focused transaction identity test, pedantic Clippy with warnings denied, rustfmt and git diff --check passed. Changes remain unstaged for user review."
+created_at = "2026-10-02T16:07:11.849158Z"
+
+[[comments]]
+id = "01a0fd68-b2b2-7f90-aaa6-4b3669cb75ab"
+author = "lkroll"
+body = "Review delta agreed: R01 eliminates the extra continuation String allocation except on a full bounded SQLite page; R02 extends the existing restart test across the 64-record recovery boundary and verifies metadata-only restoration. Holistic issue plan updated; implementation now proceeding."
+created_at = "2026-10-02T16:18:12.274613Z"
+
+[[comments]]
+id = "01a0fd6c-4b69-7a63-aa62-6f371330403c"
+author = "lkroll"
+body = "R01 and R02 implemented. SQLite reads the raw continuation String only for a full bounded page. The existing restart test now restores 65 items across the 64-record recovery boundary, verifies every recovered route state and no early full-envelope loads, and retains the original envelope-reuse check. Focused restart and SQLite metadata tests, pedantic Clippy, rustfmt, and diff check passed. Ready for review; no staging changes."
+created_at = "2026-10-02T16:22:07.977914Z"
+
+[[comments]]
+id = "01a10608-1a60-77a3-95d1-46ab8e041b7f"
+author = "lkroll"
+body = "R03/R04 agreed on 2026-10-04: startup will use one unlimited metadata fill, release its session before building scheduling state, and remove the recovery page-size constant. The existing restart test will use a small multi-recipient fixture; SQLite tests keep bounded-page coverage. Remove the tautological WHERE predicate using a shared first-predicate TEXT page-window variant. This supersedes the earlier bounded-startup and 65-item restart plan. Holistic issue body updated; staging remains untouched."
+created_at = "2026-10-04T08:29:16.768205Z"
+
+[[comments]]
+id = "01a1060c-0623-7933-a37d-5ff543cb374d"
+author = "lkroll"
+body = "R03/R04 completed: startup uses one unlimited metadata fill, releases the session before constructing scheduling state, and no longer has a recovery page-size constant. The existing restart test is reduced to two recipients and preserves restoration and eligible envelope-reuse checks. SQLite uses a shared initial-predicate TEXT helper and omits WHERE entirely on fresh scans; bounded continuation remains covered. All 46 delivery-related tests passed serially, along with rustfmt, pedantic Clippy with warnings denied, and diff checks. No new tests or staging changes."
+created_at = "2026-10-04T08:33:33.731165Z"
+
+[[comments]]
+id = "01a10610-7a87-7ae0-a267-c112a8de5084"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T08:38:25.671228Z"

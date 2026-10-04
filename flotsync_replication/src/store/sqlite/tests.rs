@@ -1,9 +1,16 @@
 //! SQLite store tests.
 use super::*;
 use crate::{
+    MAX_VERSION_VALUE,
     api::{
+        DatasetRowPageBatch,
         DatasetRowStatePatch,
+        DatasetRowStateSlice,
         DatasetRowStateWrite,
+        DatasetRowTransitionPageBatch,
+        DatasetRowTransitionQuery,
+        DatasetRowsQuery,
+        DatasetUpdateRecord,
         GroupDatasetSchemaRef,
         GroupInvitation,
         GroupSchema,
@@ -19,14 +26,30 @@ use crate::{
         MigrationProposal,
         PendingGroupDecisionRecord,
         ReplicationUpdateFilter,
+        ReplicationUpdateView,
+        ReplicationUpdatesQuery,
+        RequestedDatasetRowPageBatch,
+        RequestedDatasetRowView,
+        RequestedDatasetRowsQuery,
         SnapshotRef,
         StoreErrorClass,
+        StoreErrorClassificationSource as _,
+        VecPageBatch,
         current_slice_placeholder_group_security_material,
     },
     delivery::shared::MessageId,
     provision_local_identity,
     test_support::{
+        ExactPageCompletion,
+        MetadataPagingFixtures,
         SqliteStoreTestOwner,
+        UpdatePagingFixtures,
+        assert_delivery_metadata_paging_contract,
+        assert_metadata_paging_contract,
+        assert_requested_row_paging_contract,
+        assert_row_scan_paging_contract,
+        assert_transition_paging_contract,
+        assert_update_paging_contract,
         test_public_member_keys,
         test_replication_security_secrets,
     },
@@ -41,6 +64,7 @@ use flotsync_data_types::{
     schema::datamodel::RowOperation,
 };
 use flotsync_messages::codecs::datamodel::encode_schema_operation;
+use flotsync_utils::BoxError;
 use futures_util::future;
 use itertools::Itertools;
 use std::{
@@ -95,6 +119,70 @@ fn loaded_row_fixture(
         created_by: metadata.created_by,
         last_changed_versions: metadata.last_changed_versions.clone(),
     })
+}
+
+/// Verify requested-row outcomes and empty selections against a missing dataset.
+fn assert_requested_rows_for_missing_dataset(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    group_id: GroupId,
+    missing_dataset_id: &DatasetId,
+    schema: &Schema,
+    first_missing_row_key: RowKey,
+) {
+    let second_missing_row_key = RowKey(Uuid::from_u128(1_207));
+    let mut expected_missing_row_keys = vec![first_missing_row_key, second_missing_row_key];
+    expected_missing_row_keys.sort_unstable();
+    let mut requested_rows = RequestedDatasetRowPageBatch::unlimited(schema);
+    let mut requested_missing_cursor = PageCursor::new(RequestedDatasetRowsQuery::new(
+        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: missing_dataset_id,
+            schema,
+        }),
+        [second_missing_row_key, first_missing_row_key],
+    ));
+    wait_for_store_future(
+        transaction.load_dataset_rows_into(&mut requested_missing_cursor, &mut requested_rows),
+    )
+    .expect("requested rows from a missing dataset should load");
+    let loaded_missing_row_keys = requested_rows
+        .outcomes()
+        .map(|outcome| match outcome {
+            RequestedDatasetRowView::Missing(row_key) => row_key,
+            RequestedDatasetRowView::Present(_) => {
+                panic!("a missing dataset cannot contain requested rows")
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(loaded_missing_row_keys, expected_missing_row_keys);
+    assert!(
+        !requested_rows
+            .metadata()
+            .expect("requested missing-dataset page should retain metadata")
+            .dataset_exists
+    );
+    assert!(requested_missing_cursor.is_exhausted());
+
+    let mut empty_request_cursor = PageCursor::new(RequestedDatasetRowsQuery::new(
+        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: missing_dataset_id,
+            schema,
+        }),
+        [],
+    ));
+    wait_for_store_future(
+        transaction.load_dataset_rows_into(&mut empty_request_cursor, &mut requested_rows),
+    )
+    .expect("an empty row selection should load");
+    assert!(requested_rows.outcomes().next().is_none());
+    assert!(
+        !requested_rows
+            .metadata()
+            .expect("empty requested-row page should retain metadata")
+            .dataset_exists
+    );
+    assert!(empty_request_cursor.is_exhausted());
 }
 
 async fn apply_row_patch(
@@ -181,6 +269,34 @@ WHERE group_id = ?2 AND dataset_id = ?3 AND row_key = ?4
     .expect("raw row snapshot should update");
 }
 
+/// Replace one stored update payload while preserving its indexed identity.
+fn replace_raw_update_message(
+    store: &SqliteReplicationStore,
+    group_id: GroupId,
+    update_id: UpdateId,
+    update_message: Vec<u8>,
+) {
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await.context(SqlxSnafu)?;
+        sqlx::query(
+            "
+UPDATE dataset_updates
+SET update_message = ?1
+WHERE group_id = ?2 AND update_node_index = ?3 AND update_version = ?4
+",
+        )
+        .bind(update_message)
+        .bind(group_id.to_string())
+        .bind(i64::from(update_id.node_index))
+        .bind(encode_update_version_sort_key_vec(update_id.version))
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+        Ok::<_, StoreError>(())
+    })
+    .expect("raw update message should update");
+}
+
 type TestSqliteStore = SqliteStoreTestOwner<Arc<SqliteReplicationStore>>;
 
 fn in_memory_store(local_member: MemberIdentity) -> TestSqliteStore {
@@ -216,6 +332,44 @@ fn remote_member() -> MemberIdentity {
 
 fn third_member() -> MemberIdentity {
     MemberIdentity::from_array(["app", "carol"])
+}
+
+#[test]
+fn sqlite_transactions_have_distinct_stable_identities() {
+    let first_store = in_memory_store(local_member());
+    let second_store = in_memory_store(local_member());
+    wait_for_store_future(async {
+        let first = first_store
+            .begin_read_transaction()
+            .await
+            .expect("first transaction should start");
+        let second = first_store
+            .begin_read_transaction()
+            .await
+            .expect("second transaction should start");
+        let other_pool = second_store
+            .begin_read_transaction()
+            .await
+            .expect("transaction from second pool should start");
+
+        assert_eq!(first.transaction_id(), first.transaction_id());
+        assert_ne!(first.transaction_id(), second.transaction_id());
+        assert_ne!(first.transaction_id(), other_pool.transaction_id());
+        assert_ne!(second.transaction_id(), other_pool.transaction_id());
+
+        first
+            .release()
+            .await
+            .expect("first transaction should release");
+        second
+            .release()
+            .await
+            .expect("second transaction should release");
+        other_pool
+            .release()
+            .await
+            .expect("transaction from second pool should release");
+    });
 }
 
 #[test]
@@ -417,6 +571,13 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     wait_for_store_future(store.store_reliable_delivery_work(earlier.clone()))
         .expect("earlier work should store");
 
+    let completion = wait_for_store_future(assert_delivery_metadata_paging_contract(
+        store.as_ref(),
+        &earlier.metadata,
+        &later.metadata,
+    ));
+    assert_eq!(completion, ExactPageCompletion::AfterEmptyPage);
+
     let mut metadata = wait_for_store_future(store.load_reliable_delivery_work_metadata())
         .expect("metadata should load");
     metadata.sort_by_key(|item| (item.first_submitted_at, item.message_id));
@@ -440,8 +601,162 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     assert_eq!(
         wait_for_store_future(store.load_reliable_delivery_work_metadata())
             .expect("remaining metadata should load"),
-        vec![later.metadata]
+        vec![later.metadata.clone()]
     );
+    wait_for_store_future(store.remove_reliable_delivery_work(later.metadata.message_id))
+        .expect("final work should remove");
+    assert_empty_delivery_metadata_page(store.as_ref());
+}
+
+/// Check that an empty read session exhausts the cursor in one fill.
+fn assert_empty_delivery_metadata_page(store: &SqliteReplicationStore) {
+    let mut empty_session = wait_for_store_future(store.begin_read_session())
+        .expect("empty delivery metadata session should start");
+    let mut empty_cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(1).expect("page size is non-zero"),
+    );
+    load_delivery_metadata_page(empty_session.as_mut(), &mut empty_cursor, &mut batch)
+        .expect("empty metadata page should load");
+    assert!(batch.values().is_empty());
+    assert!(empty_cursor.is_exhausted());
+    wait_for_store_future(empty_session.release()).expect("empty session should release");
+}
+
+#[test]
+fn reliable_delivery_metadata_pages_keep_one_read_view() {
+    let path = std::env::temp_dir().join(format!(
+        "flotsync-delivery-paging-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::create_file(&path))
+        .expect("file provisioner should build");
+    wait_for_store_future(async {
+        let mut connection = provisioner.pool.connections.acquire().await?;
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut *connection)
+            .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("file store should allow concurrent readers and writers");
+    wait_for_store_future(provision_local_identity(
+        &provisioner,
+        local_member(),
+        &test_replication_security_secrets(),
+    ))
+    .expect("identity should provision");
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("file store should activate");
+    let store = SqliteStoreTestOwner::from_store(Arc::new(store));
+    let first = reliable_delivery_work(801);
+    let removed = reliable_delivery_work(803);
+    let inserted = reliable_delivery_work(802);
+    wait_for_store_future(store.store_reliable_delivery_work(first.clone()))
+        .expect("first work should store");
+    wait_for_store_future(store.store_reliable_delivery_work(removed.clone()))
+        .expect("later work should store");
+
+    let mut session = wait_for_store_future(store.begin_read_session())
+        .expect("metadata read session should start");
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(1).expect("page size is non-zero"),
+    );
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("first metadata page should load");
+    assert_eq!(batch.values(), std::slice::from_ref(&first.metadata));
+
+    wait_for_store_future(store.store_reliable_delivery_work(inserted.clone()))
+        .expect("new work should store during the read session");
+    wait_for_store_future(store.remove_reliable_delivery_work(removed.metadata.message_id))
+        .expect("old work should remove during the read session");
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("second metadata page should load from the original read view");
+    assert_eq!(batch.values(), &[removed.metadata]);
+    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
+        .expect("empty page should confirm the end of the original read view");
+    assert!(cursor.is_exhausted());
+    wait_for_store_future(session.release()).expect("metadata read session should release");
+
+    let mut current = wait_for_store_future(store.load_reliable_delivery_work_metadata())
+        .expect("new read view should load");
+    current.sort_by_key(|metadata| metadata.message_id);
+    assert_eq!(current, vec![first.metadata, inserted.metadata]);
+    drop(store);
+    std::fs::remove_file(path).expect("test database should be removed");
+}
+
+#[test]
+fn failed_reliable_delivery_metadata_page_clears_output_and_releases_on_drop() {
+    let store = in_memory_store(local_member());
+    let valid = reliable_delivery_work(811);
+    wait_for_store_future(store.store_reliable_delivery_work(valid.clone()))
+        .expect("valid work should store");
+    let invalid_id = Uuid::from_u128(812).to_string();
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await?;
+        sqlx::query(
+            "INSERT INTO reliable_delivery_work (message_id, recipient, first_submitted_at, encoded_envelope) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&invalid_id)
+        .bind("bad!")
+        .bind("1970-01-01T00:00:00Z")
+        .bind(b"invalid".as_slice())
+        .execute(&mut *connection)
+        .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("malformed metadata fixture should store");
+
+    let mut session = wait_for_store_future(store.begin_read_session())
+        .expect("metadata read session should start");
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
+        NonZeroUsize::new(2).expect("page size is non-zero"),
+    );
+    assert!(matches!(
+        load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch),
+        Err(PageError::Store { .. })
+    ));
+    assert!(batch.values().is_empty());
+    assert!(cursor.is_failed());
+    drop(session);
+
+    wait_for_store_future(async {
+        let mut connection = store.pool.connections.acquire().await?;
+        sqlx::query("DELETE FROM reliable_delivery_work WHERE message_id = ?1")
+            .bind(&invalid_id)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<_, sqlx::Error>(())
+    })
+    .expect("dropped failed session should release the database read view");
+    assert_eq!(
+        wait_for_store_future(store.load_reliable_delivery_work_metadata())
+            .expect("valid metadata should load after failed session cleanup"),
+        vec![valid.metadata]
+    );
+}
+
+/// Build one stored sender-work record for metadata page tests.
+fn reliable_delivery_work(message_id: u128) -> StoredReliableDeliveryWork {
+    StoredReliableDeliveryWork {
+        metadata: StoredReliableDeliveryWorkMetadata {
+            message_id: MessageId(Uuid::from_u128(message_id)),
+            recipient: remote_member(),
+            first_submitted_at: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        },
+        encoded_envelope: Bytes::from_static(b"stored envelope"),
+    }
+}
+
+/// Drive one metadata page through the same public session boundary as callers.
+fn load_delivery_metadata_page(
+    session: &mut dyn ReliableDeliveryReadSession,
+    cursor: &mut PageCursor<()>,
+    batch: &mut VecPageBatch<StoredReliableDeliveryWorkMetadata, ()>,
+) -> Result<(), PageError> {
+    wait_for_store_future(session.load_reliable_delivery_work_metadata_into(cursor, batch))
 }
 
 fn insert_raw_local_member(
@@ -1725,23 +2040,23 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
     );
     assert!(loaded_snapshot.missing_row_keys.contains(&missing_row_key));
 
+    let completion = wait_for_store_future(assert_requested_row_paging_contract(
+        transaction.as_mut(),
+        GroupDatasetSchemaRef {
+            group_id: &group_id,
+            dataset_id: &dataset_id,
+            schema: &schema,
+        },
+        row_key,
+        missing_row_key,
+    ));
+    assert_eq!(completion, ExactPageCompletion::WithLastRecord);
+
     let loaded_update =
         wait_for_store_future(transaction.load_replication_update(&group_id, update.update_id))
             .expect("update should load")
             .expect("update should exist");
     assert_eq!(loaded_update, update);
-    assert!(matches!(
-        wait_for_store_future(
-            transaction.load_replication_updates(
-                &group_id,
-                ReplicationUpdateFilter::PendingApply,
-                None,
-            )
-        )
-        .expect("updates should load")
-        .as_slice(),
-        [only] if only == &update
-    ));
 }
 
 #[test]
@@ -1834,6 +2149,247 @@ fn sqlite_store_loads_only_writable_group_versions_without_ordering() {
         HashMap::from([(writable_group_id, expected_writable_versions)])
     );
     wait_for_store_future(transaction.release()).expect("transaction should release");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The shared metadata paging contract needs one coherently populated store fixture."
+)]
+fn sqlite_store_satisfies_metadata_paging_contract() {
+    let store = in_memory_store(local_member());
+    let provisioned_keys = wait_for_store_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should start");
+        let key_ids = transaction
+            .load_member_public_key_ids()
+            .await
+            .expect("provisioned key id should load");
+        let [key_id] = key_ids.as_slice() else {
+            panic!("freshly provisioned store should contain one member key: {key_ids:?}");
+        };
+        let record = transaction
+            .load_member_public_keys(key_id)
+            .await
+            .expect("provisioned public keys should load")
+            .expect("provisioned public keys should exist");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        record
+    });
+    let group_ids = [
+        GroupId(Uuid::from_u128(20_001)),
+        GroupId(Uuid::from_u128(20_002)),
+        GroupId(Uuid::from_u128(20_003)),
+    ];
+    let successor_group_id = GroupId(Uuid::from_u128(20_004));
+    let mut groups = group_ids.map(sample_group).to_vec();
+    let final_versions = groups[1].version_vector.clone();
+    groups[1].lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id,
+        final_versions: final_versions.clone(),
+    };
+    let writable_group_versions = [groups[0].clone(), groups[2].clone()]
+        .map(|group| WritableReplicationGroupVersionRecord {
+            group_id: group.group_id,
+            version_vector: group.version_vector,
+        })
+        .to_vec();
+
+    let first_tied_member_keys =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+    let mut second_tied_member_keys =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&third_member()));
+    second_tied_member_keys.key_id.member_id = remote_member();
+    let mut tied_fingerprint_keys = first_tied_member_keys.clone();
+    tied_fingerprint_keys.key_id.member_id = third_member();
+    let text_first_keys = MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(
+        &MemberIdentity::from_array(["app", "a-", "x"]),
+    ));
+    let mut text_second_keys = text_first_keys.clone();
+    text_second_keys.key_id.member_id = MemberIdentity::from_array(["app", "a", "x"]);
+    let member_public_keys = vec![
+        provisioned_keys,
+        text_first_keys.clone(),
+        text_second_keys.clone(),
+        first_tied_member_keys.clone(),
+        second_tied_member_keys.clone(),
+        tied_fingerprint_keys.clone(),
+    ];
+    let member_key_trust_evidence = vec![MemberKeyTrustEvidenceRecord {
+        key_id: first_tied_member_keys.key_id.clone(),
+        evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+    }];
+
+    let pending_group_decisions = vec![
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_001))),
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_002))),
+    ];
+    let pending_group_activations = vec![
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_003))).into_activation(),
+        creation_invitation_decision(GroupId(Uuid::from_u128(21_004))).into_activation(),
+    ];
+
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        for group in groups.iter().cloned() {
+            let mut stored_group = group;
+            stored_group.lifecycle = ReplicationGroupLifecycle::Open;
+            transaction
+                .insert_replication_group(stored_group)
+                .await
+                .expect("paging group should store");
+        }
+        transaction
+            .update_replication_group_lifecycle(
+                &groups[1].group_id,
+                ReplicationGroupLifecycle::ReadOnly {
+                    successor_group_id,
+                    final_versions,
+                },
+            )
+            .await
+            .expect("paging group lifecycle should update");
+        for record in [
+            first_tied_member_keys,
+            second_tied_member_keys,
+            tied_fingerprint_keys,
+            text_first_keys,
+            text_second_keys,
+        ] {
+            transaction
+                .ensure_member_public_keys(record)
+                .await
+                .expect("paging public keys should store");
+        }
+        for record in member_key_trust_evidence.iter().cloned() {
+            transaction
+                .ensure_member_key_trust_evidence(record)
+                .await
+                .expect("paging trust evidence should store");
+        }
+        for record in pending_group_decisions.iter().cloned() {
+            let (material, _) = sample_group(record.group_id()).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("pending-decision group material should store");
+            transaction
+                .upsert_pending_group_decision(record)
+                .await
+                .expect("pending decision should store");
+        }
+        for record in pending_group_activations.iter().cloned() {
+            let (material, _) = sample_group(record.group_id()).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("pending-activation group material should store");
+            transaction
+                .upsert_pending_group_activation(record)
+                .await
+                .expect("pending activation should store");
+        }
+        transaction
+            .commit()
+            .await
+            .expect("paging fixtures should commit");
+    });
+
+    let fixtures = MetadataPagingFixtures {
+        groups,
+        writable_group_versions,
+        member_public_keys,
+        member_key_trust_evidence,
+        pending_group_decisions,
+        pending_group_activations,
+        missing_group_id: GroupId(Uuid::from_u128(29_999)),
+    };
+    wait_for_store_future(assert_metadata_paging_contract(store.as_ref(), &fixtures))
+        .expect("SQLite metadata paging contract should pass");
+}
+
+#[test]
+fn opaque_continuation_follows_sqlite_collation() {
+    wait_for_store_future(async {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool should open");
+        sqlx::query("CREATE TABLE paging_collation (value TEXT COLLATE NOCASE PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("collation fixture table should be created");
+        sqlx::query("INSERT INTO paging_collation (value) VALUES ('a'), ('B'), ('c')")
+            .execute(&pool)
+            .await
+            .expect("collation fixture values should be inserted");
+
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("collation fixture connection should be acquired");
+        let transaction_id = StoreTransactionId::new_random();
+        let mut cursor = PageCursor::new(());
+        let mut actual = Vec::new();
+        let mut page_calls = 0;
+        while cursor.has_more() {
+            page_calls += 1;
+            assert!(page_calls <= 4, "collation paging should terminate");
+            let mut batch = VecPageBatch::bounded(NonZeroUsize::new(1).unwrap());
+            let mut page = cursor
+                .begin_page::<SqliteTextPageContinuation, _>(transaction_id, &mut batch)
+                .expect("collation page should begin");
+            let mut query_builder =
+                QueryBuilder::<Sqlite>::new("SELECT value FROM paging_collation WHERE 1 = 1");
+            push_text_page_window(&mut query_builder, &page, "value COLLATE NOCASE");
+            let values = query_builder
+                .build_query_scalar::<String>()
+                .fetch_all(&mut *connection)
+                .await
+                .expect("collation page should load");
+            let mut continuation = None;
+            for value in values {
+                page.push(value.clone())
+                    .expect("collation value should enter the batch");
+                continuation = Some(SqliteTextPageContinuation::new(value));
+            }
+            finish_page(page, continuation).expect("collation page should finish");
+            actual.extend(batch.into_values());
+        }
+
+        assert_eq!(actual, ["a", "B", "c"]);
+        let mut rust_order = actual.clone();
+        rust_order.sort();
+        assert_ne!(
+            actual, rust_order,
+            "fixture must disagree with Rust ordering"
+        );
+    });
+}
+
+#[test]
+fn full_sqlite_page_requires_a_continuation() {
+    let transaction_id = StoreTransactionId::new_random();
+    let mut cursor = PageCursor::new(());
+    let mut batch = VecPageBatch::bounded(NonZeroUsize::new(1).unwrap());
+    let mut page = cursor
+        .begin_page::<SqliteTextPageContinuation, _>(transaction_id, &mut batch)
+        .expect("SQLite page should begin");
+    page.push(1_u32).expect("record should enter the batch");
+
+    assert!(matches!(
+        finish_page(page, None),
+        Err(PageError::MissingContinuation)
+    ));
+    assert!(batch.is_empty());
+    assert!(cursor.is_failed());
 }
 
 #[test]
@@ -2070,93 +2626,149 @@ fn sqlite_store_roundtrips_blocked_key_fingerprints() {
     wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
 }
 
-#[test]
-fn sqlite_store_filters_replication_updates_by_producer_range() {
-    let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store = in_memory_store(local_member());
-    let group_id = GroupId(Uuid::from_u128(10_011));
-    let group = sample_group(group_id);
-    let encoded_operation = encoded_insert_snapshot("range query", &schema);
-    let update = |node_index, version, sender| ReplicationUpdateRecord {
-        group_id,
-        update_id: UpdateId {
-            node_index,
-            version,
-        },
-        sender,
-        read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
-        dataset_updates: vec![DatasetUpdateRecord {
-            dataset_id: dataset_id.clone(),
-            operations: vec![encoded_operation.clone()],
-        }],
-        applied_locally: true,
-    };
-    let alice_v1 = update(0, 1, local_member());
-    let alice_v2 = update(0, 2, local_member());
-    let alice_v3 = update(0, 3, local_member());
-    let bob_v1 = update(1, 1, remote_member());
+/// Store and records shared by one projected-update paging scenario.
+struct UpdatePagingFixture {
+    /// SQLite owner retained across committed and read transactions.
+    store: TestSqliteStore,
+    /// Group whose update log is under test.
+    group_id: GroupId,
+    /// Dataset carried by every fixture update.
+    dataset_id: DatasetId,
+    /// Expected update order: Alice 1, Bob 1, Alice 2, Alice 3, Bob maximum.
+    updates: [ReplicationUpdateRecord; 5],
+}
 
-    let mut transaction =
-        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+impl UpdatePagingFixture {
+    /// Build updates with a same-version producer tie and the maximum supported version.
+    fn new() -> Self {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(10_011));
+        let encoded_operation = encoded_insert_snapshot("range query", &schema);
+        let update = |node_index, version, sender, applied_locally| ReplicationUpdateRecord {
+            group_id,
+            update_id: UpdateId {
+                node_index,
+                version,
+            },
+            sender,
+            read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            dataset_updates: vec![DatasetUpdateRecord {
+                dataset_id: dataset_id.clone(),
+                operations: vec![encoded_operation.clone()],
+            }],
+            applied_locally,
+        };
+        let alice_v1 = update(0, 1, local_member(), false);
+        let alice_v2 = update(0, 2, local_member(), true);
+        let alice_v3 = update(0, 3, local_member(), true);
+        let bob_v1 = update(1, 1, remote_member(), true);
+        let bob_max = update(1, MAX_VERSION_VALUE, remote_member(), false);
+        Self {
+            store,
+            group_id,
+            dataset_id,
+            updates: [alice_v1, bob_v1, alice_v2, alice_v3, bob_max],
+        }
+    }
+
+    /// Return the identities in the expected composite SQL order.
+    fn expected_ids(&self) -> Vec<UpdateId> {
+        self.updates.iter().map(|update| update.update_id).collect()
+    }
+}
+
+/// Insert all fixture updates into the transaction used for the paging checks.
+fn insert_update_paging_fixture(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    fixture: &UpdatePagingFixture,
+) {
+    let group = sample_group(fixture.group_id);
     wait_for_store_future(transaction.insert_replication_group(group)).expect("group should store");
-    for update in [
-        alice_v1.clone(),
-        alice_v2.clone(),
-        alice_v3.clone(),
-        bob_v1.clone(),
-    ] {
+    for update in fixture.updates.iter().cloned() {
         wait_for_store_future(transaction.append_replication_update(update))
             .expect("update should store");
     }
+}
 
-    let limited_alice = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
+#[test]
+fn sqlite_store_pages_projected_replication_updates_and_ids() {
+    let fixture = UpdatePagingFixture::new();
+    let mut transaction =
+        wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
+    insert_update_paging_fixture(transaction.as_mut(), &fixture);
+    let completion = wait_for_store_future(assert_update_paging_contract(
+        transaction.as_mut(),
+        &UpdatePagingFixtures {
+            group_id: fixture.group_id,
+            dataset_id: &fixture.dataset_id,
+            updates: &fixture.updates,
+            // SQLite pages use ascending (version, producer) order.
+            traversal_order: fixture.updates.each_ref().map(|update| update.update_id),
         },
-        NonZeroUsize::new(1),
-    ))
-    .expect("range should load");
-    assert_eq!(limited_alice, vec![alice_v2.clone()]);
+    ));
+    assert_eq!(completion, ExactPageCompletion::AfterEmptyPage);
+    wait_for_store_future(transaction.commit()).expect("commit should succeed");
+    assert_inconsistent_update_payload(&fixture);
+}
 
-    let limited_alice_ids = wait_for_store_future(transaction.load_replication_update_ids(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
-        },
-        NonZeroUsize::new(1),
-    ))
-    .expect("range ids should load");
-    assert_eq!(limited_alice_ids, vec![alice_v2.update_id]);
-
-    let full_alice = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
-        },
-        NonZeroUsize::new(4),
-    ))
-    .expect("range should load");
-    assert_eq!(full_alice, vec![alice_v2, alice_v3]);
-
-    let bob = wait_for_store_future(transaction.load_replication_updates(
-        &group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(1),
-            start_version: 1,
-            end_version: 3,
-        },
-        NonZeroUsize::new(4),
-    ))
-    .expect("range should load");
-    assert_eq!(bob, vec![bob_v1]);
+/// Confirm ID-only reads skip a corrupt payload while full reads report its mismatch.
+fn assert_inconsistent_update_payload(fixture: &UpdatePagingFixture) {
+    let [_, _, alice_v2, alice_v3, _] = &fixture.updates;
+    let mismatched_payload = UpdateMessageProtoSource::from(alice_v3).encode_proto_to_vec();
+    replace_raw_update_message(
+        &fixture.store,
+        fixture.group_id,
+        alice_v2.update_id,
+        mismatched_payload,
+    );
+    let mut transaction =
+        wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All);
+    let mut ids_cursor = PageCursor::new(query);
+    let mut ids = VecPageBatch::unlimited();
+    wait_for_store_future(transaction.load_replication_update_ids_into(&mut ids_cursor, &mut ids))
+        .expect("id-only paging should not decode an inconsistent payload");
+    assert_eq!(
+        ids.into_values().into_iter().sorted().collect::<Vec<_>>(),
+        fixture
+            .expected_ids()
+            .into_iter()
+            .sorted()
+            .collect::<Vec<_>>()
+    );
+    let selected_ids = HashSet::from([alice_v3.update_id]);
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
+        .with_update_ids(&selected_ids);
+    let mut selected_cursor = PageCursor::new(query);
+    let project_id = |view: ReplicationUpdateView<'_>| Ok::<_, BoxError>(view.update_id());
+    let mut selected_batch = VecPageBatch::unlimited_with(project_id);
+    wait_for_store_future(
+        transaction.load_replication_updates_into(&mut selected_cursor, &mut selected_batch),
+    )
+    .expect("an unselected inconsistent payload should not be decoded");
+    assert_eq!(selected_batch.values(), &[alice_v3.update_id]);
+    let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+        fixture.group_id,
+        ReplicationUpdateFilter::All,
+    ));
+    let own_update = |view: ReplicationUpdateView<'_>| view.try_to_owned_record();
+    let mut batch = VecPageBatch::unlimited_with(own_update);
+    let error =
+        wait_for_store_future(transaction.load_replication_updates_into(&mut cursor, &mut batch))
+            .map_err(StoreError::from)
+            .expect_err("projected update paging should validate indexed payload identity");
+    assert_sqlite_store_error(&error, |error| {
+        matches!(
+            error,
+            SqliteStoreError::StoredUpdateIdMismatch {
+                expected_update_id,
+                actual_update_id,
+            } if *expected_update_id == alice_v2.update_id
+                && *actual_update_id == alice_v3.update_id
+        )
+    });
     wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
 }
 
@@ -2273,60 +2885,31 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
-    let first_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
+    let dataset = GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    };
+    let expected = [
+        ReplicationRowMetadata {
+            row_key: first_row_key,
+            tombstoned: false,
+            created_by: Some(sample_change_id()),
+            last_changed_versions: sample_last_changed_versions(),
         },
-        None,
-        NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ))
-    .expect("first batch should scan");
-    let first_scanned_metadata = state_rows
-        .row(0)
-        .expect("first scan should return one row")
-        .metadata()
-        .clone();
-    let retained_capacity = state_rows.capacity();
-    let second_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
+        ReplicationRowMetadata {
+            row_key: second_row_key,
+            tombstoned: true,
+            created_by: None,
+            last_changed_versions: sample_last_changed_versions(),
         },
-        first_batch.next_after,
-        NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ))
-    .expect("second batch should scan");
-    let second_scanned_metadata = state_rows
-        .row(0)
-        .expect("second scan should return one row")
-        .metadata()
-        .clone();
+    ];
+    wait_for_store_future(assert_row_scan_paging_contract(
+        transaction.as_mut(),
+        dataset,
+        &expected,
+    ));
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert!(first_batch.dataset_exists);
-    assert_eq!(first_scanned_metadata.row_key, first_row_key);
-    assert!(!first_scanned_metadata.tombstoned);
-    assert_eq!(first_scanned_metadata.created_by, Some(sample_change_id()));
-    assert_eq!(
-        first_scanned_metadata.last_changed_versions,
-        sample_last_changed_versions()
-    );
-    assert_eq!(first_batch.next_after, Some(first_row_key));
-    assert_eq!(second_scanned_metadata.row_key, second_row_key);
-    assert!(second_scanned_metadata.tombstoned);
-    assert_eq!(second_scanned_metadata.created_by, None);
-    assert_eq!(
-        second_scanned_metadata.last_changed_versions,
-        sample_last_changed_versions()
-    );
-    assert_eq!(second_batch.next_after, Some(second_row_key));
-    assert_eq!(state_rows.capacity(), retained_capacity);
 }
 
 #[test]
@@ -2362,37 +2945,44 @@ fn sqlite_store_scan_clears_reused_rows_for_missing_dataset() {
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
     let limit = NonZeroUsize::new(8).expect("limit should be non-zero");
-    wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        None,
-        limit,
-        &mut state_rows,
-    ))
+    let mut state_rows = DatasetRowPageBatch::bounded(&schema, limit);
+    let mut existing_cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    }));
+    wait_for_store_future(
+        transaction.scan_dataset_rows_into(&mut existing_cursor, &mut state_rows),
+    )
     .expect("existing dataset should scan");
-    assert_eq!(state_rows.len(), 1);
+    assert_eq!(state_rows.rows().len(), 1);
 
-    let page = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &missing_dataset_id,
-            schema: &schema,
-        },
-        None,
-        limit,
-        &mut state_rows,
-    ))
-    .expect("missing dataset should return an empty page");
+    let mut missing_cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &missing_dataset_id,
+        schema: &schema,
+    }));
+    wait_for_store_future(transaction.scan_dataset_rows_into(&mut missing_cursor, &mut state_rows))
+        .expect("missing dataset should return an empty page");
+    assert!(
+        !state_rows
+            .metadata()
+            .expect("successful missing-dataset page should retain metadata")
+            .dataset_exists
+    );
+    assert!(missing_cursor.is_exhausted());
+    assert!(state_rows.rows().is_empty());
+
+    assert_requested_rows_for_missing_dataset(
+        transaction.as_mut(),
+        group_id,
+        &missing_dataset_id,
+        &schema,
+        row_key,
+    );
+
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert!(!page.dataset_exists);
-    assert!(page.next_after.is_none());
-    assert!(state_rows.is_empty());
 }
 
 #[test]
@@ -2427,21 +3017,23 @@ fn sqlite_store_scan_rejects_malformed_row_snapshot_without_publishing_metadata(
 
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut state_rows = ReplicationStateRowBatch::new(&schema);
-    let result = wait_for_store_future(transaction.scan_dataset_row_batch(
-        GroupDatasetSchemaRef {
-            group_id: &group_id,
-            dataset_id: &dataset_id,
-            schema: &schema,
-        },
-        None,
+    let mut cursor = PageCursor::new(DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+        group_id: &group_id,
+        dataset_id: &dataset_id,
+        schema: &schema,
+    }));
+    let mut state_rows = DatasetRowPageBatch::bounded(
+        &schema,
         NonZeroUsize::new(1).expect("limit should be non-zero"),
-        &mut state_rows,
-    ));
+    );
+    let result =
+        wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut state_rows));
     wait_for_store_future(transaction.release()).expect("read should release");
 
     assert!(result.is_err());
-    assert!(state_rows.is_empty());
+    assert!(state_rows.rows().is_empty());
+    assert!(state_rows.metadata().is_none());
+    assert!(cursor.is_failed());
 }
 
 #[test]
@@ -2534,60 +3126,14 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
         dataset_id: &dataset_id,
         schema: &current_schema,
     };
-    let mut transition_rows =
-        ReplicationStateRowTransitionBatch::new(&previous_schema, &current_schema);
-    let first_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
+    wait_for_store_future(assert_transition_paging_contract(
+        transaction.as_mut(),
         previous_group,
         current_group,
-        None,
-        NonZeroUsize::new(2).expect("limit should be non-zero"),
-        &mut transition_rows,
-    ))
-    .expect("first transition batch should scan");
-    let first_row_presence = transition_rows
-        .rows()
-        .map(|transition| {
-            (
-                transition.row_key(),
-                transition.previous().is_some(),
-                transition.current().is_some(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let second_batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        first_batch.next_after,
-        NonZeroUsize::new(2).expect("limit should be non-zero"),
-        &mut transition_rows,
-    ))
-    .expect("second transition batch should scan");
+        [previous_only, current_only, corresponding],
+        previous_change_id,
+    ));
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert_eq!(first_batch.dataset_id, dataset_id);
-    assert_eq!(first_batch.previous_group_id, previous_group_id);
-    assert_eq!(first_batch.current_group_id, current_group_id);
-    assert!(first_batch.previous_dataset_exists);
-    assert!(first_batch.current_dataset_exists);
-    assert_eq!(
-        first_row_presence,
-        vec![(previous_only, true, false), (current_only, false, true)]
-    );
-    assert_eq!(first_batch.next_after, Some(current_only));
-    assert_eq!(transition_rows.len(), 1);
-    let transition = transition_rows.row(0).expect("transition must exist");
-    assert_eq!(transition.row_key(), corresponding);
-    assert_eq!(
-        transition.previous().map(|row| row.metadata().created_by),
-        Some(Some(previous_change_id))
-    );
-    assert_eq!(
-        transition
-            .current()
-            .map(|row| (row.metadata().created_by, row.metadata().tombstoned)),
-        Some((None, true))
-    );
-    assert_eq!(second_batch.next_after, None);
 }
 
 #[test]
@@ -2639,27 +3185,29 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
     let limit = NonZeroUsize::new(1).expect("limit should be non-zero");
     let mut transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("read should start");
-    let mut transition_rows = ReplicationStateRowTransitionBatch::new(&schema, &schema);
-    let batch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let mut cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(previous_group),
+        DatasetRowsQuery::borrowed(current_group),
+    ));
+    let mut transition_rows = DatasetRowTransitionPageBatch::bounded(&schema, &schema, limit);
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("transition batch should scan");
+    let batch = transition_rows
+        .metadata()
+        .expect("successful transition batch should retain metadata")
+        .clone();
     let first_presence = transition_rows
+        .transitions()
         .row(0)
         .map(|row| (row.previous().is_some(), row.current().is_some()));
-    let exhausted = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        current_group,
-        batch.next_after,
-        limit,
-        &mut transition_rows,
-    ))
+    assert!(cursor.has_more());
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
+    )
     .expect("exhaustion batch should scan");
-    let exhausted_is_empty = transition_rows.is_empty();
+    let exhausted_is_empty = transition_rows.transitions().is_empty();
     let empty_dataset_id =
         DatasetId::try_from_static("empty").expect("empty dataset id should build");
     let empty_previous_group = GroupDatasetSchemaRef {
@@ -2672,36 +3220,45 @@ fn sqlite_store_transition_scan_reports_missing_dataset_and_exact_limit_exhausti
         dataset_id: &empty_dataset_id,
         schema: &schema,
     };
-    let empty = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        empty_previous_group,
-        empty_current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let mut empty_cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(empty_previous_group),
+        DatasetRowsQuery::borrowed(empty_current_group),
+    ));
+    wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut empty_cursor, &mut transition_rows),
+    )
     .expect("empty transition batch should scan");
-    let empty_is_empty = transition_rows.is_empty();
-    let mismatch = wait_for_store_future(transaction.scan_dataset_row_transition_batch(
-        previous_group,
-        empty_current_group,
-        None,
-        limit,
-        &mut transition_rows,
-    ))
+    let empty = transition_rows
+        .metadata()
+        .expect("empty transition batch should retain metadata")
+        .clone();
+    let empty_is_empty = transition_rows.transitions().is_empty();
+    let mut mismatch_cursor = PageCursor::new(DatasetRowTransitionQuery::new(
+        DatasetRowsQuery::borrowed(previous_group),
+        DatasetRowsQuery::borrowed(empty_current_group),
+    ));
+    let mismatch = wait_for_store_future(
+        transaction.scan_dataset_row_transitions_into(&mut mismatch_cursor, &mut transition_rows),
+    )
     .expect_err("different dataset references should be rejected");
     wait_for_store_future(transaction.release()).expect("read should release");
 
     assert!(batch.previous_dataset_exists);
     assert!(!batch.current_dataset_exists);
     assert_eq!(first_presence, Some((true, false)));
-    assert_eq!(batch.next_after, Some(row_key));
     assert!(exhausted_is_empty);
-    assert_eq!(exhausted.next_after, None);
+    assert!(cursor.is_exhausted());
     assert!(!empty.previous_dataset_exists);
     assert!(!empty.current_dataset_exists);
     assert!(empty_is_empty);
-    assert_eq!(empty.next_after, None);
-    assert_eq!(mismatch.classification().class, StoreErrorClass::Contract);
+    assert!(empty_cursor.is_exhausted());
+    assert_eq!(
+        mismatch
+            .store_error_classification()
+            .expect("query mismatch should remain classified")
+            .class,
+        StoreErrorClass::Contract
+    );
 }
 
 #[test]

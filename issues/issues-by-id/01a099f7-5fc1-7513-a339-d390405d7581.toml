@@ -1,0 +1,56 @@
+id = "01a099f7-5fc1-7513-a339-d390405d7581"
+ref = "flotsync-h3l.5"
+title = "Page history and catch-up update consumers"
+body = """
+Scope (AJ5)
+Convert retained-history reconciliation, availability checks, summary inspection, and catch-up responses to the projected update and ID paging APIs from flotsync-h3l.4. Keep causal replay and pending application for flotsync-h3l.6, and compatibility-adapter removal for flotsync-h3l.8. Implement this as one review slice on the current branch. Estimated 730-1,070 changed Rust LOC: retained history 250-350, availability 100-160, catch-up responses 180-260, and focused tests/wrappers 200-300.
+
+Current paging contract
+Use PageCursor<ReplicationUpdatesQuery> with the existing private backend continuation. Call load_replication_updates_into with a PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()> and load_replication_update_ids_into with an owned UpdateId batch. Each cursor is bound to one transaction and must be drained with has_more until exhausted; a full final page may need an empty confirmation call. Use finite VecPageBatch pages for incremental reconciliation, ID availability scans, and catch-up responses, distinct from any optional total response cap. Summary inspection uses one unlimited projected batch because it consumes the complete collection. The SQLite backend already provides stable ordering by update version and producer index, exclusive continuation, source-record limits, and borrowed payload projection. PageError converts to StoreError at the runtime boundary while preserving classified backend failures.
+
+Retained history
+In runtime/synchronisation/provider/incremental.rs, replace complete owned producer-range loads with finite pages on the retained read transaction. Project each borrowed update to one compact per-update value containing identity, read versions, applied state, and the dataset/row identities needed for affected-row collection. Add a borrowed SchemaOperationView row-ID decoding path beside the existing codec helper, sharing low-level UUID validation where possible; do not materialise full operation payloads. If a projection can discover a domain validation error, retain it as a per-update result and return the established contextual IncrementalPreparationError after the page call rather than losing it inside PageError::BatchPush. Validate group and producer identity, exact sequential versions, causal metadata, missing first/interior/last versions, and final exhaustion across page boundaries. Missing retained history yields IncrementalEvidence::SnapshotRequired; malformed or inconsistent metadata remains an error. Fold validated row identities into the existing ordered, deduplicated affected-row set. Remove obsolete unlimited-load TODOs.
+
+Availability
+In runtime/catch_up_manager.rs, page update IDs into ProducerVersionSets one batch at a time without reading update payloads or retaining a complete ID vector. In runtime/component/mod.rs summary inspection, load pending-apply IDs through one unlimited batch that projects directly to UpdateRangeMessage, because the downstream range-bounding step requires the full collection. Preserve the existing lifecycle and range-bounding behaviour without an intermediate ID vector.
+
+Catch-up responses
+In runtime/catch_up_manager.rs, project borrowed updates to UpdateMessage directly into finite batches. Use a fixed finite read page size when the configured total response maximum is absent. When present, use the minimum of the page size and remaining response capacity, across all requested producer ranges, and stop as soon as the total cap is reached. Do not eagerly materialise updates beyond the response. Preserve error classification and transaction snapshot behaviour.
+
+Validation
+Adapt existing runtime request observations for finite pages. Extend existing provider and catch-up scenarios for gaps crossing page boundaries, missing endpoints, exact-size final pages, multiple ranges sharing one total cap, uncapped responses with finite reads, and ID-only availability. Add only tests that establish changed behaviour; rely on existing paging-contract tests for generic cursor mechanics and existing malformed-record tests where still applicable. Check touched files for duplicate helpers, run focused tests, formatting, pedantic Clippy, and the required serial replication suite. Keep the issue open and set status_reason to in review for handover.
+Review fixes agreed 2026-09-30
+Keep the catch-up response test's shared total cap across two ranges, and change its uncapped case to one range exceeding the 64-record read page. Assert the finite page requests using the existing store request observations. Restore coverage that feeds a malformed borrowed schema operation through retained-history paging and checks the contextual IncrementalPreparationError::DecodeOperation. Resolve the three mandatory Rust style findings: explain or remove the empty Complete(()) match arm, remove nested ? expressions, and group the restricted-visibility metadata validator with restricted items. These are review refinements within the existing AJ5 scope; do not expand the generic paging tests.
+
+Review refinements agreed 2026-10-02
+In the incremental provider, use Snafu OptionExt::context when a range progress tracker has no next expected version, preserving UnexpectedUpdate error details. Document the applied-local, read-version member-count, target-frontier, and producer self-dependency checks. Rename the new progress and projection types and functions for their exact roles: UpdateRangePosition, UpdateRangeProgress, ProjectedUpdate, project_update_row_keys, validate_update_metadata, and load_update_range; update existing tests and call sites. Name the fallible projected field row_keys_result and its unwrapped collection row_keys_by_dataset. Distinguish raw_dataset_id (&str) from validated dataset_id (DatasetId). Describe the dataset-ID error as conversion failure and remove imprecise "retain" wording from new projection documentation. These are review refinements to the same implementation; no new generic paging coverage is needed. Estimated additional change: 100-180 lines, within the existing one-slice scope.
+"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["01a099f7-5f7c-7cd1-bf55-486209d43e07"]
+blocks = ["01a099f7-6090-7ee3-9045-a9a997904a48"]
+parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
+created_at = "2026-09-13T08:52:01.089125Z"
+updated_at = "2026-10-02T12:45:56.619903Z"
+closed_at = "2026-10-02T12:45:56.619903Z"
+
+[[comments]]
+id = "01a0f39c-c75c-7250-829e-6146fe08b307"
+author = "lkroll"
+body = "Review delta agreed: exercise an uncapped catch-up range spanning the 64-record page boundary and assert request limits; restore contextual malformed-operation projection coverage; resolve three Rust style findings for the empty arm, nested errors, and restricted item order."
+created_at = "2026-09-30T18:38:53.276094Z"
+
+[[comments]]
+id = "01a0fc81-8022-7873-83ae-1df14bd5397f"
+author = "codex"
+body = "Review delta agreed 2026-10-02: use one unlimited projected batch for summary pending IDs; simplify range validation with OptionExt; make update-range and projection names, result fields, dataset-ID conversion errors, and metadata docs precise. Existing tests will be updated without redundant generic paging cases."
+created_at = "2026-10-02T12:05:40.514048Z"
+
+[[comments]]
+id = "01a0fca6-5e0b-76a0-8332-67275055973d"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-02T12:45:56.619903Z"

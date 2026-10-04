@@ -1,0 +1,187 @@
+//! SQLite query construction shared by pageable store operations.
+
+use super::{
+    PageAttempt,
+    PageBatch,
+    PageEnd,
+    PageError,
+    PageLimit,
+    QueryBuilder,
+    Sqlite,
+    sqlite_limit_value,
+};
+
+/// SQLite-owned continuation containing one SQL `TEXT` value.
+pub(crate) struct SqliteTextPageContinuation(String);
+
+impl SqliteTextPageContinuation {
+    /// Capture the SQLite `TEXT` value of the final accepted source record.
+    pub(super) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the value used by SQLite's exclusive lower-bound comparison.
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Append a `TEXT` lower bound and the bounded ordering window.
+///
+/// The query must already contain a `WHERE` predicate. `column` is a trusted
+/// SQLite column expression supplied by this backend. An
+/// unlimited page adds only an existing lower bound and does not request an
+/// ordering or limit.
+pub(super) fn push_text_page_window<Params, Batch>(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
+    column: &'static str,
+) where
+    Batch: PageBatch + ?Sized,
+{
+    push_text_window(
+        query_builder,
+        page.after().map(SqliteTextPageContinuation::as_str),
+        page.limit(),
+        column,
+    );
+}
+
+/// Append a first `TEXT` predicate and the bounded ordering window.
+///
+/// The query must not yet contain a `WHERE` clause. A continuation adds
+/// `WHERE column > continuation`; a fresh cursor adds no predicate. `column`
+/// is a trusted SQLite expression. Unlimited pages request no ordering or limit.
+pub(super) fn push_initial_text_page_window<Params, Batch>(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
+    column: &'static str,
+) where
+    Batch: PageBatch + ?Sized,
+{
+    push_text_lower_bound(
+        query_builder,
+        page.after().map(SqliteTextPageContinuation::as_str),
+        column,
+        " WHERE ",
+    );
+    push_page_order_and_limit(query_builder, page.limit(), column);
+}
+
+/// Append a `TEXT` lower bound, required ordering, and optional finite limit.
+///
+/// Use this for APIs which promise ordered results even when the caller selects
+/// an unlimited page. The query must already contain a `WHERE` predicate.
+/// `column` is a trusted SQLite column expression supplied by this backend.
+pub(super) fn push_ordered_text_page_window<Params, Batch>(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    page: &PageAttempt<'_, Params, SqliteTextPageContinuation, Batch>,
+    column: &'static str,
+) where
+    Batch: PageBatch + ?Sized,
+{
+    push_text_lower_bound(
+        query_builder,
+        page.after().map(SqliteTextPageContinuation::as_str),
+        column,
+        " AND ",
+    );
+    query_builder.push(" ORDER BY ").push(column);
+    if let PageLimit::Max(limit) = page.limit() {
+        query_builder
+            .push(" LIMIT ")
+            .push_bind(sqlite_limit_value(limit));
+    }
+}
+
+/// Append a `TEXT` lower bound and bounded ordering from borrowed page values.
+///
+/// The query must already contain a `WHERE` predicate.
+pub(super) fn push_text_window(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    after: Option<&str>,
+    limit: PageLimit,
+    column: &'static str,
+) {
+    push_text_lower_bound(query_builder, after, column, " AND ");
+    push_page_order_and_limit(query_builder, limit, column);
+}
+
+/// Append one optional exclusive lower bound for a SQL `TEXT` value.
+///
+/// `predicate_prefix` is trusted SQL: ` WHERE ` for the first predicate or
+/// ` AND ` when the query already contains a predicate.
+fn push_text_lower_bound(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    after: Option<&str>,
+    column: &'static str,
+    predicate_prefix: &'static str,
+) {
+    if let Some(after) = after {
+        query_builder
+            .push(predicate_prefix)
+            .push(column)
+            .push(" > ")
+            .push_bind(after);
+    }
+}
+
+/// Finish a SQLite page, retaining `continuation` only for a full bounded fill.
+pub(super) fn finish_page<Params, Continuation, Batch>(
+    page: PageAttempt<'_, Params, Continuation, Batch>,
+    continuation: Option<Continuation>,
+) -> Result<(), PageError>
+where
+    Continuation: Send + 'static,
+    Batch: PageBatch<Metadata = ()> + ?Sized,
+{
+    finish_page_with_metadata(page, (), continuation)
+}
+
+/// Finish a SQLite page with metadata, retaining `continuation` only for a full bounded fill.
+pub(super) fn finish_page_with_metadata<Params, Continuation, Batch>(
+    page: PageAttempt<'_, Params, Continuation, Batch>,
+    metadata: Batch::Metadata,
+    continuation: Option<Continuation>,
+) -> Result<(), PageError>
+where
+    Continuation: Send + 'static,
+    Batch: PageBatch + ?Sized,
+{
+    let end = match (page.has_filled_limit(), continuation) {
+        (true, Some(continuation)) => Ok(PageEnd::MayHaveMore(continuation)),
+        (true, None) => Err(PageError::MissingContinuation),
+        (false, _) => Ok(PageEnd::Exhausted),
+    }?;
+    page.finish(metadata, end)
+}
+
+/// Return the final record index when this result fills one bounded page.
+///
+/// `Some` identifies the record whose backend position must become the next
+/// continuation. `None` means the page is unlimited or shorter than its finite
+/// limit and therefore needs no continuation.
+pub(super) fn continuation_record_index(limit: PageLimit, records: usize) -> Option<usize> {
+    match limit {
+        PageLimit::Max(limit) if records == limit.get() => records.checked_sub(1),
+        PageLimit::Max(_) | PageLimit::Unlimited => None,
+    }
+}
+
+/// Append deterministic ordering and a limit for a bounded page.
+///
+/// `order_by` is a trusted SQLite ordering expression supplied by this backend.
+/// Unlimited pages are left unchanged.
+pub(super) fn push_page_order_and_limit(
+    query_builder: &mut QueryBuilder<Sqlite>,
+    limit: PageLimit,
+    order_by: &'static str,
+) {
+    if let PageLimit::Max(limit) = limit {
+        query_builder
+            .push(" ORDER BY ")
+            .push(order_by)
+            .push(" LIMIT ")
+            .push_bind(sqlite_limit_value(limit));
+    }
+}

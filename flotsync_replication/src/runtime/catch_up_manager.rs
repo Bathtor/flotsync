@@ -1,13 +1,18 @@
 use crate::{
     api::{
+        PageCursor,
         ReplicationStore,
         ReplicationUpdateFilter,
+        ReplicationUpdatePageInput,
+        ReplicationUpdateView,
+        ReplicationUpdatesQuery,
         StoreError,
         StoreErrorClass,
         StoreErrorClassification,
         StoreErrorClassificationSource,
         StoreErrorResolution,
         StoreErrorScope,
+        VecPageBatch,
     },
     codecs::messages::{
         NeedRangeMessage,
@@ -34,7 +39,7 @@ use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_utils::{OptionExt as _, ResultExt as _, kompact_config::ConfigReadExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
-use kompact::{KompactLogger, prelude::*};
+use kompact::prelude::*;
 use snafu::{Location, prelude::*};
 use std::{
     collections::{
@@ -51,6 +56,9 @@ use std::{
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_UPDATES_PER_BATCH: usize = 16;
+/// Maximum source records read in one catch-up store page.
+pub(super) const UPDATE_READ_PAGE_SIZE: NonZeroUsize =
+    NonZeroUsize::new(64).expect("64 is non-zero");
 
 mod config_keys {
     use super::{DEFAULT_MAX_UPDATES_PER_BATCH, DEFAULT_RETRY_DELAY};
@@ -178,13 +186,6 @@ impl ProducerVersionSets {
     fn from_ranges(ranges: &[UpdateRangeMessage]) -> Self {
         let mut sets = Self::new();
         sets.insert_ranges(ranges);
-        sets
-    }
-
-    /// Build the available-version view represented by persisted update ids.
-    fn from_update_ids(update_ids: &[UpdateId]) -> Self {
-        let mut sets = Self::new();
-        sets.insert_update_ids(update_ids);
         sets
     }
 
@@ -784,11 +785,20 @@ impl CatchUpManagerComponent {
             if let Some(final_versions) = group.lifecycle.final_versions() {
                 final_versions_by_group.insert(group.group_id, final_versions.clone());
             }
-            let update_ids = transaction
-                .load_replication_update_ids(&group.group_id, ReplicationUpdateFilter::All, None)
-                .await
-                .context(catch_up::StoreAccessSnafu)?;
-            let available = ProducerVersionSets::from_update_ids(&update_ids);
+            let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+                group.group_id,
+                ReplicationUpdateFilter::All,
+            ));
+            let mut batch = VecPageBatch::<UpdateId, ()>::bounded(UPDATE_READ_PAGE_SIZE);
+            let mut available = ProducerVersionSets::new();
+            while cursor.has_more() {
+                transaction
+                    .load_replication_update_ids_into(&mut cursor, &mut batch)
+                    .await
+                    .map_err(StoreError::from)
+                    .context(catch_up::StoreAccessSnafu)?;
+                available.insert_update_ids(batch.values());
+            }
             if !available.is_empty() {
                 available_by_group.insert(group.group_id, available);
             }
@@ -809,7 +819,6 @@ impl CatchUpManagerComponent {
             group_id,
             ranges,
             self.max_updates_per_batch,
-            self.log().clone(),
         )
     }
 }
@@ -820,57 +829,46 @@ async fn load_update_batch_from_store(
     group_id: GroupId,
     ranges: Vec<UpdateRangeMessage>,
     max_updates_per_batch: Option<NonZeroUsize>,
-    logger: KompactLogger,
 ) -> Result<Vec<UpdateMessage>, CatchUpError> {
     let mut transaction = store
         .begin_read_transaction()
         .await
         .context(catch_up::StoreAccessSnafu)?;
     let mut updates = Vec::new();
-    for range in ranges {
-        let limit = if let Some(max_updates_per_batch) = max_updates_per_batch {
-            let remaining = max_updates_per_batch.get().saturating_sub(updates.len());
-            if remaining == 0 {
-                break;
-            }
-            Some(NonZeroUsize::new(remaining).unwrap())
-        } else {
-            None
-        };
-        let requested_limit = limit.map(NonZeroUsize::get);
-        let loaded = transaction
-            .load_replication_updates(
-                &group_id,
-                ReplicationUpdateFilter::ProducerRange {
-                    producer_index: MemberIndex::new(range.producer_index),
-                    start_version: range.start_version,
-                    end_version: range.end_version,
-                },
-                limit,
-            )
-            .await
-            .context(catch_up::StoreAccessSnafu)?;
-        let loaded_count = loaded.len();
-        updates.extend(loaded.into_iter().map(UpdateMessage::from));
-        if let Some(requested_limit) = requested_limit
-            && loaded_count > requested_limit
-        {
-            warn!(
-                logger,
-                "store implementation violated catch-up request limit for group {} by returning {} updates after limit {}; truncating response",
-                group_id,
-                loaded_count,
-                requested_limit
-            );
-        }
-        // The store API should honour the per-query limit above. This
-        // defensive branch only runs if an implementation violates that
-        // contract and returns more records than requested.
-        if let Some(max_updates_per_batch) = max_updates_per_batch
-            && updates.len() > max_updates_per_batch.get()
-        {
-            updates.truncate(max_updates_per_batch.get());
-            break;
+    'ranges: for range in ranges {
+        let query = ReplicationUpdatesQuery::new(
+            group_id,
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(range.producer_index),
+                start_version: range.start_version,
+                end_version: range.end_version,
+            },
+        );
+        let mut cursor = PageCursor::new(query);
+        while cursor.has_more() {
+            let page_size = match max_updates_per_batch {
+                Some(maximum) => {
+                    let remaining = maximum.get().saturating_sub(updates.len());
+                    if remaining == 0 {
+                        break 'ranges;
+                    }
+                    NonZeroUsize::new(remaining.min(UPDATE_READ_PAGE_SIZE.get()))
+                        .expect("remaining response capacity is non-zero")
+                }
+                None => UPDATE_READ_PAGE_SIZE,
+            };
+            let own_message = |view: ReplicationUpdateView<'_>| UpdateMessage::try_from_view(&view);
+            let mut batch =
+                VecPageBatch::<UpdateMessage, (), ReplicationUpdatePageInput, _>::bounded_with(
+                    page_size,
+                    own_message,
+                );
+            transaction
+                .load_replication_updates_into(&mut cursor, &mut batch)
+                .await
+                .map_err(StoreError::from)
+                .context(catch_up::StoreAccessSnafu)?;
+            updates.extend(batch.into_values());
         }
     }
     Ok(updates)
@@ -1308,37 +1306,78 @@ mod tests {
     }
 
     #[test]
-    fn load_update_batch_honours_unlimited_batch_mode() {
+    fn load_update_batch_shares_cap_across_ranges_and_pages_uncapped_responses() {
         let group_id = GroupId(Uuid::from_u128(80_001));
         let sqlite_store = provisioned_sqlite_store(&local_member());
-        let store: Arc<dyn ReplicationStore> = sqlite_store.clone();
-        persist_group_with_updates(&store, group_id, 20);
-        let system = build_test_kompact_system();
-        let logger = system.logger().clone();
+        let observed_store = Arc::new(crate::runtime::tests::FailingStore::new(
+            sqlite_store.clone(),
+        ));
+        let store: Arc<dyn ReplicationStore> = observed_store.clone();
+        persist_group_with_updates(&store, group_id, 70);
+        let ranges = vec![update_range(0, 1, 10), update_range(0, 11, 70)];
 
         let bounded_updates = wait_for_store_future(load_update_batch_from_store(
             store.clone(),
             group_id,
-            vec![update_range(0, 1, 20)],
+            ranges.clone(),
             NonZeroUsize::new(DEFAULT_MAX_UPDATES_PER_BATCH),
-            logger.clone(),
         ))
         .expect("bounded batch should load");
-        assert_eq!(bounded_updates.len(), DEFAULT_MAX_UPDATES_PER_BATCH);
+        let bounded_versions = bounded_updates
+            .iter()
+            .map(|update| update.update_id.version)
+            .collect::<Vec<_>>();
+        assert_eq!(bounded_versions, (1..=16).collect::<Vec<_>>());
+        let bounded_requests = observed_store.replication_update_load_requests();
+        let bounded_limits = bounded_requests
+            .iter()
+            .map(|request| request.limit)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bounded_limits,
+            [NonZeroUsize::new(16), NonZeroUsize::new(6)]
+        );
 
         let unlimited_updates = wait_for_store_future(load_update_batch_from_store(
             store,
             group_id,
-            vec![update_range(0, 1, 20)],
+            vec![update_range(0, 1, 70)],
             None,
-            logger,
         ))
         .expect("unlimited batch should load");
         let loaded_versions = unlimited_updates
             .iter()
             .map(|update| update.update_id.version)
             .collect::<Vec<_>>();
-        assert_eq!(loaded_versions, (1..=20).collect::<Vec<_>>());
+        assert_eq!(loaded_versions, (1..=70).collect::<Vec<_>>());
+        let requests = observed_store.replication_update_load_requests();
+        let unlimited_limits = requests[bounded_requests.len()..]
+            .iter()
+            .map(|request| request.limit)
+            .collect::<Vec<_>>();
+        assert_eq!(unlimited_limits, [Some(UPDATE_READ_PAGE_SIZE); 2]);
         wait_for_store_future(sqlite_store.close()).expect("catch-up test store should close");
+    }
+
+    #[test]
+    fn availability_refresh_accumulates_multiple_id_pages() {
+        let group_id = GroupId(Uuid::from_u128(80_104));
+        let system = build_test_kompact_system();
+        let (manager, store) = catch_up_manager_for_group(&system, group_id);
+        let store_api: Arc<dyn ReplicationStore> = store.clone();
+        persist_group_with_updates(&store_api, group_id, 70);
+
+        manager.on_definition(|component| {
+            wait_for_store_future(component.refresh_known_available_from_store())
+                .expect("ID pages should rebuild availability");
+            let available = component
+                .known_available
+                .get(&group_id)
+                .expect("persisted IDs should be available");
+            assert_eq!(available.to_message_ranges(), vec![update_range(0, 1, 70)]);
+        });
+
+        system.shutdown().wait().expect("Kompact shutdown");
+        wait_for_store_future(store.close()).expect("catch-up test store should close");
     }
 }

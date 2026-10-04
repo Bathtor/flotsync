@@ -68,40 +68,80 @@ impl DecodeProtoViewWith<MemberCountContext> for UpdateMessage {
         proto: &Self::ProtoView<'_>,
         context: MemberCountContext,
     ) -> Result<Self, Self::Error> {
-        let group_id = group_id_from_wire(proto.group_id, "update.group_id").context(
-            InvalidWireValueSnafu {
-                field: "update.group_id",
-            },
-        )?;
-        let Some(update_id) = proto.update_id.as_option() else {
-            return MissingUpdateIdSnafu.fail();
-        };
-        let update_id = UpdateId {
-            version: update_id.version,
-            node_index: update_id.node_index,
-        };
-        ensure_update_id_version_bound(update_id)?;
-        let Some(read_versions) = proto.read_versions.as_option() else {
-            return MissingReadVersionsSnafu.fail();
-        };
-        let read_versions =
-            CompactVersionVectorProtoCodec::decode_proto_view_with(read_versions, context)
-                .context(InvalidReadVersionsSnafu {
-                    field: "update.read_versions",
-                })?;
-        let read_versions = read_versions.into_version_vector();
-        if proto.dataset_updates.is_empty() {
-            return EmptyUpdateSnafu.fail();
-        }
+        let validated = validate_update_message_view(proto, context)?;
         let dataset_updates =
             DatasetUpdateMessage::decode_proto_view_collection(&proto.dataset_updates)?;
         Ok(Self {
-            group_id,
-            update_id,
-            read_versions,
+            group_id: validated.group_id,
+            update_id: validated.update_id,
+            read_versions: validated.read_versions,
             dataset_updates,
         })
     }
+}
+
+/// Validated scalar metadata from one update view.
+pub(crate) struct ValidatedUpdateMessageView {
+    /// Decoded group identifier carried by the payload.
+    pub(crate) group_id: GroupId,
+    /// Decoded and version-bounded update identifier.
+    pub(crate) update_id: UpdateId,
+    /// Decoded sender frontier with the expected member count.
+    pub(crate) read_versions: VersionVector,
+}
+
+/// Validate an update view while retaining borrowed schema-operation views.
+///
+/// # Errors
+///
+/// Returns a contextual runtime-message error when required update metadata,
+/// member-count-dependent versions, dataset identifiers, or operation
+/// collections violate the wire contract.
+pub(crate) fn validate_update_message_view(
+    proto: &replication_proto::UpdateView<'_>,
+    context: MemberCountContext,
+) -> Result<ValidatedUpdateMessageView, RuntimeMessageError> {
+    let group_id =
+        group_id_from_wire(proto.group_id, "update.group_id").context(InvalidWireValueSnafu {
+            field: "update.group_id",
+        })?;
+    let Some(update_id) = proto.update_id.as_option() else {
+        return MissingUpdateIdSnafu.fail();
+    };
+    let update_id = UpdateId {
+        version: update_id.version,
+        node_index: update_id.node_index,
+    };
+    ensure_update_id_version_bound(update_id)?;
+    let Some(read_versions) = proto.read_versions.as_option() else {
+        return MissingReadVersionsSnafu.fail();
+    };
+    let read_versions =
+        CompactVersionVectorProtoCodec::decode_proto_view_with(read_versions, context).context(
+            InvalidReadVersionsSnafu {
+                field: "update.read_versions",
+            },
+        )?;
+    let read_versions = read_versions.into_version_vector();
+    if proto.dataset_updates.is_empty() {
+        return EmptyUpdateSnafu.fail();
+    }
+    for dataset_update in &proto.dataset_updates {
+        if dataset_update.operations.is_empty() {
+            return EmptyDatasetUpdateSnafu {
+                dataset_id: dataset_update.dataset_id.to_owned(),
+            }
+            .fail();
+        }
+        DatasetId::validate(dataset_update.dataset_id).with_context(|_| InvalidDatasetIdSnafu {
+            value: dataset_update.dataset_id.to_owned(),
+        })?;
+    }
+    Ok(ValidatedUpdateMessageView {
+        group_id,
+        update_id,
+        read_versions,
+    })
 }
 
 /// Convert a stored update-log record into the catch-up wire payload.
@@ -121,6 +161,29 @@ impl From<ReplicationUpdateRecord> for UpdateMessage {
                 .map(DatasetUpdateMessage::from)
                 .collect(),
         }
+    }
+}
+
+impl UpdateMessage {
+    /// Own the wire-relevant fields of one validated temporary store view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership or dataset-id error from the borrowed projection.
+    pub(crate) fn try_from_view(
+        view: &crate::api::ReplicationUpdateView<'_>,
+    ) -> Result<Self, flotsync_utils::BoxError> {
+        let owned_dataset_updates = view.try_to_owned_dataset_updates()?;
+        let dataset_updates = owned_dataset_updates
+            .into_iter()
+            .map(DatasetUpdateMessage::from)
+            .collect();
+        Ok(Self {
+            group_id: view.group_id(),
+            update_id: view.update_id(),
+            read_versions: view.read_versions().clone(),
+            dataset_updates,
+        })
     }
 }
 
@@ -529,9 +592,6 @@ impl DecodeProtoView for DatasetUpdateMessage {
             DatasetId::try_from_owned(dataset_id_value.clone()).context(InvalidDatasetIdSnafu {
                 value: dataset_id_value,
             })?;
-        // TODO(flotsync-h3l): Retain the generated operation views in a
-        // buffer-owning reusable update batch instead of allocating owned
-        // protobuf messages at the store boundary.
         let operations = message
             .operations
             .iter()

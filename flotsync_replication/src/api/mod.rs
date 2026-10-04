@@ -21,7 +21,7 @@ use flotsync_security::{
     load_local_store_secret,
     load_or_create_local_store_secret,
 };
-use flotsync_utils::{BoxFuture, option_when};
+use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec, smallvec};
 use snafu::prelude::*;
 use std::{
@@ -35,9 +35,12 @@ use std::{
 
 mod errors;
 mod ids;
+mod paging;
 pub mod providers;
+mod row_paging;
 pub mod security;
 pub mod store_error;
+mod update_paging;
 
 pub use errors::*;
 pub use flotsync_data_types::{
@@ -56,6 +59,9 @@ pub use flotsync_data_types::{
 };
 pub use flotsync_security::{LocalStoreSecretProfile, StoreSecretKeyId};
 pub use ids::*;
+pub use paging::*;
+pub use row_paging::*;
+pub use update_paging::*;
 
 /// Convenience macro to build a [`RowValuesPatch`] inline.
 #[macro_export]

@@ -1,0 +1,13 @@
+id = "01a0a398-b314-7e02-aa75-c7e04b4ba394"
+ref = "flotsync-yzq"
+title = "Support custom page batch collections"
+body = "Explore reusable page batches backed by caller-selected collection types so complete-result helpers can populate sets, maps, or other collections directly instead of first allocating a Vec. Cover identity and transforming batches, collection construction and storage reuse, metadata retention, fallible insertion, object-safe PageBatch use, type inference for common constructors, and how collection cardinality interacts with paging source-record counts. This is follow-up design and implementation work discovered while reviewing flotsync-h3l.2; it is outside the current metadata paging change."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-09-15T05:44:48.660523Z"
+updated_at = "2026-09-15T05:44:52.545537Z"
+
+[[links]]
+target = "01a099f7-5ef6-7451-b756-e6f2a0fca0fb"
+label = "discovered from"

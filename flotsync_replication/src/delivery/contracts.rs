@@ -5,10 +5,11 @@ use super::{
     reliable_delivery::{ReliableDeliveryDeliver, ReliableDeliverySubmit},
     shared::MessageId,
 };
-use crate::api::StoreError;
+use crate::api::{OwnedPageBatchInput, PageBatch, PageCursor, PageError, StoreError, VecPageBatch};
 use bytes::Bytes;
 use flotsync_core::MemberIdentity;
 use flotsync_utils::BoxFuture;
+use futures_util::FutureExt as _;
 use kompact::prelude::Port;
 use std::time::SystemTime;
 
@@ -86,10 +87,30 @@ pub struct StoredReliableDeliveryWork {
 /// Implementations retain each accepted encoded envelope and expose its small
 /// scheduling projection separately so startup need not read all envelope bytes.
 pub trait ReliableDeliveryStore: Send + Sync {
-    /// Load metadata for every unacknowledged outbound item.
+    /// Begin one consistent read session for outstanding sender-work metadata.
+    fn begin_read_session(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReliableDeliveryReadSession>, StoreError>>;
+
+    /// Load metadata for every unacknowledged outbound item in one batch.
+    ///
+    /// This convenience uses the same session and traversal as bounded paging.
     fn load_reliable_delivery_work_metadata(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>>;
+    ) -> BoxFuture<'_, Result<Vec<StoredReliableDeliveryWorkMetadata>, StoreError>> {
+        async move {
+            let mut session = self.begin_read_session().await?;
+            let mut cursor = PageCursor::new(());
+            let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::unlimited();
+            session
+                .load_reliable_delivery_work_metadata_into(&mut cursor, &mut batch)
+                .await
+                .map_err(StoreError::from)?;
+            session.release().await?;
+            Ok(batch.into_values())
+        }
+        .boxed()
+    }
 
     /// Load the complete encoded envelope for `message_id`. Return `Ok(None)`
     /// when no such item exists.
@@ -117,4 +138,26 @@ pub trait ReliableDeliveryStore: Send + Sync {
         &self,
         message_id: MessageId,
     ) -> BoxFuture<'_, Result<bool, StoreError>>;
+}
+
+/// Consistent read view of outstanding reliable-delivery scheduling metadata.
+///
+/// A cursor binds to this session on its first fill. Dropping the session ends
+/// its read view; explicit release also reports cleanup failures to the caller.
+/// After the first page, later pages must observe the same work and metadata
+/// despite concurrent insertions or removals. A full-envelope load after the
+/// session ends may still find that a listed item has since been removed.
+pub trait ReliableDeliveryReadSession: Send {
+    /// Fill one page of metadata without reading encoded envelope bytes.
+    fn load_reliable_delivery_work_metadata_into<'a>(
+        &'a mut self,
+        cursor: &'a mut PageCursor<()>,
+        batch: &'a mut dyn PageBatch<
+            Input = OwnedPageBatchInput<StoredReliableDeliveryWorkMetadata>,
+            Metadata = (),
+        >,
+    ) -> BoxFuture<'a, Result<(), PageError>>;
+
+    /// End the read view and promptly release its store resources.
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
 }

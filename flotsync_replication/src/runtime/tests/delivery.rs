@@ -1203,7 +1203,6 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_static();
     let store = sqlite_store(bob_member.clone());
     let first_listener = Arc::new(ListenerStub::default());
     let builder = runtime_builder(app_bob_id(), store.clone(), first_listener)
@@ -1218,59 +1217,8 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
         )
         .expect("group should install");
 
-    let row_id = test_row_id(group_id, dataset_id.clone(), 36);
-    let mut source_dataset = LocalDataset::new(schema);
-    let first_operation = apply_local_upsert(
-        &mut source_dataset,
-        &row_id,
-        crate::row_values! { "title" => "first" },
-        UpdateId {
-            version: 1,
-            node_index: 0,
-        },
-    )
-    .expect("first operation should build")
-    .expect("first operation should apply")
-    .encoded_operation;
-    let second_operation = apply_local_upsert(
-        &mut source_dataset,
-        &row_id,
-        crate::row_values! { "title" => "second" },
-        UpdateId {
-            version: 2,
-            node_index: 0,
-        },
-    )
-    .expect("second operation should build")
-    .expect("second operation should apply")
-    .encoded_operation;
-    let member_count = NonZeroUsize::new(2).expect("group has two members");
-    let first_message = UpdateMessage {
-        group_id,
-        update_id: UpdateId {
-            version: 1,
-            node_index: 0,
-        },
-        read_versions: VersionVector::initial(member_count),
-        dataset_updates: vec![DatasetUpdateMessage {
-            dataset_id: dataset_id.clone(),
-            operations: vec![first_operation],
-        }],
-    };
-    let mut second_read_versions = VersionVector::initial(member_count);
-    second_read_versions.increment_at(0);
-    let second_message = UpdateMessage {
-        group_id,
-        update_id: UpdateId {
-            version: 2,
-            node_index: 0,
-        },
-        read_versions: second_read_versions,
-        dataset_updates: vec![DatasetUpdateMessage {
-            dataset_id: dataset_id.clone(),
-            operations: vec![second_operation],
-        }],
-    };
+    let (row_id, first_message, second_message) =
+        consecutive_title_update_messages(group_id, dataset_id.clone(), 36);
 
     runtime
         .apply_update_for_test(alice_member.clone(), second_message)
@@ -1338,7 +1286,6 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_static();
     let sqlite_store = sqlite_store(bob_member.clone());
     let store = Arc::new(FailingStore::new(sqlite_store.clone()));
     let listener = Arc::new(ListenerStub::default());
@@ -1354,62 +1301,11 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
         )
         .expect("group should install");
 
-    let row_id = test_row_id(group_id, dataset_id.clone(), 38);
-    let mut source_dataset = LocalDataset::new(schema);
-    let first_operation = apply_local_upsert(
-        &mut source_dataset,
-        &row_id,
-        crate::row_values! { "title" => "first" },
-        UpdateId {
-            version: 1,
-            node_index: 0,
-        },
-    )
-    .expect("first operation should build")
-    .expect("first operation should apply")
-    .encoded_operation;
-    let second_operation = apply_local_upsert(
-        &mut source_dataset,
-        &row_id,
-        crate::row_values! { "title" => "second" },
-        UpdateId {
-            version: 2,
-            node_index: 0,
-        },
-    )
-    .expect("second operation should build")
-    .expect("second operation should apply")
-    .encoded_operation;
-    let member_count = NonZeroUsize::new(2).expect("group has two members");
-    let first_message = UpdateMessage {
-        group_id,
-        update_id: UpdateId {
-            version: 1,
-            node_index: 0,
-        },
-        read_versions: VersionVector::initial(member_count),
-        dataset_updates: vec![DatasetUpdateMessage {
-            dataset_id: dataset_id.clone(),
-            operations: vec![first_operation],
-        }],
-    };
-    let mut second_read_versions = VersionVector::initial(member_count);
-    second_read_versions.increment_at(0);
-    let second_message = UpdateMessage {
-        group_id,
-        update_id: UpdateId {
-            version: 2,
-            node_index: 0,
-        },
-        read_versions: second_read_versions,
-        dataset_updates: vec![DatasetUpdateMessage {
-            dataset_id: dataset_id.clone(),
-            operations: vec![second_operation],
-        }],
-    };
+    let (row_id, first_message, second_message) =
+        consecutive_title_update_messages(group_id, dataset_id.clone(), 38);
 
     runtime
-        .apply_update_for_test(alice_member.clone(), second_message)
+        .apply_update_for_test(alice_member.clone(), second_message.clone())
         .expect("out-of-order update should persist pending state");
     store.fail_next_apply_dataset_row_patch(dataset_id.clone());
     let error = runtime
@@ -1458,10 +1354,58 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
         0
     );
 
+    store.fail_next_exact_update_load_for(second_message.update_id);
+    let error = runtime
+        .apply_update_for_test(alice_member.clone(), first_message.clone())
+        .expect_err("loading a later ready payload should abort the whole chain");
+    assert!(matches!(error, InboundDeliveryError::StoreAccess { .. }));
+    assert!(listener.captured_data_changes().is_empty());
+    assert!(
+        load_persisted_update(sqlite_store.as_ref(), group_id, first_message.update_id).is_none(),
+        "the earlier ready update must roll back when a later payload lookup fails"
+    );
+    assert_eq!(
+        load_persisted_group(sqlite_store.as_ref(), group_id)
+            .version_vector
+            .version_at(0),
+        0
+    );
+
     runtime
         .apply_update_for_test(alice_member, first_message)
         .expect("retry after rollback should succeed");
     listener.wait_for_data_change_count(2);
+}
+
+#[test]
+fn missing_scheduled_payload_reports_store_inconsistency() {
+    let sqlite_store = sqlite_store(bob_member());
+    let store = FailingStore::new(sqlite_store.clone());
+    let group_id = GroupId(Uuid::from_u128(39));
+    let update_id = UpdateId {
+        version: 2,
+        node_index: 0,
+    };
+    let scheduled = UpdateDependency {
+        update_id,
+        read_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    store.omit_next_exact_update_load_for(update_id);
+    let error = wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("test transaction should open");
+        load_scheduled_pending_update(transaction.as_mut(), group_id, &scheduled).await
+    })
+    .expect_err("an absent scheduled payload should be an inconsistency");
+    assert!(matches!(
+        error,
+        InboundDeliveryError::MissingScheduledUpdate {
+            group_id: missing_group,
+            update_id: missing_update,
+        } if missing_group == group_id && missing_update == update_id
+    ));
 }
 
 #[test]
