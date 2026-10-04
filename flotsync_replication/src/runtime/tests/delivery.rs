@@ -817,6 +817,108 @@ fn update_batch_failure_after_first_update_keeps_first_notifications() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The failure and retry share state assertions so committed rows, notifications, and read positions are checked together."
+)]
+fn update_batch_store_failure_preserves_committed_notification_and_retry_position() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let fixture =
+        load_failing_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
+    let sqlite_store = &fixture.sqlite_owner;
+    let group_id = GroupId(Uuid::from_u128(22_211));
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let (row_id, first_update, second_update) =
+        consecutive_title_update_messages(group_id, dataset_id.clone(), 22_212);
+    let first_update_id = first_update.update_id;
+    let second_update_id = second_update.update_id;
+    let batch = UpdateBatchMessage {
+        group_id,
+        updates: vec![first_update, second_update],
+    };
+    fixture
+        .store
+        .fail_next_exact_update_load_for(second_update_id);
+    let mut expected_changes = Vec::new();
+    let mut expected_read_tokens = Vec::new();
+
+    // Check the committed prefix after failure, then the complete batch after retry.
+    for (expected_version, expected_title) in [(1, "first"), (2, "second")] {
+        let result = fixture
+            .runtime
+            .apply_update_batch_for_test(alice_member.clone(), batch.clone());
+        if expected_version == 1 {
+            let error = result.expect_err("the second update should fail its store lookup");
+            assert!(matches!(error, InboundDeliveryError::StoreAccess { .. }));
+        } else {
+            result.expect("retry should apply the second update and skip the committed first");
+        }
+
+        assert_eq!(
+            snapshot_string_field(
+                sqlite_store.as_ref(),
+                group_id,
+                &dataset_id,
+                &row_id,
+                "title",
+            ),
+            expected_title,
+            "stored row must match the latest committed notification"
+        );
+        let persisted_group = load_persisted_group(sqlite_store.as_ref(), group_id);
+        assert_eq!(
+            persisted_group.version_vector.version_at(0),
+            expected_version
+        );
+        assert!(
+            load_persisted_update(sqlite_store.as_ref(), group_id, first_update_id)
+                .expect("first update must remain committed")
+                .applied_locally
+        );
+        let persisted_second =
+            load_persisted_update(sqlite_store.as_ref(), group_id, second_update_id);
+        if expected_version == 1 {
+            assert!(
+                persisted_second.is_none(),
+                "the failed second update must leave no stored record"
+            );
+        } else {
+            assert!(
+                persisted_second
+                    .expect("retried second update must be committed")
+                    .applied_locally
+            );
+        }
+
+        expected_changes.push(CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: row_id.clone(),
+                title: expected_title.to_owned(),
+            }],
+        });
+        expected_read_tokens.push(GroupReadToken::from_group_version(
+            group_id,
+            persisted_group.version_vector,
+        ));
+        assert_eq!(fixture.listener.captured_data_changes(), expected_changes);
+        assert_eq!(
+            fixture.listener.captured_data_change_read_tokens(),
+            expected_read_tokens,
+            "listener positions must follow commits without duplicate retry notifications"
+        );
+    }
+}
+
+#[test]
 fn inbound_listener_read_token_is_scoped_to_the_updated_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -1286,12 +1388,12 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let sqlite_store = sqlite_store(bob_member.clone());
-    let store = Arc::new(FailingStore::new(sqlite_store.clone()));
-    let listener = Arc::new(ListenerStub::default());
-    let builder = runtime_builder(app_bob_id(), store.clone(), listener.clone())
-        .application_schemas(&TITLE_APPLICATION_SCHEMAS);
-    let runtime = load_runtime(builder);
+    let fixture =
+        load_failing_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
+    let sqlite_store = &fixture.sqlite_owner;
+    let store = &fixture.store;
+    let listener = &fixture.listener;
+    let runtime = &fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(37));
     runtime
         .install_group_for_test(

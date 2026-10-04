@@ -449,6 +449,26 @@ pub(super) fn load_runtime_fixture(
     }
 }
 
+/// Load a runtime with injectable store failures and retain ownership for orderly cleanup.
+pub(super) fn load_failing_runtime_fixture(
+    application_id: ApplicationId,
+    local_member: MemberIdentity,
+    application_schemas: &'static ApplicationSchemas,
+) -> RuntimeFixture<FailingStore<SqliteReplicationStore>> {
+    let listener = Arc::new(ListenerStub::default());
+    let sqlite_owner = sqlite_store(local_member.clone());
+    let store = Arc::new(FailingStore::new(sqlite_owner.clone()));
+    let builder = runtime_builder(application_id, store.clone(), listener.clone())
+        .application_schemas(application_schemas);
+    RuntimeFixture {
+        local_member,
+        runtime: load_runtime(builder),
+        listener,
+        store,
+        sqlite_owner,
+    }
+}
+
 #[test]
 pub(super) fn runtime_api_returns_local_public_key_bundle() {
     let fixture = load_runtime_fixture(app_alice_id(), alice_member(), ApplicationSchemas::EMPTY);

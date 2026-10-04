@@ -26,7 +26,8 @@ D04. Large resumable snapshot transfer, strict transport Ack semantics, explicit
 Implementation size
 
 The combined implementation is expected to exceed 1000 LOC. The epic is therefore split into independently planned child tasks, each of which must be aligned and estimated separately before implementation."""
-status = "open"
+status = "closed"
+status_reason = "completed"
 type = "epic"
 priority = 1
 children = [
@@ -39,4 +40,11 @@ children = [
     "01a041d5-ab95-7f33-915a-2f9b247522d7",
 ]
 created_at = "2026-08-25T16:35:10.400462Z"
-updated_at = "2026-08-27T06:09:07.236048Z"
+updated_at = "2026-10-04T11:04:55.439419Z"
+closed_at = "2026-10-04T11:04:55.439419Z"
+
+[[comments]]
+id = "01a10696-998f-7863-a812-75cac260780f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T11:04:55.439419Z"

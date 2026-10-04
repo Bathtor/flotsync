@@ -1,0 +1,33 @@
+id = "01a10696-f564-7c42-80c9-4fe0acf4f1dc"
+ref = "flotsync-k0v"
+title = "Publish FlotSync 0.1.0 after satisfactory maintain-rs integration"
+body = """
+Goal
+
+Publish FlotSync 0.1.0 once initial integration into maintain-rs has been exercised and judged satisfactory.
+
+Release requirement
+
+R01. Publication is a prerequisite for releasing the maintain-rs version that integrates FlotSync.
+R02. Initial maintain-rs integration must validate the application-facing replication API, SQLite store, startup reconciliation, listener delivery, and runtime lifecycle before publication proceeds.
+
+Acceptance criteria
+
+A01. Record satisfactory initial maintain-rs integration and resolve any release-blocking findings.
+A02. Confirm which workspace crates are needed by the integration; prepare publishable 0.1.0 packages and their dependency metadata.
+A03. Validate that maintain-rs can consume the packaged dependency set.
+A04. Publish the required crates in dependency order and record the release artefacts.
+A05. Release the integrated maintain-rs version only after the required FlotSync 0.1.0 packages are published.
+
+Planning
+
+Prepare and align a concrete publication plan after integration evidence is available. Estimate each part and split the work if it is likely to exceed 1000 LOC."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-10-04T11:05:18.948533Z"
+updated_at = "2026-10-04T11:05:35.442341Z"
+
+[[links]]
+target = "01a039c6-93c0-74f1-89f6-63962aaf68c2"
+label = "discovered from"

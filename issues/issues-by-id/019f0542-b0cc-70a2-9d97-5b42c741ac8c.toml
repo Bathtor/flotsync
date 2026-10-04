@@ -1,13 +1,55 @@
 id = "019f0542-b0cc-70a2-9d97-5b42c741ac8c"
 ref = "flotsync-46i"
 title = "Preserve listener notifications across partial inbound apply failures"
-body = "During replication runtime inbound update draining, one causally-ready update batch may apply successfully before a later buffered batch fails. The current runtime only emits listener notifications after the whole drain completes, which can desynchronise the application-facing event stream from the already-committed local state. Track a follow-up to either emit incrementally with compensating behaviour or redesign the drain/apply contract so committed state and listener notifications cannot diverge."
-status = "open"
+body = """
+Goal
+
+Ensure inbound apply failures cannot hide listener notifications for already-committed state.
+
+Current findings
+
+C01. The ready chain is applied in one store transaction, so a failure later in that chain rolls back earlier changes and produces no listener event.
+C02. Catch-up UpdateBatch processing notifies listeners after each committed update, preserving earlier notifications if a later update fails.
+C03. Existing tests cover an invalid producer in the second catch-up update and store failures rolling back a buffered ready chain. The missing focused case is a store access failure in a later separately committed catch-up update, with persisted state and listener read-position assertions.
+
+Agreed plan
+
+P01. Add a regression in runtime/tests/delivery.rs using the existing SQLite fixture and FailingStore controls. Submit two consecutive updates in one catch-up batch and inject an exact-payload load failure for the second update.
+P02. Verify the first update remains committed, its row value and listener notification agree, and its group read token reports the committed position. Verify the second update and row change roll back.
+P03. Retry the batch and verify the second update succeeds without a duplicate first-update notification, with stored state and listener read position advancing together.
+P04. Reuse the current fixture and failure controls. Production changes are only needed if the regression reveals a defect; align any such change separately.
+
+Validation
+
+V01. Run the new focused regression and the existing catch-up partial-failure and buffered-chain rollback regressions serially.
+V02. Check formatting and pedantic Clippy for the affected crate, and inspect touched files for newly duplicated logic.
+
+Estimate
+
+E01. Regression setup and failure boundary: approximately 60-90 LOC.
+E02. Persisted-state, listener-token, and retry assertions: approximately 40-70 LOC.
+E03. Total approximately 100-160 LOC, below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "codex"
 created_at = "2026-04-16T05:58:17Z"
-updated_at = "2026-05-29T14:42:11Z"
+updated_at = "2026-10-04T11:22:27.908772Z"
+closed_at = "2026-10-04T11:22:27.908772Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
 label = "discovered from"
+
+[[comments]]
+id = "01a1069d-13cc-7f90-9003-6f97fbeb62b2"
+author = "codex"
+body = "Implemented the agreed regression: a second catch-up update fails its injected store lookup, while the first update remains committed with matching stored title, listener notification, and group read token. Retrying the same batch commits the second update without duplicating the first notification. Existing invalid-producer and buffered-chain rollback regressions also pass. Extracted load_failing_runtime_fixture for both delivery tests so runtime and SQLite cleanup share existing RuntimeFixture ownership. Duplication review found no new repeated test assertions; the small concrete fixture constructors intentionally keep wrapped versus unwrapped store ownership explicit rather than introducing generic construction indirection. Formatting, diff whitespace checks, and all-target pedantic Clippy pass. No production change was required. Ready for review."
+created_at = "2026-10-04T11:11:59.948039Z"
+
+[[comments]]
+id = "01a106a6-a8c4-7771-8da8-325d6bab8a57"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T11:22:27.908772Z"
