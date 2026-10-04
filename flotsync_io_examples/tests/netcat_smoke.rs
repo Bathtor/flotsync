@@ -1,10 +1,12 @@
+//! Process-level netcat smoke tests with broker-owned listener reservations.
+
 use flotsync_io::{
     config_keys,
     test_support::{ReservedSocketKind, ReservedSocketLease, reserve_sockets},
 };
 use std::{
     io::{ErrorKind, Read},
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket},
     process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -117,7 +119,9 @@ fn udp_connect_client_exits_after_server_disappears() {
     let mut client = spawn_netcat(&["udp", "connect", "--remote", &server_addr.to_string()]);
     client.wait_for_stderr("UDP connected ");
 
-    let _server_output = server.kill_and_collect();
+    // Keep the destination unbound and owned until the client has observed its
+    // disappearance. Returning the lease early could let another test bind it.
+    let (_server_output, mut server_lease) = server.kill_and_collect_retaining_unbound_lease();
 
     client.send_line("ping");
     let client_output = client.wait_for_output();
@@ -133,6 +137,35 @@ fn udp_connect_client_exits_after_server_disappears() {
             || stderr.contains("UDP closed (Disconnected) for remote"),
         "client stderr: {stderr}"
     );
+    server_lease
+        .rebind_binding(0)
+        .expect("restore server reservation after client disconnect");
+}
+
+#[test]
+fn stopped_udp_server_keeps_its_reserved_destination_unbound() {
+    let mut server =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
+    let server_addr = server.wait_for_socket_addr("UDP bound ");
+
+    let (server_output, mut server_lease) = server.kill_and_collect_retaining_unbound_lease();
+    assert_eq!(server_lease.addr(0), server_addr);
+    assert!(
+        String::from_utf8_lossy(&server_output.stderr).contains("UDP bound "),
+        "server diagnostics were lost: {server_output:?}"
+    );
+
+    // This probe uses the server's existing broker reservation. An exclusive
+    // bind succeeds only if both the child and the hidden socket are gone.
+    let probe = UdpSocket::bind(server_addr).expect("stopped server destination must be unbound");
+    drop(probe);
+
+    server_lease
+        .rebind_binding(0)
+        .expect("restore stopped server reservation");
+    let bind_error = UdpSocket::bind(server_addr)
+        .expect_err("restored reservation must occupy the server destination");
+    assert_eq!(bind_error.kind(), ErrorKind::AddrInUse);
 }
 
 #[test]
@@ -309,7 +342,9 @@ fn udp_bind_replies_to_the_last_sender_without_explicit_target() {
 }
 
 struct SpawnedNetcat {
+    /// Broker ownership retained while the child uses its reserved address.
     socket_lease: Option<ReservedSocketLease>,
+    /// Whether the hidden reservation was closed after the child reported its bind.
     binding_released: bool,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -466,6 +501,31 @@ impl SpawnedNetcat {
 
     fn kill_and_collect(mut self) -> Output {
         self.kill_and_collect_in_place()
+    }
+
+    /// Stops a bound child and returns its diagnostics with its unbound lease.
+    ///
+    /// The lease keeps this destination unavailable to other broker clients
+    /// without binding a hidden socket that could swallow disconnect probes.
+    /// Keep it until all probes and assertions finish, then rebind its socket.
+    /// Dropping the lease also attempts restoration, including during unwinding.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the child has reported its reserved bind and the hidden
+    /// reservation has been released, or if child output collection fails.
+    fn kill_and_collect_retaining_unbound_lease(mut self) -> (Output, ReservedSocketLease) {
+        assert!(
+            self.binding_released,
+            "child must report its reserved bind before retaining an unbound lease"
+        );
+        let socket_lease = self
+            .socket_lease
+            .take()
+            .expect("reserved child socket lease");
+        self.binding_released = false;
+        let output = self.kill_and_collect_in_place();
+        (output, socket_lease)
     }
 
     fn kill_and_collect_in_place(&mut self) -> Output {

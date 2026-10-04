@@ -4,36 +4,63 @@ title = "Stabilise UDP disconnect netcat smoke test"
 body = """
 Goal
 
-Make the macOS UDP connected-client shutdown smoke test reliable under the same default-concurrency workspace load used by CI.
+Make the macOS UDP connected-client shutdown smoke test reliable under default-concurrency workspace load.
 
-Evidence
+Evidence and mechanism
 
-E01. On 2026-09-06, the exact macOS CI command cargo test --workspace --locked failed once in two outside-sandbox runs at flotsync_io_examples/tests/netcat_smoke.rs::udp_connect_client_exits_after_server_disappears.
-E02. The child remained alive for the full 10-second deadline and logged UDP connected, but never UDP closed (Disconnected).
-E03. Five isolated reruns passed, so the failure depends on suite load or timing rather than occurring deterministically.
-E04. Five full flotsync_replication package runs with default concurrency passed; the earlier serial replication failure also did not recur under CI-style concurrency.
+E01. On 2026-09-06, cargo test --workspace --locked failed once in two outside-sandbox macOS runs: udp_connect_client_exits_after_server_disappears remained alive for its full 10-second deadline after logging UDP connected, without UDP closed (Disconnected).
+E02. Five isolated reruns passed; concurrent load or timing affects the outcome. Five full default-concurrency replication package runs also passed.
+E03. Investigation on 2026-10-04 confirms server kill_and_collect rebinds the hidden reservation and consumes/drops the fixture before the client sends its probe. Lease drop returns the rebound socket to the broker, which can retain or reuse it for waiting UDP reservations. Without waiting demand it closes the socket. This refines the original narrow rebind-window hypothesis: broker retention/reuse can keep the supposedly closed destination bound.
+E04. Retaining the unbound lease prevents idle-pool return and fresh broker allocation of that owned address. The UDP driver produces Disconnected on ConnectionRefused; the netcat component exits on Closed. The isolated baseline passed today, without reproducing the concurrent failure.
 
-Likely mechanism to verify
+Agreed implementation plan (2026-10-04)
 
-H01. The server fixture releases its broker reservation while the child binds, then kill_and_collect restores the reserved UDP binding before the client sends its probe. That restored socket can receive the datagram silently, preventing the ICMP port-unreachable signal the test expects.
-H02. The usual passing outcome may therefore depend on a narrow close/rebind/ICMP timing window.
+P1. Add a private netcat fixture shutdown method returning process Output and the still-owned unbound ReservedSocketLease. Reuse existing kill/wait/output collection and diagnostics; keep ordinary fixture shutdown behaviour intact. Document the lease lifetime and restoration obligations. Estimate 25-45 LOC.
+P2. Change the macOS disconnect smoke test to retain the unbound lease until client exit and all disconnect assertions finish, then explicitly rebind. ReservedSocketLease Drop provides restoration on panic unwinding. Estimate 10-20 LOC.
+P3. Add a focused fixture regression proving the stopped server destination is unbound while its lease remains owned, using the same broker-reserved address. Release the probe before restoring the reservation. The existing macOS smoke test verifies actual disconnect and clean client exit. Estimate 35-60 LOC.
+P4. Validate with the focused regression and smoke suite, 30 isolated disconnect-test repetitions, and three sequential cargo test --workspace --locked runs with default concurrency outside the sandbox. Check formatting, pedantic Clippy, and duplication in touched files. Record failures and limitations rather than claiming unrelated failures resolved.
 
-Proposed direction
+Scope and completion
 
-P01. Confirm the socket-lease rebind timing and whether the restored socket occupies the former server destination before the client probe.
-P02. Keep broker ownership while leaving the server destination genuinely unbound until the client observes disconnection, then restore the reservation during final cleanup.
-P03. Preserve process diagnostics and ensure cleanup restores every brokered socket even on panic.
-P04. Stress the isolated test and run cargo test --workspace --locked repeatedly with default concurrency outside the sandbox.
-
-Estimate
-
-S01. Approximately 80 to 180 LOC including lifecycle helpers and regression coverage; well below 1000 LOC."""
-status = "open"
+Estimated total 70-125 LOC, below 1000 LOC. Confine implementation to the netcat smoke fixture and tests. Preserve process diagnostics and restore brokered sockets on normal cleanup and panic. No production UDP driver or public broker API change is planned. Keep the issue open until the user agrees the work is complete; hand over as in review after validation. The source link to flotsync-5ou.3 remains relevant."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 created_at = "2026-09-06T07:33:34.118313Z"
-updated_at = "2026-09-06T07:33:39.110312Z"
+updated_at = "2026-10-04T10:27:52.42746Z"
+closed_at = "2026-10-04T10:27:52.42746Z"
 
 [[links]]
 target = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
 label = "discovered from"
+
+[[comments]]
+id = "01a10655-714c-7cc2-9770-699fdc45cf4f"
+author = "codex"
+body = "Investigation 2026-10-04: confirmed that netcat_smoke.rs kills and waits for the server, rebinds its hidden reservation, then consumes/drops SpawnedNetcat before sending the client probe. ReservedSocketLease::drop returns the rebound socket to the broker; reclaim_idle/trim_idle_to_waiting closes it only when there is no waiting demand. Under concurrent UDP reservations the socket may instead remain bound or be handed to another test. This refines H02: the important race is broker retention/reuse after lease return, not merely the brief explicit rebind. Keeping the unbound lease owned until the disconnect assertion prevents both idle-pool return and fresh broker allocation of that address (occupied_addrs includes all owned slots). The UDP driver emits Disconnected on ConnectionRefused, and the netcat component exits on Closed. Proposed scope is a test-fixture shutdown helper returning process Output plus the still-owned unbound lease, using existing process-collection logic and ReservedSocketLease RAII restoration. No implementation yet; awaiting plan alignment."
+created_at = "2026-10-04T09:53:45.292883Z"
+
+[[comments]]
+id = "01a10655-a71b-7a73-b154-a94a24aea36d"
+author = "codex"
+body = "Baseline validation: cargo test -p flotsync_io_examples --test netcat_smoke udp_connect_client_exits_after_server_disappears --locked -- --exact --nocapture passed (1 test, 0.53 s). This does not reproduce the concurrent failure; investigation establishes the problematic lifecycle from source. Proposed validation after agreement: a focused fixture regression checking the retained destination is unbound using the same brokered address, the existing disconnect smoke test, 30 isolated repetitions, and 3 sequential default-concurrency workspace runs outside the sandbox, plus formatting and pedantic Clippy checks."
+created_at = "2026-10-04T09:53:59.06765Z"
+
+[[comments]]
+id = "01a10667-8aa2-7cc3-9bf0-85d3be7a21f2"
+author = "codex"
+body = """
+Implementation and validation completed on 2026-10-04. P1-P3 are implemented in flotsync_io_examples/tests/netcat_smoke.rs: the fixture transfers its released lease to the caller before using the existing kill/wait/output collector; the disconnect smoke test keeps that lease unbound through client exit and assertions and then explicitly restores it; a new cross-platform fixture regression verifies the destination accepts an exclusive bind after shutdown and rejects one after explicit restoration, while preserving process diagnostics. ReservedSocketLease Drop remains the panic-unwinding restoration path. No new broker API or production driver code was required.
+
+P4 validation passed: all 10 netcat smoke tests; 30 sequential isolated macOS disconnect repetitions outside the sandbox; three sequential cargo test --workspace --locked runs with default concurrency outside the sandbox (each 42 successful suites and 1110 passed tests/examples); cargo fmt --all -- --check; cargo clippy -p flotsync_io_examples --test netcat_smoke --no-deps --locked -- -W clippy::pedantic with no warnings; git diff --check. Full stress logs are retained under .agent_local_docs/tmp/flotsync-ejm/.
+
+Final audit used the root AGENTS.md and active session instructions; there are no nested AGENTS.md files in the changed crate. The new probe uses the existing broker-reserved server address, the helper documents its preconditions and lease lifecycle, and process collection is reused without duplicated helper logic. Small explicit rebind calls remain at test cleanup sites to keep their distinct lifecycle assertions and diagnostics clear. All agreed plan items are complete; nothing is deferred. The prior concurrent failure was not independently reproduced before the fix, so the stress results support stability without claiming a mathematical guarantee. Changes are ready for user review; the issue remains open pending acceptance."""
+created_at = "2026-10-04T10:13:31.426678Z"
+
+[[comments]]
+id = "01a10674-adeb-79b2-860a-884617b1b487"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T10:27:52.42746Z"
