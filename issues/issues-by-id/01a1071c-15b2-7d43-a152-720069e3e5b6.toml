@@ -1,0 +1,27 @@
+id = "01a1071c-15b2-7d43-a152-720069e3e5b6"
+ref = "flotsync-zop.16"
+title = "Specify store isolation and revalidate flow phases"
+body = """
+Goal
+Make transaction isolation requirements and cross-phase revalidation explicit before overlap is enabled. Transaction half of parent R19; follows flotsync-zop.15.
+
+Instructions
+S01. Derive the required store guarantees from publication and group acceptance/activation algorithms. Document required atomicity, retained-read snapshot behaviour and conflict/lost-update prevention; do not infer these from Send + Sync. Inspect current SQLite BEGIN IMMEDIATE writes and other store implementations/doubles.
+S02. Reload authoritative pending activation by key in each activation transaction. Revalidate selected successor/final cut, lifecycle, target material/membership/schema and completion/supersession evidence. Missing pending work alone cannot imply success. Preserve valid observable acceptance and activation commit states for other database users.
+S03. Validate publication lifecycle/progress and mutable security assumptions at the transaction boundary. Use suitable backend isolation or conditional writes; do not add a runtime-global database gate or retry committed effects.
+S04. Ensure activation provider rows, read token and replacement lineage describe the same established read snapshot. Identify transaction creation versus actual snapshot establishment. Keep same-group ownership until this boundary is safe.
+
+Acceptance and validation
+Controlled tests exercise competing acceptance, stale work between phases, conflicting writes and provider/token consistency. Preserve error classifications and transaction-scoped retry boundaries. This is focused contract coverage, not implementation of the entire flotsync-uvo store conformance project.
+
+Review and size
+150-350 edited/new LOC including tests; split newly discovered backend work if it threatens 1000 LOC rather than hiding it in this child. Follow parent validation/no-staging policy and user acceptance before closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-1499-7af1-bfe0-7ce5bb415139"]
+blocks = ["01a1071c-5f8e-7110-9a0d-c80ffd2f3325"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:43.50604Z"
+updated_at = "2026-10-04T13:31:02.627452Z"

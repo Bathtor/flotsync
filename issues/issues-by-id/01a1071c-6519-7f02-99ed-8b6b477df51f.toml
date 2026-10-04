@@ -1,0 +1,27 @@
+id = "01a1071c-6519-7f02-99ed-8b6b477df51f"
+ref = "flotsync-zop.22"
+title = "Enable compatible runtime flow concurrency"
+body = """
+Goal
+Enable actual overlap between admitted ownership-compatible flows. Implements parent R17; follows flotsync-zop.21.
+
+Instructions
+S01. Relax the serial admission limit incrementally using reviewed owned partitions, not a global database reader/writer lock. Keep head-only admission: demonstrations must distinguish permitted overlap after admission from intentionally blocked younger starts.
+S02. Start with independent identity/security/read/preparation work and unrelated-group operations. Preserve same-group publication/apply order, whole-batch ownership, predecessor/successor exclusion, projection-writer lifetime and serial listener invocation.
+S03. For every admitted pair document permitted intermediate inconsistency, inaccessible partitions, aliased store access, revalidation, listener/provider lifetime, bounded output and the absence of a wait cycle. CPU-parallel execution is not required; overlapping asynchronous waits is.
+S04. Keep creation, publication and membership dispatch/listener ordering distinct. Do not remove safeguards merely because operations use different group ids. Do not relax whole-map projection-writer exclusion or implement group deltas.
+
+Acceptance and validation
+Controlled futures demonstrate real progress of an independent admitted operation while another waits, in both completion orders. Negative tests prove conflicting operations remain deferred and head fairness holds. Include retained activation provider versus batch/store waits, failure during overlap and projection-publication lag.
+
+Review and size
+350-550 edited/new LOC including tests; split operation-family enablement into separate review patches if necessary. Removing block_on alone is not acceptance. Follow parent Rust/no-staging rules and user-reviewed closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-63fc-7301-abda-8e9449035063"]
+blocks = ["01a1071c-6637-7470-bd1d-f64411ba59f0"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:03.833158Z"
+updated_at = "2026-10-04T13:31:04.330104Z"

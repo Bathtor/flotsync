@@ -1,0 +1,27 @@
+id = "01a1071b-c9f8-7b52-8ffe-1730696fc09a"
+ref = "flotsync-zop.06"
+title = "Compose inbound and listener flow FSMs"
+body = """
+Goal
+Convert inbound single/batch application and ordered listener delivery into owned composed FSMs. Implements parent R06 and F03/F07; follows flotsync-zop.05.
+
+Instructions
+S01. Reuse the extracted transaction service and driver. Single apply owns its delivery context and moves through transaction completion, observations/listener delivery and classified termination.
+S02. Batch state owns the remaining-input cursor, accumulated catch-up observations and group consistency interval. Keep the group partition for the whole batch. Compose the single-apply behaviour without forcing identical single/batch observation timing where current code differs.
+S03. Factor a narrow listener child operation owning payload/provider and continuation. Preserve ordinary empty-update filtering, empty activation events and transaction/provider cleanup. Do not introduce independent listener components or framework local inboxes.
+S04. Preserve one transaction per batch input, earlier committed notifications and observation flush on partial failure. Retain blocking execution for the whole batch at this stage.
+
+Acceptance and validation
+Exercise successful and failing batches, causal chains, duplicate inputs, failure after an earlier item is notified and listener rejection. Trace listener and catch-up effect order; verify no publication/live update interleaving. Reuse existing tests and controlled fixtures.
+
+Review and size
+450-700 new/edited LOC including tests, at most 200 moved. If listener extraction and batch conversion exceed 800 substantive lines, present them as separately reviewable patches within this child. Follow parent Rust checks, no staging and user-reviewed closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"]
+blocks = ["01a1071b-cacb-7752-82c6-f26dd90a71a3"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:24.120019Z"
+updated_at = "2026-10-04T13:30:24.476885Z"

@@ -1,0 +1,27 @@
+id = "01a1071c-1144-76f3-b850-24a2404c2d38"
+ref = "flotsync-zop.12"
+title = "Convert membership replacement flow"
+body = """
+Goal
+Convert local membership replacement into an owned orchestration flow. Second half of parent R11; follows flotsync-zop.11.
+
+Instructions
+S01. Model preparation, persisted acceptance, activation, outbound dispatch, listener completion and reply. Compose the shared activation machinery while leaving operation-specific effect order visible.
+S02. Acquire predecessor/successor/decision-set ownership together. Preserve acceptance making the old group read-only, immutable accepted direction/final cut, target activation and eventual old-group closure.
+S03. Dispatch replacement messages after activation and before the activation listener event, as current behaviour requires. Avoid mixing this with creation's listener-before-invitation rule.
+S04. Retain resumable accepted work on activation failure and existing fatal post-commit handling. Do not add leave, schema-change, cross-group read-token remapping or long-lived transfer semantics.
+
+Acceptance and validation
+Cover successful replacement lineage, competing proposals, invalid membership/name inputs, acceptance committed before failure, read-only predecessor preservation, and notification/reply ordering. All partition restoration/fault paths are explicit; execution remains blocking.
+
+Review and size
+300-450 edited/new LOC including tests, 150-250 moved. Follow parent transaction/error and Rust validation rules, inspect touched duplication and leave staging untouched. User acceptance precedes closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-102b-7160-9a01-ea553fbc6180"]
+blocks = ["01a1071c-1261-78a2-b6d7-141eff66dc8a"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:42.3726Z"
+updated_at = "2026-10-04T13:30:42.871195Z"

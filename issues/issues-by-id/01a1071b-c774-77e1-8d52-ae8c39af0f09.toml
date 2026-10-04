@@ -1,0 +1,27 @@
+id = "01a1071b-c774-77e1-8d52-ae8c39af0f09"
+ref = "flotsync-zop.03"
+title = "Extract publication transaction service"
+body = """
+Goal
+Extract publication transaction logic from the component while preserving its exact sequence. Implements parent R03; follows flotsync-zop.02.
+
+Instructions
+S01. Move publish_changes_transactionally and its publication-specific preparation helpers into a narrow service/module receiving store, immutable identity/schema inputs and the request, not the entire component.
+S02. Preserve one transactional read/validate/rebase/apply/append/version-update/commit sequence. Validate group writability and the request read token inside the transaction; preserve existing error classifications.
+S03. Return an owned committed-publication payload only after commit, carrying receipt/read token, outbound bytes and listener changes. Keep its construction private enough that uncommitted data cannot enter the post-commit path accidentally.
+S04. Keep the existing blocking handler and ordering: commit, submit outbound, notify catch-up availability, deliver listener changes, reply. Do not introduce retries, concurrency, new promises or transaction splitting.
+
+Acceptance and validation
+Existing publish persistence, stale-token rebasing, cross-group token rejection and listener-before-reply tests pass. Add focused coverage only for newly exposed meaningful boundaries. A listener failure cannot rerun a committed write. Review the relocated helper ownership and duplication within touched files.
+
+Review and size
+150-250 new/edited LOC including tests; 350-550 relocated. Supply a move map separately from semantic edits. Follow parent review/validation rules, including serial sandbox tests and pedantic Clippy. No staging or issue closure before user review.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071b-c69e-7381-b14a-0c11abb589c0"]
+blocks = ["01a1071b-c84c-7400-9af8-bbbed8c1963e"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:23.476815Z"
+updated_at = "2026-10-04T13:30:23.834011Z"

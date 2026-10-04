@@ -1,0 +1,27 @@
+id = "01a1071c-102b-7160-9a01-ea553fbc6180"
+ref = "flotsync-zop.11"
+title = "Convert local group creation flow"
+body = """
+Goal
+Convert local group creation into a finite owned orchestration flow. First half of parent R11; follows flotsync-zop.10.
+
+Instructions
+S01. Model validation/setup preparation, creation transaction, projection publication, listener notification, invitation dispatch and reply with explicit owned payloads.
+S02. Preserve the current creation order: commit/install group, deliver even an empty initial listener event, then submit peer invitations and return the group id. Do not accidentally reuse publication's outbound-before-listener ordering.
+S03. Reuse narrow setup/security, transaction and listener primitives without making a flag-driven universal group operation. Own the projection-writing interval and any group state until its required consistency is restored.
+S04. Preserve member ordering, name validation, bootstrap material limits and partial-failure/error behaviour. Blocking execution remains the adapter in this child.
+
+Acceptance and validation
+Cover empty/invalid creation, successful persistence across restart, initial event delivery and invitation/listener/reply sequence, including listener failure after commit. No key exchange, new schemas or creation API changes.
+
+Review and size
+250-400 edited/new LOC including tests, 100-200 relocated. Keep independent from membership conversion so it can be accepted alone. Apply parent validation/no-staging rules; close only after user agreement.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-0f0c-7612-b9e0-391c0f016207"]
+blocks = ["01a1071c-1144-76f3-b850-24a2404c2d38"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:42.091484Z"
+updated_at = "2026-10-04T13:30:42.585796Z"

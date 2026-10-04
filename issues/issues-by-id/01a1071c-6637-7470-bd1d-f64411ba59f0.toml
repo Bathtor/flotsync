@@ -1,0 +1,27 @@
+id = "01a1071c-6637-7470-bd1d-f64411ba59f0"
+ref = "flotsync-zop.23"
+title = "Complete concurrent shutdown and terminal event handling"
+body = """
+Goal
+Complete shutdown, cancellation and terminal mailbox behaviour with concurrent flows. Lifecycle half of parent R18; follows flotsync-zop.22.
+
+Instructions
+S01. Stopping closes new-flow admission, resolves queued API requests, and disposes pending protocol inputs according to the verified delivery contract. Existing flows must still receive completions needed for cleanup or a safe committed checkpoint.
+S02. Define phase-specific finish/cancel/fault behaviour. Dropping an effect or losing a reply does not prove rollback; do not return owned partitions while an effect can still mutate their state. Preserve read-provider and transaction cleanup and explicit faulted partitions.
+S03. Integrate finite-flow failure/timeout handling with host shutdown. A hung listener cannot be promised an indefinite graceful drain; define escalation without pretending arbitrary futures are safely cancellable. Use scheduled timer UUIDs where timers are needed.
+S04. Retire events for terminated flows as legitimate replay/stale input or invariant failure, rather than leaving them at the mailbox head. Guard stopped state against late completions. Preserve idempotent public shutdown and component-replacement deferral to flotsync-sae.
+
+Acceptance and validation
+Exercise stopping while writing, after commit before publication, during listener/provider delivery, with deferred requests and with full queue capacity. Verify no lost reply/processed obligation, invalid partition return or post-stop state mutation. Test repeated shutdown and late completions.
+
+Review and size
+250-450 edited/new LOC including tests; split if timeout/host integration exceeds 800 substantive lines. Follow parent validation/no-staging and user acceptance before closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-6519-7f02-99ed-8b6b477df51f"]
+blocks = ["01a1071c-6752-77e1-b939-6ff6c711399e"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:04.119746Z"
+updated_at = "2026-10-04T13:31:04.61226Z"

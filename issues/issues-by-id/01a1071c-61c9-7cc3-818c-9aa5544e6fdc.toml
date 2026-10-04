@@ -1,0 +1,27 @@
+id = "01a1071c-61c9-7cc3-818c-9aa5544e6fdc"
+ref = "flotsync-zop.19"
+title = "Implement head-only flow admission and selective scheduling"
+body = """
+Goal
+Implement the agreed head-only admission policy with selective receive for active flows. Scheduling half of parent R15; follows flotsync-zop.18.
+
+Instructions
+S01. Start a new flow only from the actual shared-mailbox head and only when its complete partition set is available. Never scan for younger eligible new work; intentional head-of-line blocking is the fairness trade-off.
+S02. Existing flows select their first matching event from anywhere, using their current receive policy. Reconsider the head after consumption/termination; rotate fairly between active flows and bound work per turn so ingress/lifecycle also progress.
+S03. Distinguish start requests, correlated continuations, replay/stale/orphan input and lifecycle control. A second publish for the same group is new work. Invalid/unmatchable head input must receive an explicit outcome rather than remain permanently stranded.
+S04. Enforce the progress condition: an active owner cannot wait for a new flow behind a blocked head. Preserve operation correlation and do not reset arrival order to bypass the policy. Do not add age-based reservations, bypass admission or mandatory local queue layouts.
+
+Acceptance and validation
+Exercise A owning projection, head B needing projection, younger independent C and completion A behind both: A completes, then B starts before C. Also cover multiple active receivers, pattern changes, malformed/orphan head, multi-partition atomic admission and scheduling budget exhaustion. Include a negative dependency-cycle scenario in design/test fixtures.
+
+Review and size
+250-450 edited/new LOC including tests. Integrate with simulated completions while production remains serial. Follow parent validation and review/no-staging rules.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-60ae-7462-90b1-4604ff307d51"]
+blocks = ["01a1071c-62e5-7350-9c88-31f940812104"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:02.985807Z"
+updated_at = "2026-10-04T13:31:03.474216Z"

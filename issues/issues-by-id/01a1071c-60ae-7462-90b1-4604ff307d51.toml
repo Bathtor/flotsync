@@ -1,0 +1,27 @@
+id = "01a1071c-60ae-7462-90b1-4604ff307d51"
+ref = "flotsync-zop.18"
+title = "Implement shared selective mailbox storage"
+body = """
+Goal
+Implement the single arrival-ordered selective mailbox as a small independently testable data structure. Storage half of parent R15; follows flotsync-zop.17.
+
+Instructions
+S01. Own each unconsumed RuntimeInput once in a shared queue; use nested concern enums where useful. Expose head inspection/removal and first-match selection/removal from an arbitrary position. No transfer into framework-owned local inboxes at flow creation.
+S02. Prefer an arrival-linked slot arena or equivalent with constant-time removal once a slot is found. Matching remains a bounded scan. Protect traversal/removal identities against slot reuse and removal by another flow.
+S03. Support resumable scans for unchanged receive patterns, new arrivals and cursor invalidation when state/pattern changes can make previously skipped events match. Matches are pure and synchronous; no database IO or message mutation during selection.
+S04. Track entry/payload ownership and accounting through removal. Expose hooks for completion reservations and limits without changing live ingress until the capacity child supplies verified policies. Flows remain free to consume out-of-order events into their own domain state.
+
+Acceptance and validation
+Test head/middle/tail removal, first-match arrival order, no match, append during saved scans, earlier-message eligibility after pattern change, removal/slot reuse, bounded scan resumption and exact ownership/accounting. Avoid timing benchmarks as unit-test contracts.
+
+Review and size
+250-400 edited/new LOC including tests. Keep this runtime-local and do not build a generic Erlang mailbox library. Follow parent checks/no-staging policy and user-reviewed closure.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-5f8e-7110-9a0d-c80ffd2f3325"]
+blocks = ["01a1071c-61c9-7cc3-818c-9aa5544e6fdc"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:02.702588Z"
+updated_at = "2026-10-04T13:31:03.197448Z"

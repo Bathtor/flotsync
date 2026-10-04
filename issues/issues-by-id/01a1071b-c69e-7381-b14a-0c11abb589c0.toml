@@ -1,0 +1,27 @@
+id = "01a1071b-c69e-7381-b14a-0c11abb589c0"
+ref = "flotsync-zop.02"
+title = "Extract runtime messages and API adapters"
+body = """
+Goal
+Separate the component shell's public messages, test plumbing and narrow API adapters without changing scheduling. Implements parent R02; follows flotsync-zop.01.
+
+Instructions
+S01. Extract ReplicationRuntimeMessage, pending decision response types and test-support commands into cohesive modules while retaining existing public re-exports and cfg visibility.
+S02. Isolate security request handling and summary ingress/delegation behind narrow adapters. Keep current block_on versus spawn_local choices, promise ownership, error mapping and remote SummaryRequestManager routing unchanged.
+S03. Do not create a new component, public gateway contract or general dispatch framework. This is preparatory organisation; lifetime partition ownership will be added by later children.
+S04. Keep moved text mechanically recognisable. Separate relocation from necessary import/visibility changes, provide an old-to-new symbol map, and avoid incidental renaming/formatting across unrelated code. Preserve the repository mod.rs convention when turning a file into a folder module.
+
+Acceptance and validation
+The shell retains the same public API, actor vocabulary and test-support behaviour. Existing downstream boundary tests and affected runtime tests cover the move; no tests that merely mirror module layout. Inspect touched files for duplicated helpers and run formatting/pedantic Clippy as appropriate.
+
+Review and size
+150-250 new/edited LOC, plus 450-700 existing LOC relocated. Split mechanical patches if needed to keep review comprehensible; follow parent constraints, stage nothing and close only after user acceptance.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071b-c612-7091-bfd1-4f885b41735c"]
+blocks = ["01a1071b-c774-77e1-8d52-ae8c39af0f09"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:23.262303Z"
+updated_at = "2026-10-04T13:30:23.620293Z"
