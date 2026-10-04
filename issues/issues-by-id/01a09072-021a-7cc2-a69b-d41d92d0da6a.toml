@@ -4,35 +4,35 @@ title = "Specify replication update paging contract"
 body = """
 Goal
 
-Define and implement a general reusable store paging mechanism, apply it across current collection APIs, and restore bounded replication-history reads without eager operation ownership. The user approved this holistic plan and its eight-child breakdown. Status: plan agreed; no production implementation has started.
+Define and implement a general reusable store paging mechanism, apply it across current collection APIs, and restore bounded replication-history reads without eager operation ownership. The user approved this holistic plan and its eight-child breakdown. Status: children flotsync-h3l.1 through .7 and the opaque-continuation redesign flotsync-o3o are complete. flotsync-h3l.8 has completed the integrated audit, compatibility cleanup and extraction of existing backend test assertions and is in review. Parent completion awaits user review and agreement.
 
 Requirements
 
-P01. Replication updates and update IDs have deterministic ascending UpdateId ordering: (version, node_index).
+P01. Bounded replication-update and update-ID fills use deterministic backend-defined traversal order. SQLite uses ascending (version, node_index); reusable contract checks accept each backend's expected order separately from fixture contents. Unlimited fills have no ordering guarantee and avoid unnecessary ORDER BY overhead, following the later agreed flotsync-h3l.6 refinement.
 P02. ProducerRange selects exactly one producer and inclusive start/end versions, independent of applied status; inverted ranges are empty. Bounded batch limits are exact maxima. The catch-up optional total response cap remains distinct.
-P03. Use generic PageCursor<Params, Key> with ordinary immutable parameter data and private continuation. No PageQuery trait, per-query cursor factory, separate filter/cursor arguments or separate page-size argument. One object-safe store method per pageable query.
+P03. Use generic PageCursor<Params> with ordinary immutable parameter data and an opaque backend-owned continuation, following completed flotsync-o3o. Rust ordering and Clone bounds are not part of the generic cursor contract. No PageQuery trait, per-query cursor factory, separate filter/cursor arguments or separate page-size argument. One object-safe store method per pageable query.
 P04. Replace every TODO(flotsync-h3l) temporary unlimited history load with correct reusable paging; remove all associated TODOs when their paths are converted.
 P05. Audit every update caller and store implementation/wrapper, preserving causality, validation, lifecycle and transaction semantics.
 P06. Provide reusable backend contract tests for ordering, filters, boundaries, empty/exact-size pages, maxima, continuation, metadata, failures and batch reuse.
 P07. Restore bounded retained-history payload loading. Missing retained evidence requests a snapshot; malformed/inconsistent evidence is a contextual error. Accumulated affected-row sets/dependency metadata need not have constant size.
 P08. Apply one general paging protocol to updates/IDs, metadata collections, dataset rows/transitions, requested-row lookup and reliable-delivery metadata. Complete-result conveniences may remain without partial-result controls and should reuse scans where useful.
-P09. Offer generated borrowed SchemaOperationView values during store projection and retain only one projected result per source record. Do not default to retaining entire encoded buffers or materialising every owned operation. This supersedes the original P09 wording requiring a buffer-owning batch.
+P09. Offer generated borrowed SchemaOperationView values during synchronous store projection. Finite page limits count accepted source records independently of output cardinality; custom batches may filter or expand, following flotsync-o3o. Do not default to retaining entire encoded buffers or materialising every owned operation. This supersedes the original P09 wording requiring a buffer-owning batch.
 
 Agreed API and backend reuse
 
-PageCursor::new(params) is generic; the store method determines Params/Key types. Bind on first use to a common opaque UUID-backed transaction identity and operation identity where needed. UUID generation is backend controlled, not mandated v4; identities distinguish transactions across pools/store instances accessible to surviving cursors. No associated identity propagation or memory-address identity. Cursors retain no transaction borrow between page calls.
+PageCursor::new(params) is generic; each store method determines its ordinary Params and private backend continuation format. Bind on first use to a common opaque UUID-backed transaction identity. Validate erased continuation format compatibility, without operation identity or query-specific cursor aliases. UUID generation is backend controlled, not mandated v4; identities distinguish transactions across pools/store instances accessible to surviving cursors. No associated identity propagation or memory-address identity. Cursors retain no transaction borrow between page calls.
 
-ProjectionBatch<View> supplies page_limit(), clear() and fallible push(view). It owns the projection and retained storage. Higher-ranked borrowed views cannot escape into results. Projection is one-to-one: no skipping/expansion. PageLimit is Records(NonZeroUsize) or Unlimited. Provide reusable runtime Vec and nonzero compile-time SmallVec batches; enforced one-to-one bounds permit inline fixed storage. Clear preserves policy/projection/capacity. Batch instance, projection and limit may change each call, including rotating buffers; cursor retains none of them. Sample the limit once per fill. Unlimited consumes the remaining result in that call while releasing source payloads incrementally.
+PageBatch supplies page_limit(), clear(), fallible push(view) and metadata access. Reusable implementations own their projection and storage. Higher-ranked borrowed views cannot escape into results. Custom projections may skip or expand output: shared limits apply to source-record counts. PageLimit is Max(NonZeroUsize) or Unlimited. VecPageBatch and InlinePageBatch provide reusable runtime Vec and nonzero compile-time SmallVec storage with one value per successful projection; positional row batches share their storage implementation. Clear preserves policy/projection/capacity. Batch instance, projection and limit may change each call, including rotating buffers; cursor retains none of them. Sample the limit once per fill. Unlimited consumes the remaining result in that call while releasing source payloads incrementally.
 
-The shared helper handles binding, lifecycle, batch clearing, projection dispatch, maxima, strict key advancement, continuation, exhaustion and failed/cancelled page cleanup. Backends implement selection, ordered retrieval and decoding. Each query defines a deterministic unique key and exclusive continuation. Exact-size final pages may need one empty follow-up. Exhaustion is permanent; page result carries query-specific metadata even when empty. Failure/cancellation clears partial output and fails the cursor; external callback effects cannot be rolled back. Snafu PageError distinguishes contextual store/projection/contract failures and preserves store classification.
+The shared PageAttempt handles transaction/format binding, lifecycle, batch clearing, projection dispatch, source-record maxima, opaque continuation commits, exhaustion and failed/cancelled page cleanup. Backends implement selection, ordering, exclusive continuation comparisons and decoding. PageEnd explicitly distinguishes MayHaveMore from Exhausted; an unlimited or empty fill cannot report a continuation. Erased continuations need Send + 'static, with no generic Ord or Clone assumptions. Exact-size final pages may need one empty follow-up. Exhaustion is permanent and resubmission returns an error; successful batches carry query-specific metadata even when empty. Failure/cancellation clears partial output and fails the cursor; external callback effects cannot be rolled back. Snafu PageError distinguishes contextual store/projection/contract failures and preserves store classification.
 
 Read cursors observe their transaction snapshot. Mutable transactions retain read-your-own-writes and do not revisit changes behind continuation. External schema/query input borrows may live with the cursor, but not a transaction borrow. Existing application-facing BatchProvider APIs may remain adapters.
 
 Collection and runtime specifics
 
-Groups/progress use GroupId order; keys/evidence/work use documented canonical unique identities. Dataset rows use RowKey; transitions use the union RowKey with both existence flags. Requested-row queries fix distinct requested keys and emit present/missing outcomes exactly once. Delivery metadata gets a narrow consistent read session and MessageId ordering without envelope loading.
+Groups/progress, keys/evidence and pending work use deterministic backend-defined bounded traversal, with SQLite continuations based on its stored TEXT/BLOB values. Dataset row scans use ascending backend row-key order even when unlimited; transitions use the union of row keys with both existence flags. Requested-row queries fix distinct requested keys and emit present/missing outcomes exactly once. Delivery metadata uses a narrow consistent read session and backend-defined bounded order without envelope loading. Complete-result conveniences delegate to unlimited fills and keep no partial-result controls.
 
-Retained-history reconciliation projects per-update affected-row information and validates continuity across pages. Availability uses ID-only reads without payload decoding. Replay and pending application retain IDs plus read_versions dependency frontiers, schedule IDs, then load bounded ready payload groups within the same transaction; ID order alone is not causal order. Catch-up preserves an optional total response maximum independently from individual read sizes. Audit single-update reads alongside pages to avoid leaving eager conversion there. Retain owned append input where useful. Use established protobuf codec/view traits and adapters; request approval for necessary deviations.
+Incremental history reconciliation projects per-update affected-row information in bounded pages and validates continuity across page boundaries. Availability uses ID-only reads without payload decoding. Replay and pending application load compact IDs plus read_versions dependency frontiers in one unlimited projected fill, schedule IDs, then load one selected payload at a time within the same transaction; ID order alone is not causal order. Optional ready-ID selection is part of the query and SQLite applies it during decoding before reading unselected payloads. Whole compact summary/recovery outputs likewise use an unlimited projected fill; availability and catch-up payloads are consumed in bounded pages. Catch-up preserves an optional total response maximum independently from individual read sizes. Audit single-update reads alongside pages to avoid leaving eager conversion there. Keep owned append input where useful. Use established protobuf codec/view traits and adapters; request approval for necessary deviations.
 
 Child breakdown and dependencies
 
@@ -43,7 +43,7 @@ flotsync-h3l.4 / AJ4: Projected update/ID reads, SQLite and borrowed codecs, sin
 flotsync-h3l.5 / AJ5: History, availability and catch-up consumers. Blocked by .4. 450-700 LOC.
 flotsync-h3l.6 / AJ6: Dependency-only causal scheduling and bounded payload loading. Blocked by .4. 650-950 LOC.
 flotsync-h3l.7 / AJ7: Delivery metadata paging/read session. Blocked by .1. 250-450 LOC.
-flotsync-h3l.8 / AJ8: Integrated audit, removal of superseded surfaces/adapters/TODOs. Blocked by .2-.7. 200-350 LOC.
+flotsync-h3l.8 / AJ8: Integrated audit, removal of superseded surfaces/adapters/TODOs. Blocked by .2-.7, all now complete. Final cleanup estimate: 360-600 affected Rust LOC, mainly relocation of existing assertions; no duplicate test cases.
 
 Total estimate: 3,800-5,850 changed Rust LOC including documentation and relevant tests. Each child is below 1,000 LOC. Recommended execution order begins .1 -> .2 -> .3 -> .4 to validate generality before update consumer conversion; only the explicit blocker links are hard dependencies. Narrow temporary compatibility adapters may keep intermediate children buildable; .8 removes them. No database migrations or unrelated runtime-store genericisation.
 
@@ -53,10 +53,16 @@ Every child remains buildable, includes meaningful regression/contract tests, ru
 
 Context
 
-Discovered during flotsync-5ou.3 review (linked as discovered from). The previous implementation temporarily removed limit-driven retained-history cursors because ordering/limits were not a portable contract. Review also found eager MessageView::to_owned_message conversion in DatasetUpdateMessage decoding. Subsequent user discussion generalised the solution beyond updates, moved projection and sizing into batches, and fixed one-to-one semantics. Chronological feedback is in .agent_local_docs/tmp/flotsync-h3l-plan-feedback.md; this issue is the authoritative holistic plan.
+Discovered during flotsync-5ou.3 review (linked as discovered from). The previous implementation temporarily removed limit-driven retained-history cursors because ordering/limits were not a portable contract. Review also found eager MessageView::to_owned_message conversion in DatasetUpdateMessage decoding. Subsequent user discussion generalised the solution beyond updates and moved projection and sizing into batches. flotsync-o3o later made backend continuation ordering opaque and source-record limits independent of output cardinality. Later child refinements are reflected in this current holistic plan; chronological proposals remain in issue comments. Chronological feedback is in .agent_local_docs/tmp/flotsync-h3l-plan-feedback.md; this issue is the authoritative holistic plan.
+
+Final audit and explicit follow-ups
+
+flotsync-h3l.8 removes the last two optional-limit update adapters after converting their five test call sites. Existing public-interface update/ID, row/requested/transition and delivery metadata assertions are extracted into test-support helpers alongside the metadata suite, and invoked by the same SQLite tests. Raw corruption and backend-specific exact-boundary completion checks stay local. No duplicate tests are added. Generic lifecycle assertions remain in the shared paging suite.
+
+Known separate work remains deferred: flotsync-yzq (custom collection batches), flotsync-mzc (composed cursors), flotsync-dj1 (SQLite crate extraction), flotsync-duu (further row scan streaming/allocation work), and flotsync-git-qsg (inline snapshot threshold). Deliberate complete-result conveniences, generated-view construction for external backends and exact owned single-update reads remain supported. No additional runtime correctness defect was found by the integrated audit.
 """
-status = "in-progress"
-status_reason = "plan agreed"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 assignee = "codex"
@@ -72,7 +78,8 @@ children = [
     "01a0a36d-6908-7213-936e-f0ef7b3daa00",
 ]
 created_at = "2026-09-11T12:29:45.882933Z"
-updated_at = "2026-09-15T04:57:36.974208Z"
+updated_at = "2026-10-04T09:34:53.158023Z"
+closed_at = "2026-10-04T09:34:53.158023Z"
 
 [[links]]
 target = "01a060af-43d8-7250-8bb6-f7eb9ae61700"
@@ -95,3 +102,15 @@ id = "01a099eb-a03a-7ed3-80fd-18f3c93a4806"
 author = "codex"
 body = "API decisions consolidated: use a fixed UUID-backed transaction identity, with generation controlled by the backend (v4 is not required); identities must distinguish transaction instances across pools/store instances accessible to surviving cursors. Associated identity types are rejected to avoid propagation through runtime trait objects. Projection is one-to-one; batches own per-call bounded or unlimited sizing and may be replaced or rotated between calls. Provide reusable Vec and compile-time inline SmallVec batch implementations. Generic cursor construction, first-use binding, one object-safe method per pageable query, and shared paging lifecycle machinery remain agreed directions. Preparing the holistic implementation plan and proposed child-task boundaries; implementation has not started."
 created_at = "2026-09-13T08:39:11.162631Z"
+
+[[comments]]
+id = "01a10626-96a1-7fb0-b2fa-c26597f384c0"
+author = "codex"
+body = "Final child audit reconciled the holistic body with accepted later decisions: opaque continuations without operation identity, source limits independent of output cardinality, bounded-only update ordering, and unlimited compact dependency/recovery fills. h3l.8 removes compatibility update adapters and extracts existing domain assertions for reusable backend checks, preserving local SQLite-specific checks and the existing test count. Completion still awaits user agreement; separate design/streaming follow-ups remain deferred."
+created_at = "2026-10-04T09:02:34.657348Z"
+
+[[comments]]
+id = "01a10644-2ae6-7560-be55-70ed021ee68b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T09:34:53.158023Z"

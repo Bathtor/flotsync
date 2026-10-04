@@ -573,32 +573,6 @@ pub trait ReplicationStoreReadTransaction: Send {
         batch: &'call mut dyn PageBatch<Input = ReplicationUpdatePageInput, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>>;
 
-    /// Load persisted replication updates for one group using the given filter and optional limit.
-    ///
-    /// Results without a limit have no ordering guarantee.
-    ///
-    /// TODO(flotsync-h3l.8): Remove this compatibility adapter after every
-    /// runtime consumer uses projected update pages directly.
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        async move {
-            let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(*group_id, filter));
-            let own_update = |view: ReplicationUpdateView<'_>| view.try_to_owned_record();
-            let mut batch = match limit {
-                Some(limit) => VecPageBatch::bounded_with(limit, own_update),
-                None => VecPageBatch::unlimited_with(own_update),
-            };
-            self.load_replication_updates_into(&mut cursor, &mut batch)
-                .await?;
-            Ok(batch.into_values())
-        }
-        .boxed()
-    }
-
     /// Load persisted replication update ids selected by the cursor into `batch`.
     ///
     /// Implementations must not fetch or decode update payloads for this method.
@@ -609,33 +583,6 @@ pub trait ReplicationStoreReadTransaction: Send {
         cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>>;
-
-    /// Load only persisted replication update ids for one group.
-    ///
-    /// This is for availability/frontier checks that must not decode full
-    /// update payloads. A finite limit uses the backend's paging order;
-    /// unlimited results have no ordering guarantee.
-    ///
-    /// TODO(flotsync-h3l.8): Remove this compatibility adapter after every
-    /// runtime consumer uses update-id pages directly.
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        async move {
-            let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(*group_id, filter));
-            let mut batch = match limit {
-                Some(limit) => VecPageBatch::bounded(limit),
-                None => VecPageBatch::unlimited(),
-            };
-            self.load_replication_update_ids_into(&mut cursor, &mut batch)
-                .await?;
-            Ok(batch.into_values())
-        }
-        .boxed()
-    }
 
     /// Load requested dataset-row outcomes selected by `cursor` into `batch`.
     fn load_dataset_rows_into<'call, 'query: 'call>(

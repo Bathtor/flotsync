@@ -2,38 +2,48 @@ id = "01a099f7-6090-7ee3-9045-a9a997904a48"
 ref = "flotsync-h3l.8"
 title = "Audit and finish store pagination contract"
 body = """
-Scope (AJ8)
-Perform the integrated audit and remove temporary compatibility surfaces. Estimate: 200-350 changed Rust LOC; if material missing implementation is discovered, record and split it rather than concealing it in this estimate. Blocked by flotsync-h3l.2 through flotsync-h3l.7.
+Scope
+Finish the integrated store-pagination audit after completed children flotsync-h3l.1-.7 and the opaque-continuation redesign flotsync-o3o. The user agreed the remaining cleanup and authorised execution on 2026-10-04. Do not close this child or the parent without user approval. Preserve manual changes and review staging. Do not create/switch branches.
 
-Starting points
-All public store traits in flotsync_replication/src/api/store.rs and delivery/contracts.rs, store/sqlite implementations/tests, runtime test wrappers, all load/scan/page call sites, and TODO(flotsync-h3l). Read the completed child bodies and parent full plan as the checklist.
+Current agreed contract
+Use PageCursor<Params>, constructed directly with ordinary immutable query data. Params may borrow; separate query/call lifetimes are intentional for mutable cursor variance. The backend supplies a private Send + 'static continuation, erased into Any by the cursor; Rust Ord/Clone and caller-visible continuation semantics are not required. Format validation preserves a cursor on recoverable mismatch, but is not operation identity. Do not reintroduce operation tags or query-specific cursor aliases.
+PageBatch is object safe and supports temporary borrowed views during synchronous projection. Finite limits count successful source records independently of output cardinality. Custom batches may filter or expand. Vec/inline batches and positional row batches reuse their storage. A new fill clears output/metadata; failed, cancelled or unwound active fills clear output and fail the cursor. Exhausted reuse is an error. Backend PageEnd separates continuation/exhaustion from result length and metadata; unlimited and empty fills cannot yield continuations.
+Bounded update/ID pages use each backend's deterministic traversal order; SQLite orders by version then producer; inclusive producer filters do not depend on applied state and inverted ranges are empty. Unlimited update and metadata reads need no ORDER BY, except where a particular API promises order (ordinary row/transition scans). Existing lower bounds still apply when switching to unlimited. Requested-row selections report present/missing explicitly and may know exact final exhaustion or require an empty confirmation page. Transaction identity is common UUID-backed and wrappers forward it; cursor calls hold no transaction borrow afterwards. Preserve snapshots, read-your-own-writes, error classification and contextual Snafu errors.
+Read generated operation views from temporary stored payloads without materialising operations. SQLite ID-only reads exclude payloads; selected-ID decoding skips unselected payloads. Exact full-update lookup shares validation with the projected scan. Compact dependency/recovery/summary collections use unlimited projection when the complete output must be assembled before processing; incremental history and response payload reads stay bounded with a separate response cap. Application-facing providers remain adapters.
 
-Work
-Audit every collection-returning store API. Each exposes the shared correct paging mechanism or a clearly complete-result API without pagination controls; remove old limit-only update loaders and temporary compatibility adapters once consumers are converted. Verify existing row/transition callers use the common mechanism, requested-row absence is explicit, lightweight ID queries do not decode payloads, and no unnecessary eager ownership remains at audited update read boundaries.
-Compare the integrated result against parent requirements P01-P09, including deterministic update ordering, precise inclusive producer filters, result bounds, all TODO removals, reusable backend contract tests, bounded retained-history payloads, generic applicability and generated operation-view projections.
-Review error classification, snapshot/read-your-own-writes contracts, transaction/operation identity, cancellation cleanup, switched batches/limits and unlimited mode across implementations. Preserve existing application-facing providers as adapters where used.
-Routine duplicate checks remain limited to touched files; do not start an unrelated repository-wide refactor. Record discovered future concerns as linked issues/comments rather than leaving untracked notes. Do not close this child or parent without user agreement.
+Audit results
+All collection families have common _into methods or deliberate complete-result conveniences. Production update callers are converted. Old row/transition APIs are gone. Shared lifecycle/error/cancellation/cardinality tests cover the common implementation. Runtime regression tests cover the adopted call paths. No additional runtime correctness defect was identified in inspected paths.
+Only two TODO(flotsync-h3l) remain: the temporary limit-only update and update-ID adapters in api/store.rs. Their five call sites are SQLite test helpers. Reusable backend-specific domain scenarios currently exist for metadata only, whereas this child's acceptance includes all adopted families; update/row/transition/requested-row/delivery scenarios are presently SQLite-specific.
 
-Acceptance
-No TODO(flotsync-h3l), superseded fake pagination surface or undocumented temporary adapter remains. All backend/wrapper/caller contracts are accounted for. Run relevant integrated tests and pedantic clippy following serial cargo/socket requirements. Report any intentionally complete-result APIs and outstanding issues explicitly. Tests must include the shared suite across adopted query families and regression coverage from each child; do not merely list local commands as PR validation.
+Agreed work
+A01. Remove both legacy optional-limit update methods after converting existing SQLite helper calls to _into. Preserve all existing filter, bounded selection, indexed/payload mismatch and ID-only assertions. Rename the legacy helper and remove obsolete imports. Do not remove single-record ownership conversion or valid complete-result conveniences. Estimate 60-100 changed Rust LOC.
+A02. Make existing public-boundary domain assertions reusable by extracting narrow test-support helpers for update/ID, ordinary/requested/transition rows and delivery metadata. Accept public trait objects and caller-prepared fixtures; use them from the same existing SQLite tests. Leave SQLite corruption injection, query details and database-specific checks in SQLite tests. Agreed review fixes R01/R02: accept backend traversal order separately from the five update fixtures; derive projected/ID/selected/limited expectations from that order, and compare projected flags by identity. Return ExactPageCompletion for requested-row checks, allowing immediate exhaustion or an empty confirmation; SQLite asserts its immediate-exhaustion choice locally. About 80-130 affected Rust lines, using existing tests only. Do not add redundant tests or repeat the generic cursor lifecycle suite. Estimate 300-500 affected Rust LOC, primarily moved/refactored code; preserve existing test count where practical. If decoupling exposes substantial extra implementation, report and split instead of concealing it in this estimate.
+A03. Keep this holistic plan reconciled with later accepted changes and record chronological audit/progress comments. Before final handover reconcile the parent P01-P09 checklist with bounded-only update ordering, opaque backend continuation and arbitrary batch output cardinality. Preserve original goals and intentional deferrals; do not restore superseded sketches. Tracking changes only.
+Total estimated Rust scope: 360-600 affected LOC, under 1,000. Implementation is authorised.
 
-Agreed context and API contract
+Implementation completed for review
+A01: removed both optional-limit compatibility methods and migrated their five test call sites. Source/tests/docs contain no TODO(flotsync-h3l) or legacy update-loader invocation.
+A02: existing SQLite tests now call public async contract helpers for updates/IDs, ordinary rows, requested-row present/missing outcomes, transitions and delivery metadata. Helpers take public trait objects plus caller-prepared contexts or borrowed fixtures. SQLite corruption, absent-dataset/SQL/snapshot checks stay local. ExactPageCompletion reports either valid backend exact-boundary policy; existing SQLite update/delivery cases still assert the empty-confirmation policy and requested-row cases assert immediate completion. Library test count remains 421; no new test cases or batch implementations.
+A03: reconciled the full parent requirements/contract with accepted opaque ordering, cardinality and unlimited metadata decisions, preserving linked follow-ups and historical comments.
+R01/R02 review fixes completed: update fixtures supply backend traversal order separately; projected flags are compared by identity and ordered/limited expectations derive from that order. Requested-row checks return ExactPageCompletion and allow empty confirmation, with SQLite asserting immediate completion locally. Both affected existing SQLite tests, all-target and test-support-feature pedantic Clippy, formatting and diff checks passed. No test cases added. Review staging untouched.
+Validation: 421 library tests and the downstream backend construction boundary test passed. Final formatting, all-target pedantic Clippy and diff checks complete the review gate. Parent/child remain open pending user agreement; nothing is staged or committed during this implementation.
 
-This is an implementation child of flotsync-h3l, whose plan and eight-task breakdown were approved by the user. No conversation context is required. Read current AGENTS.md and current code before editing; preserve manual changes. Do not create or switch branches without explicit user authorisation. Follow dependency links before starting.
+Validation and acceptance
+Use existing tests, extracting rather than duplicating domain coverage. Parent P01-P09 are checked with accepted refinements: bounded update order, precise inclusive producer filters and result bounds; legacy TODO removal; all callers/wrappers; reusable backend scenarios; bounded history payload processing; one protocol across collection families; generated operation-view projections. Verify relevant integrated tests, external backend boundary, formatting and pedantic Clippy, with serial Cargo and socket broker requirements. Limit duplication inspection to touched files. No TODO(flotsync-h3l), obsolete partial-result compatibility adapter or undocumented temporary API remains after implementation. Report intentional complete-result APIs and unresolved linked work explicitly.
 
-Use a common PageCursor<Params, Key> constructed with PageCursor::new(params). Params is ordinary immutable argument data, not a PageQuery trait implementation. Cursor fields and continuation are private. One object-safe store method per pageable query accepts &mut cursor and a dyn projection batch; there is no per-query cursor factory or separate page-size argument. The cursor binds on first use to a common UUID-backed transaction identity and, where needed, operation identity. Backends choose UUID generation; v4 is not required, but identities must distinguish transaction instances across pools and stores while old cursors may survive. Do not use associated identity types or object addresses. No transaction borrow survives a page call.
-
-ProjectionBatch<View> owns projection and reusable storage, with page_limit(), clear(), and fallible push(view). Borrowed record views are valid only during projection; one source record produces exactly one retained value. No filtering or expansion by the projection. Batch policy is Records(NonZeroUsize) or Unlimited, sampled once per call. Different batch instances, projections and limits may be used on successive calls. clear preserves projection, policy and reusable capacity. Support runtime Vec batches and compile-time bounded SmallVec batches; nonzero inline size and enforced one-to-one limit avoid spilling. Unlimited consumes the remaining query in one call but releases temporary source payloads incrementally.
-
-Shared helper handles binding, lifecycle, clearing, projection, record limits, strictly advancing keys, continuation, exhaustion and failed/cancelled page cleanup. A deterministic unique key orders each query; continuation is exclusive. Exact-size final pages may require one empty follow-up. Explicit page status and query-specific metadata are independent of result length. Exhaustion is permanent. Errors/cancellation clear partial batch output and fail the cursor; external callback effects cannot be rolled back. Read transactions provide their snapshot; mutable transactions retain read-your-own-writes, without revisiting changes behind the cursor. Preserve contextual Snafu errors and store error classification.
-
-Validation and delivery
-
-Keep the repository buildable at this child boundary; do not wait for the final audit to add tests. Add meaningful tests for this child's behaviour, use the reusable contract suite where applicable, run relevant Rust tests and pedantic clippy, and inspect touched files for duplicated helpers. Follow repository cargo serialisation/socket rules. Update issue progress before handover, compare against acceptance criteria, and do not close without user agreement. Type/method names below are agreed sketches: align naming with the shared implementation without changing semantics.
+Explicit deferrals
+flotsync-yzq: custom collection-backed batches (including the trust-evidence Vec-to-set conversion).
+flotsync-mzc: generic composed cursors/two-source transition fallback.
+flotsync-dj1: extracting SQLite into a separate crate; public external-backend view construction is already covered.
+flotsync-duu: further row scan allocation/streaming work (reusable output is now implemented, SQL fetch_all evaluation remains separate).
+flotsync-git-qsg: inline initial snapshot threshold/Metadata path; existing TODO remains intentionally outside this parent.
+No database migrations, new branches, operation identity, generic engine ordering assumptions, or redundant tests.
 """
-status = "open"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 blocked_by = [
     "01a099f7-5ef6-7451-b756-e6f2a0fca0fb",
     "01a099f7-5f38-7b23-afbd-f06add65c741",
@@ -44,4 +54,41 @@ blocked_by = [
 ]
 parent = "01a09072-021a-7cc2-a69b-d41d92d0da6a"
 created_at = "2026-09-13T08:52:01.296322Z"
-updated_at = "2026-09-13T08:53:13.185869Z"
+updated_at = "2026-10-04T09:34:53.084345Z"
+closed_at = "2026-10-04T09:34:53.084345Z"
+
+[[comments]]
+id = "01a10617-e710-7f50-9d9c-0706f5e3f2a9"
+author = "codex"
+body = "Integrated audit after 605bc6f: all production collection callers use shared paging or deliberate complete-result conveniences. Remaining A01 is removal of two temporary optional-limit update adapters and conversion of their five SQLite test call sites. A02 is extracting existing public-interface update/ID, row/requested/transition and delivery metadata assertions into reusable backend test-support helpers, without duplicate tests. The holistic body now records opaque continuations, arbitrary batch cardinality, no operation identity and bounded-only update ordering from later agreed changes. Proposed cleanup is 360-600 affected Rust LOC and awaits alignment. No production code changed during this audit; known separate design/streaming follow-ups remain deferred."
+created_at = "2026-10-04T08:46:32.208662Z"
+
+[[comments]]
+id = "01a10619-3304-7d20-ad87-6fe94d3c252b"
+author = "codex"
+body = "Audit validation completed: all 421 replication library tests passed serially; the downstream store-backend construction integration test passed; all-target replication pedantic Clippy passed with warnings denied; workspace formatting and diff checks passed. No production changes made. A01/A02 cleanup remains proposed for alignment."
+created_at = "2026-10-04T08:47:57.188305Z"
+
+[[comments]]
+id = "01a1062a-cec8-71e3-a40e-7a8b7b133021"
+author = "codex"
+body = "A01-A03 implemented and ready for review: removed both optional-limit update adapters and all associated TODOs; migrated the five test call sites; extracted existing update/ID, ordinary/requested/transition row and delivery metadata checks into public async test-support helpers. Backend-specific exact-boundary policy assertions remain local through ExactPageCompletion, as do SQLite corruption/snapshot/SQL checks. All 421 library tests and the downstream backend boundary test passed; pedantic all-target Clippy, formatting and diff checks passed. No test cases added, no batch implementation duplicated, and review staging untouched. Parent and child remain open pending user agreement."
+created_at = "2026-10-04T09:07:11.176388Z"
+
+[[comments]]
+id = "01a1063b-3400-7870-b887-8195a883274f"
+author = "codex"
+body = "Review fixes R01/R02 agreed: reusable update checks will accept backend traversal order separately from fixed filter fixtures and derive ordered/limited expectations from it; requested-row checks will accept either exact-boundary completion policy, with SQLite-specific assertions kept local. Parent P01 and child contract wording reconciled. Existing test cases only; review staging untouched."
+created_at = "2026-10-04T09:25:05.664695Z"
+
+[[comments]]
+id = "01a1063d-fa8f-75b2-b6f2-c397483b77c4"
+author = "codex"
+body = "R01/R02 completed: backend-specific traversal expectations are supplied separately from update fixtures; requested-row checks accept immediate or empty-confirmation completion while SQLite keeps its chosen assertion locally. Both affected existing tests passed, as did all-target and test-support-feature pedantic Clippy, formatting and diff checks. No test cases added; review staging untouched."
+created_at = "2026-10-04T09:28:07.56787Z"
+
+[[comments]]
+id = "01a10644-2a9c-72e2-9d81-e4a19321a3c8"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-04T09:34:53.084345Z"

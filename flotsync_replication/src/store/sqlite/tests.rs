@@ -19,7 +19,6 @@ use crate::{
         InitialSnapshot,
         InitialSnapshotMetadata,
         InitialValueRow,
-        InlinePageBatch,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberPublicKeysRecord,
@@ -27,7 +26,6 @@ use crate::{
         MigrationProposal,
         PendingGroupDecisionRecord,
         ReplicationUpdateFilter,
-        ReplicationUpdatePageInput,
         ReplicationUpdateView,
         ReplicationUpdatesQuery,
         RequestedDatasetRowPageBatch,
@@ -42,9 +40,16 @@ use crate::{
     delivery::shared::MessageId,
     provision_local_identity,
     test_support::{
+        ExactPageCompletion,
         MetadataPagingFixtures,
         SqliteStoreTestOwner,
+        UpdatePagingFixtures,
+        assert_delivery_metadata_paging_contract,
         assert_metadata_paging_contract,
+        assert_requested_row_paging_contract,
+        assert_row_scan_paging_contract,
+        assert_transition_paging_contract,
+        assert_update_paging_contract,
         test_public_member_keys,
         test_replication_security_secrets,
     },
@@ -84,19 +89,6 @@ struct ReplicationRowStateFixture {
     last_changed_versions: VersionVector,
 }
 
-/// Small retained projection used to prove update pages need not own payloads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProjectedUpdateSummary {
-    /// Selected update identity.
-    update_id: UpdateId,
-    /// Dataset identifier copied from the temporary payload view.
-    dataset_id: String,
-    /// Number of borrowed operations observed without materialising them.
-    operation_count: usize,
-    /// Whether this update is already reflected in local state.
-    applied_locally: bool,
-}
-
 const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wait_for_store_future<F>(future: F) -> F::Output
@@ -108,31 +100,6 @@ where
         future,
         "timed out waiting for sqlite store future",
     )
-}
-
-/// Retain only the fields needed by the projected-update paging scenario.
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unnecessary_wraps,
-    reason = "page projections share the reusable fallible batch callback signature"
-)]
-fn project_update_summary(
-    update: ReplicationUpdateView<'_>,
-) -> Result<ProjectedUpdateSummary, BoxError> {
-    let mut datasets = update.dataset_updates();
-    let dataset = datasets
-        .next()
-        .expect("test updates should contain one dataset");
-    assert!(
-        datasets.next().is_none(),
-        "test updates should contain exactly one dataset"
-    );
-    Ok(ProjectedUpdateSummary {
-        update_id: update.update_id(),
-        dataset_id: dataset.dataset_id().to_owned(),
-        operation_count: dataset.operations().count(),
-        applied_locally: update.applied_locally(),
-    })
 }
 
 /// Materialise one loaded positional row for assertions which compare owned fixtures.
@@ -604,7 +571,12 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     wait_for_store_future(store.store_reliable_delivery_work(earlier.clone()))
         .expect("earlier work should store");
 
-    assert_delivery_metadata_pages(store.as_ref(), &earlier.metadata, &later.metadata);
+    let completion = wait_for_store_future(assert_delivery_metadata_paging_contract(
+        store.as_ref(),
+        &earlier.metadata,
+        &later.metadata,
+    ));
+    assert_eq!(completion, ExactPageCompletion::AfterEmptyPage);
 
     let mut metadata = wait_for_store_future(store.load_reliable_delivery_work_metadata())
         .expect("metadata should load");
@@ -634,39 +606,6 @@ fn reliable_delivery_store_round_trips_metadata_and_encoded_envelopes() {
     wait_for_store_future(store.remove_reliable_delivery_work(later.metadata.message_id))
         .expect("final work should remove");
     assert_empty_delivery_metadata_page(store.as_ref());
-}
-
-/// Check bounded continuation, session binding, and exact-size exhaustion.
-fn assert_delivery_metadata_pages(
-    store: &SqliteReplicationStore,
-    earlier: &StoredReliableDeliveryWorkMetadata,
-    later: &StoredReliableDeliveryWorkMetadata,
-) {
-    let mut session = wait_for_store_future(store.begin_read_session())
-        .expect("delivery metadata session should start");
-    let mut cursor = PageCursor::new(());
-    let mut batch = VecPageBatch::<StoredReliableDeliveryWorkMetadata, ()>::bounded(
-        NonZeroUsize::new(1).expect("page size is non-zero"),
-    );
-    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
-        .expect("first metadata page should load");
-    assert_eq!(batch.values(), std::slice::from_ref(earlier));
-    let mut other_session = wait_for_store_future(store.begin_read_session())
-        .expect("second delivery metadata session should start");
-    assert!(matches!(
-        load_delivery_metadata_page(other_session.as_mut(), &mut cursor, &mut batch),
-        Err(PageError::TransactionMismatch { .. })
-    ));
-    wait_for_store_future(other_session.release()).expect("second session should release");
-    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
-        .expect("second metadata page should load");
-    assert_eq!(batch.values(), std::slice::from_ref(later));
-    assert!(cursor.has_more(), "an exact-size page needs confirmation");
-    load_delivery_metadata_page(session.as_mut(), &mut cursor, &mut batch)
-        .expect("empty confirmation page should load");
-    assert!(batch.values().is_empty());
-    assert!(cursor.is_exhausted());
-    wait_for_store_future(session.release()).expect("metadata session should release");
 }
 
 /// Check that an empty read session exhausts the cursor in one fill.
@@ -2101,35 +2040,17 @@ fn sqlite_store_roundtrips_group_dataset_and_update_records() {
     );
     assert!(loaded_snapshot.missing_row_keys.contains(&missing_row_key));
 
-    let query = RequestedDatasetRowsQuery::new(
-        DatasetRowsQuery::borrowed(GroupDatasetSchemaRef {
+    let completion = wait_for_store_future(assert_requested_row_paging_contract(
+        transaction.as_mut(),
+        GroupDatasetSchemaRef {
             group_id: &group_id,
             dataset_id: &dataset_id,
             schema: &schema,
-        }),
-        [missing_row_key, row_key, row_key],
-    );
-    let mut cursor = PageCursor::new(query);
-    let mut requested_page = RequestedDatasetRowPageBatch::bounded(
-        &schema,
-        NonZeroUsize::new(1).expect("requested-row page limit should be non-zero"),
-    );
-    wait_for_store_future(transaction.load_dataset_rows_into(&mut cursor, &mut requested_page))
-        .expect("first requested-row page should load");
-    let first_outcomes = requested_page.outcomes().collect::<Vec<_>>();
-    assert!(matches!(
-        first_outcomes.as_slice(),
-        [RequestedDatasetRowView::Present(row)] if row.metadata().row_key == row_key
+        },
+        row_key,
+        missing_row_key,
     ));
-    assert!(cursor.has_more());
-
-    wait_for_store_future(transaction.load_dataset_rows_into(&mut cursor, &mut requested_page))
-        .expect("second requested-row page should load");
-    assert!(matches!(
-        requested_page.outcomes().collect::<Vec<_>>().as_slice(),
-        [RequestedDatasetRowView::Missing(key)] if *key == missing_row_key
-    ));
-    assert!(cursor.is_exhausted());
+    assert_eq!(completion, ExactPageCompletion::WithLastRecord);
 
     let loaded_update =
         wait_for_store_future(transaction.load_replication_update(&group_id, update.update_id))
@@ -2777,199 +2698,19 @@ fn sqlite_store_pages_projected_replication_updates_and_ids() {
     let mut transaction =
         wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
     insert_update_paging_fixture(transaction.as_mut(), &fixture);
-    assert_projected_update_pages(transaction.as_mut(), &fixture);
-    assert_bounded_update_id_pages(transaction.as_mut(), &fixture);
-    assert_update_filters_and_legacy_limit(transaction.as_mut(), &fixture);
+    let completion = wait_for_store_future(assert_update_paging_contract(
+        transaction.as_mut(),
+        &UpdatePagingFixtures {
+            group_id: fixture.group_id,
+            dataset_id: &fixture.dataset_id,
+            updates: &fixture.updates,
+            // SQLite pages use ascending (version, producer) order.
+            traversal_order: fixture.updates.each_ref().map(|update| update.update_id),
+        },
+    ));
+    assert_eq!(completion, ExactPageCompletion::AfterEmptyPage);
     wait_for_store_future(transaction.commit()).expect("commit should succeed");
     assert_inconsistent_update_payload(&fixture);
-}
-
-/// Check inline and Vec projections, changed limits, and exact-page exhaustion.
-fn assert_projected_update_pages(
-    transaction: &mut dyn ReplicationStoreTransaction,
-    fixture: &UpdatePagingFixture,
-) {
-    let mut projected_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
-        fixture.group_id,
-        ReplicationUpdateFilter::All,
-    ));
-    let mut projected = Vec::new();
-    let mut first_batch =
-        InlinePageBatch::<ProjectedUpdateSummary, (), 1, ReplicationUpdatePageInput, _>::new_with(
-            project_update_summary,
-        );
-    wait_for_store_future(
-        transaction.load_replication_updates_into(&mut projected_cursor, &mut first_batch),
-    )
-    .expect("first projected update page should load");
-    assert_eq!(first_batch.values().len(), 1);
-    projected.extend_from_slice(first_batch.values());
-
-    let mut final_page_len = usize::MAX;
-    while projected_cursor.has_more() {
-        let mut batch =
-            VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::bounded_with(
-                NonZeroUsize::new(2).expect("two updates per page"),
-                project_update_summary,
-            );
-        wait_for_store_future(
-            transaction.load_replication_updates_into(&mut projected_cursor, &mut batch),
-        )
-        .expect("continued projected update page should load");
-        final_page_len = batch.values().len();
-        projected.extend(batch.into_values());
-    }
-    assert_eq!(
-        final_page_len, 0,
-        "an exact final page needs an empty confirmation"
-    );
-    assert_eq!(
-        projected
-            .iter()
-            .map(|summary| summary.update_id)
-            .collect::<Vec<_>>(),
-        fixture.expected_ids()
-    );
-    assert!(projected.iter().all(|summary| {
-        summary.dataset_id == fixture.dataset_id.as_str() && summary.operation_count == 1
-    }));
-    assert_eq!(
-        projected
-            .iter()
-            .map(|summary| summary.applied_locally)
-            .collect::<Vec<_>>(),
-        vec![false, true, true, true, false]
-    );
-
-    let selected_ids = HashSet::from([fixture.updates[2].update_id, fixture.updates[4].update_id]);
-    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
-        .with_update_ids(&selected_ids);
-    let mut selected_cursor = PageCursor::new(query);
-    let mut selected_batch =
-        VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::bounded_with(
-            NonZeroUsize::new(1).expect("one update per page"),
-            project_update_summary,
-        );
-    let mut selected = Vec::new();
-    while selected_cursor.has_more() {
-        wait_for_store_future(
-            transaction.load_replication_updates_into(&mut selected_cursor, &mut selected_batch),
-        )
-        .expect("selected update page should load");
-        selected.extend(
-            selected_batch
-                .values()
-                .iter()
-                .map(|summary| summary.update_id),
-        );
-    }
-    assert_eq!(
-        selected,
-        vec![fixture.updates[2].update_id, fixture.updates[4].update_id]
-    );
-}
-
-/// Check that lightweight ID reads cross the same-version producer boundary.
-fn assert_bounded_update_id_pages(
-    transaction: &mut dyn ReplicationStoreTransaction,
-    fixture: &UpdatePagingFixture,
-) {
-    let mut ids_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
-        fixture.group_id,
-        ReplicationUpdateFilter::All,
-    ));
-    let mut ids_batch =
-        VecPageBatch::<UpdateId, ()>::bounded(NonZeroUsize::new(1).expect("one update per page"));
-    let mut paged_ids = Vec::new();
-    while ids_cursor.has_more() {
-        wait_for_store_future(
-            transaction.load_replication_update_ids_into(&mut ids_cursor, &mut ids_batch),
-        )
-        .expect("update ids should load");
-        paged_ids.extend_from_slice(ids_batch.values());
-    }
-    assert!(ids_cursor.is_exhausted());
-    assert_eq!(paged_ids, fixture.expected_ids());
-
-    let selected_ids = HashSet::from([fixture.updates[2].update_id]);
-    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
-        .with_update_ids(&selected_ids);
-    let mut selected_cursor = PageCursor::new(query);
-    wait_for_store_future(
-        transaction.load_replication_update_ids_into(&mut selected_cursor, &mut ids_batch),
-    )
-    .expect("selected update id should load");
-    assert_eq!(ids_batch.values(), &[fixture.updates[2].update_id]);
-}
-
-/// Compare projected adapters and ID selection for every filter and one legacy limit.
-fn assert_update_filters_and_legacy_limit(
-    transaction: &mut dyn ReplicationStoreTransaction,
-    fixture: &UpdatePagingFixture,
-) {
-    let [alice_v1, bob_v1, alice_v2, alice_v3, bob_max] = &fixture.updates;
-    let filter_cases = [
-        (
-            ReplicationUpdateFilter::PendingApply,
-            vec![alice_v1.update_id, bob_max.update_id],
-        ),
-        (
-            ReplicationUpdateFilter::Applied,
-            vec![bob_v1.update_id, alice_v2.update_id, alice_v3.update_id],
-        ),
-        (
-            ReplicationUpdateFilter::ProducerRange {
-                producer_index: MemberIndex::new(0),
-                start_version: 2,
-                end_version: 3,
-            },
-            vec![alice_v2.update_id, alice_v3.update_id],
-        ),
-        (
-            ReplicationUpdateFilter::ProducerRange {
-                producer_index: MemberIndex::new(0),
-                start_version: 3,
-                end_version: 2,
-            },
-            Vec::new(),
-        ),
-    ];
-    for (filter, expected) in filter_cases {
-        let updates = wait_for_store_future(transaction.load_replication_updates(
-            &fixture.group_id,
-            filter,
-            None,
-        ))
-        .expect("filtered updates should load");
-        let ids = wait_for_store_future(transaction.load_replication_update_ids(
-            &fixture.group_id,
-            filter,
-            None,
-        ))
-        .expect("filtered update ids should load");
-        let update_ids = updates
-            .iter()
-            .map(|update| update.update_id)
-            .sorted()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            update_ids,
-            expected.iter().copied().sorted().collect::<Vec<_>>()
-        );
-        assert_eq!(ids.into_iter().sorted().collect::<Vec<_>>(), update_ids);
-    }
-
-    let limited_alice = wait_for_store_future(transaction.load_replication_updates(
-        &fixture.group_id,
-        ReplicationUpdateFilter::ProducerRange {
-            producer_index: MemberIndex::new(0),
-            start_version: 2,
-            end_version: 3,
-        },
-        NonZeroUsize::new(1),
-    ))
-    .expect("bounded compatibility query should load");
-    assert_eq!(limited_alice, vec![alice_v2.clone()]);
 }
 
 /// Confirm ID-only reads skip a corrupt payload while full reads report its mismatch.
@@ -2984,14 +2725,13 @@ fn assert_inconsistent_update_payload(fixture: &UpdatePagingFixture) {
     );
     let mut transaction =
         wait_for_store_future(fixture.store.begin_transaction()).expect("transaction should start");
-    let ids = wait_for_store_future(transaction.load_replication_update_ids(
-        &fixture.group_id,
-        ReplicationUpdateFilter::All,
-        None,
-    ))
-    .expect("id-only paging should not decode an inconsistent payload");
+    let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All);
+    let mut ids_cursor = PageCursor::new(query);
+    let mut ids = VecPageBatch::unlimited();
+    wait_for_store_future(transaction.load_replication_update_ids_into(&mut ids_cursor, &mut ids))
+        .expect("id-only paging should not decode an inconsistent payload");
     assert_eq!(
-        ids.into_iter().sorted().collect::<Vec<_>>(),
+        ids.into_values().into_iter().sorted().collect::<Vec<_>>(),
         fixture
             .expected_ids()
             .into_iter()
@@ -3002,28 +2742,23 @@ fn assert_inconsistent_update_payload(fixture: &UpdatePagingFixture) {
     let query = ReplicationUpdatesQuery::new(fixture.group_id, ReplicationUpdateFilter::All)
         .with_update_ids(&selected_ids);
     let mut selected_cursor = PageCursor::new(query);
-    let mut selected_batch =
-        VecPageBatch::<ProjectedUpdateSummary, (), ReplicationUpdatePageInput, _>::unlimited_with(
-            project_update_summary,
-        );
+    let project_id = |view: ReplicationUpdateView<'_>| Ok::<_, BoxError>(view.update_id());
+    let mut selected_batch = VecPageBatch::unlimited_with(project_id);
     wait_for_store_future(
         transaction.load_replication_updates_into(&mut selected_cursor, &mut selected_batch),
     )
     .expect("an unselected inconsistent payload should not be decoded");
-    assert_eq!(
-        selected_batch
-            .values()
-            .iter()
-            .map(|summary| summary.update_id)
-            .collect::<Vec<_>>(),
-        vec![alice_v3.update_id]
-    );
-    let error = wait_for_store_future(transaction.load_replication_updates(
-        &fixture.group_id,
+    assert_eq!(selected_batch.values(), &[alice_v3.update_id]);
+    let mut cursor = PageCursor::new(ReplicationUpdatesQuery::new(
+        fixture.group_id,
         ReplicationUpdateFilter::All,
-        None,
-    ))
-    .expect_err("projected update paging should validate indexed payload identity");
+    ));
+    let own_update = |view: ReplicationUpdateView<'_>| view.try_to_owned_record();
+    let mut batch = VecPageBatch::unlimited_with(own_update);
+    let error =
+        wait_for_store_future(transaction.load_replication_updates_into(&mut cursor, &mut batch))
+            .map_err(StoreError::from)
+            .expect_err("projected update paging should validate indexed payload identity");
     assert_sqlite_store_error(&error, |error| {
         matches!(
             error,
@@ -3155,55 +2890,26 @@ fn sqlite_store_scans_dataset_rows_in_key_order() {
         dataset_id: &dataset_id,
         schema: &schema,
     };
-    let mut cursor = PageCursor::new(DatasetRowsQuery::borrowed(dataset));
-    let mut first_page = DatasetRowPageBatch::bounded(
-        &schema,
-        NonZeroUsize::new(1).expect("limit should be non-zero"),
-    );
-    wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut first_page))
-        .expect("first batch should scan");
-    let first_scanned_metadata = first_page
-        .rows()
-        .row(0)
-        .expect("first scan should return one row")
-        .metadata()
-        .clone();
-    assert!(cursor.has_more());
-    let mut second_page = DatasetRowPageBatch::bounded(
-        &schema,
-        NonZeroUsize::new(2).expect("rotated limit should be non-zero"),
-    );
-    wait_for_store_future(transaction.scan_dataset_rows_into(&mut cursor, &mut second_page))
-        .expect("second batch should scan");
-    let second_scanned_metadata = second_page
-        .rows()
-        .row(0)
-        .expect("second scan should return one row")
-        .metadata()
-        .clone();
-    assert!(cursor.is_exhausted());
+    let expected = [
+        ReplicationRowMetadata {
+            row_key: first_row_key,
+            tombstoned: false,
+            created_by: Some(sample_change_id()),
+            last_changed_versions: sample_last_changed_versions(),
+        },
+        ReplicationRowMetadata {
+            row_key: second_row_key,
+            tombstoned: true,
+            created_by: None,
+            last_changed_versions: sample_last_changed_versions(),
+        },
+    ];
+    wait_for_store_future(assert_row_scan_paging_contract(
+        transaction.as_mut(),
+        dataset,
+        &expected,
+    ));
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert!(
-        second_page
-            .metadata()
-            .expect("successful second page should retain metadata")
-            .dataset_exists
-    );
-    assert_eq!(first_scanned_metadata.row_key, first_row_key);
-    assert!(!first_scanned_metadata.tombstoned);
-    assert_eq!(first_scanned_metadata.created_by, Some(sample_change_id()));
-    assert_eq!(
-        first_scanned_metadata.last_changed_versions,
-        sample_last_changed_versions()
-    );
-    assert_eq!(second_scanned_metadata.row_key, second_row_key);
-    assert!(second_scanned_metadata.tombstoned);
-    assert_eq!(second_scanned_metadata.created_by, None);
-    assert_eq!(
-        second_scanned_metadata.last_changed_versions,
-        sample_last_changed_versions()
-    );
 }
 
 #[test]
@@ -3420,67 +3126,14 @@ fn sqlite_store_scans_dataset_row_transitions_in_key_order() {
         dataset_id: &dataset_id,
         schema: &current_schema,
     };
-    let mut cursor = PageCursor::new(DatasetRowTransitionQuery::new(
-        DatasetRowsQuery::borrowed(previous_group),
-        DatasetRowsQuery::borrowed(current_group),
+    wait_for_store_future(assert_transition_paging_contract(
+        transaction.as_mut(),
+        previous_group,
+        current_group,
+        [previous_only, current_only, corresponding],
+        previous_change_id,
     ));
-    let mut transition_rows = DatasetRowTransitionPageBatch::bounded(
-        &previous_schema,
-        &current_schema,
-        NonZeroUsize::new(2).expect("limit should be non-zero"),
-    );
-    wait_for_store_future(
-        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
-    )
-    .expect("first transition batch should scan");
-    let first_batch = transition_rows
-        .metadata()
-        .expect("first transition batch should retain metadata")
-        .clone();
-    let first_row_presence = transition_rows
-        .transitions()
-        .rows()
-        .map(|transition| {
-            (
-                transition.row_key(),
-                transition.previous().is_some(),
-                transition.current().is_some(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert!(cursor.has_more());
-    wait_for_store_future(
-        transaction.scan_dataset_row_transitions_into(&mut cursor, &mut transition_rows),
-    )
-    .expect("second transition batch should scan");
     wait_for_store_future(transaction.release()).expect("read should release");
-
-    assert_eq!(first_batch.dataset_id, dataset_id);
-    assert_eq!(first_batch.previous_group_id, previous_group_id);
-    assert_eq!(first_batch.current_group_id, current_group_id);
-    assert!(first_batch.previous_dataset_exists);
-    assert!(first_batch.current_dataset_exists);
-    assert_eq!(
-        first_row_presence,
-        vec![(previous_only, true, false), (current_only, false, true)]
-    );
-    assert_eq!(transition_rows.transitions().len(), 1);
-    let transition = transition_rows
-        .transitions()
-        .row(0)
-        .expect("transition must exist");
-    assert_eq!(transition.row_key(), corresponding);
-    assert_eq!(
-        transition.previous().map(|row| row.metadata().created_by),
-        Some(Some(previous_change_id))
-    );
-    assert_eq!(
-        transition
-            .current()
-            .map(|row| (row.metadata().created_by, row.metadata().tombstoned)),
-        Some((None, true))
-    );
-    assert!(cursor.is_exhausted());
 }
 
 #[test]

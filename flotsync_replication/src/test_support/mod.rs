@@ -79,9 +79,28 @@ use std::{
     time::Duration,
 };
 
+mod delivery_paging;
 mod metadata_paging;
+mod row_paging;
+mod update_paging;
 
+pub use delivery_paging::assert_delivery_metadata_paging_contract;
 pub use metadata_paging::{MetadataPagingFixtures, assert_metadata_paging_contract};
+pub use row_paging::{
+    assert_requested_row_paging_contract,
+    assert_row_scan_paging_contract,
+    assert_transition_paging_contract,
+};
+pub use update_paging::{UpdatePagingFixtures, assert_update_paging_contract};
+
+/// How a backend established exhaustion at an exact page boundary in a contract check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExactPageCompletion {
+    /// The backend knew the last non-empty page had no remaining records.
+    WithLastRecord,
+    /// The backend confirmed exhaustion with a subsequent empty page.
+    AfterEmptyPage,
+}
 
 const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
