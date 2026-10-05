@@ -34,18 +34,8 @@ use super::{
         publish,
     },
     group_state::SharedGroupState,
-    in_memory::{
-        LoadedGroupMeta,
-        PendingUpdateSet,
-        apply_one_update,
-        load_ready_row_scope,
-        load_scheduled_pending_update,
-        load_update_dependencies,
-        validate_inbound_update_read_versions,
-        validate_update_mapping,
-    },
+    in_memory::LoadedGroupMeta,
     pending_group,
-    replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
 #[cfg(test)]
@@ -59,7 +49,6 @@ use crate::{
         DataChangeLineage,
         DataChangeReadPosition,
         DatasetId,
-        DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupInvitation,
         GroupInvitationResponder,
@@ -91,14 +80,11 @@ use crate::{
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
-        ReplicationUpdateFilter,
-        ReplicationUpdateRecord,
         RowChange,
         RowId,
         RowKey,
         RowProvider,
         RowProviderError,
-        Summary,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
     },
@@ -110,7 +96,6 @@ use crate::{
         MigrationProposalMessage,
         RuntimeMessage,
         RuntimeMessageDecodeContext,
-        SummaryMessage,
         UpdateBatchMessage,
         UpdateMessage,
         UpdateRangeMessage,
@@ -124,7 +109,7 @@ use crate::{
             ReliableDeliveryPortIndication,
             ReliableDeliveryPortRequest,
         },
-        group_broadcast::{GroupBroadcastDeliver, GroupMessageHeader},
+        group_broadcast::GroupBroadcastDeliver,
         reliable_delivery::{
             ReliableDeliveryDeliver,
             ReliableDeliverySubmit,
@@ -151,7 +136,6 @@ use flotsync_utils::{
     kompact_config::ConfigReadExt as _,
 };
 use futures_util::FutureExt;
-use itertools::Itertools;
 use kompact::prelude::*;
 use roaring::RoaringBitmap;
 use smallvec::{SmallVec, smallvec};
@@ -193,14 +177,12 @@ use inbound_support::{
     summary_from_message,
 };
 use listeners::{
-    ListenerDataChangeBatches,
     ListenerDataChanges,
     notify_listener_batches,
     notify_listener_data_change,
     notify_pending_activation_data_changes,
 };
 use publication::CommittedPublication;
-use row_patches::apply_dataset_row_patches;
 
 mod activation_provider;
 mod group_work;
@@ -213,6 +195,7 @@ mod security_api;
 mod summary_api;
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
+mod update_ranges;
 
 /// Stateful Kompact component that hosts one replication runtime.
 ///
@@ -416,66 +399,6 @@ impl ReplicationRuntimeComponent {
         GroupReadToken::from_group_version(group_id, group.version_vector)
     }
 
-    /// Return catch-up ranges required before an inbound update can apply.
-    ///
-    /// The update can be blocked both by versions in its read frontier and by
-    /// earlier versions from the same producer. The latter are not present in
-    /// the read frontier because producer updates do not read themselves.
-    fn missing_ranges_for_update_frontier(
-        local_versions: &VersionVector,
-        group_id: GroupId,
-        update_id: UpdateId,
-        read_versions: &VersionVector,
-    ) -> Result<Vec<UpdateRangeMessage>, InboundDeliveryError> {
-        let mut ranges = local_versions
-            .missing_version_ranges_to(read_versions)
-            .into_iter()
-            .map(UpdateRangeMessage::from)
-            .collect_vec();
-        let producer_index = update_id.node_index as usize;
-        ensure!(
-            producer_index < local_versions.num_members().get(),
-            inbound::UpdateProducerIndexNotInGroupSnafu {
-                group_id,
-                producer_index: MemberIndex::new(update_id.node_index),
-            }
-        );
-        let expected_producer_version = local_versions.version_at(producer_index) + 1;
-        if update_id.version > expected_producer_version {
-            ranges.push(UpdateRangeMessage {
-                producer_index: update_id.node_index,
-                start_version: expected_producer_version,
-                end_version: update_id.version - 1,
-            });
-        }
-        Ok(ranges)
-    }
-
-    /// Clamp producer ranges to the immutable replay cut of a non-open group.
-    fn bound_update_ranges(
-        lifecycle: &ReplicationGroupLifecycle,
-        ranges: Vec<UpdateRangeMessage>,
-    ) -> Vec<UpdateRangeMessage> {
-        let Some(final_versions) = lifecycle.final_versions() else {
-            return ranges;
-        };
-        ranges
-            .into_iter()
-            .filter_map(|mut range| {
-                let producer_index = range.producer_index as usize;
-                if producer_index >= final_versions.num_members().get() {
-                    return None;
-                }
-                let final_version = final_versions.version_at(producer_index);
-                if range.start_version > final_version {
-                    return None;
-                }
-                range.end_version = range.end_version.min(final_version);
-                Some(range)
-            })
-            .collect()
-    }
-
     /// Validate an open old group and build its accepted read-only lifecycle.
     fn accepted_read_only_lifecycle(
         group: &ReplicationGroupRecord,
@@ -537,54 +460,6 @@ impl ReplicationRuntimeComponent {
                 group_id: group.group_id,
             }
             .fail(),
-        }
-    }
-
-    /// Validate the envelope sender for one inbound update and return the producer identity.
-    ///
-    /// Direct producer sends must come from the canonical producer index.
-    /// Forwarded catch-up updates only require the envelope sender to be a
-    /// group member; the persisted sender remains the canonical producer.
-    fn validated_inbound_update_producer(
-        local_group: &LoadedGroupMeta,
-        group_id: GroupId,
-        origin: InboundUpdateOrigin,
-        update_id: UpdateId,
-    ) -> Result<MemberIdentity, InboundDeliveryError> {
-        let producer_index = MemberIndex::new(update_id.node_index);
-        let producer = local_group
-            .members
-            .member_at_index(producer_index)
-            .context(inbound::UpdateProducerIndexNotInGroupSnafu {
-                group_id,
-                producer_index,
-            })?;
-        match origin {
-            InboundUpdateOrigin::Producer { sender } => {
-                let expected_sender_index = local_group.members.member_index(&sender).context(
-                    inbound::UpdateSenderNotInGroupSnafu {
-                        group_id,
-                        sender: sender.clone(),
-                    },
-                )?;
-                ensure!(
-                    expected_sender_index == producer_index,
-                    inbound::UpdateSenderIndexMismatchSnafu {
-                        group_id,
-                        sender: sender.clone(),
-                        expected_index: expected_sender_index,
-                        actual_index: producer_index,
-                    }
-                );
-                Ok(sender)
-            }
-            InboundUpdateOrigin::Forwarder { sender } => {
-                local_group
-                    .members
-                    .member_index(&sender)
-                    .context(inbound::UpdateSenderNotInGroupSnafu { group_id, sender })?;
-                Ok(producer)
-            }
         }
     }
 
@@ -1762,26 +1637,6 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Convert one runtime update message into the stored update-record shape.
-    fn build_replication_update_record(
-        sender: MemberIdentity,
-        message: UpdateMessage,
-        applied_locally: bool,
-    ) -> ReplicationUpdateRecord {
-        ReplicationUpdateRecord {
-            group_id: message.group_id,
-            update_id: message.update_id,
-            sender,
-            read_versions: message.read_versions,
-            dataset_updates: message
-                .dataset_updates
-                .into_iter()
-                .map(DatasetUpdateRecord::from)
-                .collect(),
-            applied_locally,
-        }
-    }
-
     /// Resolve the publication schema before calling the isolated transaction service.
     async fn publish_changes_transactionally(
         &mut self,
@@ -2376,12 +2231,7 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Persist one inbound update and apply every newly-ready successor inside
-    /// the same store transaction.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The inbound transaction is intentionally linear to keep causality checks and rollback handling auditable."
-    )]
+    /// Resolve the hosted schema before calling the inbound transaction service.
     async fn persist_and_apply_update(
         &mut self,
         origin: InboundUpdateOrigin,
@@ -2392,215 +2242,14 @@ impl ReplicationRuntimeComponent {
             .group_memberships
             .group_schema(&group_id)
             .context(inbound::UnknownHostedGroupSnafu { group_id })?;
-        let mut transaction = self
-            .store
-            .begin_transaction()
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let persisted_group = transaction
-            .load_replication_group(&group_id)
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let persisted_group =
-            persisted_group.context(inbound::UnknownHostedGroupSnafu { group_id })?;
-        let lifecycle = persisted_group.lifecycle.clone();
-        let local_group =
-            LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
-                .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
-        let producer = Self::validated_inbound_update_producer(
-            &local_group,
-            group_id,
+        inbound_support::persist_and_apply_update(
+            self.store.as_ref(),
+            &self.local_member,
+            group_schema.as_ref(),
             origin,
-            message.update_id,
-        )?;
-        let exceeds_final_versions = lifecycle.final_versions().is_some_and(|final_versions| {
-            message.update_id.version
-                > final_versions.version_at(message.update_id.node_index as usize)
-        });
-        if exceeds_final_versions {
-            transaction
-                .commit()
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-            return Ok(InboundUpdateOutcome {
-                event_batches: ListenerDataChangeBatches::new(),
-                needed_ranges: Vec::new(),
-                observed_available: Vec::new(),
-            });
-        }
-        let incoming_available_range = UpdateRangeMessage::from(message.update_id);
-        let needed_ranges = Self::missing_ranges_for_update_frontier(
-            &local_group.version_vector,
-            message.group_id,
-            message.update_id,
-            &message.read_versions,
-        )?;
-        let mut needed_ranges = Self::bound_update_ranges(&lifecycle, needed_ranges);
-        let inbound_update = Self::build_replication_update_record(producer, message, false);
-        validate_inbound_update_read_versions(&inbound_update)?;
-        if local_group.has_applied(inbound_update.update_id) {
-            transaction
-                .commit()
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-            return Ok(InboundUpdateOutcome {
-                event_batches: ListenerDataChangeBatches::new(),
-                needed_ranges,
-                observed_available: vec![incoming_available_range],
-            });
-        }
-
-        if let Some(existing_update) = transaction
-            .load_replication_update(&group_id, inbound_update.update_id)
-            .await
-            .context(inbound::StoreAccessSnafu)?
-        {
-            ensure!(
-                existing_update == inbound_update,
-                inbound::ConflictingPersistedUpdateSnafu {
-                    group: group_id,
-                    update: inbound_update.update_id,
-                }
-            );
-        } else {
-            let touched_dataset_ids = inbound_update
-                .dataset_updates
-                .iter()
-                .map(|dataset_update| dataset_update.dataset_id.clone())
-                .collect::<HashSet<_>>();
-            for dataset_id in touched_dataset_ids {
-                ensure!(
-                    group_schema.schema(&dataset_id).is_some(),
-                    inbound::MissingDatasetSchemaSnafu {
-                        group_id,
-                        dataset_id,
-                    }
-                );
-            }
-            validate_update_mapping(&inbound_update, group_schema.as_ref())?;
-            transaction
-                .append_replication_update(inbound_update.clone())
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-        }
-
-        let pending_updates = load_update_dependencies(
-            transaction.as_mut(),
-            group_id,
-            ReplicationUpdateFilter::PendingApply,
+            message,
         )
         .await
-        .context(inbound::StoreAccessSnafu)?;
-        let mut observed_available = vec![incoming_available_range];
-        observed_available.extend(
-            pending_updates
-                .iter()
-                .map(|update| UpdateRangeMessage::from(update.update_id)),
-        );
-        let mut pending_updates = PendingUpdateSet::from_updates(pending_updates);
-        let mut local_group = local_group;
-        let apply_plan = pending_updates.plan_apply_chain(&local_group);
-        for applied_update_id in &apply_plan.already_applied {
-            transaction
-                .mark_replication_update_applied(&group_id, *applied_update_id)
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-        }
-        if apply_plan.ready_chain.is_empty() {
-            for blocked_update in &apply_plan.blocked_updates {
-                let blocked_ranges = Self::missing_ranges_for_update_frontier(
-                    &local_group.version_vector,
-                    group_id,
-                    blocked_update.update_id,
-                    &blocked_update.read_versions,
-                )?;
-                needed_ranges.extend(Self::bound_update_ranges(&lifecycle, blocked_ranges));
-            }
-            transaction
-                .commit()
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-            return Ok(InboundUpdateOutcome {
-                event_batches: ListenerDataChangeBatches::new(),
-                needed_ranges,
-                observed_available,
-            });
-        }
-
-        let ready_ids = apply_plan
-            .ready_chain
-            .iter()
-            .map(|update| update.update_id)
-            .collect::<HashSet<_>>();
-        let touched_dataset_rows = load_ready_row_scope(
-            transaction.as_mut(),
-            group_id,
-            group_schema.as_ref(),
-            &ready_ids,
-        )
-        .await?;
-        let touched_dataset_slices = replay::load_touched_dataset_slices(
-            transaction.as_mut(),
-            group_schema.as_ref(),
-            group_id,
-            &touched_dataset_rows,
-        )
-        .await
-        .context(inbound::StoreAccessSnafu)?;
-        let mut working_datasets =
-            replay::materialise_dataset_slices(group_schema.as_ref(), touched_dataset_slices);
-        let mut event_batches = ListenerDataChangeBatches::new();
-        for scheduled_update in &apply_plan.ready_chain {
-            let ready_update =
-                load_scheduled_pending_update(transaction.as_mut(), group_id, scheduled_update)
-                    .await?;
-            let applied_batch =
-                apply_one_update(&mut local_group, &mut working_datasets, &ready_update)?;
-            if lifecycle.emits_data_changes() && !applied_batch.row_changes.is_empty() {
-                let read_token = GroupReadToken::from_group_version(
-                    group_id,
-                    local_group.version_vector.clone(),
-                );
-                event_batches.push(ListenerDataChanges {
-                    read_token,
-                    row_changes: applied_batch.row_changes,
-                });
-            }
-            apply_dataset_row_patches(
-                transaction.as_mut(),
-                group_schema.as_ref(),
-                applied_batch.row_patches,
-            )
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-            transaction
-                .mark_replication_update_applied(&group_id, scheduled_update.update_id)
-                .await
-                .context(inbound::StoreAccessSnafu)?;
-        }
-        for blocked_update in &apply_plan.blocked_updates {
-            let blocked_ranges = Self::missing_ranges_for_update_frontier(
-                &local_group.version_vector,
-                group_id,
-                blocked_update.update_id,
-                &blocked_update.read_versions,
-            )?;
-            needed_ranges.extend(Self::bound_update_ranges(&lifecycle, blocked_ranges));
-        }
-        let applied_versions = local_group.version_vector.clone();
-        transaction
-            .update_replication_group_version_vector(&group_id, applied_versions)
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        transaction
-            .commit()
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        Ok(InboundUpdateOutcome {
-            event_batches,
-            needed_ranges,
-            observed_available,
-        })
     }
 
     /// Persist one catch-up batch before emitting catch-up notifications.
@@ -2685,13 +2334,9 @@ impl ReplicationRuntimeComponent {
         batch_sender: MemberIdentity,
         message: UpdateBatchMessage,
     ) -> HandlerResult {
-        // Keep batch application on the component's blocking path. These
-        // helpers borrow component state mutably across awaits, and the
-        // component is intentionally not Sync, so the future cannot be safely
-        // detached with spawn_local. Blocking also prevents live updates or
-        // publishes from interleaving between batch elements and making
-        // listener ordering or catch-up notifications reflect an artificial
-        // intermediate state.
+        // Blocking keeps the batch's per-input commits and callbacks contiguous.
+        // Each callback completes before the next transaction begins, and live
+        // updates or publishes wait until accumulated catch-up observations flush.
         Handled::block_on(self, async move |mut async_self| {
             let error = async_self
                 .persist_apply_and_notify_update_batch(batch_sender, message)

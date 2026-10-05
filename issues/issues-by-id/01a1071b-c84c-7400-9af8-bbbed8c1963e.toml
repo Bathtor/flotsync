@@ -7,7 +7,7 @@ Extract inbound update transaction services without altering causal or batch beh
 
 Instructions
 S01. Extract persist_and_apply_update and its validation/replay helpers into narrow domain services. Preserve producer versus forwarder validation, final-version bounds, duplicate/conflicting-update handling and classified failures.
-S02. Keep a newly ready causal chain inside one store transaction. Preserve pending-update storage and missing/available range derivation, touched-row loading and version updates.
+S02. Keep a newly ready causal application sequence inside one store transaction. Preserve pending-update storage and missing/available range derivation, touched-row loading and version updates.
 S03. Return owned committed listener/observation outcomes; keep their ordering outside the transaction service. Do not move listener calls into the database transaction.
 S04. Keep the existing batch orchestration blocking: one transaction per input update, listener results after each successful item, accumulated catch-up observations flushed at completion or failure. No whole-batch atomicity redesign and no live update/publish interleaving yet.
 
@@ -15,20 +15,142 @@ Acceptance and validation
 Existing causal replay, duplicates, final-version bounds and partial-batch failure coverage remains effective. Add a controlled failure regression only if needed to show earlier committed listener data and accumulated observations survive a later item failure. Preserve borrowed protobuf conversion conventions and store classifications.
 
 Review and size
-200-300 new/edited LOC including tests; 400-650 relocated. Separate moves from logic changes, check touched-file duplication and follow parent Rust validation/review rules. No staging; close only after user acceptance.
+200-300 new/edited LOC including tests; 400-650 relocated. Review the full change set together, identifying relocated logic and new boundaries in the handover; check touched-file duplication and follow parent Rust validation/review rules. No staging; close only after user acceptance.
 
 Findings from accepted flotsync-zop.01
 
 The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
 
-Preserve the different transaction units: a single inbound update and its newly ready causal chain are atomic in one transaction; a batch commits one input at a time. Causally blocked input is persisted pending work and ends its finite operation, rather than leaving a future flow waiting for more messages. Duplicate and post-cut inputs remain explicit outcomes.
+Preserve the different transaction units: a single inbound update and its newly ready causal application sequence are atomic in one transaction; a batch commits one input at a time. Causally blocked input is persisted pending work and ends its finite operation, rather than leaving a future flow waiting for more messages. Duplicate and post-cut inputs remain explicit outcomes.
 
-The new update_batch_waits_for_listener_before_committing_next_input test proves the first input is visible and the second is absent while the first callback waits. Existing delivery tests cover committed-prefix failure/retry and ready-chain rollback. Single-input catch-up observations precede the callback; batches accumulate observations and flush them on finish or transaction/listener failure. Do not homogenise these timings during extraction."""
-status = "open"
+The new update_batch_waits_for_listener_before_committing_next_input test proves the first input is visible and the second is absent while the first callback waits. Existing delivery tests cover committed-prefix failure/retry and ready-update rollback. Single-input catch-up observations precede the callback; batches accumulate observations and flush them on finish or transaction/listener failure. Do not homogenise these timings during extraction.
+
+Agreed execution plan P04.1-P04.6 (2026-10-05)
+
+Baseline at plan alignment: flotsync-zop.03 was accepted, closed and committed as 261d7fe. publication.rs now has concrete service inputs, schema/group/token validation helpers and no too_many_lines override. row_patches::apply_dataset_row_patches is already shared with inbound application. component/mod.rs still owns the 219-line inbound transaction, its source validation and record conversion, two range helpers, and the blocking single/batch notification drivers. InboundUpdateOrigin and InboundUpdateOutcome currently live in inbound_support.rs. Range clamping also serves summary_api.rs.
+
+P04.1. Establish the narrow service boundary.
+Extend component/inbound_support.rs with persist_and_apply_update(store: &dyn ReplicationStore, local_member: &MemberIdentity, group_schema: &GroupSchema, origin: InboundUpdateOrigin, message: UpdateMessage) -> Result<InboundUpdateOutcome, InboundDeliveryError>. Keep a thin component wrapper that resolves the existing Arc<GroupSchema> before opening a write transaction, preserving UnknownHostedGroup error precedence. Keep InboundUpdateOrigin and InboundUpdateOutcome alongside the service in their existing module; reuse their existing data rather than creating duplicate result wrappers. Construct each returned outcome only after successful commit. Document what listener batches, needed ranges and observed availability mean, including that a committed pending update need not yet be applied. Estimate: 35-55 edited/new LOC plus 25 relocated.
+
+P04.2. Share update-range policy with summary handling.
+Move missing_ranges_for_update_frontier and bound_update_ranges into component/update_ranges.rs as free functions. Preserve dependency gaps plus earlier versions from the same producer, inclusive endpoints and final-cut clipping. Update both inbound and summary_api.rs to call the same clamping helper; remove the corresponding component associated functions. The summary observation algorithm remains intact. Review-authorised R01 serialises summary inspection to remove its demonstrated read/write scheduling deadlock. Reuse row_patches.rs for writes. Estimate: 20-30 edited/new LOC plus 55-65 relocated.
+
+P04.3. Break down validation and persistence without a lint allowance.
+Move validated_inbound_update_producer into the service, preserving direct-producer index equality versus forwarded sender membership and canonical persisted producer identity. Add load_inbound_group(transaction, local_member, group_id) returning the loaded metadata and lifecycle; keep sender validation before indexing final versions. Move record conversion into a private inbound_record_for_message helper with applied_locally fixed to false, since inbound records initially enter the pending log. Extract persist_pending_update(transaction, group_schema, &record): an existing pending record must match exactly; a new one must pass all touched-dataset schema checks and validate_update_mapping before append. Preserve validate_inbound_update_read_versions and its position before the applied-duplicate branch. Keep the existing in_memory/replay algorithms and proto conversion conventions. Estimate: 45-70 edited/new LOC plus 100-120 relocated.
+
+P04.4. Extract ready-update execution while retaining transaction ownership.
+The service orchestrator keeps begin -> load/validate -> post-cut/already-applied disposition -> persist pending -> drain ready updates -> commit -> return. Retain the distinct no-listener paths: post-cut input commits without availability; already-applied input commits with its existing observations; causally blocked input commits pending storage plus availability/needs. In particular, applied duplicates currently do not compare their payload against the persisted record, while pending duplicates do: preserve that distinction.
+Use drain_pending_updates(transaction, group_schema, group_id, lifecycle, &mut local_group, &mut needed_ranges, &mut observed_available) -> Result<PendingDrainOutcome, InboundDeliveryError>. It loads pending dependencies, plans with PendingUpdateSet, marks already-applied records, collects availability, and delegates the ready updates. Its private named outcome distinguishes NoReadyUpdates from AppliedReadyUpdates { event_batches }; an applied sequence can emit no callbacks, so an empty listener collection cannot encode this distinction. apply_ready_updates(transaction, group_schema, group_id, lifecycle, &mut local_group, ready_updates) -> Result<ListenerDataChangeBatches, InboundDeliveryError> loads touched row scope once, materialises slices, loads each scheduled payload, applies and writes patches, marks applied ids and creates lifecycle-permitted listener batches/tokens. Factor blocked dependency-range collection once and use the final applied vector. The orchestrator updates the group vector only for AppliedReadyUpdates, preserving the current no-ready-update store behaviour. All helper work stays inside the caller-owned transaction; only the orchestrator commits and returns InboundUpdateOutcome. Keep all new functions below Clippy's line limit, with documented parameters/preconditions/outcomes and correct visibility grouping; introduce no component impl outside mod.rs. Estimate: 75-105 edited/new LOC plus 160-190 relocated.
+
+P04.5. Retain shell ordering and extend one missing failure boundary.
+Keep handle_update, persist_apply_and_notify_update_batch and handle_update_batch in mod.rs. Single input sends available/needed observations before its listener; a batch accumulates them, awaits each committed input's callback before opening the next transaction, then flushes observations on completion or transaction/listener failure. Keep Handled::block_on. Update the batch handler's stale comment about component borrowing so it explains the actual sequencing requirement after extraction. Add one focused batch-listener-rejection regression using consecutive_title_update_messages and the .03 one-shot ListenerStub control: first input commits, callback rejects, second input remains absent; retry skips the committed first input, applies/notifies the second, and preserves exact callback rows/read tokens. Existing later-item store failure tests already prove a successfully notified prefix survives later transaction failure. Source-check observation flush ordering; executable effect-order traces belong to .06. Estimate: 95-130 edited/new LOC including the new test; no new fault framework or socket harness.
+
+P04.6. Validate and hand over the complete change set.
+Run the delivery test module covering causal buffering/restart, producer/forwarder validation, duplicates/conflicting pending payloads, operation/frontier rejection, read-only/closed bounds and batch/ready-update failure cases, plus the new callback rejection case. Run the publication changes module because it shares row persistence. Check default and test-support library/test targets, no-default library, formatting and pedantic Clippy. Preserve serial cargo and established outside-sandbox fixture execution; audit touched-file documentation, ordering and duplication. Hand over one complete unstaged change set, preserving any manual staging state. Keep .04 open for acceptance; .05/.06 own FSM conversion and .16 owns concurrent phase/backend revalidation.
+
+Size and trade-offs
+Approximately 260-380 edited/new LOC plus 340-400 relocated; below 1000 substantive LOC, so no additional task split is expected. If the decomposition materially exceeds that estimate, align on a smaller boundary before expanding scope. The helpers add explicit transaction-borrow plumbing but expose causal, validation and commit boundaries directly. Passing the component or a broad dependency context would be shorter but obscure those dependencies. Retaining the existing outcome avoids parallel representations; it promises successful commit on return, with its fields describing observations/notifications rather than application of every input. Single/batch scheduling remains in the shell until .06. Summary inspection now finishes in a blocking turn before another runtime operation enters, removing a demonstrated scheduling deadlock. Backend isolation, retry policy and update/publish interleaving remain unchanged.
+
+Status: review corrections and catch-up stall investigation completed; complete unstaged change set awaits user acceptance. Root cause is demonstrated by a controlled regression that fails before the fix and passes afterwards. Agreed revisions: combine transaction services with existing inbound_support.rs and use causal application order terminology. Rename PendingUpdateSet::plan_apply_chain to plan_ready_updates and PendingApplyPlan.ready_chain to ready_updates, updating the production caller and existing planner unit test together. Updates may become ready as earlier planned updates advance the frontier; the returned order preserves this requirement. Estimate includes an additional 10-20 edited LOC for coordinated terminology changes.
+
+Implementation and review evidence (2026-10-05)
+
+P04.1-P04.4 are implemented: inbound_support.rs owns the explicit-input transaction service, producer/group validation, pending-record persistence, ready-update execution and blocked-range accumulation. update_ranges.rs shares unchanged causal-gap/final-cut policy with summary_api.rs. Existing row_patches.rs remains shared. The component wrapper resolves schema before entering the service. No component impl was added outside mod.rs, and the former inbound too_many_lines override is removed. PendingUpdateSet::plan_ready_updates and PendingApplyPlan.ready_updates describe the preserved deterministic causal application order.
+
+P04.5 is implemented: single/batch delivery scheduling remains in the component, with unchanged transaction and observation boundaries. New update_batch_listener_rejection_preserves_commit_and_retry_position coverage checks the committed first input, absent second input, exact callback rows/read tokens and successful retry. Its setup shares one narrow fixture with the existing callback-gating test. The service outcome explicitly distinguishes pending storage, applied duplicates and post-cut observations; an AppliedReadyUpdates drain may prepare no visible callback, while still requiring the group-vector write.
+
+P04.6 validation: final captured-output delivery suite passes 24/24, publication selection passes 15/15 and the planner test passes. Default and test-support library/test pedantic checks, no-default library compilation, Rust formatting and diff hygiene pass. Existing Clippy warnings remain; the new service/range modules and new regression add no diagnostics. Touched-file ordering, docs and duplication checked. The index remains unchanged and the complete change set is unstaged.
+
+Resolved validation blocker: the catch-up stall was reproduced again, with timeout stack samples showing SQLite workers waiting in shared-cache unlock notification. Component-local advisory summary inspection held a read transaction while a later blocking writer prevented that read task from resuming. Serial summary inspection removes this dependency. The controlled regression fails before the fix and passes afterwards; the original captured-output reproduction then passed 30 consecutive attempts. All investigation and fixes were performed within .04. flotsync-2x5 is a duplicate record of this work, not a deferred investigation task. Do not create further investigation tasks without the user asking.
+
+Follow-up boundaries remain as agreed: .05/.06 own FSM conversion and effect-order traces; .16 owns concurrent phase/backend revalidation. Agreed review F04.R4 adds a TODO beside observed-summary blocking inspection linking .21's asynchronous effect execution and .22's overlap enablement. .16 must establish backend lock-holder and connection-pool progress constraints; .21 must keep lock-holding effects runnable while other effects await them; .22 must demonstrate that a paused summary reader resumes, releases its transaction and allows a conflicting writer to finish. Disjoint component fields alone do not prove forward progress. Retain the corrected blocking summary boundary until these guarantees are established. F04.R3's existing fatal escalation code and documentation are accepted unchanged. No additional production component state was introduced. The R01 correctness fix serialises observed summary inspection until the existing flow/scheduler conversion supplies independent store-task progress. Keep this task open until the user accepts the change set.
+
+
+Agreed review corrections and investigation (2026-10-05)
+
+R01. Establish the stalled await/resumption dependency in partial_update_batch_retry_narrows_remaining_need. Inspect component-local summary reads versus blocking update handlers and store transaction locks; use controlled interleaving to prove the cause rather than relying on timing-sensitive logging. Fix the demonstrated scheduling/transaction dependency and add deterministic forward-progress regression coverage. Repeat the original captured-output reproduction and affected delivery/publication/build checks. Scheduling changes required to remove the demonstrated deadlock are now within this child; broader FSM and concurrency redesign remain assigned to the existing children. Estimated 100-250 additional edited/test LOC, to be refined after diagnosis.
+
+M-SNAFU. Use with_context in producer membership validation so sender cloning occurs only on failure.
+
+M-FLOW. Express final-cut None versus clipped Some using explicit if/else where the early return avoids only two lines.
+
+The user has authorised these corrections and insists the flaky test be squashed now. Keep all earlier extraction goals, transaction units and callback/observation order guarantees. Do not stage or commit; keep .04 open for acceptance.
+
+
+Review correction evidence (2026-10-05)
+
+M-SNAFU is fixed with lazy sender error context in inbound_support.rs. M-FLOW is fixed with explicit final-cut None/clipped-Some branches in update_ranges.rs.
+
+R01 is fixed in summary_api.rs using Handled::block_on for observed-summary inspection. Update transaction units and single/batch callback/observation ordering remain as agreed. The new observed_summary_finishes_read_before_admitting_update_batch test pauses the actual summary transaction before its pending-id scan, drives a queued batch turn while that read is suspended, then verifies both committed updates, ordered callbacks and final vector. Its failure-injecting store reports overlapping write admission rather than hanging teardown; this test failed under the original scheduling policy and passes under the correction. Store and listener controls share one unwind-safe completion gate, and the read-pause lifecycle has explicit Disabled/Waiting/Paused states. Temporary tracing and timeout sampling hooks were removed from production/test sources.
+
+Validation after correction: original captured-output catch-up test passed 30 consecutive runs; final delivery suite passed 24/24, publication/local-summary suite 15/15 and causal planner 1/1. Default/test-support pedantic checks and no-default library compilation passed with existing warnings and no new diagnostics. Rust formatting and diff hygiene passed. Touched-file duplication, documentation, visibility ordering and test socket-broker coverage checked. Additional implementation/test scope is approximately 180 LOC, with no new task split.
+
+The existing .14 plan now reflects the corrected summary scheduling boundary and retains the regression during FSM integration. Store-owning flows must continue making progress when other flows wait for their resources; disjoint field sets alone are insufficient. This informs the already planned driver work and does not defer the current investigation. Keep .04 open for acceptance; no staging or commit.
+"""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 blocked_by = ["01a1071b-c774-77e1-8d52-ae8c39af0f09"]
 blocks = ["01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:23.692389Z"
-updated_at = "2026-10-04T14:22:17.202341Z"
+updated_at = "2026-10-05T14:21:05.166059Z"
+closed_at = "2026-10-05T14:21:05.166059Z"
+
+[[links]]
+target = "01a1071c-63fc-7301-abda-8e9449035063"
+label = "store progress follow-up"
+
+[[links]]
+target = "01a1071c-6519-7f02-99ed-8b6b477df51f"
+label = "store progress follow-up"
+
+[[comments]]
+id = "01a10b50-5265-7f92-a8e1-f474fd4cd120"
+author = "codex"
+body = "Claimed after accepted .03 commit 261d7fe. Proposed P04.1-P04.6 against current code: concrete-input inbound service, shared range helpers serving summary, producer/pending-record validation helpers, caller-owned atomic ready-chain execution with a named no-ready/applied outcome, unchanged blocking single/batch sequencing, one batch listener-rejection regression using existing fixtures, and focused delivery/publication/configuration checks. Estimated 260-380 edited/new plus 340-400 relocated LOC. No implementation; awaiting alignment."
+created_at = "2026-10-05T09:06:15.781413Z"
+
+[[comments]]
+id = "01a10b5b-84c1-7553-baa0-e08917edaab7"
+author = "codex"
+body = "User accepted P04.1-P04.6 with revisions: combine transaction service and helpers with existing inbound_support.rs; describe a causal application order rather than a chain. Use plan_ready_updates/ready_updates/apply_ready_updates and explicit NoReadyUpdates/AppliedReadyUpdates outcomes, coordinating the existing planner unit test and caller names. Recorded review feedback and integrated the holistic plan before production edits. Beginning execution; complete change set remains unstaged for review."
+created_at = "2026-10-05T09:18:29.569287Z"
+
+[[comments]]
+id = "01a10b78-ed39-76c2-ba62-7554dfe88fab"
+author = "codex"
+body = "Implemented P04.1-P04.6: combined inbound transaction service/helpers in inbound_support.rs, shared range policy in update_ranges.rs, preserved blocking single/batch sequencing, and coordinated causal-planner names. Added batch-listener-rejection commit/retry regression and shared its narrow setup. Final delivery 23/23, publication 15/15 and planner coverage pass; default/test-support pedantic and no-default checks, formatting, ordering, duplication and diff checks pass with existing warnings. Residual validation risk: flotsync-2x5 records intermittent network catch-up stalls; baseline comparison and passing final suites do not establish a cause. Keep the extraction open for review and consider that risk before acceptance. No staging or commit."
+created_at = "2026-10-05T09:50:36.857927Z"
+
+[[comments]]
+id = "01a10be5-6f10-7aa0-a242-3cac47748bd1"
+author = "codex"
+body = "User authorised R01, M-SNAFU and M-FLOW corrections. Catch-up stall diagnosis, fix and deterministic regression are required within this task; flotsync-2x5 is evidence rather than deferred work. Integrated the full plan before production edits. No new investigation issue, staging or commit."
+created_at = "2026-10-05T11:49:07.98423Z"
+
+[[comments]]
+id = "01a10bf8-64df-7a82-8ce3-8232e2be6e50"
+author = "codex"
+body = "R01 diagnosis: reproduced the catch-up timeout and sampled SQLite workers blocked in shared-cache unlock notification. A controlled paused-summary-read regression fails with the original spawn_local policy because a blocking batch enters while that read is suspended, and passes with blocking summary inspection. The summary read now completes before another runtime operation enters; update transaction/callback ordering is preserved. Updated existing .14 baseline to preserve this correction when integrating the future driver. No investigation is deferred."
+created_at = "2026-10-05T12:09:50.559067Z"
+
+[[comments]]
+id = "01a10bfd-f1c2-78f0-aa04-f5b0205e647c"
+author = "codex"
+body = "Completed R01, M-SNAFU and M-FLOW. Controlled regression fails with the old spawned summary read and passes with blocking inspection; original catch-up test passed 30 captured-output attempts, final delivery 24/24, publication/local summary 15/15 and planner 1/1. Default/test-support pedantic, no-default compilation, formatting and diff checks pass with existing warnings only. Store/listener pauses share a gate and read-pause states are explicit. flotsync-2x5 closed as duplicate because the user requires this work here; no investigation remains deferred. Existing .14 baseline updated. Complete work remains unstaged and open for acceptance."
+created_at = "2026-10-05T12:15:54.306822Z"
+
+[[comments]]
+id = "01a10c5a-4911-7e91-9797-5fdaef350fce"
+author = "codex"
+body = "Agreed review F04.R4: add a source TODO linking flotsync-zop.21 and flotsync-zop.22 before replacing blocking summary inspection. Updated existing .16 backend progress constraints, .21 independent effect progress and .22 controlled overlapping summary-reader/writer acceptance coverage, including relevant connection-pool pressure. The demonstrated deadlock remains fixed here; these requirements guard the later parallelisation. F04.R3 fatal escalation code and documentation are accepted unchanged. No new investigation issue."
+created_at = "2026-10-05T13:56:45.969137Z"
+
+[[comments]]
+id = "01a10c70-8d0e-7d81-a946-18e7c4c81bc9"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-05T14:21:05.166059Z"

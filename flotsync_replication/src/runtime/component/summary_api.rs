@@ -11,6 +11,7 @@ use super::{
         SummaryCatchUpObservation,
         panic_if_fatal_inbound_failure,
     },
+    update_ranges::bound_update_ranges,
 };
 use crate::{
     api::{
@@ -208,8 +209,7 @@ async fn inspect_summary_catch_up(
         .into_iter()
         .map(UpdateRangeMessage::from)
         .collect_vec();
-    let observed_available =
-        ReplicationRuntimeComponent::bound_update_ranges(&lifecycle, pending_batch.into_values());
+    let observed_available = bound_update_ranges(&lifecycle, pending_batch.into_values());
     let needed_ranges = subtract_available_ranges(&summary_needed_ranges, &observed_available);
     Ok(Some(SummaryCatchUpObservation {
         group_id: summary.group_id,
@@ -286,14 +286,17 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Inspect peer progress asynchronously; stale observations are best-effort hints.
+    /// Finish the peer-progress read before admitting another runtime operation.
     pub(super) fn handle_observed_summary(&mut self, summary: Summary) -> HandlerResult {
-        // Summary catch-up is advisory: it reads a store snapshot and sends
-        // catch-up notifications, but it does not mutate runtime component
-        // state. Running it asynchronously can at worst produce stale
-        // best-effort ranges, which the catch-up manager de-duplicates against
-        // later availability observations.
-        self.spawn_local(move |async_self| async move {
+        // block_on suspends this component's spawn_local tasks. A spawned summary
+        // read could retain SQLite locks needed by a later blocking update, leaving
+        // the update waiting for a read task it prevents from resuming. Complete
+        // this read in the blocking turn so its transaction ends before writes enter.
+        // TODO(flotsync-zop.21, flotsync-zop.22): Replace this blocking boundary
+        // once lock-holding effects can keep progressing while other effects await
+        // their locks or pool connections. Prove an overlapping summary reader can
+        // resume, release its transaction and let a conflicting writer complete.
+        Handled::block_on(self, async move |async_self| {
             if let Some(observation) = inspect_summary_catch_up(
                 async_self.store.as_ref(),
                 &async_self.local_member,
@@ -311,8 +314,7 @@ impl ReplicationRuntimeComponent {
                 // The summary refers to a group this runtime no longer hosts.
             }
             Handled::OK
-        });
-        Handled::OK
+        })
     }
 
     /// Submit through the request's delivery path, then complete reliable processing.

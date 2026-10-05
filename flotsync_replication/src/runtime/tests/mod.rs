@@ -339,6 +339,22 @@ pub(super) struct ReplicationUpdateLoadRequest {
     pub(super) limit: Option<NonZeroUsize>,
 }
 
+/// Build a single-use asynchronous pause with unwind-safe release by its test owner.
+fn test_completion_pause() -> (PendingTestCompletion, TestCompletionGate) {
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_future) = promise();
+    (
+        PendingTestCompletion {
+            entered: entered_tx,
+            release: release_future,
+        },
+        TestCompletionGate {
+            entered,
+            release: Some(release),
+        },
+    )
+}
+
 struct RuntimeFixture<S> {
     local_member: MemberIdentity,
     runtime: Arc<ReplicationRuntime>,
@@ -385,6 +401,18 @@ enum NextCommitAction {
     RejectAndRollback,
 }
 
+/// Single read-scan pause, including the interval in which writes must be rejected.
+#[derive(Default)]
+enum UpdateIdReadPause {
+    /// All reads and writes proceed normally.
+    #[default]
+    Disabled,
+    /// The next read-only update-id scan owns this completion pause.
+    Waiting(PendingTestCompletion),
+    /// A scan holds its transaction at the pause; overlapping writes report a test fault.
+    Paused,
+}
+
 /// Shared failure controls consulted by the store and its delegated transactions.
 #[derive(Default)]
 struct FailingStoreControlState {
@@ -404,6 +432,8 @@ struct FailingStoreControlState {
     replication_update_load_requests: Vec<ReplicationUpdateLoadRequest>,
     /// Optional deterministic replacement for all-groups reads in malformed-store tests.
     loaded_groups_override: Option<Vec<ReplicationGroupRecord>>,
+    /// One pending or active read-only update-id scan pause.
+    update_id_read_pause: UpdateIdReadPause,
 }
 
 /// Test-only store wrapper that can fail selected future writes while
@@ -432,6 +462,18 @@ impl<S> FailingStore<S> {
             hide_local_private_keys: false,
             control: Arc::new(Mutex::new(FailingStoreControlState::default())),
         }
+    }
+
+    /// Hold the next read-only update-id scan; reject overlapping writes instead of deadlocking.
+    fn gate_next_update_id_read(&self) -> TestCompletionGate {
+        let (pause, gate) = test_completion_pause();
+        let mut control = Self::lock_control(&self.control);
+        assert!(matches!(
+            control.update_id_read_pause,
+            UpdateIdReadPause::Disabled
+        ));
+        control.update_id_read_pause = UpdateIdReadPause::Waiting(pause);
+        gate
     }
 
     /// Configure this wrapper to emulate an unsupported store that exposes an identity without
@@ -539,6 +581,16 @@ where
         let control = self.control.clone();
         let hide_local_private_keys = self.hide_local_private_keys;
         async move {
+            let read_paused = matches!(
+                Self::lock_control(&control).update_id_read_pause,
+                UpdateIdReadPause::Paused
+            );
+            if read_paused {
+                let source = std::io::Error::other("write attempted while summary read is paused");
+                return Err::<Box<dyn ReplicationStoreTransaction>, _>(source)
+                    .boxed()
+                    .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
+            }
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
                 standalone_transaction_id: StoreTransactionId::new_random(),
@@ -1016,10 +1068,38 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         cursor: &'call mut PageCursor<ReplicationUpdatesQuery<'query>>,
         batch: &'call mut dyn PageBatch<Input = OwnedPageBatchInput<UpdateId>, Metadata = ()>,
     ) -> BoxFuture<'call, Result<(), PageError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update_ids_into(cursor, batch)
+        let pause = if matches!(self.inner, Some(FailingStoreTransactionInner::Read(_))) {
+            let mut control = Self::lock_control(&self.control);
+            match std::mem::take(&mut control.update_id_read_pause) {
+                UpdateIdReadPause::Waiting(pause) => {
+                    control.update_id_read_pause = UpdateIdReadPause::Paused;
+                    Some(pause)
+                }
+                state => {
+                    control.update_id_read_pause = state;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        async move {
+            if let Some(pause) = pause {
+                let _entered = pause.entered.send(());
+                pause
+                    .release
+                    .await
+                    .expect("test should release the read pause");
+                Self::lock_control(&self.control).update_id_read_pause =
+                    UpdateIdReadPause::Disabled;
+            }
+            self.inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated reads")
+                .load_replication_update_ids_into(cursor, batch)
+                .await
+        }
+        .boxed()
     }
 
     fn scan_dataset_rows_into<'call, 'query: 'call>(
@@ -1488,45 +1568,45 @@ struct ListenerStubState {
     rejected_pending_group_event_count: usize,
     buffered_events: mpsc::Receiver<CapturedDataChange>,
     /// One opt-in pause after capturing the next data change, before its callback completes.
-    next_data_change_completion: Option<PendingDataChangeCompletion>,
+    next_data_change_completion: Option<PendingTestCompletion>,
     /// Reject the next captured data-change callback when true; false completes it normally.
     reject_next_data_change: bool,
 }
 
-/// Listener-owned half of a single callback-completion pause.
-struct PendingDataChangeCompletion {
-    /// Signals that provider rows and the callback position have been captured.
+/// Operation-owned half of a single test-controlled completion pause.
+struct PendingTestCompletion {
+    /// Signals that the operation has reached the controlled boundary.
     entered: mpsc::Sender<()>,
-    /// Awaited outside the listener mutex until the test releases its gate.
+    /// Awaited outside control mutexes until the test releases its gate.
     release: KFuture<()>,
 }
 
-/// Test-owned gate which releases the callback even if an assertion unwinds.
-struct DataChangeCompletionGate {
-    /// Receipt confirms that the callback has reached its completion boundary.
+/// Test-owned gate which releases the operation even if an assertion unwinds.
+struct TestCompletionGate {
+    /// Receipt confirms that the operation has reached its completion boundary.
     entered: mpsc::Receiver<()>,
     /// Taken exactly once when the gate is released or dropped during cleanup.
     release: Option<KPromise<()>>,
 }
 
-impl DataChangeCompletionGate {
-    /// Wait for the listener to capture the data change, with the usual test timeout.
+impl TestCompletionGate {
+    /// Wait for the operation to reach the pause, with the usual test timeout.
     fn wait_until_entered(&self) {
         self.entered
             .recv_timeout(TEST_WAIT_TIMEOUT)
-            .expect("listener should reach its gated completion boundary");
+            .expect("operation should reach its gated completion boundary");
     }
 
-    /// Allow the paused callback to complete before awaiting its operation or shutdown.
+    /// Allow the paused operation to complete before awaiting its result or shutdown.
     fn release(self) {
         drop(self);
     }
 }
 
-impl Drop for DataChangeCompletionGate {
+impl Drop for TestCompletionGate {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
-            // A failed callback may already have dropped the receiver; cleanup must not panic.
+            // A failed operation may already have dropped the receiver; cleanup must not panic.
             let _released = release.fulfil(());
         }
     }
@@ -1569,9 +1649,8 @@ impl ListenerStub {
     }
 
     /// Pause only the next data-change callback; ordinary captures remain available while paused.
-    fn gate_next_data_change_completion(&self) -> DataChangeCompletionGate {
-        let (entered_tx, entered) = mpsc::channel();
-        let (release, release_future) = promise();
+    fn gate_next_data_change_completion(&self) -> TestCompletionGate {
+        let (pause, gate) = test_completion_pause();
         let mut state = self
             .state
             .lock()
@@ -1580,14 +1659,8 @@ impl ListenerStub {
             state.next_data_change_completion.is_none(),
             "a next-callback gate must not replace an existing gate"
         );
-        state.next_data_change_completion = Some(PendingDataChangeCompletion {
-            entered: entered_tx,
-            release: release_future,
-        });
-        DataChangeCompletionGate {
-            entered,
-            release: Some(release),
-        }
+        state.next_data_change_completion = Some(pause);
+        gate
     }
 
     fn drain_buffered_events(&self) {
@@ -2244,14 +2317,14 @@ fn pending_dependencies_load_once_before_causal_scheduling() {
         assert_eq!(request.filter, ReplicationUpdateFilter::PendingApply);
         assert_eq!(request.limit, None);
     }
-    let plan = PendingUpdateSet::from_updates(dependencies).plan_apply_chain(&group_meta);
+    let plan = PendingUpdateSet::from_updates(dependencies).plan_ready_updates(&group_meta);
     assert!(plan.already_applied.is_empty());
     assert!(plan.blocked_updates.is_empty());
-    assert_eq!(plan.ready_chain.len(), 3);
-    assert_eq!(plan.ready_chain[0].update_id.node_index, 1);
-    assert_eq!(plan.ready_chain[1].update_id.version, 2);
+    assert_eq!(plan.ready_updates.len(), 3);
+    assert_eq!(plan.ready_updates[0].update_id.node_index, 1);
+    assert_eq!(plan.ready_updates[1].update_id.version, 2);
     assert_eq!(
-        plan.ready_chain[2].update_id,
+        plan.ready_updates[2].update_id,
         UpdateId {
             node_index: 0,
             version: 1,
@@ -2259,7 +2332,7 @@ fn pending_dependencies_load_once_before_causal_scheduling() {
     );
     let actual_read_versions = VersionVector::initial(member_count);
     let scheduled = UpdateDependency {
-        update_id: plan.ready_chain[0].update_id,
+        update_id: plan.ready_updates[0].update_id,
         read_versions: VersionVector::initial(member_count).with_version_at(1, 2),
     };
     assert_scheduled_mismatch_diagnostics(&store, group_id, &scheduled, &actual_read_versions);

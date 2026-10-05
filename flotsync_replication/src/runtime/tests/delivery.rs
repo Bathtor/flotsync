@@ -1,6 +1,32 @@
 //! Inbound delivery, causal buffering, and retry scenarios.
 
 use super::*;
+use crate::{
+    codecs::messages::{RuntimeMessage, SummaryMessage},
+    delivery::{
+        contracts::{GroupBroadcastPort, GroupBroadcastPortIndication},
+        group_broadcast::{GroupBroadcastDeliver, GroupMessageEnvelope, GroupMessageHeader},
+        shared::{MessageId, PlaintextPayload},
+    },
+};
+use flotsync_messages::proto::EncodeProto as _;
+use kompact::prelude::{CoreContainer as _, LockingRequireRef as _};
+
+/// Install Alice's producer group on Bob before enabling inbound callback controls.
+fn load_two_member_inbound_fixture(group_id: GroupId) -> RuntimeFixture<SqliteReplicationStore> {
+    let bob_member = bob_member();
+    let fixture =
+        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    fixture
+}
 
 #[test]
 fn pending_apply_need_retries_after_route_appears() {
@@ -239,6 +265,86 @@ fn partial_update_batch_retry_narrows_remaining_need() {
                 }],
             },
         ]
+    );
+}
+
+#[test]
+fn observed_summary_finishes_read_before_admitting_update_batch() {
+    let group_id = GroupId(Uuid::from_u128(50_321));
+    let fixture =
+        load_failing_runtime_fixture(app_bob_id(), bob_member(), &TITLE_APPLICATION_SCHEMAS);
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member(), bob_member()])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let component = fixture.runtime.runtime_component_for_test();
+    let gate = fixture.store.gate_next_update_id_read();
+    let summary = RuntimeMessage::Summary(SummaryMessage::new(
+        group_id,
+        Uuid::new_v4(),
+        VersionVector::initial(NonZeroUsize::new(2).expect("group has two members")),
+    ));
+    let inbound_port = component.required_ref();
+    component.system().trigger_i::<GroupBroadcastPort>(
+        GroupBroadcastPortIndication::Deliver(GroupBroadcastDeliver {
+            envelope: GroupMessageEnvelope {
+                header: GroupMessageHeader {
+                    group_id,
+                    sender: alice_member(),
+                    message_id: MessageId(Uuid::new_v4()),
+                },
+                payload: PlaintextPayload {
+                    bytes: summary.encode_proto_to_bytes(),
+                },
+            },
+        }),
+        &inbound_port,
+    );
+    gate.wait_until_entered();
+    let (row_id, first, second) =
+        consecutive_title_update_messages(group_id, docs_dataset_id(), 50_322);
+    let reply = fixture.runtime.submit_update_batch_for_test(
+        alice_member(),
+        UpdateBatchMessage {
+            group_id,
+            updates: vec![first, second],
+        },
+    );
+    // Drive a queued turn while the read is definitely suspended, rather than sleep
+    // and hope that the mailbox races the read. The store rejects an overlapping
+    // write so the old scheduling policy fails without a database deadlock on cleanup.
+    let _decision = component.execute();
+    gate.release();
+    wait_for_test_reply(reply)
+        .expect("runtime should answer the batch")
+        .expect("summary read must finish before the batch opens its writes");
+    fixture.listener.wait_for_data_change_count(2);
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: row_id.clone(),
+                    title: "first".to_owned()
+                }]
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "second".to_owned()
+                }]
+            },
+        ]
+    );
+    assert_eq!(
+        group_read_token(fixture.runtime.as_ref(), group_id)
+            .version()
+            .version_at(0),
+        2
     );
 }
 
@@ -755,19 +861,9 @@ fn inbound_update_with_out_of_range_producer_index_is_rejected() {
 #[test]
 fn update_batch_waits_for_listener_before_committing_next_input() {
     let alice_member = alice_member();
-    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let fixture =
-        load_runtime_fixture(app_bob_id(), bob_member.clone(), &TITLE_APPLICATION_SCHEMAS);
     let group_id = GroupId(Uuid::from_u128(22_221));
-    fixture
-        .runtime
-        .install_group_for_test(
-            group_id,
-            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
-                .expect("group should build"),
-        )
-        .expect("group should install");
+    let fixture = load_two_member_inbound_fixture(group_id);
     let (row_id, first_update, second_update) =
         consecutive_title_update_messages(group_id, dataset_id.clone(), 22_222);
     let first_update_id = first_update.update_id;
@@ -839,6 +935,109 @@ fn update_batch_waits_for_listener_before_committing_next_input() {
                     title: "second".to_owned(),
                 }],
             },
+        ]
+    );
+}
+
+#[test]
+fn update_batch_listener_rejection_preserves_commit_and_retry_position() {
+    let group_id = GroupId(Uuid::from_u128(22_231));
+    let fixture = load_two_member_inbound_fixture(group_id);
+    let dataset_id = docs_dataset_id();
+    let (row_id, first_update, second_update) =
+        consecutive_title_update_messages(group_id, dataset_id.clone(), 22_232);
+    let first_update_id = first_update.update_id;
+    let second_update_id = second_update.update_id;
+    let batch = UpdateBatchMessage {
+        group_id,
+        updates: vec![first_update, second_update],
+    };
+    fixture.listener.reject_next_data_change();
+    let error = fixture
+        .runtime
+        .apply_update_batch_for_test(alice_member(), batch.clone())
+        .expect_err("listener rejection should terminate the batch after its first commit");
+    assert!(matches!(
+        error,
+        InboundDeliveryError::NotifyListener {
+            source: ListenerError::Rejected { .. },
+        }
+    ));
+    let committed_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(committed_group.version_vector.version_at(0), 1);
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, first_update_id)
+            .expect("listener rejection follows the first committed input")
+            .applied_locally
+    );
+    assert_eq!(
+        load_persisted_update(fixture.store.as_ref(), group_id, second_update_id),
+        None
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "first"
+    );
+    let first_changes = CapturedDataChange {
+        rows: vec![CapturedRowChange::Upsert {
+            row_id: row_id.clone(),
+            title: "first".to_owned(),
+        }],
+    };
+    let first_token = GroupReadToken::from_group_version(group_id, committed_group.version_vector);
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![first_changes.clone()]
+    );
+    assert_eq!(
+        fixture.listener.captured_data_change_read_tokens(),
+        vec![first_token.clone()]
+    );
+
+    fixture
+        .runtime
+        .apply_update_batch_for_test(alice_member(), batch)
+        .expect("retry should skip the committed first input and apply the second");
+    let committed_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(committed_group.version_vector.version_at(0), 2);
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, second_update_id)
+            .expect("retry should commit the second input")
+            .applied_locally
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "second"
+    );
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![
+            first_changes,
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "second".to_owned()
+                }]
+            }
+        ]
+    );
+    assert_eq!(
+        fixture.listener.captured_data_change_read_tokens(),
+        vec![
+            first_token,
+            GroupReadToken::from_group_version(group_id, committed_group.version_vector)
         ]
     );
 }

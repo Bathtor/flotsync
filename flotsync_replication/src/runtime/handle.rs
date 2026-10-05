@@ -1327,6 +1327,14 @@ impl ReplicationRuntime {
         self.with_host_for_test(DeliveryRuntimeHost::membership_snapshot)
     }
 
+    /// Expose runtime logic so scheduler tests can drive a queued turn while a read is paused.
+    #[cfg(test)]
+    pub(super) fn runtime_component_for_test(
+        &self,
+    ) -> Arc<Component<super::ReplicationRuntimeComponent>> {
+        self.with_host_for_test(|host| host.runtime_component().clone())
+    }
+
     pub(crate) fn advertised_loopback_udp_addr_for_test(&self) -> std::net::SocketAddr {
         self.with_host_for_test(DeliveryRuntimeHostTestSupportExt::advertised_loopback_udp_addr)
     }

@@ -385,9 +385,12 @@ impl PendingUpdateSet {
 
     /// Determine which pending updates are already reflected in group state
     /// and which additional updates can now apply in causal order.
-    pub(super) fn plan_apply_chain(&mut self, group: &LoadedGroupMeta) -> PendingApplyPlan {
+    ///
+    /// Returned updates become ready in the planned order as earlier applications
+    /// advance the simulated vector. Ties between ready updates follow update-id order.
+    pub(super) fn plan_ready_updates(&mut self, group: &LoadedGroupMeta) -> PendingApplyPlan {
         let mut already_applied = Vec::new();
-        let mut ready_chain = Vec::new();
+        let mut ready_updates = Vec::new();
         let mut simulated_group = group.clone();
 
         while let Some(ready_update_id) =
@@ -398,12 +401,12 @@ impl PendingUpdateSet {
                 .remove(&ready_update_id)
                 .expect("pending update must still exist while draining");
             simulated_group.mark_applied(ready_update_id);
-            ready_chain.push(ready_update);
+            ready_updates.push(ready_update);
         }
 
         PendingApplyPlan {
             already_applied,
-            ready_chain,
+            ready_updates,
             blocked_updates: std::mem::take(&mut self.updates).into_values().collect(),
         }
     }
@@ -411,8 +414,11 @@ impl PendingUpdateSet {
 
 /// One transaction-local decision about pending persisted updates.
 pub(super) struct PendingApplyPlan {
+    /// Pending records whose updates are already represented by the group vector.
     pub(super) already_applied: Vec<UpdateId>,
-    pub(super) ready_chain: Vec<UpdateDependency>,
+    /// Updates that become applicable in this order as the vector advances.
+    pub(super) ready_updates: Vec<UpdateDependency>,
+    /// Remaining updates whose prerequisites are still missing after the planned applications.
     pub(super) blocked_updates: Vec<UpdateDependency>,
 }
 

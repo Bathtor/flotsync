@@ -6,13 +6,13 @@ Goal
 Replace blocking execution with correlated asynchronous effects while still admitting at most one exclusive domain flow. Implements parent R16; follows flotsync-zop.20.
 
 Instructions
-S01. Keep the same domain FSMs and owned partition values; replace the driver adapter so effects run asynchronously and return typed operation/phase-correlated completions through the selective mailbox.
+S01. Keep the same domain FSMs and owned partition values; replace the driver adapter so effects run asynchronously and return typed operation/phase-correlated completions through the selective mailbox. Effects holding store locks or pool connections must remain runnable while another effect waits for those resources; neither a component blocking turn nor a driver/effect executor may suspend the resource holder behind the waiter. Apply .16's backend progress contract, including aliases and pool acquisition waits. Preserve .04's blocking summary inspection until this execution mechanism supplies the replacement guarantee.
 S02. Install state/ownership before launching each effect. Do not hold unrestricted component borrows across await. Use existing Kompact closure access correctly; take owned service handles only where effect lifetime requires ownership.
 S03. Route all production API/port/recovery paths through the agreed admission/progress policy, retaining lifecycle gating and current independent advisory semantics as explicitly classified. No new flow may bypass head-only admission accidentally through a legacy handler.
 S04. Distinguish cancelled/late external results from impossible internal completions; preserve pending reply/processed obligations. Keep the production admission limit serial to separate execution-mechanism review from interleaving changes.
 
 Acceptance and validation
-Prove an active flow consumes its completion behind blocked new requests and completes with a full ordinary mailbox. Test duplicate/wrong-phase/stale completions, cancellation with in-flight effects and existing transaction/listener ordering. No unsafe partition return or committed-write replay.
+Prove an active flow consumes its completion behind blocked new requests and completes with a full ordinary mailbox. Test duplicate/wrong-phase/stale completions, cancellation with in-flight effects and existing transaction/listener ordering. No unsafe partition return or committed-write replay. Add controlled execution coverage proving that a resource-owning effect can resume and release its transaction or pool connection while another effect is awaiting that resource. Keep the one-exclusive-flow admission limit for this child; .22 owns the production overlapping-summary-reader/writer regression. Preserve observed_summary_finishes_read_before_admitting_update_batch until its blocking-policy assertions can be replaced by that progress coverage.
 
 Review and size
 450-700 edited/new LOC including tests. This child removes relevant block_on waits without claiming full concurrency is finished. Follow parent tests/Clippy, duplication and no-staging rules; close after user review.
@@ -31,4 +31,10 @@ blocked_by = ["01a1071c-62e5-7350-9c88-31f940812104"]
 blocks = ["01a1071c-6519-7f02-99ed-8b6b477df51f"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:31:03.548542Z"
-updated_at = "2026-10-04T14:22:31.955007Z"
+updated_at = "2026-10-05T13:57:48.648537Z"
+
+[[comments]]
+id = "01a10c5b-3de8-7491-b2a2-7159b5a257a5"
+author = "codex"
+body = "Review F04.R4 from flotsync-zop.04: asynchronous effects holding database locks or pool connections must remain runnable while another effect waits for those resources. Preserve the fixed summary boundary until replacement progress is proved, retaining serial exclusive-flow admission in this child. flotsync-zop.22 owns the production overlapping reader/writer regression. Full task plan updated."
+created_at = "2026-10-05T13:57:48.648537Z"
