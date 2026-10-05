@@ -224,7 +224,7 @@ use flotsync_security::{
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::{Fulfillable, KFuture, KPromise, promise};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -375,9 +375,21 @@ enum ExactUpdateLoadFault {
     Missing,
 }
 
+/// One-shot disposition of the next write transaction reaching its commit boundary.
+#[derive(Default)]
+enum NextCommitAction {
+    /// Delegate commit normally when no failure has been requested.
+    #[default]
+    Commit,
+    /// Roll back before delegation and report the configured store error.
+    RejectAndRollback,
+}
+
 /// Shared failure controls consulted by the store and its delegated transactions.
 #[derive(Default)]
 struct FailingStoreControlState {
+    /// Consumed exactly once when a write transaction reaches its commit boundary.
+    next_commit_action: NextCommitAction,
     fail_next_apply_dataset_row_patch: Option<DatasetId>,
     /// Selected exact update lookup and its one-shot injected outcome.
     exact_update_load_fault: Option<(UpdateId, ExactUpdateLoadFault)>,
@@ -431,6 +443,11 @@ impl<S> FailingStore<S> {
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
         Self::lock_control(&self.control).fail_next_apply_dataset_row_patch = Some(dataset_id);
+    }
+
+    /// Roll back the next write transaction instead of delegating its commit, exactly once.
+    fn reject_next_commit(&self) {
+        Self::lock_control(&self.control).next_commit_action = NextCommitAction::RejectAndRollback;
     }
 
     /// Make the next exact payload lookup for this update report no record.
@@ -1371,11 +1388,27 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             ..
         } = *self;
         async move {
-            inner
+            let transaction = inner
                 .expect("failing store transaction must remain open until commit")
-                .into_write()
-                .commit()
-                .await?;
+                .into_write();
+            let commit_action = {
+                let mut control = Self::lock_control(&control);
+                std::mem::take(&mut control.next_commit_action)
+            };
+            match commit_action {
+                NextCommitAction::Commit => {
+                    transaction.commit().await?;
+                }
+                NextCommitAction::RejectAndRollback => {
+                    transaction.rollback().await?;
+                    let source = std::io::Error::other(
+                        "failing store intentionally rejected commit before delegation",
+                    );
+                    return Err::<(), _>(source)
+                        .boxed()
+                        .context(STORE_EXTERNAL_UNCLASSIFIED_SNAFU);
+                }
+            }
             let should_fail = {
                 let mut control = Self::lock_control(&control);
                 if removed_pending_group_activation
@@ -1456,6 +1489,8 @@ struct ListenerStubState {
     buffered_events: mpsc::Receiver<CapturedDataChange>,
     /// One opt-in pause after capturing the next data change, before its callback completes.
     next_data_change_completion: Option<PendingDataChangeCompletion>,
+    /// Reject the next captured data-change callback when true; false completes it normally.
+    reject_next_data_change: bool,
 }
 
 /// Listener-owned half of a single callback-completion pause.
@@ -1517,6 +1552,7 @@ impl Default for ListenerStub {
                 rejected_pending_group_event_count: 0,
                 buffered_events,
                 next_data_change_completion: None,
+                reject_next_data_change: false,
             }),
             buffered_event_tx,
         }
@@ -1524,6 +1560,14 @@ impl Default for ListenerStub {
 }
 
 impl ListenerStub {
+    /// Reject the next data-change callback after capturing its committed row changes.
+    fn reject_next_data_change(&self) {
+        self.state
+            .lock()
+            .expect("listener state mutex must not be poisoned")
+            .reject_next_data_change = true;
+    }
+
     /// Pause only the next data-change callback; ordinary captures remain available while paused.
     fn gate_next_data_change_completion(&self) -> DataChangeCompletionGate {
         let (entered_tx, entered) = mpsc::channel();
@@ -1678,7 +1722,7 @@ impl ReplicationEventListener for ListenerStub {
                     .await
                     .boxed()
                     .context(ListenerExternalSnafu)?;
-                    let completion = {
+                    let (completion, reject_data_change) = {
                         let mut state = self
                             .state
                             .lock()
@@ -1686,7 +1730,9 @@ impl ReplicationEventListener for ListenerStub {
                         state.data_change_batch_sizes.push(batch_sizes);
                         state.data_change_read_tokens.push(read_token);
                         state.data_change_lineages.push(lineage);
-                        state.next_data_change_completion.take()
+                        let completion = state.next_data_change_completion.take();
+                        let reject_data_change = std::mem::take(&mut state.reject_next_data_change);
+                        (completion, reject_data_change)
                     };
                     self.buffered_event_tx
                         .send(CapturedDataChange {
@@ -1701,6 +1747,12 @@ impl ReplicationEventListener for ListenerStub {
                             .await
                             .expect("test gate should release the callback before shutdown");
                     }
+                    ensure!(
+                        !reject_data_change,
+                        crate::api::RejectedSnafu {
+                            message: "data-change event rejected by test listener".to_owned(),
+                        }
+                    );
                 }
                 ReplicationEvent::GroupInvitation {
                     invitation,

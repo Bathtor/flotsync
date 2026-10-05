@@ -15,7 +15,7 @@ Acceptance and validation
 Existing publish persistence, stale-token rebasing, cross-group token rejection and listener-before-reply tests pass. Add focused coverage only for newly exposed meaningful boundaries. A listener failure cannot rerun a committed write. Review the relocated helper ownership and duplication within touched files.
 
 Review and size
-150-250 new/edited LOC including tests; 350-550 relocated. Supply a move map separately from semantic edits. Follow parent review/validation rules, including serial sandbox tests and pedantic Clippy. No staging or issue closure before user review.
+150-250 new/edited LOC including tests; 350-550 relocated. Review the entire change set together, as requested by the user; no separate patch or move-map deliverable. Follow parent review/validation rules, including serial sandbox tests and pedantic Clippy. No staging or issue closure before user review.
 
 Findings from accepted flotsync-zop.01
 
@@ -23,12 +23,105 @@ The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its re
 
 The publication service must return only committed data: receipt/read token, encoded outbound submission, catch-up observations and listener changes. Current sequencing is commit, group outbound submission, catch-up availability, awaited listener, then API reply. Keep transaction failure distinct from listener failure after commit; a notification error cannot cause re-execution of the write.
 
-The strengthened publish_changes_emits_local_data_changed_event_before_reply test observes committed rows, update record and version vector through independent transactions while listener completion is gated, then checks the reply/token after release. Reuse this boundary evidence. The test does not independently observe outbound ports, so retain the source-verified outbound sequence and add targeted effect-order evidence when the FSM is introduced. Earlier mutable security evidence and lifecycle/progress assumptions must be identified for .16 revalidation."""
-status = "open"
+The strengthened publish_changes_emits_local_data_changed_event_before_reply test observes committed rows, update record and version vector through independent transactions while listener completion is gated, then checks the reply/token after release. Reuse this boundary evidence. The test does not independently observe outbound ports, so retain the source-verified outbound sequence and add targeted effect-order evidence when the FSM is introduced. Earlier mutable security evidence and lifecycle/progress assumptions must be identified for .16 revalidation.
+
+Findings from accepted flotsync-zop.02
+Accepted and committed as 48c1dcf on 2026-10-05. Messages/test/security/summary adapters preserve scheduling and public boundaries. Imports and non-test module declarations are explicitly separate from visibility grouping. All new component impls must remain in component/mod.rs: .02 split impls are temporary, with mandatory retirement tracked in .14 and .24. This child should introduce free transaction functions and service-owned types with colocated impls, not another component extension. Existing FailingStore and ListenerStub fixtures provide the starting point for focused publication commit/listener error evidence. .02 configuration builds and 171 runtime/six integration/two downstream boundary tests establish the accepted extraction baseline.
+
+Agreed execution plan P03.1-P03.5 (2026-10-05; P03.6 review splitting withdrawn at user request)
+
+P03.1. Extract the shared row-write primitive.
+Move apply_dataset_row_patches from component/mod.rs to a small component/row_patches.rs module as a free async function taking &mut dyn ReplicationStoreTransaction, &GroupSchema and Vec<DatasetRowStatePatch>. Publication and inbound application both use this function; preserve patch order, schema lookup, existing invariant expect and StoreError handling. Do not duplicate it or move the large replay/in_memory modules. Estimate: 15-30 edited/new LOC plus approximately 20 relocated.
+
+P03.2. Establish publication inputs without passing component state to the transaction service.
+Add component/publication.rs. scope_request(PublishChangesRequest) -> Result<ScopedPublication, PublishChangesError> reuses collect_group_row_scope to preserve empty/mixed-group checks and derive touched rows exactly once. ScopedPublication owns the request and validated TouchedGroupRows, has private fields and a group_id accessor. Its constructor is private; scope_request is the construction boundary. The thin existing component method scopes the request, resolves its Arc<GroupSchema> with the existing UnknownGroup classification, then calls the free async publication service with store, local identity, &GroupSchema and ScopedPublication. Scope/schema validation order stays before opening the write transaction; lifecycle and read-token validation remain inside it. This splits preflight/schema resolution from IO explicitly without passing SharedGroupState, an entire snapshot, a component or a schema-lookup callback into the service. Estimate: 45-70 edited/new LOC; no extra read transaction.
+
+P03.3. Move the transactional publication algorithm and introduce its committed outcome.
+Move next_local_update_id, build_local_dataset_updates and publish_changes_transactionally into publication.rs as free functions, retaining replay::load_publish_dataset_state and current operation/update conversions. Preserve one write transaction: load/validate writable group and read token; replay/rebase staged mutations; allocate/apply update; apply row patches; append applied update; update group version vector; commit; encode the protocol payload after commit. Keep UpdateId/ReadVV, lifecycle/member-count/ahead-of-state checks, Snafu classification and existing ordering exactly.
+Replace PreparedLocalPublish with CommittedPublication defined in publication.rs with private fields and no exposed constructor. Only the service's successful post-commit return creates one. It owns the update/read token, group id, encoded bytes and listener row changes. Restricted read-only accessors let the component submit outbound and catch-up data; a consuming into_notification method returns the existing PublishReceipt plus listener rows for completion. The opaque outcome is process-local evidence that commit succeeded, not a new crash-survival or acknowledgement guarantee.
+Keep publication orchestration readable through three validation helpers: ScopedPublication::validate_dataset_schemas checks each touched dataset before opening the transaction; load_writable_group loads the group, requires a writable lifecycle and validates persisted metadata; validate_publication_read_token checks group identity, member count and the stored vector bound. Preserve validation/error precedence. Keep replay/rebase, mutation preparation, the ordered row/update/vector writes, commit and post-commit encoding/outcome construction visible in the main function. Remove its too_many_lines allowance and satisfy pedantic Clippy through this breakdown.
+Keep handle_publish_changes, submit_group_update, notifications and API mapping in component/mod.rs. Sequence remains commit, submit group update, notify catch-up availability, await listener, reply. Listener failure remains a post-commit error without re-running the transaction. No new ReplicationRuntimeComponent impl outside mod.rs. Restricted free functions precede the service-owned types, each type's impl is adjacent, and private helper functions follow in their visibility group. Estimate: 80-125 edited/new LOC plus approximately 230-260 relocated.
+
+P03.4. Add two tests for the newly explicit commit boundary.
+Reuse existing runtime fixtures, FailingStore and ListenerStub. Add a narrowly scoped one-shot pre-commit rejection to FailingStore (reject just before delegating commit, not an ambiguous after-commit failure); verify publication returns the existing store/API error, rows/update/vector remain unchanged and no publication listener callback occurs. Add a one-shot data-change callback rejection to ListenerStub; verify its API error leaves exactly one committed publication, does not re-run the write, and the next publication advances from that committed version. Configure faults after group creation so setup is unaffected. Keep the existing controlled listener-before-reply test as the successful commit/pending-callback evidence. Do not add module-layout or getter tests, transaction mocks or generic failure frameworks. Estimate: 140-200 edited/new LOC including fixture controls.
+
+P03.5. Validate relevant behaviour and shared-helper callers.
+Run the existing changes test module (persistence, token rejection, operation-id encoding, stale-field rebase, read-only rejection, exhaustion and source errors), the new boundary tests, and focused inbound ready-chain/batch rollback tests because row writes now use a shared free helper. Use the existing controlled callback test and downstream application API boundary tests. Check default, no-default and test-support library/test configurations as applicable, format and use pedantic Clippy. Preserve the known sandbox constraint: grouped tests inside use --test-threads=1; use outside-sandbox execution for fixture/socket suites when needed as established by .02. Keep cargo/git commands sequential. No redundant full-suite repetition once meaningful selections pass.
+
+Review and remaining scope
+The user accepted P03.1-P03.5 and authorised implementation on 2026-10-05, withdrawing P03.6 separate review units/checkpoints and move-map preparation. Deliver one complete unstaged change set for review. Estimated 280-425 edited/new LOC plus 250-280 relocated, below 1000 substantive LOC. .05 owns publication FSM conversion; .16 owns concurrent phase revalidation; .14/.24 retain end-of-parent impl-colocation requirements. No backend isolation, retry/concurrency, transaction splitting, schema architecture, listener or delivery contract changes. Keep this issue open until user acceptance and do not start .04.
+
+Trade-offs: the extra ScopedPublication type adds a small preflight boundary and preserves error precedence/touched-row reuse in exchange for keeping the service independent of global projection state. Passing SharedGroupState or a lookup callback would be shorter but would hide that dependency in the transaction API. The private committed outcome adds accessor glue but prevents the shell from fabricating a successful transaction result. Store errors at a real commit may have backend-specific uncertainty; the new fault test covers a known pre-commit rejection and does not claim that every commit error proves rollback.
+
+Implementation hand-over for flotsync-zop.03
+
+Implemented accepted P03.1-P03.5 as one complete change set. The user's F03.6 review preference is honoured: no separate checkpoint patches or move-map deliverable. Changes remain unstaged/uncommitted and .04 has not started.
+
+Publication now has concrete store, local identity, resolved schema and ScopedPublication inputs in component/publication.rs. scope_request derives the single-group/touched-row scope once; the thin component wrapper resolves the existing schema before the service starts its transaction. Empty/mixed-group and schema error precedence is preserved. Writability, membership/frontier/read-token checks and all row/update/vector writes remain in one transaction. Replay/rebase and operation/protobuf conversion use the existing helpers and traits. Payload encoding still follows commit.
+
+CommittedPublication has private fields and no exposed constructor, and is constructed only on successful return after commit. Its borrowed group/update/payload accessors support submission/catch-up; consuming into_notification transfers the existing receipt and listener rows. Delivery and callback scheduling stay in component/mod.rs with commit -> outbound submission -> catch-up observation -> awaited listener -> API reply unchanged. All new service-owned types have colocated impls; no new component impl was added outside mod.rs.
+
+component/row_patches.rs supplies one shared row-write free function for publication and inbound ready-chain application. Patch order, schema precondition, store errors and transaction ownership are unchanged. The formerly component-private StoreError import is now cfg(test), retaining the existing activation-provider test dependency without production unused imports.
+
+Added two publication boundary tests using existing fixtures: known pre-commit rejection explicitly rolls back and leaves rows, update, vector and callback count unchanged, and the next write reuses the uncommitted version; listener rejection leaves one committed update and the next publication advances to version two. The store fault has an explicit one-shot NextCommitAction enum rather than another boolean policy. Listener failure is injected after capture and consumed once. New tests assert the actual existing API classifications: StoreExternal with UNKNOWN classification wrapping PublishChangesError::StoreAccess, and ApiExternal wrapping InboundDeliveryError::NotifyListener with ListenerError::Rejected. Initial test expectation failures exposed these existing wrappers; only expectations were corrected, with production classification unchanged.
+
+Validation: 15 changes/publication/rebase/lifecycle tests, four inbound batch tests, one ready-chain rollback test and two downstream application boundary tests passed outside the sandbox, including Send trybuild coverage. After the final fixture-helper/action refinements, the two new boundary cases and ready-chain rollback were verified again where affected. Default and test-support library/test targets and no-default library configuration compile. Formatting and final pedantic Clippy pass with existing warnings only. Tests added cover failure/commit behaviour, not file layout or accessors.
+
+Rust instruction audit and duplication inspection: imports precede declarations, non-test modules precede visibility groups, restricted free functions precede restricted types, local type impls are adjacent and tests remain last. New helpers, fields and outcome preconditions are documented; no immediate invoked closures, nested fallible expressions or empty branches were introduced. Shared row persistence and new test group setup are extracted once. Existing replay/local-mutation/notification helpers are reused. No copied transaction implementation remains in the component. Existing legacy fixture/test ordering and warning sites are not broadly rewritten.
+
+The child is ready for user review and remains open. Publication FSM conversion stays in .05; backend phase revalidation/concurrency stays in .16 and later children. Existing .14/.24 component-impl retirement requirements remain. A real commit error may have backend-specific uncertainty; the new rejection test intentionally proves rollback only for the configured before-delegation fault.
+
+Agreed review revision P03.R1-P03.R4 (2026-10-05)
+
+F03.R1: describe module responsibilities affirmatively: scope, validate/rebase, persist and construct committed delivery/listener data. F03.R2: document scope_request's exact EmptyChanges and MixedGroups checks, unique touched rows per dataset and preserved mutation order; state the same invariant on ScopedPublication. F03.R3: implement the three validation helpers integrated into P03.3 above and remove the too_many_lines suppression. P03.R4: verify with existing publication tests, formatting and pedantic Clippy, then audit documentation, ordering and touched-file duplication. Estimated 90-120 relocated/edited LOC and 20-35 net added LOC; existing scope and child ownership remain applicable. Preserve the user's staged review state and leave this revision unstaged.
+
+Review revision completed
+
+Implemented F03.R1-F03.R3: affirmative module responsibilities, exact non-empty/single-group scoping guarantees and three documented schema/group/token validation helpers. Removed the too_many_lines allowance; the main function retains replay, preparation, ordered writes, commit and post-commit result construction. All 15 existing changes/publication tests passed; formatting and pedantic Clippy passed with existing warnings and no publication module diagnostics. Item ordering and touched-file duplication audited. The user's existing staging state is preserved; this revision is unstaged and ready for review."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 blocked_by = ["01a1071b-c69e-7381-b14a-0c11abb589c0"]
 blocks = ["01a1071b-c84c-7400-9af8-bbbed8c1963e"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:23.476815Z"
-updated_at = "2026-10-04T14:22:16.343238Z"
+updated_at = "2026-10-05T09:01:37.034559Z"
+closed_at = "2026-10-05T09:01:37.034559Z"
+
+[[comments]]
+id = "01a10b03-8989-76d2-96fb-84e6fd22f9dc"
+author = "codex"
+body = "Claimed after user acceptance/closure of .02 and commit 48c1dcf on the current parent branch. Proposed P03.1-P03.6: shared row-patch free helper, scoped publication request plus immutable schema/store/identity service inputs, opaque post-commit outcome, retained shell sequencing, two focused pre-commit/listener-error tests, and three independently compiling review units. Estimate 280-425 edited/new plus 250-280 relocated LOC. No implementation; awaiting plan alignment. .05 owns FSM conversion and .16 owns concurrent phase revalidation."
+created_at = "2026-10-05T07:42:23.625695Z"
+
+[[comments]]
+id = "01a10b0d-2f66-70e2-a32f-94c429adbedf"
+author = "codex"
+body = "User accepted P03.1-P03.5 and authorised implementation, withdrawing P03.6 split review checkpoints/patches/move-map preparation. Recorded F03.6 and integrated the complete agreed plan before production edits. Delivering one complete unstaged change set, keeping concrete service inputs, an opaque post-commit outcome, shared row-write logic and both focused failure-boundary tests. No FSM conversion or .04 work."
+created_at = "2026-10-05T07:52:55.910883Z"
+
+[[comments]]
+id = "01a10b1d-8726-7633-b312-167791b8d563"
+author = "codex"
+body = "Implemented agreed P03.1-P03.5 as one unstaged change set; P03.6 review splitting withdrawn as requested. Extracted concrete-input publication service and private committed outcome, retained blocking post-commit ordering, and shared row persistence with inbound application. Added known pre-commit rollback and post-commit listener rejection coverage, asserting existing API error chains. All 22 focused tests, configuration checks, formatting and pedantic Clippy passed with existing warnings only. Ordering and touched-file duplication audited. Ready for review; issue remains open and .04 has not started. Full handover integrated into the issue body."
+created_at = "2026-10-05T08:10:46.950846Z"
+
+[[comments]]
+id = "01a10b42-0dcc-7fc1-a8fe-fddab0edb310"
+author = "codex"
+body = "User approved review revision P03.R1-P03.R4. Recorded all three comments before edits and integrated the helper breakdown into the holistic plan: affirmative module docs, exact scoping guarantees, three validation helpers and removal of the too_many_lines allowance. Transaction/error ordering and private committed outcome remain intact. Fresh status shows the earlier change set is now staged by the user; preserving that review state and leaving this revision unstaged."
+created_at = "2026-10-05T08:50:40.716694Z"
+
+[[comments]]
+id = "01a10b45-42d8-7e41-9675-c3304d040538"
+author = "codex"
+body = "Completed agreed F03.R1-F03.R3 review revision. Module and scoping documentation now state concrete responsibilities and guarantees. Extracted schema, writable-group and token validation helpers; removed too_many_lines suppression while retaining ordered writes and commit in the main function. All 15 changes/publication tests, formatting and pedantic Clippy passed; no publication module diagnostics. Documentation, ordering and duplication audited. Preserved the existing index exactly; revision is unstaged and ready for review."
+created_at = "2026-10-05T08:54:10.904142Z"
+
+[[comments]]
+id = "01a10b4c-118a-7c21-8069-0cf3a70116c0"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-05T09:01:37.034559Z"

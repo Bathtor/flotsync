@@ -1,6 +1,20 @@
 //! Local change publication, snapshots, and rebase scenarios.
 
 use super::*;
+use std::assert_matches;
+
+/// Create the writable group before either publication failure control is enabled.
+fn create_publication_test_group(
+    runtime: &ReplicationRuntime,
+    local_member: MemberIdentity,
+) -> GroupId {
+    wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![local_member],
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("create_group should succeed")
+}
 
 #[test]
 fn publish_changes_persists_applied_update_and_snapshot_state() {
@@ -96,6 +110,149 @@ fn publish_changes_rejects_a_read_token_for_another_group() {
         },
         error => panic!("unexpected API error: {error:?}"),
     }
+}
+
+#[test]
+fn publish_changes_rejected_commit_keeps_store_and_listener_unchanged() {
+    let alice_member = alice_member();
+    let fixture = load_failing_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        &TITLE_APPLICATION_SCHEMAS,
+    );
+    let group_id = create_publication_test_group(fixture.runtime.as_ref(), alice_member);
+    let dataset_id = docs_dataset_id();
+    let row_id = test_row_id(group_id, dataset_id.clone(), 35_002);
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
+    let changes_before = fixture.listener.captured_data_changes();
+    fixture.store.reject_next_commit();
+
+    let error = wait_for_test_reply(fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: read_token.clone(),
+        changes: vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! { "title" => "must roll back" },
+        }],
+    }))
+    .expect_err("publication should report the rejected commit");
+    match error {
+        ApiError::StoreExternal {
+            classification,
+            source,
+        } => {
+            assert_eq!(classification, StoreErrorClassification::UNKNOWN);
+            assert_matches!(
+                source.downcast_ref::<PublishChangesError>(),
+                Some(PublishChangesError::StoreAccess { .. })
+            );
+        }
+        other => panic!("unexpected publication commit error: {other:?}"),
+    }
+    assert_eq!(
+        load_persisted_group(fixture.store.as_ref(), group_id).version_vector,
+        *read_token.version()
+    );
+    let update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    assert_eq!(
+        load_persisted_update(fixture.store.as_ref(), group_id, update_id),
+        None
+    );
+    let rows = load_persisted_row_slice(
+        fixture.store.as_ref(),
+        group_id,
+        &dataset_id,
+        [row_id.row_key],
+    );
+    assert!(loaded_state_row(&rows, &row_id.row_key).is_none());
+    assert_eq!(fixture.listener.captured_data_changes(), changes_before);
+
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! { "title" => "next commit succeeds" },
+        }],
+    );
+    assert_eq!(receipt.update_id, update_id);
+}
+
+#[test]
+fn publish_changes_listener_rejection_keeps_one_committed_update() {
+    let alice_member = alice_member();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        &TITLE_APPLICATION_SCHEMAS,
+    );
+    let group_id = create_publication_test_group(fixture.runtime.as_ref(), alice_member);
+    let dataset_id = docs_dataset_id();
+    let row_id = test_row_id(group_id, dataset_id.clone(), 35_003);
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
+    let callbacks_before = fixture.listener.captured_data_changes().len();
+    fixture.listener.reject_next_data_change();
+
+    let error = wait_for_test_reply(fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: read_token.clone(),
+        changes: vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! { "title" => "committed despite rejection" },
+        }],
+    }))
+    .expect_err("publication should report the rejected listener callback");
+    match error {
+        ApiError::ApiExternal { source } => {
+            assert_matches!(
+                source.downcast_ref::<InboundDeliveryError>(),
+                Some(InboundDeliveryError::NotifyListener {
+                    source: ListenerError::Rejected { .. }
+                })
+            );
+        }
+        other => panic!("unexpected publication listener error: {other:?}"),
+    }
+    let update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    let committed_versions = read_token.version().with_update_applied(update_id);
+    assert_eq!(
+        load_persisted_group(fixture.store.as_ref(), group_id).version_vector,
+        committed_versions
+    );
+    assert!(
+        load_persisted_update(fixture.store.as_ref(), group_id, update_id)
+            .expect("rejected listener callback follows a committed publication")
+            .applied_locally
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &dataset_id,
+            &row_id,
+            "title"
+        ),
+        "committed despite rejection"
+    );
+    assert_eq!(
+        fixture.listener.captured_data_changes().len(),
+        callbacks_before + 1
+    );
+
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        GroupReadToken::from_group_version(group_id, committed_versions),
+        vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! { "title" => "next update" },
+        }],
+    );
+    assert_eq!(receipt.update_id.version, 2);
+    assert_eq!(receipt.update_id.node_index, update_id.node_index);
 }
 
 #[test]
