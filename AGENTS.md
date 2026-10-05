@@ -43,6 +43,7 @@
 - Add loop labels when control flow spans non-trivial nested loops or retries.
 - Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep. This includes `let ... else` branches whose `else` returns, continues, or breaks.
 - Prefer `async move {}.boxed()` over `Box::pin(async move {})` and similar for other future creating functions (e.g. `future::ready(_).boxed()` instead of `Box::pin(future::ready(_))`).
+- After imports, place all non-test module declarations before the visibility-based item groups, regardless of module visibility. Keep test modules in the final tests group; cfg-gated test-support helper modules belong with the other module declarations.
 - Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:
     1. public items (`pub`)
     2. restricted-visibility items (`pub(<qualifier>)`)

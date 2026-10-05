@@ -8,7 +8,7 @@ Decompose ReplicationRuntimeComponent and its service/topology setup into explic
 
 Status
 
-Plan agreed by the user on 2026-10-04. Concurrent execution is required by the end of this task; blocking is an intermediate implementation only. Flows own state partitions across complete consistency intervals, permitting private temporary inconsistency. One shared selective mailbox retains events; only its head can start a new flow, while existing finite flows may scan for matching progress events. Intentional head-of-line blocking replaces bypass admission and age-based reservation machinery. Branch: codex/decompose-replication-runtime-component-flotsync-zop. Claimed by codex; status_reason is plan agreed. Detailed child issues below define the review sequence. flotsync-zop.01 was accepted on 2026-10-04: docs/replication_runtime_flow_contracts.md records the source-verified contracts and evidence; the controlled publication and batch listener tests establish the current hand-off boundaries. Its findings are integrated into .02-.24. The .01 child is completed; .02 is the next ready review unit and remains unclaimed. The parent stays in progress until all conversion and concurrency acceptance criteria are satisfied.
+Plan agreed by the user on 2026-10-04. Concurrent execution is required by the end of this task; blocking is an intermediate implementation only. Flows own state partitions across complete consistency intervals, permitting private temporary inconsistency. One shared selective mailbox retains events; only its head can start a new flow, while existing finite flows may scan for matching progress events. Intentional head-of-line blocking replaces bypass admission and age-based reservation machinery. Branch: codex/decompose-replication-runtime-component-flotsync-zop. Claimed by codex; status_reason is plan agreed. Detailed child issues below define the review sequence. flotsync-zop.01 was accepted on 2026-10-04: docs/replication_runtime_flow_contracts.md records the source-verified contracts and evidence; the controlled publication and batch listener tests establish the current hand-off boundaries. Its findings are integrated into .02-.24. The .01 child is completed; .02 is claimed by codex and in review. Its accepted G02.1-G02.4 review correction clarifies module ordering and marks split impls for mandatory retirement without implementing the FSM conversions early. The parent stays in progress until all conversion and concurrency acceptance criteria are satisfied.
 
 Evidence
 
@@ -83,7 +83,7 @@ M01. Keep component/mod.rs as the public Kompact shell with ingress and lifecycl
 M02. Put domain machines, transaction functions and their tests together under workflow folders: updates, publication, groups/decisions, groups/activation, groups/creation, groups/membership, recovery and listener delivery. Preserve existing activation provider, replay, pending_group and group_state boundaries where sound. Split a single-file module by moving existing contents to mod.rs first, per repository rules.
 M03. A group-state owner controls projection publication after committed group changes; transaction code builds outcomes without publishing independently. No duplicate mutable group lifecycle cache.
 M04. Inject store access and immutable identity/schema views into transaction services; listener access only into listener execution; delivery submission into the shell/effect adapter; security preparation into group setup and the security adapter. Keep the existing grouped topology inputs but narrow what each consumer receives. Do not move or redesign the entire topology file just to meet a line target.
-M05. Aim for cohesive production modules of roughly 200-600 LOC as a review heuristic, not a hard limit. Review dependency direction and single ownership more strongly than file length. Do not move impl ReplicationRuntimeComponent across ten files and call that the completed architecture.
+M05. Aim for cohesive production modules of roughly 200-600 LOC as a review heuristic, not a hard limit. Review dependency direction and single ownership more strongly than file length. Do not move impl ReplicationRuntimeComponent across ten files and call that the completed architecture. Any cross-module component impl introduced for incremental extraction is temporary and must carry an issue-linked TODO. Convert its domain behaviour into sub-FSMs or narrow services as the corresponding child is implemented. All inherent and trait impls of ReplicationRuntimeComponent must reside with its declaration in component/mod.rs at parent completion. .14 retires summary/security extension impls; .24 finishes fixture/message helper cleanup and audits all component impls. Colocate sub-FSM types and their impls, and colocate message constructors with their message type or use fixture-local free builders.
 
 Future work mapping and boundaries
 
@@ -135,7 +135,7 @@ T05. Runtime enums suit dynamic dispatch and persisted recovery; use typestate l
 
 Acceptance criteria
 
-Z01. Main component is a thin adapter, domain transition ownership is explicit, and the combined FSM admits compatible operations concurrently with explicit deferred input. Completion requires demonstrated overlap and conflict/order enforcement, not only removal of block_on or smaller files.
+Z01. Main component is a thin adapter, domain transition ownership is explicit, and the combined FSM admits compatible operations concurrently with explicit deferred input. Completion requires demonstrated overlap and conflict/order enforcement, not only removal of block_on or smaller files. No impl of ReplicationRuntimeComponent may remain outside component/mod.rs. Domain behaviour belongs to sub-FSMs with colocated types/impls; the component retains only thin dispatch, scheduling, port and lifecycle glue. .24 must verify this source-level invariant before parent acceptance.
 Z02. Preserve transaction boundaries, per-group causal/listener guarantees, processed acknowledgement points, error classifications, persisted record formats and startup reconciliation. The reviewed concurrency contract explicitly defines cross-group order, overload outcomes and shutdown behaviour; any resulting public API additions must be specified before implementation.
 Z03. Every existing workflow has a named owner and inspectable transition coverage; future snapshot fetch, lifecycle and security features have clear extension points.
 Z04. Each extraction/conversion is accepted independently. The parent remains open until the user agrees the complete decomposition is finished.
@@ -205,7 +205,7 @@ children = [
     "01a1071c-6752-77e1-b939-6ff6c711399e",
 ]
 created_at = "2026-09-01T18:52:17.43323Z"
-updated_at = "2026-10-04T14:23:07.483108Z"
+updated_at = "2026-10-04T15:59:03.521438Z"
 
 [[comments]]
 id = "01a106d2-868c-7f30-9214-1cff929b62d7"
@@ -238,3 +238,9 @@ id = "01a1074c-0edb-7ac1-9c6e-66ab61506aa3"
 author = "codex"
 body = "Accepted and completed flotsync-zop.01 on 2026-10-04. The flow-contract document and controlled listener tests establish the baseline; all 23 sibling plans now include relevant findings and remaining validation obligations. Reliable Summary response completion remains summary-manager-owned, store aliases require more than disjoint component fields, and concurrent safety still needs .16/.20/.22/.23 coverage. Dependency ordering is unchanged. .02 is ready but remains unclaimed; the parent stays in progress. Removed two accidentally captured compiler-output lines from the issue body while updating this progress record."
 created_at = "2026-10-04T14:23:07.483108Z"
+
+[[comments]]
+id = "01a107a3-69c5-7710-9363-1cc374c2dfc5"
+author = "codex"
+body = "Accepted .02 review requirement F02.R2: split component impls are temporary only. All ReplicationRuntimeComponent inherent/trait impls must reside beside the struct in component/mod.rs at parent completion; domain sub-FSM types/impls are colocated. .14 retires summary/security extensions; .24 finishes fixture/message cleanup and audits the source. Integrated into M05 and Z01; source issue .02 links both existing children, preserving the review chain."
+created_at = "2026-10-04T15:58:32.389Z"

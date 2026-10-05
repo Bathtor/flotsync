@@ -9,10 +9,10 @@ Instructions
 S01. Represent local/inbound summary read, reply or delegation and completion as finite operations compatible with the shared driver. Preserve reliable summary processed completion after reply submission.
 S02. Keep remote request correlation, route handling and timeouts in SummaryRequestManagerComponent; NeedRange ownership remains in CatchUpManagerComponent.
 S03. Preserve advisory summary inspection's stale-tolerant semantics and security operations' existing independent execution until scheduler integration. Record store aliases and mutable security assumptions rather than treating different service fields as independent databases.
-S04. Give simple security calls explicit completion/reply ownership without inventing long-lived security FSMs. Preserve public API/message exports and current classification of inbound errors.
+S04. Give simple security calls explicit completion/reply ownership without inventing long-lived security FSMs. Preserve public API/message exports and current classification of inbound errors. Replace the temporary ReplicationRuntimeComponent impls introduced in component/summary_api.rs and component/security_api.rs by .02: move summary behaviour to its finite flow types and security behaviour to narrow operation/service owners, with each type's impls colocated. Keep any necessary thin component scheduling/delegation methods in component/mod.rs. Retire the corresponding TODO(flotsync-zop) markers as their conversions complete.
 
 Acceptance and validation
-Test local summary success/failure, remote delegation, reliable reply/processed order, advisory staleness and security reply mapping where coverage is missing. Every runtime input family now has a named owner and a clear future scheduler classification.
+Test local summary success/failure, remote delegation, reliable reply/processed order, advisory staleness and security reply mapping where coverage is missing. Every runtime input family now has a named owner and a clear future scheduler classification. Neither summary_api.rs nor security_api.rs may contain a ReplicationRuntimeComponent impl after this child; verify colocation of new flow/service impls without changing separate-manager ownership.
 
 Review and size
 200-350 edited/new LOC including tests, at most 150 moved. Do not refactor remote manager protocols or select a permanent gateway architecture. Follow parent Rust/review rules; no staging or premature closure.
@@ -31,4 +31,10 @@ blocked_by = ["01a1071c-1261-78a2-b6d7-141eff66dc8a"]
 blocks = ["01a1071c-1499-7af1-bfe0-7ce5bb415139"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:42.942827Z"
-updated_at = "2026-10-04T14:22:25.855144Z"
+updated_at = "2026-10-04T15:59:04.340197Z"
+
+[[comments]]
+id = "01a107a3-69d5-7fc3-8e61-311736241d79"
+author = "codex"
+body = "Follow-up from .02 review F02.R2: retire TODO(flotsync-zop) component impls in security_api.rs and summary_api.rs during this finite summary/security integration. New flow/service impls belong beside their own types; necessary thin component glue belongs in component/mod.rs. Source .02 links this child and .24 performs the final audit. No long-lived security FSM or remote manager redesign is implied."
+created_at = "2026-10-04T15:58:32.405743Z"

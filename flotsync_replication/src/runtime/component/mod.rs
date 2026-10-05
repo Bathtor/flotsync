@@ -2,12 +2,7 @@
 
 use super::{
     DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
-    catch_up_manager::{
-        CatchUpManagerMessage,
-        NeedVersions,
-        ObservedAvailable,
-        subtract_available_ranges,
-    },
+    catch_up_manager::{CatchUpManagerMessage, NeedVersions, ObservedAvailable},
     config_keys,
     errors::{
         AcceptMigrationError,
@@ -31,14 +26,12 @@ use super::{
         SecuritySnafu,
         StoreGroupSnafu,
         StoreStartupSnafu,
-        SummaryError,
         accept_migration,
         activation,
         change_membership,
         group_lifecycle,
         inbound,
         publish,
-        summary,
     },
     group_state::SharedGroupState,
     in_memory::{
@@ -58,10 +51,6 @@ use super::{
     replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::api::MemberKeyId;
-#[cfg(any(test, feature = "test-support"))]
-use crate::test_support::{test_group_key, test_public_member_keys};
 use crate::{
     MAX_VERSION_VALUE,
     api::{
@@ -90,8 +79,6 @@ use crate::{
         MigrationId,
         MigrationProposal,
         MigrationProposalResponder,
-        OwnedPageBatchInput,
-        PageCursor,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
@@ -111,7 +98,6 @@ use crate::{
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
-        ReplicationUpdatesQuery,
         RowChange,
         RowId,
         RowKey,
@@ -120,16 +106,8 @@ use crate::{
         RowProviderError,
         StoreError,
         Summary,
-        SummaryRequest,
-        VecPageBatch,
         api_error::ApiExternalSnafu,
         providers::VecRowProvider,
-        security::{
-            AssessPublicKeyBundleRequest,
-            KnownMemberKeysReport,
-            PublicKeyBundleReport,
-            RecordPublicKeyBundleFeedbackRequest,
-        },
     },
     codecs::messages::{
         BootstrapMemberKeyMessage,
@@ -140,7 +118,6 @@ use crate::{
         RuntimeMessage,
         RuntimeMessageDecodeContext,
         SummaryMessage,
-        SummaryRequestMessage,
         UpdateBatchMessage,
         UpdateMessage,
         UpdateRangeMessage,
@@ -172,14 +149,10 @@ use flotsync_core::{
     membership::{GroupMembers, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
-#[cfg(any(test, feature = "test-support"))]
-use flotsync_data_types::schema::datamodel::SchemaSource;
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
-use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
+use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
 use flotsync_utils::{
-    BoxError,
     BoxFuture,
-    KClaimablePromise,
     OptionExt as _,
     ResultExt as _,
     kompact_config::ConfigReadExt as _,
@@ -197,10 +170,11 @@ use std::{
 };
 use uuid::Uuid;
 
-mod activation_provider;
-mod group_work;
-mod inbound_support;
-mod listeners;
+use messages::PendingGroupDecisionResponseKind;
+pub use messages::{PendingGroupDecisionResponse, ReplicationRuntimeMessage};
+use summary_api::SummaryReplyRoute;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::ReplicationRuntimeTestMessage;
 
 use activation_provider::StoreActivationRowProvider;
 use group_work::{
@@ -221,7 +195,6 @@ use inbound_support::{
     InboundDeliveryFailure,
     InboundUpdateOrigin,
     InboundUpdateOutcome,
-    SummaryCatchUpObservation,
     handled_after_inbound_failure,
     panic_if_fatal_inbound_failure,
     summary_from_message,
@@ -234,184 +207,15 @@ use listeners::{
     notify_pending_activation_data_changes,
 };
 
-/// One local publish batch after local apply, encoding, and delivery-envelope preparation.
-struct PreparedLocalPublish {
-    group_id: GroupId,
-    update_id: UpdateId,
-    read_token: GroupReadToken,
-    payload: bytes::Bytes,
-    row_changes: Vec<RowChange>,
-}
-
-/// Application response to one pending group decision replayed through the listener.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingGroupDecisionResponse {
-    /// Stable idempotence key of the pending decision being resolved.
-    key: PendingGroupWorkKey,
-    /// Requested resolution for the pending decision.
-    response: PendingGroupDecisionResponseKind,
-}
-
-/// Resolution requested by a listener-facing pending group responder.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PendingGroupDecisionResponseKind {
-    /// Accept the pending decision and move it into activation work.
-    Accept,
-    /// Reject the pending decision and discard it.
-    Reject {
-        /// Application-supplied reason for the rejection.
-        reason: RejectionReason,
-    },
-}
-
-/// Local-actor messages understood by [`ReplicationRuntimeComponent`].
-///
-/// This is the imperative bridge surface between the public async runtime
-/// handle and the Kompact-hosted replication component.
-#[derive(Debug)]
-pub enum ReplicationRuntimeMessage {
-    /// Return the local member's shareable public key bundle through the component interface.
-    LocalPublicKeyBundle(Ask<(), Result<PublicKeyBundle, ApiError>>),
-    /// Return stored member-key bindings and local trust through the component interface.
-    KnownMemberKeys(Ask<(), Result<KnownMemberKeysReport, ApiError>>),
-    /// Assess one decoded public key bundle through the component interface.
-    AssessPublicKeyBundle(
-        Ask<AssessPublicKeyBundleRequest, Result<PublicKeyBundleReport, ApiError>>,
-    ),
-    /// Record public key bundle feedback through the component interface.
-    RecordPublicKeyBundleFeedback(Ask<RecordPublicKeyBundleFeedbackRequest, Result<(), ApiError>>),
-    /// Submit one local publish request through the component interface.
-    PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
-    /// Ask one group member for its current group version vector.
-    RequestSummary(Ask<SummaryRequest, Result<Summary, ApiError>>),
-    /// Create one new fixed-membership group through the component interface.
-    CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
-    /// Request one group-membership change through the component interface.
-    ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<MigrationId, ApiError>>),
-    /// Resolve one listener-mediated pending group decision through the component.
-    PendingGroupDecisionResponse(Ask<PendingGroupDecisionResponse, Result<(), ApiError>>),
-    /// Test-support command channel for runtime fixture setup and assertions.
-    #[cfg(any(test, feature = "test-support"))]
-    Test(ReplicationRuntimeTestMessage),
-}
-
-/// Delivery path that should carry one inbound summary response.
-enum SummaryReplyRoute {
-    /// Reply to a recipient-addressed reliable request and acknowledge it after
-    /// the response is submitted.
-    Reliable {
-        recipient: MemberIdentity,
-        processed: KClaimablePromise<()>,
-    },
-    /// Reply to a group-broadcast request by publishing the summary to the group.
-    GroupBroadcast,
-}
-
-/// Test-only pending-group input kept boxed to avoid inflating the command enum.
-#[cfg(test)]
-type PendingGroupTestInput = (
-    MemberIdentity,
-    Box<PendingGroupDecisionRecord>,
-    Arc<GroupSetupMessage>,
-);
-
-/// Test-only request used to inject pending-group work without transport.
-#[cfg(test)]
-type PendingGroupTestAsk = Ask<PendingGroupTestInput, Result<(), InboundDeliveryError>>;
-
+mod activation_provider;
+mod group_work;
+mod inbound_support;
+mod listeners;
+mod messages;
+mod security_api;
+mod summary_api;
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug)]
-#[allow(
-    private_interfaces,
-    reason = "test-only ask plumbing reuses internal error types"
-)]
-pub enum ReplicationRuntimeTestMessage {
-    /// Confirm that the runtime component is alive and able to process one
-    /// mailbox turn after startup.
-    #[cfg(test)]
-    Ping(Ask<(), ()>),
-    /// Install a group directly in runtime state for integration scenarios that
-    /// need pre-existing group membership until production group setup exists.
-    InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
-    /// Read one group's current store position for publication-oriented unit tests.
-    #[cfg(test)]
-    ReadGroupToken(Ask<GroupId, Result<Option<GroupReadToken>, StoreError>>),
-    /// Apply one inbound update directly to runtime logic tests.
-    #[cfg(test)]
-    ApplyUpdate(Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>),
-    /// Apply one inbound update batch directly to runtime logic tests.
-    #[cfg(test)]
-    ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
-    /// Apply one inbound pending-group message directly to runtime logic tests.
-    #[cfg(test)]
-    ApplyPendingGroup(PendingGroupTestAsk),
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl ReplicationRuntimeMessage {
-    #[cfg(test)]
-    pub(super) fn test_ping(promise: KPromise<()>) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::Ping(Ask::new(promise, ())))
-    }
-
-    pub(super) fn test_install_group(
-        promise: KPromise<Result<(), GroupInstallError>>,
-        group_id: GroupId,
-        members: GroupMembers,
-    ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::InstallGroup(Ask::new(
-            promise,
-            (group_id, members),
-        )))
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_read_group_token(
-        promise: KPromise<Result<Option<GroupReadToken>, StoreError>>,
-        group_id: GroupId,
-    ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::ReadGroupToken(Ask::new(
-            promise, group_id,
-        )))
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_apply_update(
-        promise: KPromise<Result<(), InboundDeliveryError>>,
-        sender: MemberIdentity,
-        message: UpdateMessage,
-    ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::ApplyUpdate(Ask::new(
-            promise,
-            (sender, message),
-        )))
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_apply_update_batch(
-        promise: KPromise<Result<(), InboundDeliveryError>>,
-        sender: MemberIdentity,
-        message: UpdateBatchMessage,
-    ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(Ask::new(
-            promise,
-            (sender, message),
-        )))
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_apply_pending_group(
-        promise: KPromise<Result<(), InboundDeliveryError>>,
-        sender: MemberIdentity,
-        record: PendingGroupDecisionRecord,
-        group_setup: Arc<GroupSetupMessage>,
-    ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::ApplyPendingGroup(Ask::new(
-            promise,
-            (sender, Box::new(record), group_setup),
-        )))
-    }
-}
+mod test_support;
 
 /// Stateful Kompact component that hosts one replication runtime.
 ///
@@ -434,33 +238,6 @@ pub struct ReplicationRuntimeComponent {
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
     max_inline_bootstrap_public_key_bundles: usize,
-}
-
-/// Identity and membership views shared by runtime logic components.
-#[derive(Clone)]
-pub(super) struct RuntimeIdentityContext {
-    pub(super) local_member: MemberIdentity,
-    pub(super) group_memberships: Arc<SharedGroupState>,
-}
-
-/// Application-facing services consumed by the replication runtime component.
-#[derive(Clone)]
-pub(super) struct RuntimeApplicationServices {
-    pub(super) store: Arc<dyn ReplicationStore>,
-    pub(super) listener: Arc<dyn ReplicationEventListener>,
-    pub(super) config: ReplicationConfig,
-}
-
-/// Security services used for delivery and bootstrap material handling.
-#[derive(Clone)]
-pub(super) struct RuntimeSecurityContext {
-    pub(super) security: DeliverySecurity,
-}
-
-/// Actor dependencies created by the runtime logic topology.
-pub(super) struct RuntimeComponentActors {
-    pub(super) summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
-    pub(super) catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
 }
 
 impl ReplicationRuntimeComponent {
@@ -511,18 +288,6 @@ impl ReplicationRuntimeComponent {
         if promise.fulfil(reply).is_err() {
             warn!(self.log(), "dropping {operation} reply");
         }
-    }
-
-    /// Load one current group position without restoring the removed snapshot API.
-    #[cfg(test)]
-    async fn load_group_read_token_for_test(
-        &mut self,
-        group_id: GroupId,
-    ) -> Result<Option<GroupReadToken>, StoreError> {
-        let mut transaction = self.store.begin_read_transaction().await?;
-        let group = transaction.load_replication_group(&group_id).await?;
-        transaction.release().await?;
-        Ok(group.map(|group| GroupReadToken::from_group_version(group_id, group.version_vector)))
     }
 
     fn record_inbound_failure(&self, failure: &InboundDeliveryFailure) -> InboundFailureAction {
@@ -1105,69 +870,6 @@ impl ReplicationRuntimeComponent {
             });
     }
 
-    fn validate_summary_request(&self, request: &SummaryRequest) -> Result<(), SummaryError> {
-        let memberships = self.group_memberships.snapshot();
-        let members =
-            memberships
-                .members(&request.group_id)
-                .context(summary::UnknownGroupSnafu {
-                    group_id: request.group_id,
-                })?;
-        ensure!(
-            members.contains(&request.target),
-            summary::TargetNotInGroupSnafu {
-                group_id: request.group_id,
-                target: request.target.clone(),
-            }
-        );
-        Ok(())
-    }
-
-    async fn load_summary_versions_from_store(
-        store: Arc<dyn ReplicationStore>,
-        group_id: GroupId,
-    ) -> Result<Option<VersionVector>, StoreError> {
-        let mut transaction = store.begin_read_transaction().await?;
-        let group = transaction.load_replication_group(&group_id).await?;
-        Ok(group.map(|group| group.lifecycle.bound_versions(&group.version_vector)))
-    }
-
-    fn summary_message_for_request(
-        message: SummaryRequestMessage,
-        has_versions: VersionVector,
-    ) -> RuntimeMessage {
-        RuntimeMessage::Summary(SummaryMessage::new(
-            message.group_id,
-            message.correlation_id,
-            has_versions,
-        ))
-    }
-
-    async fn load_summary_message_from_store(
-        store: Arc<dyn ReplicationStore>,
-        message: SummaryRequestMessage,
-    ) -> Result<RuntimeMessage, InboundDeliveryError> {
-        let has_versions = Self::load_summary_versions_from_store(store, message.group_id)
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let has_versions = has_versions.context(inbound::UnknownHostedGroupSnafu {
-            group_id: message.group_id,
-        })?;
-        Ok(Self::summary_message_for_request(message, has_versions))
-    }
-
-    fn summary_for_request(
-        group_id: GroupId,
-        responder: MemberIdentity,
-        has_versions: VersionVector,
-    ) -> Summary {
-        Summary {
-            group_id,
-            responder,
-            has_versions,
-        }
-    }
-
     /// Persist one newly observed group definition.
     ///
     /// If the same group already exists with the same canonical membership
@@ -1412,6 +1114,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         response: PendingGroupDecisionResponse,
     ) -> Result<Option<Box<PendingGroupActivationRecord>>, ApiError> {
+        let (work_key, response_kind) = response.into_parts();
         let mut accepted_activation = None;
         let mut unsupported_activation = None;
         let mut transaction = self
@@ -1419,16 +1122,16 @@ impl ReplicationRuntimeComponent {
             .begin_transaction()
             .await
             .map_err(ApiError::from_store_classification_source)?;
-        match response.response {
+        match response_kind {
             PendingGroupDecisionResponseKind::Accept => {
-                match Self::accept_pending_group_work(transaction.as_mut(), response.key).await? {
+                match Self::accept_pending_group_work(transaction.as_mut(), work_key).await? {
                     PendingGroupAcceptOutcome::Missing => {
                         // A responder may outlive work resolved through another
                         // listener event. Acceptance is idempotent once no work
                         // remains, but log the stale response for diagnostics.
                         debug!(
                             self.log(),
-                            "ignoring acceptance for missing pending group work {:?}", response.key,
+                            "ignoring acceptance for missing pending group work {:?}", work_key,
                         );
                     }
                     PendingGroupAcceptOutcome::UnsupportedSnapshot(group_id) => {
@@ -1440,14 +1143,14 @@ impl ReplicationRuntimeComponent {
                 }
             }
             PendingGroupDecisionResponseKind::Reject { .. } => {
-                let rejected_group_id = match response.key {
+                let rejected_group_id = match work_key {
                     PendingGroupWorkKey::GroupInvitation { group_id, .. } => group_id,
                     PendingGroupWorkKey::MigrationProposal { migration_id } => {
                         migration_id.new_group_id
                     }
                 };
                 transaction
-                    .remove_pending_group_decision(response.key)
+                    .remove_pending_group_decision(work_key)
                     .await
                     .map_err(ApiError::from_store_classification_source)?;
                 transaction
@@ -2331,57 +2034,6 @@ impl ReplicationRuntimeComponent {
             read_token,
             payload,
             row_changes: prepared_local_changes.row_changes,
-        })
-    }
-
-    fn submit_summary_reply(
-        &mut self,
-        route: SummaryReplyRoute,
-        message: SummaryRequestMessage,
-        summary: &RuntimeMessage,
-    ) -> Result<(), InboundDeliveryError> {
-        match route {
-            SummaryReplyRoute::Reliable {
-                recipient,
-                processed,
-            } => {
-                self.submit_reliable_runtime_message(recipient, summary);
-                processed
-                    .complete()
-                    .context(inbound::CompleteProcessedPromiseSnafu {
-                        group_id: message.group_id,
-                    })?;
-            }
-            SummaryReplyRoute::GroupBroadcast => {
-                self.group_broadcast.trigger(
-                    GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
-                        .for_member_in_group(self.local_member.clone(), message.group_id)
-                        .with_payload(summary.encode_proto_to_bytes()),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_inbound_summary_request(
-        &mut self,
-        context: InboundDeliveryContext,
-        route: SummaryReplyRoute,
-        message: SummaryRequestMessage,
-    ) -> HandlerResult {
-        let store = self.store.clone();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = async {
-                let summary = Self::load_summary_message_from_store(store, message).await?;
-                async_self.submit_summary_reply(route, message, &summary)
-            }
-            .await;
-            if let Err(error) = reply {
-                let failure = InboundDeliveryFailure::new(context, error);
-                let action = async_self.record_inbound_failure(&failure);
-                panic_if_fatal_inbound_failure(action, &failure);
-            }
-            Handled::OK
         })
     }
 
@@ -3327,207 +2979,6 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    fn handle_assess_public_key_bundle(
-        &mut self,
-        ask: Ask<AssessPublicKeyBundleRequest, Result<PublicKeyBundleReport, ApiError>>,
-    ) -> HandlerResult {
-        let (promise, request) = ask.take();
-        let security = self.security.clone();
-        self.spawn_local(move |async_self| async move {
-            let reply = security
-                .assess_public_key_bundle(request)
-                .await
-                .map_err(ApiError::from_store_classification_source);
-            async_self.reply_api(promise, "assess_public_key_bundle", reply);
-            Handled::OK
-        });
-        Handled::OK
-    }
-
-    fn handle_record_public_key_bundle_feedback(
-        &mut self,
-        ask: Ask<RecordPublicKeyBundleFeedbackRequest, Result<(), ApiError>>,
-    ) -> HandlerResult {
-        let (promise, request) = ask.take();
-        let security = self.security.clone();
-        self.spawn_local(move |async_self| async move {
-            let reply = security
-                .record_public_key_bundle_feedback(request)
-                .await
-                .map_err(ApiError::from_store_classification_source);
-            async_self.reply_api(promise, "record_public_key_bundle_feedback", reply);
-            Handled::OK
-        });
-        Handled::OK
-    }
-
-    fn handle_local_public_key_bundle(
-        &mut self,
-        ask: Ask<(), Result<PublicKeyBundle, ApiError>>,
-    ) -> HandlerResult {
-        let (promise, ()) = ask.take();
-        let reply = Ok(self.security.local_public_key_bundle());
-        self.reply_api(promise, "local_public_key_bundle", reply);
-        Handled::OK
-    }
-
-    fn handle_known_member_keys(
-        &mut self,
-        ask: Ask<(), Result<KnownMemberKeysReport, ApiError>>,
-    ) -> HandlerResult {
-        let (promise, ()) = ask.take();
-        let security = self.security.clone();
-        self.spawn_local(move |async_self| async move {
-            let reply = security
-                .known_member_keys_report()
-                .await
-                .map_err(ApiError::from_store_classification_source);
-            async_self.reply_api(promise, "known_member_keys", reply);
-            Handled::OK
-        });
-        Handled::OK
-    }
-
-    fn handle_request_summary(
-        &mut self,
-        ask: Ask<SummaryRequest, Result<Summary, ApiError>>,
-    ) -> HandlerResult {
-        let (promise, request) = ask.take();
-        if let Err(error) = self.validate_summary_request(&request) {
-            let reply = Err(ApiError::from_store_classification_source(error));
-            self.reply_api(promise, "request_summary", reply);
-            return Handled::OK;
-        }
-        Handled::block_on(self, async move |async_self| {
-            let store = async_self.store.clone();
-            let local_member = async_self.local_member.clone();
-            let group_id = request.group_id;
-            let reply = async move {
-                let mut transaction = store
-                    .begin_read_transaction()
-                    .await
-                    .context(summary::StoreAccessSnafu)?;
-                let group = transaction
-                    .load_replication_group(&group_id)
-                    .await
-                    .context(summary::StoreAccessSnafu)?
-                    .context(summary::UnknownGroupSnafu { group_id })?;
-                transaction
-                    .release()
-                    .await
-                    .context(summary::StoreAccessSnafu)?;
-                ensure!(
-                    group.lifecycle.is_readable(),
-                    summary::GroupClosedSnafu { group_id }
-                );
-                Ok::<_, SummaryError>(group.version_vector)
-            }
-            .await;
-            match reply {
-                Ok(has_versions) if request.target == local_member => {
-                    let summary =
-                        Self::summary_for_request(request.group_id, local_member, has_versions);
-                    async_self.reply_api(promise, "request_summary", Ok(summary));
-                }
-                Ok(_) => {
-                    // Temporary glue: public runtime API requests currently enter through
-                    // this component and are then routed to the dedicated summary manager.
-                    // See flotsync-ozi for revisiting this component boundary.
-                    async_self.summary_request_manager.tell(
-                        SummaryRequestManagerMessage::RequestSummary(Ask::new(promise, request)),
-                    );
-                }
-                Err(error) => {
-                    let reply = Err(ApiError::from_store_classification_source(error));
-                    async_self.reply_api(promise, "request_summary", reply);
-                }
-            }
-            Handled::OK
-        })
-    }
-
-    /// Inspect local progress after a peer summary and derive catch-up notifications.
-    async fn inspect_summary_catch_up(
-        store: Arc<dyn ReplicationStore>,
-        local_member: MemberIdentity,
-        summary: Summary,
-    ) -> Result<Option<SummaryCatchUpObservation>, InboundDeliveryError> {
-        let mut transaction = store
-            .begin_read_transaction()
-            .await
-            .context(inbound::StoreAccessSnafu)?;
-        let Some(persisted_group) = transaction
-            .load_replication_group(&summary.group_id)
-            .await
-            .context(inbound::StoreAccessSnafu)?
-        else {
-            return Ok(None);
-        };
-        let mut pending_cursor = PageCursor::new(ReplicationUpdatesQuery::new(
-            summary.group_id,
-            ReplicationUpdateFilter::PendingApply,
-        ));
-        let mut pending_batch = VecPageBatch::<
-            UpdateRangeMessage,
-            (),
-            OwnedPageBatchInput<UpdateId>,
-            _,
-        >::unlimited_with(|update_id| {
-            Ok::<_, BoxError>(UpdateRangeMessage::from(update_id))
-        });
-        transaction
-            .load_replication_update_ids_into(&mut pending_cursor, &mut pending_batch)
-            .await
-            .map_err(StoreError::from)
-            .context(inbound::StoreAccessSnafu)?;
-        let lifecycle = persisted_group.lifecycle.clone();
-        let bounded_summary_versions = lifecycle.bound_versions(&summary.has_versions);
-        let local_group =
-            LoadedGroupMeta::from_replication_group_record(&local_member, persisted_group)
-                .context(inbound::InvalidPersistedGroupSnafu {
-                    group_id: summary.group_id,
-                })?;
-        let summary_needed_ranges = local_group
-            .version_vector
-            .missing_version_ranges_to(&bounded_summary_versions)
-            .into_iter()
-            .map(UpdateRangeMessage::from)
-            .collect_vec();
-        let observed_available = Self::bound_update_ranges(&lifecycle, pending_batch.into_values());
-        let needed_ranges = subtract_available_ranges(&summary_needed_ranges, &observed_available);
-        Ok(Some(SummaryCatchUpObservation {
-            group_id: summary.group_id,
-            observed_available,
-            needed_ranges,
-        }))
-    }
-
-    fn handle_observed_summary(&mut self, summary: Summary) -> HandlerResult {
-        // Summary catch-up is advisory: it reads a store snapshot and sends
-        // catch-up notifications, but it does not mutate runtime component
-        // state. Running it asynchronously can at worst produce stale
-        // best-effort ranges, which the catch-up manager de-duplicates against
-        // later availability observations.
-        self.spawn_local(move |async_self| async move {
-            let store = async_self.store.clone();
-            let local_member = async_self.local_member.clone();
-            if let Some(observation) = Self::inspect_summary_catch_up(store, local_member, summary)
-                .await
-                .whatever_benign("failed to inspect local progress for summary catch-up")?
-            {
-                async_self.notify_catch_up_available(
-                    observation.group_id,
-                    observation.observed_available,
-                );
-                async_self.notify_catch_up_needed(observation.group_id, observation.needed_ranges);
-            } else {
-                // The summary refers to a group this runtime no longer hosts.
-            }
-            Handled::OK
-        });
-        Handled::OK
-    }
-
     /// Persist and install a prepared local group, notify the application, and invite peers.
     async fn complete_group_creation(
         &mut self,
@@ -3733,143 +3184,6 @@ impl ReplicationRuntimeComponent {
             Handled::OK
         })
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn handle_test_install_group(
-        &mut self,
-        ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
-    ) -> HandlerResult {
-        let (promise, (group_id, members)) = ask.take();
-        // TODO(flotsync-sec.9): Remove this test-only message once production
-        // group creation installs real group secrets through the normal API.
-        let group_key = test_group_key(group_id);
-        let security_material = match self.security.seal_group_secret(group_id.0, &group_key) {
-            Ok(security_material) => security_material,
-            Err(source) => {
-                let _ = promise.fulfil(Err(GroupInstallError::TestGroupSecurity {
-                    group_id,
-                    source,
-                }));
-                return Handled::OK;
-            }
-        };
-        let member_keys = members
-            .ordered_members()
-            .into_iter()
-            .map(|member_id| MemberKeyId {
-                fingerprint: test_public_member_keys(&member_id).fingerprint(),
-                member_id,
-            })
-            .collect::<Vec<_>>();
-        let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
-            .expect("test install group members were already validated");
-        let group_schema = GroupSchema::new(
-            self.group_memberships
-                .application_schemas()
-                .iter()
-                .map(|(dataset_id, schema)| (dataset_id, SchemaSource::Static(schema)))
-                .collect(),
-        );
-        let record = self.build_replication_group_record(
-            group_id,
-            None,
-            member_keys,
-            group_schema,
-            security_material,
-        );
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .store_new_replication_group(record)
-                .await
-                .map(|_persisted_group| ());
-            let _ = promise.fulfil(reply);
-            Handled::OK
-        })
-    }
-
-    #[cfg(test)]
-    fn handle_test_read_group_token(
-        &mut self,
-        ask: Ask<GroupId, Result<Option<GroupReadToken>, StoreError>>,
-    ) -> HandlerResult {
-        let (promise, group_id) = ask.take();
-        self.spawn_local(async move |mut async_self| {
-            let reply = async_self.load_group_read_token_for_test(group_id).await;
-            if promise.fulfil(reply).is_err() {
-                warn!(async_self.log(), "dropping test group read-token reply");
-            }
-            Handled::OK
-        });
-        Handled::OK
-    }
-
-    #[cfg(test)]
-    #[allow(
-        clippy::unused_self,
-        reason = "Kompact test messages use the same component method shape as production handlers."
-    )]
-    fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> HandlerResult {
-        let (promise, ()) = ask.take();
-        let _ = promise.fulfil(());
-        Handled::OK
-    }
-
-    #[cfg(test)]
-    fn handle_test_apply_update(
-        &mut self,
-        ask: Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>,
-    ) -> HandlerResult {
-        let (promise, (sender, message)) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = match async_self
-                .persist_and_apply_update(InboundUpdateOrigin::Producer { sender }, message)
-                .await
-            {
-                Ok(outcome) => {
-                    notify_listener_batches(async_self.listener.clone(), outcome.event_batches)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            let _ = promise.fulfil(reply);
-            Handled::OK
-        })
-    }
-
-    #[cfg(test)]
-    fn handle_test_apply_update_batch(
-        &mut self,
-        ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
-    ) -> HandlerResult {
-        let (promise, (batch_sender, message)) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .persist_apply_and_notify_update_batch(batch_sender, message)
-                .await;
-            let _ = promise.fulfil(reply);
-            Handled::OK
-        })
-    }
-
-    #[cfg(test)]
-    fn handle_test_apply_pending_group(&mut self, ask: PendingGroupTestAsk) -> HandlerResult {
-        let (promise, (sender, record, group_setup)) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .install_pending_group_delivery(*record, group_setup, sender)
-                .await;
-            let reply = match reply {
-                Err(error) if error.is_unrecoverable() => {
-                    return Err(error).whatever_unrecoverable(
-                        "test pending group activation failed after commit",
-                    );
-                }
-                reply => reply,
-            };
-            let _ = promise.fulfil(reply);
-            Handled::OK
-        })
-    }
 }
 
 impl ComponentLifecycle for ReplicationRuntimeComponent {
@@ -3953,32 +3267,46 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::PendingGroupDecisionResponse(ask) => {
                 self.handle_pending_group_decision_response(ask)
             }
-            #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::Ping(ask)) => {
-                self.handle_test_ping(ask)
-            }
             #[cfg(any(test, feature = "test-support"))]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {
-                self.handle_test_install_group(ask)
-            }
-            #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ReadGroupToken(ask)) => {
-                self.handle_test_read_group_token(ask)
-            }
-            #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdate(ask)) => {
-                self.handle_test_apply_update(ask)
-            }
-            #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
-                ask,
-            )) => self.handle_test_apply_update_batch(ask),
-            #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyPendingGroup(
-                ask,
-            )) => self.handle_test_apply_pending_group(ask),
+            ReplicationRuntimeMessage::Test(message) => self.handle_test_message(message),
         }
     }
+}
+
+/// Identity and membership views shared by runtime logic components.
+#[derive(Clone)]
+pub(super) struct RuntimeIdentityContext {
+    pub(super) local_member: MemberIdentity,
+    pub(super) group_memberships: Arc<SharedGroupState>,
+}
+
+/// Application-facing services consumed by the replication runtime component.
+#[derive(Clone)]
+pub(super) struct RuntimeApplicationServices {
+    pub(super) store: Arc<dyn ReplicationStore>,
+    pub(super) listener: Arc<dyn ReplicationEventListener>,
+    pub(super) config: ReplicationConfig,
+}
+
+/// Security services used for delivery and bootstrap material handling.
+#[derive(Clone)]
+pub(super) struct RuntimeSecurityContext {
+    pub(super) security: DeliverySecurity,
+}
+
+/// Actor dependencies created by the runtime logic topology.
+pub(super) struct RuntimeComponentActors {
+    pub(super) summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+    pub(super) catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
+}
+
+/// One local publish batch after local apply, encoding, and delivery-envelope preparation.
+struct PreparedLocalPublish {
+    group_id: GroupId,
+    update_id: UpdateId,
+    read_token: GroupReadToken,
+    payload: bytes::Bytes,
+    row_changes: Vec<RowChange>,
 }
 
 #[cfg(test)]

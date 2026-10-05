@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Normalise requested group members so the local creator occupies member index 0.
+pub(super) fn creator_first_member_order(
+    mut members: Vec<MemberIdentity>,
+    creator: &MemberIdentity,
+) -> Result<Vec<MemberIdentity>, CreateGroupError> {
+    let creator_position = members
+        .iter()
+        .position(|member| member == creator)
+        .context(CreatorNotInMembersSnafu {
+            creator: creator.clone(),
+        })?;
+    members.swap(0, creator_position);
+    Ok(members)
+}
 /// Locally validated group-creation input before security material is prepared.
 pub(super) struct PreparedCreatedGroup {
     pub(super) group_id: GroupId,
@@ -115,10 +129,7 @@ impl ComponentBackedPendingGroupResponder {
             runtime_ref,
             work_key,
         } = self;
-        let request = PendingGroupDecisionResponse {
-            key: work_key,
-            response,
-        };
+        let request = PendingGroupDecisionResponse::new(work_key, response);
         let future = runtime_ref.ask_with(move |promise| {
             ReplicationRuntimeMessage::PendingGroupDecisionResponse(Ask::new(promise, request))
         });
@@ -156,19 +167,4 @@ impl MigrationProposalResponder for ComponentBackedPendingGroupResponder {
     ) -> BoxFuture<'static, Result<(), ApiError>> {
         (*self).respond(PendingGroupDecisionResponseKind::Reject { reason })
     }
-}
-
-/// Normalise requested group members so the local creator occupies member index 0.
-pub(super) fn creator_first_member_order(
-    mut members: Vec<MemberIdentity>,
-    creator: &MemberIdentity,
-) -> Result<Vec<MemberIdentity>, CreateGroupError> {
-    let creator_position = members
-        .iter()
-        .position(|member| member == creator)
-        .context(CreatorNotInMembersSnafu {
-            creator: creator.clone(),
-        })?;
-    members.swap(0, creator_position);
-    Ok(members)
 }
