@@ -1,0 +1,33 @@
+id = "01a12607-9cd3-7812-8f4e-0665ae63f0be"
+ref = "flotsync-oyr"
+title = "Design a typed DSL for owned runtime flows"
+body = """
+Problem
+The publication flow added by flotsync-zop.05 repeats the same step relationships across PublicationEffect, PublicationCompletion, PublicationState and PublicationPhase, plus their match arms. Before extending this pattern to inbound/listener and other runtime flows, design a small typed DSL that makes those relationships explicit once and reduces handwritten boilerplate.
+
+Priority and sequence
+P0 requested by the user during the 2026-10-10 publication review. Agree the design and assess a small prototype before further flow generalisation, starting with flotsync-zop.06 (Compose inbound and listener flow FSMs). The existing publication implementation remains the behavioural reference. Do not begin production implementation before plan alignment.
+
+Design requirements
+Declare each waiting step, owned action inputs, typed result and state data together. Derive action/result variants, result-kind validation and state names from the declaration; investigate removing the separate phase enum rather than simply generating four redundant representations. Keep domain transitions and effect execution readable as ordinary Rust, with explicit success/error branches and named helpers where useful.
+
+Respect different data lifetimes: the listener action owns ListenerDataChanges while the waiting state owns PublishReceipt; the API reply action owns KPromise and the reply value while the waiting state owns PublicationOutcome. Resource claims remain non-cloneable, waiting state is recorded before an action is exposed, and terminal handling returns complete ownership explicitly. Wrong-flow, wrong-step and repeated results remain contextual Snafu errors. A dropped reply receiver does not cancel committed work; committed writes are never automatically retried. Keep existing error source chains and component fault handling.
+
+Compare a small macro_rules! declaration with a procedural macro only if syntax, diagnostics or IDE navigation justify the additional machinery. No Any-based framework, runtime type erasure, unnecessary allocation, hidden scheduling or automatic Drop-based release. The DSL must work with a component-local wrapping ID allocator and remain usable when later tasks add composed flows and asynchronous execution. Do not implement the scheduler or resource registry in this task.
+
+Acceptance
+Agree syntax and ownership/error rules with the user. Show the equivalent publication flow and its generated Rust. Demonstrate that wrong typed transitions fail to compile and existing behavioural tests still cover ordering, failures, repeated results and cleanup. Assess readability, debugging, diagnostics and the actual reduction in repeated declarations. Include one small branching/composition example to avoid designing solely for a linear happy path. Record whether to adopt the prototype or keep handwritten flows before proceeding to additional conversions.
+
+Sizing and review
+Estimate 400–700 substantive LOC for the first design/prototype and focused checks. If prototype plus publication adoption exceeds 1000 LOC, split them into separately planned and reviewed tasks; broad rollout belongs to the existing conversion tasks. This is a proposed exploration, not an agreed macro implementation. Preserve staged review state and obtain user acceptance before closing.
+"""
+status = "open"
+type = "task"
+priority = 0
+blocks = ["01a1071b-c9f8-7b52-8ffe-1730696fc09a"]
+created_at = "2026-10-10T13:36:35.539748Z"
+updated_at = "2026-10-10T13:36:55.652276Z"
+
+[[links]]
+target = "01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"
+label = "discovered from"

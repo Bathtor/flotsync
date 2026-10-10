@@ -1,0 +1,62 @@
+id = "01a124b2-2e0f-7ea1-bef5-5e44847f79c1"
+ref = "flotsync-305"
+title = "Enforce finite-state register transition ordering"
+body = """
+The TotalOrderFiniteStateRegister data-model implementation accepts backwards transitions. Discovered during review of maintain-rs-m5t.4.3, which uses Field::finite_state_register("is_completed", [false, true]). This must be addressed in flotsync, not by an application workaround in maintain-rs.
+
+Confirmed against commit 3f575eee43bdd70f6f676329380c8fccb77bff34, the revision locked by maintain-rs. The schema contract states that transitions only move from lower to higher state indices and the highest index wins conflicts. The repro below inserts false, writes true, then writes false. The final write succeeds and the resulting value is false.
+
+Exact reproduction:
+
+Cargo.toml:
+```toml
+[package]
+name = "maintain-review-fsr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flotsync_data_types = { git = "https://github.com/Bathtor/flotsync", rev = "3f575eee43bdd70f6f676329380c8fccb77bff34" }
+```
+
+src/main.rs:
+```rust
+use flotsync_data_types::{Field, Schema, TableOperations, RowOperations};
+use flotsync_data_types::schema::datamodel::InMemoryStateData;
+
+fn main() {
+    let schema = Box::leak(Box::new(Schema::from_fields([
+        Field::finite_state_register("completed", [false, true]).unwrap(),
+    ])));
+    let mut data = InMemoryStateData::<u64, u64>::with_static_schema(schema);
+    data.insert_row(0, 1, [schema["completed"].initial(false).unwrap()]).unwrap();
+    data.modify_row(1, 1, [schema["completed"].set(true).unwrap()]).unwrap();
+    let result = data.modify_row(2, 1, [schema["completed"].set(false).unwrap()]);
+    println!("reverse transition: {result:?}");
+    let row = data.get_row(&1).unwrap();
+    println!("completed after true then false: {}", row.get_field_value::<bool>("completed").unwrap());
+}
+```
+
+Run `cargo run` from the reproduction directory. The original isolated repro used a path dependency to the Cargo checkout of the same exact commit and was run with `cargo run --manifest-path /tmp/maintain-review-fsr/Cargo.toml --offline --quiet`.
+
+Observed output:
+```text
+reverse transition: Ok(Applied(SchemaOperation { change_id: 2, operation: Update { row_id: 1, fields: [OperationFieldValue { field_name: "completed", value: TotalOrderFiniteStateRegisterSet(Value(Boolean(false))) }] } }))
+completed after true then false: false
+```
+
+Expected: the backwards write must not lower the stored state; the value must remain true, with the API returning its documented rejection or no-op outcome.
+
+Investigation starting points at the confirmed revision:
+- flotsync_data_types/src/schema/mod.rs: TotalOrderFiniteStateRegister documents monotonic transitions and highest-index conflict resolution.
+- flotsync_data_types/src/schema/datamodel/in_memory/operations.rs: build of TotalOrderFiniteStateRegisterSet checks only equality, and apply_operation_value directly assigns the incoming value.
+
+Acceptance: reproduce on the current flotsync checkout first; add regression tests for local backwards transitions, application of incoming lower-state operations, duplicate operations, and delivery-order-independent highest-index resolution. Include non-boolean and nullable ordered states so enforcement follows schema indices rather than natural primitive ordering. Fix the owning data-model implementation if the bug remains, and document exact rejection/no-op semantics. The supplied sequential repro proves backwards-transition acceptance; concurrent conflict behaviour requires additional tests.
+"""
+status = "open"
+type = "bug"
+priority = 1
+labels = ["bug"]
+created_at = "2026-10-10T07:23:39.407339Z"
+updated_at = "2026-10-10T07:36:38.078611Z"

@@ -1,0 +1,14 @@
+id = "01a12582-f4bc-7b90-abbb-80c654837bd6"
+ref = "flotsync-muc"
+title = "Provide consuming RowValues to RowValuesPatch conversion"
+body = """
+Discovered while addressing review feedback in maintain-rs-m5t.4.3 (/Users/lkroll/Programming/maintain-rs). Full-row encoders return schema-validated RowValues, while RowMutation::Upsert accepts RowValuesPatch. At pinned revision 3f575eee43bdd70f6f676329380c8fccb77bff34 and in the current local checkout, RowValues exposes only borrowed fields(), so application insertion adapters must clone the entire field map to construct the patch.
+
+Proposed API: add RowValues::into_fields(self) -> HashMap<String, NullableBasicValue> in flotsync_data_types, and impl From<RowValues> for RowValuesPatch in flotsync_replication using the consuming accessor. Transfer the existing map, strings, arrays and binary buffers without copying or re-encoding. Preserve explicit NULL, empty payloads and field names. Conversion does not validate completeness itself, change mutation semantics or imply row absence; full-row encoders remain responsible for schema validation.
+
+Align the upstream implementation plan before changing code. Add focused coverage for preserved values and ownership transfer, and document the consuming API. Ensure application consumers can access the conversion through flotsync_replication. Maintain-rs will temporarily use a local consuming adapter with fields().clone() and a TODO referencing this issue. This follow-up is not a blocker for maintain-rs and does not authorise an upstream implementation or dependency bump in the application review."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-10-10T11:11:41.756516Z"
+updated_at = "2026-10-10T11:11:41.756516Z"

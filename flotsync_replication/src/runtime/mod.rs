@@ -2,9 +2,6 @@
 
 use kompact::{config::UsizeValue, kompact_config};
 
-/// Default maximum group size for inlining public key bundles in bootstrap messages.
-pub const DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES: usize = 10;
-
 /// Kompact configuration keys consumed by the replication runtime.
 pub mod config_keys {
     use super::{DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES, UsizeValue, kompact_config};
@@ -28,9 +25,13 @@ pub(crate) mod host;
 mod in_memory;
 mod pending_group;
 mod replay;
+mod replies;
 mod store_security_validation;
 mod summary_request_manager;
 mod synchronisation;
+
+/// Default maximum group size for inlining public key bundles in bootstrap messages.
+pub const DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES: usize = 10;
 
 pub use component::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};
 pub(crate) use errors::BoxedError;

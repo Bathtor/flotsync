@@ -1,6 +1,9 @@
 //! Application and route-triggered summary request protocol management.
 
-use super::errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary};
+use super::{
+    errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary},
+    replies::{ReplyOutcome, complete_reply},
+};
 use crate::{
     api::{ApiError, Summary, SummaryRequest},
     codecs::messages::{
@@ -190,6 +193,7 @@ impl SummaryRequestManagerComponent {
         self.available_direct_peers.contains(peer)
     }
 
+    /// Attempt one API reply and log if its caller has dropped the receiver.
     fn reply_api<T>(
         &self,
         promise: KPromise<Result<T, ApiError>>,
@@ -198,7 +202,10 @@ impl SummaryRequestManagerComponent {
     ) where
         T: Send + 'static,
     {
-        if promise.fulfil(reply).is_err() {
+        if matches!(
+            complete_reply(promise, reply),
+            ReplyOutcome::ReceiverDropped
+        ) {
             warn!(self.log(), "dropping {operation} reply");
         }
     }
@@ -388,9 +395,7 @@ impl SummaryRequestManagerComponent {
                 self.pending_summaries.insert(correlation_id, pending);
             } else {
                 self.cancel_timer(pending.timeout_timer);
-                if pending.promise.fulfil(Ok(summary)).is_err() {
-                    warn!(self.log(), "dropping request_summary reply");
-                }
+                self.reply_api(pending.promise, "request_summary", Ok(summary));
             }
         } else {
             self.fulfil_internal_summary(correlation_id, &summary)?;
@@ -458,16 +463,14 @@ impl SummaryRequestManagerComponent {
             .pending_summaries
             .remove(&correlation_id)
             .whatever_unrecoverable("checked pending summary must still exist")?;
-        if pending
-            .promise
-            .fulfil(Err(ApiError::SummaryTimedOut {
+        self.reply_api(
+            pending.promise,
+            "request_summary timeout",
+            Err(ApiError::SummaryTimedOut {
                 group_id: pending.group_id,
                 target: pending.target,
-            }))
-            .is_err()
-        {
-            warn!(self.log(), "dropping request_summary timeout reply");
-        }
+            }),
+        );
         Handled::OK
     }
 

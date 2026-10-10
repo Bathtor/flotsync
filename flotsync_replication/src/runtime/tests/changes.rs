@@ -256,6 +256,70 @@ fn publish_changes_listener_rejection_keeps_one_committed_update() {
 }
 
 #[test]
+fn publish_changes_dropped_reply_finishes_and_allows_next_publication() {
+    let alice = alice_member();
+    let fixture = load_runtime_fixture(app_alice_id(), alice.clone(), &TITLE_APPLICATION_SCHEMAS);
+    let group_id = create_publication_test_group(fixture.runtime.as_ref(), alice);
+    let row_id = test_row_id(group_id, docs_dataset_id(), 35_004);
+    let read_token = group_read_token(fixture.runtime.as_ref(), group_id);
+    let gate = fixture.listener.gate_next_data_change_completion();
+    let first = fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token,
+        changes: vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! { "title" => "disposed reply" },
+        }],
+    });
+    gate.wait_until_entered();
+    drop(first);
+    let first_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(first_group.version_vector.version_at(0), 1);
+    let second = fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: GroupReadToken::from_group_version(group_id, first_group.version_vector),
+        changes: vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! { "title" => "next publication" },
+        }],
+    });
+    gate.release();
+    let receipt =
+        wait_for_test_reply(second).expect("dropped receiver must allow claims to be released");
+    assert_eq!(receipt.update_id.version, 2);
+    assert_eq!(
+        load_persisted_group(fixture.store.as_ref(), group_id).version_vector,
+        *receipt.read_token.version()
+    );
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange { rows: Vec::new() },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: row_id.clone(),
+                    title: "disposed reply".to_owned()
+                }]
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: row_id.clone(),
+                    title: "next publication".to_owned()
+                }]
+            },
+        ],
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            &docs_dataset_id(),
+            &row_id,
+            "title"
+        ),
+        "next publication"
+    );
+}
+
+#[test]
 fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_id() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();

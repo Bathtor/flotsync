@@ -153,7 +153,7 @@ pub(super) async fn publish_changes_transactionally(
 /// Owned request containing at least one mutation, with all row identities in one group.
 ///
 /// `scope_request` constructs this input and collects unique touched row keys per dataset.
-/// The request retains the original mutation order. Dataset schemas are checked before
+/// The request keeps the original mutation order. Dataset schemas are checked before
 /// the transaction; writable-group and read-token checks use its stored group state.
 pub(super) struct ScopedPublication {
     /// Original mutation order and read position supplied by the application.
@@ -192,7 +192,7 @@ impl ScopedPublication {
 ///
 /// Private fields prevent the component from constructing a successful result
 /// before commit. The result owns post-commit delivery and listener data; it does
-/// not assert that delivery or application notification has already completed.
+/// not assert that delivery or the application listener callback has already completed.
 pub(super) struct CommittedPublication {
     /// Hosted group whose row state, update record and vector were committed together.
     group_id: GroupId,
@@ -224,8 +224,8 @@ impl CommittedPublication {
 
     /// Consume the result into its API receipt and pending listener row changes.
     ///
-    /// The component must await notification before returning the receipt to the caller.
-    pub(super) fn into_notification(self) -> (PublishReceipt, Vec<RowChange>) {
+    /// The component must await the listener callback before replying with the receipt.
+    pub(super) fn into_listener_data(self) -> (PublishReceipt, Vec<RowChange>) {
         let receipt = PublishReceipt {
             update_id: self.update_id,
             read_token: self.read_token,
@@ -238,7 +238,7 @@ impl CommittedPublication {
 ///
 /// Reports store access failures, `UnknownGroup` for absence, `GroupNotWritable` for a
 /// lifecycle that rejects writes, and `InvalidPersistedGroup` for inconsistent metadata.
-/// The caller retains the transaction through subsequent reads, writes and commit.
+/// The caller owns the transaction until subsequent reads, writes and commit finish.
 async fn load_writable_group(
     transaction: &mut dyn ReplicationStoreTransaction,
     local_member: &MemberIdentity,
@@ -385,4 +385,20 @@ fn build_local_dataset_updates(
         row_patches,
         row_changes,
     })
+}
+
+/// Construct a synthetic committed result for pure FSM tests that never run a store transaction.
+#[cfg(test)]
+pub(super) fn committed_publication_for_test(
+    group_id: GroupId,
+    receipt: PublishReceipt,
+    row_changes: Vec<RowChange>,
+) -> CommittedPublication {
+    CommittedPublication {
+        group_id,
+        update_id: receipt.update_id,
+        read_token: receipt.read_token,
+        payload: bytes::Bytes::from_static(b"committed update"),
+        row_changes,
+    }
 }

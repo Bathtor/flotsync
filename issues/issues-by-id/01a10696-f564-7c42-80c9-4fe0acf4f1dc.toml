@@ -25,8 +25,9 @@ Prepare and align a concrete publication plan after integration evidence is avai
 status = "open"
 type = "task"
 priority = 1
+children = ["01a110ab-5063-7c13-b31d-5859a046c958"]
 created_at = "2026-10-04T11:05:18.948533Z"
-updated_at = "2026-10-04T11:05:35.442341Z"
+updated_at = "2026-10-06T10:03:48.426211Z"
 
 [[links]]
 target = "01a039c6-93c0-74f1-89f6-63962aaf68c2"

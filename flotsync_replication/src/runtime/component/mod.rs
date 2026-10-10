@@ -36,6 +36,7 @@ use super::{
     group_state::SharedGroupState,
     in_memory::LoadedGroupMeta,
     pending_group,
+    replies::{ReplyOutcome, complete_reply},
     summary_request_manager::SummaryRequestManagerMessage,
 };
 #[cfg(test)]
@@ -154,6 +155,7 @@ use summary_api::SummaryReplyRoute;
 pub use test_support::ReplicationRuntimeTestMessage;
 
 use activation_provider::StoreActivationRowProvider;
+use flow_driver::{FlowEffect, FlowIdAllocator, FlowProtocolError, FlowSlot, FlowStep};
 use group_work::{
     ComponentBackedPendingGroupResponder,
     MigrationProposalArrival,
@@ -182,14 +184,17 @@ use listeners::{
     notify_listener_data_change,
     notify_pending_activation_data_changes,
 };
-use publication::CommittedPublication;
+use publication::ScopedPublication;
+use publication_flow::{PublicationCompletion, PublicationEffect, PublicationFlow};
 
 mod activation_provider;
+mod flow_driver;
 mod group_work;
 mod inbound_support;
 mod listeners;
 mod messages;
 mod publication;
+mod publication_flow;
 mod row_patches;
 mod security_api;
 mod summary_api;
@@ -216,6 +221,10 @@ pub struct ReplicationRuntimeComponent {
     group_memberships: Arc<SharedGroupState>,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
+    /// Owns publication's replication group and listener claims until its reply finishes.
+    publication_slot: FlowSlot<PublicationFlow>,
+    /// Shared ID sequence for all flows owned by this component; slot release does not reset it.
+    flow_ids: FlowIdAllocator,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
     max_inline_bootstrap_public_key_bundles: usize,
 }
@@ -240,6 +249,8 @@ impl ReplicationRuntimeComponent {
             group_memberships: identity.group_memberships,
             summary_request_manager: actors.summary_request_manager,
             catch_up_manager: actors.catch_up_manager,
+            publication_slot: FlowSlot::Available,
+            flow_ids: FlowIdAllocator::default(),
             max_inline_bootstrap_public_key_bundles:
                 DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
         }
@@ -257,17 +268,21 @@ impl ReplicationRuntimeComponent {
         self.listener = listener;
     }
 
+    /// Attempt one API reply, log a dropped receiver, and return the reply outcome.
     fn reply_api<T>(
         &self,
         promise: KPromise<Result<T, ApiError>>,
         operation: &'static str,
         reply: Result<T, ApiError>,
-    ) where
+    ) -> ReplyOutcome
+    where
         T: Send + 'static,
     {
-        if promise.fulfil(reply).is_err() {
+        let outcome = complete_reply(promise, reply);
+        if matches!(outcome, ReplyOutcome::ReceiverDropped) {
             warn!(self.log(), "dropping {operation} reply");
         }
+        outcome
     }
 
     fn record_inbound_failure(&self, failure: &InboundDeliveryFailure) -> InboundFailureAction {
@@ -1042,15 +1057,6 @@ impl ReplicationRuntimeComponent {
         Ok(accepted_activation)
     }
 
-    /// Submit one encoded live update to the group-broadcast layer.
-    fn submit_group_update(&mut self, prepared_publish: &CommittedPublication) {
-        self.group_broadcast.trigger(
-            GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
-                .for_member_in_group(self.local_member.clone(), prepared_publish.group_id())
-                .with_payload(prepared_publish.payload().clone()),
-        );
-    }
-
     /// Submit one runtime envelope through reliable delivery using its authority scope.
     fn submit_reliable_runtime_message(
         &mut self,
@@ -1637,24 +1643,18 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Resolve the publication schema before calling the isolated transaction service.
-    async fn publish_changes_transactionally(
-        &mut self,
+    /// Scope the request and resolve its immutable schema before admitting store work.
+    fn prepare_publication(
+        &self,
         request: PublishChangesRequest,
-    ) -> Result<CommittedPublication, PublishChangesError> {
+    ) -> Result<(ScopedPublication, Arc<GroupSchema>), PublishChangesError> {
         let scoped = publication::scope_request(request)?;
         let group_id = scoped.group_id();
         let group_schema = self
             .group_memberships
             .group_schema(&group_id)
             .context(publish::UnknownGroupSnafu { group_id })?;
-        publication::publish_changes_transactionally(
-            self.store.as_ref(),
-            &self.local_member,
-            group_schema.as_ref(),
-            scoped,
-        )
-        .await
+        Ok((scoped, group_schema))
     }
 
     fn handle_inbound_pending_group_decision(
@@ -2356,34 +2356,106 @@ impl ReplicationRuntimeComponent {
         ask: Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>,
     ) -> HandlerResult {
         let (promise, request) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = match async_self.publish_changes_transactionally(request).await {
-                Ok(prepared_publish) => {
-                    let update_id = prepared_publish.update_id();
-                    async_self.submit_group_update(&prepared_publish);
-                    async_self.notify_catch_up_available(
-                        prepared_publish.group_id(),
-                        vec![UpdateRangeMessage::from(update_id)],
-                    );
-                    let (receipt, row_changes) = prepared_publish.into_notification();
-                    match notify_listener_batches(
-                        async_self.listener.clone(),
-                        smallvec![ListenerDataChanges {
-                            read_token: receipt.read_token.clone(),
-                            row_changes,
-                        }],
-                    )
-                    .await
-                    {
-                        Ok(()) => Ok(receipt),
-                        Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+        match self.prepare_publication(request) {
+            Ok((scoped, schema)) => {
+                let group_id = scoped.group_id();
+                let admitted =
+                    self.publication_slot
+                        .admit(&mut self.flow_ids, group_id, |ownership| {
+                            PublicationFlow::new(ownership, scoped, schema, promise)
+                        });
+                match admitted {
+                    Ok(initial) => Handled::block_on(self, async move |mut async_self| {
+                        async_self
+                            .drive_publication(initial)
+                            .await
+                            .whatever_unrecoverable(
+                                "publication driver violated its ownership/phase protocol",
+                            )?;
+                        Handled::OK
+                    }),
+                    Err(error) => {
+                        let error = self.publication_slot.fault(error);
+                        Err(error)
+                            .whatever_unrecoverable("publication admission violated ownership")
                     }
                 }
-                Err(error) => Err(ApiError::from_store_classification_source(error)),
-            };
-            async_self.reply_api(promise, "publish_changes", reply);
-            Handled::OK
-        })
+            }
+            Err(error) => {
+                let reply = Err(ApiError::from_store_classification_source(error));
+                self.reply_api(promise, "publish_changes", reply);
+                Handled::OK
+            }
+        }
+    }
+
+    /// Execute publication actions while the flow owns its replication group and listener claims.
+    async fn drive_publication(
+        &mut self,
+        initial: FlowEffect<PublicationEffect>,
+    ) -> Result<(), FlowProtocolError> {
+        let mut pending = Some(initial);
+        while let Some(effect) = pending {
+            let completion = self.execute_publication_effect(effect.effect).await;
+            let transition = self
+                .publication_slot
+                .transition(|flow| flow.complete(effect.flow_id, completion))?;
+            match transition {
+                FlowStep::Continue(effect) => pending = Some(effect),
+                FlowStep::Finished(finished) => {
+                    debug!(
+                        self.log(),
+                        "publication finished: {:?}, reply {:?}", finished.outcome, finished.reply
+                    );
+                    self.publication_slot.restore(finished.ownership)?;
+                    pending = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute one action using component services; the flow receives only the result.
+    async fn execute_publication_effect(
+        &mut self,
+        effect: PublicationEffect,
+    ) -> PublicationCompletion {
+        match effect {
+            PublicationEffect::Write { scoped, schema } => {
+                let result = publication::publish_changes_transactionally(
+                    self.store.as_ref(),
+                    &self.local_member,
+                    schema.as_ref(),
+                    scoped,
+                )
+                .await;
+                PublicationCompletion::Written(result)
+            }
+            PublicationEffect::Broadcast(committed) => {
+                self.group_broadcast.trigger(
+                    GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
+                        .for_member_in_group(self.local_member.clone(), committed.group_id())
+                        .with_payload(committed.payload().clone()),
+                );
+                PublicationCompletion::Broadcasted(committed)
+            }
+            PublicationEffect::Advertise(committed) => {
+                self.notify_catch_up_available(
+                    committed.group_id(),
+                    vec![UpdateRangeMessage::from(committed.update_id())],
+                );
+                PublicationCompletion::Advertised(committed)
+            }
+            PublicationEffect::NotifyListener(listener_data) => {
+                let result =
+                    notify_listener_batches(self.listener.clone(), smallvec![listener_data]).await;
+                PublicationCompletion::ListenerNotified(result)
+            }
+            PublicationEffect::Reply { promise, reply } => {
+                let outcome = self.reply_api(promise, "publish_changes", reply);
+                PublicationCompletion::Replied(outcome)
+            }
+        }
     }
 
     /// Persist and install a prepared local group, notify the application, and invite peers.
