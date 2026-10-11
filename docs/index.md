@@ -5,8 +5,10 @@ Do not edit it directly.
 
 ## API Contract
 
+- [Derive-Based Owned Flow DSL](derive_owned_flow_dsl.md) - Explores a derive-based alternative using a real waiting-state enum, ordinary Rust payload types and structured macro implementation.
 - [FlotSync Freeform I/O API](flotsync_io_api.md) - Defines the raw and Kompact-facing freeform network I/O API model.
 - [Group Replacement Row Lineage](group_replacement_row_lineage.md) - Defines listener-visible row correspondence, divergence, and accepted-cut evidence across group replacements.
+- [Typed Owned Flow DSL](typed_owned_flow_dsl.md) - Proposes a caller-driven typed flow declaration with explicit ownership and ordinary Rust transitions, independent of the replication runtime.
 
 ## Benchmark
 

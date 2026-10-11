@@ -27,11 +27,14 @@ Ordinary empty update batches are filtered, while empty activation and creation 
 status = "open"
 type = "task"
 priority = 1
-blocked_by = [
-    "01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1",
-    "01a12607-9cd3-7812-8f4e-0665ae63f0be",
-]
+blocked_by = ["01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"]
 blocks = ["01a1071b-cacb-7752-82c6-f26dd90a71a3"]
 parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
 created_at = "2026-10-04T13:30:24.120019Z"
-updated_at = "2026-10-10T13:36:55.652276Z"
+updated_at = "2026-10-11T09:05:31.45326Z"
+
+[[comments]]
+id = "01a12a35-cd3d-7d32-9624-729f59294dd3"
+author = "codex"
+body = "The DSL exploration flotsync-oyr is deferred at user request. Its blocker has been removed so concrete flow work can continue and inform a later abstraction decision. Both proposals remain available as unselected design references."
+created_at = "2026-10-11T09:05:31.45326Z"
