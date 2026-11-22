@@ -108,6 +108,11 @@ jobs:
               with:
                   toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
 
+            - name: Install Nushell
+              uses: hustcer/setup-nu@v3.29
+              with:
+                  version: "0.117.0"
+
             - name: Install Buf
               uses: bufbuild/buf-setup-action@v1
               with:
@@ -116,6 +121,11 @@ jobs:
 
             - name: Cache Rust build artifacts
               uses: Swatinem/rust-cache@v2
+
+            - name: Check Core without runtime dependencies
+              run: nu scripts/check-core-runtime-deps.nu
+              env:
+                  RUSTUP_TOOLCHAIN: ${{ env.RUST_MSRV_TOOLCHAIN }}
 
             - name: Run nightly workspace tests
               run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} test --workspace --locked

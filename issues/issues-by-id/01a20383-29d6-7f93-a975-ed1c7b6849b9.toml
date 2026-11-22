@@ -1,0 +1,13 @@
+id = "01a20383-29d6-7f93-a975-ed1c7b6849b9"
+ref = "flotsync-ehe"
+title = "Fix Discovery build without default features"
+body = "The standalone `cargo check --locked -p flotsync_discovery --no-default-features --lib` build fails because `endpoint_selection.rs` always compiles the `EndpointSelectionPort` implementation, which refers to the optional Kompact dependency. Gate the port module and its re-export behind `kompact-runtime`, keeping endpoint selection available in the base build. Verify the featureless, peer-announcement, and default Discovery library builds."
+status = "open"
+type = "bug"
+priority = 3
+created_at = "2026-11-22T13:47:37.302733Z"
+updated_at = "2026-11-22T13:47:40.314216Z"
+
+[[links]]
+target = "01a1bb81-ade5-7962-8959-67d39ab70290"
+label = "discovered from"
