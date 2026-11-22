@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 
+[features]
+default = []
+async-timeouts = ["dep:async-std"]
+kompact-runtime = ["dep:kompact", "dep:futures-util"]
+
 [dependencies]
-async-std = { workspace = true }
-futures-util = { workspace = true }
+async-std = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 hashbrown = { workspace = true }
 iddqd = { workspace = true }
-kompact = { workspace = true }
+kompact = { workspace = true, optional = true }
 snafu = { workspace = true }
 
 [dev-dependencies]

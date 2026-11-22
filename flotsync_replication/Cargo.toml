@@ -24,7 +24,7 @@ flotsync_messages = { path = "../flotsync_messages" }
 flotsync_routes = { path = "../flotsync_routes" }
 flotsync_security = { path = "../flotsync_security", default-features = false }
 flotsync_io = { path = "../flotsync_io" }
-flotsync_utils = { path = "../flotsync_utils" }
+flotsync_utils = { path = "../flotsync_utils", features = ["async-timeouts", "kompact-runtime"] }
 futures-util = { workspace = true }
 iddqd = { workspace = true }
 interval = { package = "intervallum", version = "1" }

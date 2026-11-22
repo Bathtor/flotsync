@@ -1,29 +1,36 @@
 //! Shared utility helpers used across Flotsync crates.
+//!
+//! The `async-timeouts` feature enables future timeouts backed by async-std.
+//! The `kompact-runtime` feature enables Kompact configuration, state machines,
+//! testing helpers, claimable promises, and handler-error extensions.
 
+#[cfg(feature = "kompact-runtime")]
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
+#[cfg(feature = "kompact-runtime")]
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
-use std::{
-    convert::Infallible,
-    error::Error,
-    fmt,
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    time::Duration,
-};
+#[cfg(feature = "async-timeouts")]
+use std::time::Duration;
+use std::{convert::Infallible, error::Error, fmt, future::Future, marker::PhantomData, pin::Pin};
 
+#[cfg(feature = "kompact-runtime")]
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
+#[cfg(feature = "kompact-runtime")]
 pub mod kompact_config;
+#[cfg(feature = "kompact-runtime")]
 pub mod kompact_fsm;
+#[cfg(feature = "kompact-runtime")]
 pub mod kompact_testing;
 pub mod projected_hash_map;
 mod projected_index_hash_map;
 pub mod testing;
 
+#[cfg(feature = "async-timeouts")]
 pub use async_std::future::TimeoutError;
+#[cfg(feature = "kompact-runtime")]
 pub use claimable_promise::KClaimablePromise;
+#[cfg(feature = "kompact-runtime")]
 pub use kompact;
 pub use projected_hash_map::{
     DuplicateProjectedIndexKeyError,
@@ -61,8 +68,11 @@ pub fn coerce_infallible<T>(infallible: Infallible) -> T {
 
 /// Stable timeout extension for futures.
 ///
+/// Available with the `async-timeouts` feature.
+///
 /// This mirrors async-std's unstable `FutureExt::timeout` method shape while
 /// delegating to its stable free function.
+#[cfg(feature = "async-timeouts")]
 pub trait FutureTimeoutExt: Future + Sized {
     /// Return a future that completes with this future's output or a timeout.
     #[must_use]
@@ -92,9 +102,11 @@ pub trait FutureTimeoutExt: Future + Sized {
     }
 }
 
+#[cfg(feature = "async-timeouts")]
 impl<F> FutureTimeoutExt for F where F: Future {}
 
 /// Snafu `Whatever` context helpers that immediately classify handler errors.
+#[cfg(feature = "kompact-runtime")]
 pub trait ResultExt<T, E>: Sized {
     /// Add eager `Whatever` context and classify failures as benign handler errors.
     ///
@@ -160,6 +172,7 @@ pub trait ResultExt<T, E>: Sized {
         E: Into<<snafu::Whatever as FromString>::Source>;
 }
 
+#[cfg(feature = "kompact-runtime")]
 impl<T, E> ResultExt<T, E> for Result<T, E> {
     fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
     where
@@ -215,6 +228,8 @@ impl<T, E> ResultExt<T, E> for Result<T, E> {
     }
 }
 
+/// Adds conditional construction and, with `kompact-runtime`, handler-error
+/// classification to `Option`.
 pub trait OptionExt<T> {
     /// Construct `Some` only when `cond` is true.
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;
@@ -224,6 +239,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Benign`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>;
@@ -233,6 +249,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Benign`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,
@@ -243,6 +260,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Recoverable`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>;
@@ -252,6 +270,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Recoverable`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,
@@ -262,6 +281,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Unrecoverable`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>;
@@ -271,6 +291,7 @@ pub trait OptionExt<T> {
     /// # Errors
     ///
     /// Returns [`HandlerError::Unrecoverable`] when `self` is `None`.
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,
@@ -282,6 +303,7 @@ impl<T> OptionExt<T> for Option<T> {
         if cond { Some(thunk()) } else { None }
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>,
@@ -289,6 +311,7 @@ impl<T> OptionExt<T> for Option<T> {
         SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).benign_err()
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,
@@ -297,6 +320,7 @@ impl<T> OptionExt<T> for Option<T> {
         SnafuOptionExt::with_whatever_context::<F, S, snafu::Whatever>(self, context).benign_err()
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>,
@@ -304,6 +328,7 @@ impl<T> OptionExt<T> for Option<T> {
         SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).recoverable_err()
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,
@@ -313,6 +338,7 @@ impl<T> OptionExt<T> for Option<T> {
             .recoverable_err()
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
     where
         S: Into<String>,
@@ -320,6 +346,7 @@ impl<T> OptionExt<T> for Option<T> {
         SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).unrecoverable_err()
     }
 
+    #[cfg(feature = "kompact-runtime")]
     fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
     where
         F: FnOnce() -> S,

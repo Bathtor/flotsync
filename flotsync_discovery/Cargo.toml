@@ -7,7 +7,11 @@ rust-version.workspace = true
 [features]
 default = ["zeroconf-via-kompact"]
 kompact-runtime = ["dep:kompact"]
-peer-announcement-via-kompact = ["kompact-runtime", "dep:flotsync_io"]
+peer-announcement-via-kompact = [
+    "kompact-runtime",
+    "dep:flotsync_io",
+    "flotsync_utils/kompact-runtime",
+]
 zeroconf-support = ["dep:zeroconf"]
 zeroconf-via-kompact = [
     "kompact-runtime",
