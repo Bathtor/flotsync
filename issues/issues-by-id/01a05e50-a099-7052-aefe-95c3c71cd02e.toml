@@ -4,33 +4,249 @@ title = "Decompose replication runtime component"
 body = """
 Goal
 
-Decompose the oversized ReplicationRuntimeComponent and its service/topology setup into maintainable boundaries, making important runtime phases explicit without coupling the work to application startup synchronisation.
+Decompose ReplicationRuntimeComponent and its service/topology setup into explicit, maintainable state ownership and workflow boundaries, ending with explicit concurrent execution and local input deferral. Preserve correctness guarantees and application startup synchronisation; change scheduling in separately reviewed steps after behaviour-preserving extraction. Design for approximately twice the current runtime functionality without requiring one large code review.
 
-Context
+Status
 
-C01. ReplicationRuntimeComponent currently combines public API dispatch, update application, group workflows, listener delivery, security operations, startup recovery, and replication-port handling in one module of roughly 4,000 lines.
-C02. Several operations currently use Handled::block_on to prevent interleaving while async work is in progress. Some of these blocking sections may be encoding meaningful implicit runtime states rather than merely awaiting short atomic work.
-C03. flotsync-5ou can use the existing inactive-component lifecycle and therefore does not require this decomposition.
-C04. This remains priority-1 architectural work because adding further behaviour to the current component without clearer state ownership will make ordering and failure handling increasingly difficult to maintain.
+Plan agreed by the user on 2026-10-04. Concurrent execution is required by the end of this task; blocking is an intermediate implementation only. Flows own state partitions across complete consistency intervals, permitting private temporary inconsistency. One shared selective mailbox retains events; only its head can start a new flow, while existing finite flows may scan for matching progress events. Intentional head-of-line blocking replaces bypass admission and age-based reservation machinery. Branch: codex/decompose-replication-runtime-component-flotsync-zop. Claimed by codex; status_reason is plan agreed. Detailed child issues below define the review sequence. flotsync-zop.01 was accepted on 2026-10-04: docs/replication_runtime_flow_contracts.md records the source-verified contracts and evidence; the controlled publication and batch listener tests establish the current hand-off boundaries. Its findings are integrated into .02-.24. The accepted .02 G02.1-G02.4 review correction clarifies module ordering and marks split impls for mandatory retirement without implementing the FSM conversions early. The parent stays in progress until all conversion and concurrency acceptance criteria are satisfied.
 
-Investigation direction
+Evidence
 
-D01. Inventory block_on call sites and distinguish genuinely atomic mailbox turns from implicit lifecycle or protocol phases.
-D02. Where a phase has meaningful entry, accepted inputs, deferred inputs, completion, rollback, or failure semantics, represent it as an explicit FSM state rather than relying on a long blocked handler.
-D03. Keep transition ownership and invariants central while allowing coherent FSM state implementations to live in separate files instead of growing one monolithic component module.
-D04. Evaluate which responsibilities should remain one serialised Kompact component, which should become owned domain state/service objects, and which justify separate components or ports.
-D05. Preserve existing behaviour through incremental, independently reviewable extractions with focused transition and ordering tests.
-D06. Revisit runtime-service and topology inputs so dependencies are grouped by responsibility rather than exposing every service to the whole component.
+E01. component/mod.rs has 4251 lines; component/ totals 6201 lines including tests. activation_provider.rs accounts for 1576 lines, with its test section beginning around line 759. host/topology.rs has 1071 lines and already groups IO, transport, discovery, delivery and runtime logic.
+E02. Ten production Handled::block_on sites cover inbound summary, inbound pending group work, single update, update batch, publish, API summary, group creation, membership change, decision response and startup. Four further sites support tests. Security requests and advisory observed-summary work already use spawn_local.
+E03. Inbound update transactions apply a newly-ready causal chain atomically. An UpdateBatch uses one transaction per input update, emits committed listener results as it progresses, and accumulates catch-up observations until completion/failure. The entire batch currently excludes mailbox interleaving.
+E04. Publication commits before outbound submission and listener notification; replies follow notification. Creation instead notifies before sending invitations. Membership replacement dispatches after activation and before its listener notification. Preserve these operation-specific sequences.
+E05. Accepted pending work is committed before activation. Failure before activation commit leaves resumable accepted work and the predecessor read-only. Failure opening the activation listener provider after activation commit is unrecoverable and requires restart/resynchronisation. Listener failures have caller-specific policies; do not replace them with blanket retry or rollback.
+E06. Reliable processed promises are completed at specific handler success points. They must remain owned through the appropriate workflow and never be completed simply because ingress admitted a message.
+E07. Inspected the complete 352-issue inventory, including 74 unresolved issues; both list results had skipped=0. Read relevant issue plans and current implementation. Some historical issue descriptions are stale: kompact_fsm already lives in flotsync_utils, and topology inputs are already grouped.
 
-Planning constraint
+Agreed architecture
 
-Detailed boundaries and implementation sequencing are intentionally deferred until this task is discussed separately. Do not use flotsync-5ou as the vehicle for opportunistic structural refactoring.
+A01. Compose owned domain FSMs beneath one runtime coordinator, retaining one serialised mutation/listener domain initially. Keep existing SummaryRequestManagerComponent and CatchUpManagerComponent separate. This is an internal decomposition, not a commitment to a permanent single public gateway; preserve public Kompact exports and future concern-specific interfaces from flotsync-ozi/flotsync-3ht.
+A02. Separate three kinds of state: runtime lifecycle, transient operation progress, and persisted group/work lifecycle. Persisted records remain authoritative; do not introduce a second mutable map mirroring all group state. Pending decisions are long-lived domain work, not a reason to keep the whole runtime busy.
+A03. Combined FSM shape: Inactive -> Recovering(RecoveryState) -> Running(SchedulerState) -> Stopping -> Stopped, with fault exits delegated to Kompact. Initially the scheduler admits one owned exclusive operation; finally it owns a bounded set of active operation FSMs, shared-resource reservations and pending input. Recovery can embed the same activation and listener machines used in normal operation. This is hierarchical composition, not a flattened Cartesian product of every possible child state.
+A04. Domain machines own phase payloads, pending obligations and the partitions of component state they need for a complete flow or explicitly delimited subsection. A partition may be temporarily inconsistent with other partitions while exclusively owned by that flow. Competing flows cannot access it until the owner restores the required consistency and returns it. Typed state variants encode the weaker intermediate invariants. Transition-level field destructuring supplements this lifetime ownership; it does not replace it. Child machines receive no unrestricted RuntimeServices or component access. Audit aliases and external effects separately.
+A05. A small runtime-local transition API should support handling a domain event, producing an effect, advancing on its typed completion, reporting an expected domain outcome, and faulting on an internal invariant violation. Request replies and reliable processed completions are explicit obligations. Prefer domain enums and concrete handlers initially, not a general trait hierarchy, boxed Any or an untyped action bus.
+A06. A shared operation driver advances synchronous transitions until an effect is required, executes that effect, and passes its completion back to the owning machine. The initial adapter drives exclusive workflows inside Handled::block_on, preserving mailbox admission and ordering. State transitions perform no IO; transaction bodies remain ordinary linear async functions. Expose transaction commit and listener completion as meaningful boundaries, not every store call as a synthetic event.
+A07. Before suspension, install the next owned FSM state and record its partition ownership. An explicit Occupied(flow_id) partition slot is valid across awaits; an accidentally empty State<T> slot is not. Keep the partition in the FSM or its owned in-flight effect, with no second mutable alias. Return it only after the relevant consistency boundary is restored. On failure, perform domain cleanup or retain a faulted/unavailable partition; never use unconditional drop-based unlocking to imply restored consistency.
+A08. Use flotsync_utils::kompact_fsm as an ownership-mechanics reference, not as a complete policy engine: its Invalid outcome marks a recoverable component fault, which is not correct for every malformed external message or post-commit failure. Keep flotsync-rok/flotsync-ct7n independent; feed production evidence back rather than requiring the entire generic design first.
 
-Sizing
+FSM inventory
 
-The complete implementation is likely to exceed 1000 LOC. Once the FSM inventory and ownership boundaries are agreed, split the work into independently reviewable child tasks where practical."""
-status = "open"
+F01. Recovery: replay unresolved decisions -> resume accepted activations -> ready; failure retains existing startup fault semantics. Application reconciliation before component activation remains host-owned and outside this machine.
+F02. Publish: validate/prepare -> execute transaction -> committed -> submit broadcast/catch-up observations -> notify listener -> reply. Pre-commit failure and committed-but-not-notified failure are distinct outcomes; preserve public error mapping.
+F03. Inbound apply: validate -> execute causal-chain transaction -> committed outcome -> notify/observe -> done. Batch owns an item cursor and aggregate catch-up observations and composes this machine; partial failure preserves preceding commits and emits accumulated observations exactly as today.
+F04. Group decision: classify replay/conflict -> verify setup -> evaluate policy -> persist decision or acceptance or rejection -> notify decision listener or start activation -> finish processed/reply obligation. Awaiting user choice lives in persisted pending work. Accepted direction is coordinated by predecessor group, not independently per target, so competing targets cannot both win.
+F05. Activation: accepted work -> activation transaction -> committed -> install group snapshot -> acquire listener provider -> deliver activation -> done. Reuse for auto-accept, explicit response, local replacement and startup. Keep creation and replacement dispatch placement outside the shared activation primitive.
+F06. Creation and membership-change orchestration: preparation -> store/acceptance checkpoint -> common activation where applicable -> operation-specific dispatch/notification/reply. Factor shared policy and transaction helpers without merging distinct ordering rules into flags.
+F07. Listener delivery: ready(payload/provider and continuation) -> delivering -> accepted or failed. It is an owned child operation under the ordering gate, not a new component or independent queue initially. Preserve empty activation notifications and existing update empty-batch filtering, provider lifetime and transaction cleanup.
+F08. Summary handling: read snapshot -> construct/submit reply or delegate -> done. Remote timeout/correlation stays in SummaryRequestManager. Advisory catch-up inspection retains its existing independent, stale-tolerant execution. Security APIs are narrow services with request completion, not elaborate long-lived FSMs until a real protocol needs them.
+
+Scheduling and failure contract
+
+B01. Initial conversion preserves existing block_on behaviour, including ordinary API/port work waiting during exclusive operations and the existing scheduling of spawned advisory/security work. Do not claim a total FIFO across distinct Kompact input sources.
+B02. Concurrent scheduling is required within zop after the structural conversion. Route every relevant ingress through explicit admission, correlate asynchronous completions, replace the global operation gate with reviewed resource/order reservations, and implement bounded local pending input with fairness, overflow and shutdown policy. The concurrency design is reviewed before initial FSM interfaces are fixed. Never introduce an unbounded hidden postpone queue.
+B03. Long external waits belong in persisted domain work or a dedicated protocol owner; future snapshot fetch should not hold the global runtime gate for an entire transfer. Per-group concurrency would require reserving both predecessor and successor for replacement and reviewing global listener ordering and shared snapshot publication.
+B04. Expected API rejection returns its existing typed error; malformed network inputs retain classified diagnostics/drop/fault behaviour; impossible internal completions fault. Known stale work follows explicit idempotence policy. Preserve StoreError classifications and distinguish retryable operations from transaction-scoped failures. Do not automatically retry committed work or infer rollback from a lost reply or cancellation.
+B05. Listener callbacks are awaited. Calling and awaiting a conflicting runtime operation inside a callback can form a wait cycle, including through retained provider transactions. Preserve bounded hand-off assumptions and add a documented/tested example; concurrent unrelated work does not imply arbitrary callback reentrancy. Shutdown retains current behaviour during extraction and acquires explicit admission/drain semantics in the concurrent phase. Automatic component replacement remains flotsync-sae.
+
+Agreed concurrent end state
+
+C01. Concurrency means multiple operations can be in flight while their IO/callback futures wait; coordinator transitions remain serialised Kompact turns. CPU-parallel execution is not required. The scheduler accepts compatible resource claims and enforces same-domain ordering instead of treating the entire component as busy.
+C02. Each ownership interval documents partitions taken, intermediate inconsistencies permitted, consumers excluded, stable shared views still accessible, and completion/failure conditions for returning the partitions. Store the partition values in flow-owned state across asynchronous phases rather than borrowing them only for synchronous transitions. Admission takes the full required set atomically. Immutable published views may remain available with explicit stale-tolerance; a flow requiring current coherent state needs the relevant partition capability. Rust ownership proves exclusive value access, but aliases and external observations still require review.
+C03. Describe store access by canonical store identity, logical records and read/write mode for review, testing and capacity accounting; this descriptor is not automatically a runtime reader/writer lock. Store wrappers and different fields may alias. Retain scheduler claims only for demonstrated multi-phase ordering needs: same-group mutation/listener sequencing, predecessor/successor workflow coordination, listener invocation and bounded capacity. Avoid a generic lock manager that duplicates database concurrency control.
+C04. Revised after user feedback: rely on a specified/tested backend transaction-isolation contract rather than imposing runtime-wide store read/write exclusion. Current SQLite writes begin with BEGIN IMMEDIATE and reads provide retained snapshots; the generic trait does not itself state enough to assume all backends prevent lost updates. For each transaction, document required atomicity/conflict behaviour; require appropriate backend isolation or conditional validation, and classify/retry aborted transactions at their existing policy boundary. Revalidate accepted work, lifecycle, chosen target/cut and key/schema assumptions in each new transaction, not in a separate preflight read. Every intermediate committed state must be valid for other components to observe. Resource admission remains useful for capacity and application ordering, not as a substitute for the store contract.
+C05. Hold per-group owned partitions through the interval in which outsiders would see inconsistent state or ordering. Batches retain their group partition for the whole batch; replacement takes predecessor, successor and decision-set partitions together. Acquire the full set atomically, avoiding hold-and-wait between flows. If later phases need additional partitions, release at a verified stable checkpoint and re-enter fair admission with revalidation, or acquire the conservative union initially. Database transaction lifetimes need not equal partition lifetimes.
+C06. The projection is RuntimeGroupStateSnapshot: group id, name, members, resolved schema and lifecycle, excluding rows/version-vector progress. Prefer retaining whole-map publication with an exclusively owned ProjectionWriter partition from before the snapshot-building database read through commit and publication. All projection-changing runtime flows honour that ownership, so no newer projection can be overwritten by an older completion. Non-projection-changing flows may still progress. The owner can represent DatabaseCommittedButProjectionPending privately while other consumers use a documented older published snapshot or wait for consistency. Audit delivery/security consumers and all group-metadata writers; the runtime cannot hide a committed database inconsistency from external users or revoke existing Arc snapshots. Affected-group deltas remain an alternative for finer writer concurrency, not a prerequisite of zop.
+C07. One listener lane serialises callback invocation. Reserve bounded output capacity before commits producing events; ordinary buffered notifications queue in coordinator completion order. Preserve per-group causal order and contiguous batch notifications. Batches reserve the lane before their first transaction. For activation, retain a target-group mutation boundary until the listener's read transaction has actually established the required snapshot and its token/lineage has been validated; transaction creation alone may not establish the backend snapshot. Initially retain the stronger same-group boundary through callback completion for simpler ordering. Different groups may progress. No write transaction is held while awaiting the listener. Retained read providers use the backend's snapshot/concurrency contract, not a global application reader lock. Keep listener/store wait-dependency tests, especially for backends where retained readers impede writers; reserve the activation lane before opening such a provider if necessary to prevent waiting behind a batch requiring writes.
+C08. Concrete intended overlap, when admission reaches these requests: immutable identity queries during a blocked listener; independent snapshot queries; security preparation/IO while an unrelated operation waits; group B preparation/transaction while group A awaits an ordinary listener callback after its transaction completes. Same-group mutations, predecessor/target replacement conflicts and listener invocations remain ordered. A blocked new-flow request at the head intentionally prevents younger independent starts. Tests must demonstrate actual overlap and forbidden pairs under this policy; removing block_on alone is insufficient acceptance evidence.
+C09. Retain all unconsumed domain events in one arrival-ordered selective mailbox. Only the actual head can start a new flow, and only if all its required partitions are available. Never scan for younger eligible starts. Existing finite flows may take their first matching event from anywhere. Reconsider the head after consumption/termination. No global-to-local event transfer or mandatory framework-owned inboxes. Explicit flow/work correlation distinguishes continuations from new requests, including a second publish for the same group. Retain original owned envelopes where validation belongs at consumption.
+C10. Flows choose their own event matching and accumulation: they may consume admissible out-of-order events into domain state or leave them pending. The framework prescribes neither local FIFO nor event-class buckets. Use an arrival-linked slot arena (or equivalent) for bounded traversal and O(1) removal given a matched slot, avoiding VecDeque middle-shifting. Save scan position for an unchanged pattern while awaiting new arrivals; invalidate/restart when the pattern or relevant admission conditions change. Limit work per scheduler turn and schedule active flows fairly. Selection is pure/non-consuming until a message is assigned to exactly one owner. Matching may inspect event metadata/correlation, not perform async database work.
+C11. Completion events can live in the same selective mailbox but use capacity reserved when their effects are launched, so ordinary ingress cannot prevent progress. Lifecycle control remains directly handled. Correlate completion with operation and expected phase; classify late cancelled completions versus impossible internal completions. Bound in-flight effects, flow-owned accumulations and outputs as well as mailbox entries. Timer identity uses existing Kompact scheduled timer UUIDs.
+C12. Overload proposals to resolve in the concurrency contract: reject new API work with an explicit typed busy/overload outcome; coalesce only advisory observations with a proven merge rule; never silently discard accepted mutations or complete reliable processed promises merely to free queue space. Reliable ingress needs verified redelivery/negative-completion or a bounded upstream hand-off; do not assume dropping its promise guarantees retry. Best-effort update loss must be justified by catch-up semantics. Trace every event family's overload action before enabling finite caps. Local pending bounds do not bound upstream Kompact mailboxes; document and test that limit, and add producer-side permits/credits where an end-to-end bound is required.
+C13. Stopping closes admission, resolves pending API requests, retires pending protocol inputs according to their delivery contract, and continues handling completions while active operations reach safe terminal/checkpoint states. After commit, cancellation never implies rollback. Preserve cleanup of transactions/providers and prevent stale completions mutating stopped state. Define timeout escalation consistently with the host; no promise that a hung application callback can be gracefully drained indefinitely.
+C14. Required evidence per admitted overlap: field ownership compatibility, external-resource compatibility, logical ordering compatibility, bounded retained resources, and no cycle in the wait dependencies (especially store/listener/port replies). Test both completion orders, failures and shutdown at phase boundaries. Distinguish safety from liveness and responsiveness. The access declaration is an executable admission input, not only documentation.
+C15. Require finite ownership intervals with success, failure and cleanup paths; persisted human decisions or long remote waits end the interval and resume as new work. Head-only admission prevents younger new flows overtaking an older blocked start. Fair active-flow turns permit current owners to finish. No active flow may require starting a new flow from behind a blocked head to make progress: such work must be an effect/continuation of an existing flow or the owner must first finish a safe interval. Unsupported/stale/orphan head input has an explicit terminal disposition. External waits retain justified timeout/fault policies. No age-based reservations or bypass admission; retries cannot silently reorder pending starts.
+
+Concrete transaction and FSM design refinements
+
+D01. Publication machine proposal: Writing(reply) -> Notifying(reply, committed receipt) -> Finished. Transaction completion returns a typed CommittedPublish payload (encoded outbound data, catch-up observations and listener changes); only this payload can produce post-commit effects. Write failure replies with the classified transaction error. Notification failure replies with the existing post-commit error policy and never retries the publication transaction. Domain transitions are synchronous, take owned state/event and return Next(state, effect) or Finish; invalid internal state/event combinations use a contextual Snafu invariant error.
+D02. Flow construction takes owned partitions from an availability registry: Available(T), Occupied(FlowId), or Faulted(context). An activation flow owns its ProjectionWriter plus relevant group/decision partitions through acceptance/activation publication intervals. States such as Committing and DatabaseCommittedButProjectionPending carry those values and their weaker invariants. The completion path publishes/restores consistency before returning a usable partition; a failure path explicitly repairs, returns a valid older state when safe, or faults. Exhaustive synchronous field partitioning remains useful for implementing transitions but is secondary to this flow-lifetime ownership.
+D03. Acceptance commit must leave predecessor read-only with an immutable selected successor/final cut, accepted pending activation and matching inactive material, while competitors are discarded atomically. That is a supported observable intermediate state, not an inconsistency hidden by a runtime lock. Activation begins a new transaction, reloads the pending activation by key and verifies the predecessor direction/cut, target material/schema/membership and target status before doing any writes.
+D04. Activation commit atomically installs target rows/progress, activates target, closes the hosted predecessor and removes pending activation. A concurrent/stale request is classified as already completed, superseded or invalid persisted state as appropriate; missing work alone is not proof of success. The subsequent provider snapshot must agree with its read token and replacement lineage. Keep a same-group ordering boundary while establishing that snapshot, without blocking unrelated groups. Never combine rows from a newer cut with the activation's older token.
+D05. Transactional rereads alone are insufficient under weak isolation: implementations must prevent conflicting concurrent decisions/updates from both committing, through appropriate isolation, row locks or conditional writes. Scope any missing store-contract clarification/tests explicitly; do not assume Send + Sync or the word transaction proves serialisability. Validate policy-sensitive security evidence again at the transaction boundary if earlier preparation used mutable trust state.
+D06. Shared-mailbox proposal: RuntimeInput distinguishes new work and correlated continuations inside one event union. Each active flow exposes matches(&RuntimeInput) and consumes a selected owned event through its typed transition handler. A scheduler metadata queue may track runnable flow IDs but owns no messages. Duplicate completions are never silently overwritten. On flow termination, correlated remaining events get explicit replay/rejection/fault disposition; unsupported messages do not remain forever waiting for a nonexistent receiver. Match caches must be invalidated when state changes make earlier skipped events relevant.
+
+Module and dependency boundaries
+
+M01. Keep component/mod.rs as the public Kompact shell with ingress and lifecycle adaptation, targeting roughly 250-450 production LOC. Separate coordinator and effect execution; neither should accumulate domain algorithms.
+M02. Put domain machines, transaction functions and their tests together under workflow folders: updates, publication, groups/decisions, groups/activation, groups/creation, groups/membership, recovery and listener delivery. Preserve existing activation provider, replay, pending_group and group_state boundaries where sound. Split a single-file module by moving existing contents to mod.rs first, per repository rules.
+M03. A group-state owner controls projection publication after committed group changes; transaction code builds outcomes without publishing independently. No duplicate mutable group lifecycle cache.
+M04. Inject store access and immutable identity/schema views into transaction services; listener access only into listener execution; delivery submission into the shell/effect adapter; security preparation into group setup and the security adapter. Keep the existing grouped topology inputs but narrow what each consumer receives. Do not move or redesign the entire topology file just to meet a line target.
+M05. Aim for cohesive production modules of roughly 200-600 LOC as a review heuristic, not a hard limit. Review dependency direction and single ownership more strongly than file length. Do not move impl ReplicationRuntimeComponent across ten files and call that the completed architecture. Any cross-module component impl introduced for incremental extraction is temporary and must carry an issue-linked TODO. Convert its domain behaviour into sub-FSMs or narrow services as the corresponding child is implemented. All inherent and trait impls of ReplicationRuntimeComponent must reside with its declaration in component/mod.rs at parent completion. .14 retires summary/security extension impls; .24 finishes fixture/message helper cleanup and audits all component impls. Colocate sub-FSM types and their impls, and colocate message constructors with their message type or use fixture-local free builders.
+
+Future work mapping and boundaries
+
+G01. flotsync-i8m: activation gains a snapshot-ready prerequisite and a separate resumable fetch protocol; retain provider-based bounded delivery, do not materialise a full snapshot in the coordinator.
+G02. flotsync-kti, flotsync-yty, flotsync-pcv, flotsync-qzt, flotsync-8k4 and flotsync-2js: group lifecycle and predecessor/target coordination remain local to the group workflows; no new leave, close, schema-epoch or read-token-remapping semantics in zop.
+G03. flotsync-2jw, flotsync-hitr, flotsync-kxpeer and flotsync-z4s: key/trust work belongs behind security service/protocol boundaries. No key-discovery FSM variants in the runtime-wide coordinator.
+G04. flotsync-opy, flotsync-5j0.4, flotsync-yd6 and relay/route work: delivery semantics remain delivery-owned; zop preserves current processed and submission boundaries without claiming stronger acknowledgements or persistence.
+G05. flotsync-sae, flotsync-3ht and flotsync-gxo: supervision, external Kompact embedding and parallel topology startup stay separate. Operation state must not hide authoritative component references in arbitrary child services.
+G06. flotsync-5az, flotsync-duu, flotsync-mzc and flotsync-dj1: preserve transaction-scoped paging/provider contracts and backend independence; no storage redesign or data-format conversion work.
+G07. flotsync-get, flotsync-xrs and flotsync-qy6: deterministic state/effect tests create useful seams now; no dependency on a full network simulator before this decomposition can ship.
+
+Proposed review units (new or materially edited LOC includes tests; relocated unchanged code estimated separately)
+
+R01. Behaviour contracts and narrow controlled-completion test fixtures: 250-400 LOC, no moves. Cover current cross-operation ordering and checkpoint failure boundaries.
+R02. Isolate public messages/test plumbing and narrow security/summary adapters: 150-250 LOC, 450-700 existing LOC relocated. Separate mechanical movement from semantic edits in review.
+R03. Extract publication transaction/service boundary: 150-250 LOC, 350-550 relocated. Preserve existing handler sequencing.
+R04. Extract inbound apply transaction/service boundary: 200-300 LOC, 400-650 relocated. Preserve chain atomicity and batch partial progress.
+R05. Runtime-local transition driver plus combined coordinator, first integrated with publication: 450-650 LOC, at most 150 relocated. Use other operations through existing handlers while incrementally converting; no runtime feature flag or permanent dual implementation.
+R06. Convert inbound single/batch application and listener sequencing: 450-700 LOC, at most 200 relocated. Compare effect traces and exercise adversarial completion order.
+R07. Extract group classification/policy and decision persistence: 250-400 LOC, 500-700 relocated. Split moves into smaller patches if total review burden exceeds the target.
+R08. Convert pending decision/acceptance workflow: 450-700 LOC, at most 200 relocated. Include stale response, replay and competing-target coverage.
+R09. Extract activation transaction/provider boundary: 200-300 LOC, 300-450 relocated. Retain existing activation provider tests in place.
+R10. Convert activation and its failure checkpoints: 450-700 LOC, at most 150 relocated. Exercise all entry paths and provider cleanup.
+R11. Convert local creation and membership orchestration in separate child reviews (.11 and .12): 550-850 LOC combined, 250-450 relocated.
+R12. Convert startup recovery and finish narrow service/topology assembly: 350-550 LOC, 200-350 relocated. Verify startup hand-off, inactive queue behaviour and lifecycle cleanup.
+R13. Intermediate coverage/ownership audit is integrated into .14/.15; final scaffolding removal and complete parent acceptance audit are .24. No completion at the blocking-only checkpoint.
+R14. Flow-owned partition registry, store-access descriptors and fair admission, initially one-operation policy: 300-450 LOC including tests. Specify ownership intervals, permitted intermediate inconsistency, restoration/fault paths and transactional invariants during R01/R05. Do not introduce blanket store read/write exclusion.
+R15. Split shared selective mailbox (.18), head-only admission/selective scheduling (.19), and bounded ingress/completion/output policies (.20) into separate review units. Include pattern-change invalidation, head-of-line blocking, completion progress and stale-head disposition. No bypass admission or framework local inboxes. Review concrete per-input overflow contracts before enabling caps.
+R16. Asynchronous effect completion and active-operation registry: 450-700 LOC including tests. First retain serial admission while removing mailbox blocking; prove completion progress under deferred-input pressure.
+R17. Enable tested compatible overlap in small operation-family increments: 350-550 LOC including tests. Keep transactional assumptions, flow-owned projection/group partitions and listener constraints explicit. Do not add a blanket store reader/writer gate or create a large all-at-once enablement patch.
+R18. Concurrent shutdown, overload and adversarial scheduling coverage; final cleanup: 250-400 LOC including tests. Split if delivery backpressure or API changes push this over the review budget.
+R19. Before R17: flow-owned projection publication and phase revalidation/isolation coverage, in two review patches if needed: 350-750 LOC including tests. Approximately 200-400 LOC for ownership/checkpoint publication and 150-350 LOC for transaction revalidation/contracts. Preserve immutable published views; demonstrate exclusion through commit/publication and concurrent progress of unaffected flows. Group-delta redesign is not included unless later evidence justifies revisiting this choice.
+
+Sizing and review process
+
+S01. The detailed 24-child estimates sum to approximately 6900-11100 new/materially edited LOC including tests/docs, plus existing-code relocations accounted for separately in child bodies. This supersedes the earlier coarse 6200-9650 range by explicitly separating creation/membership, completing summary/security integration, and budgeting mailbox storage, scheduling, capacity and final validation. Each child targets 150-700 edited/new LOC; no single review should approach the aggregate size. Upstream delivery hand-off changes may require further linked slices and estimates. Counts are planning ranges, not net repository growth; deleted monolith code offsets much of the work. Do not cut required validation to force the earlier estimate.
+S02. The 24 child issues below form a deliberate sequential review chain: each blocks on its immediate predecessor, and .01 is initially ready. These are delivery/review dependencies, not a claim that all work is technically inseparable. Prefer one review unit active at a time and incremental PRs against the last accepted baseline. Each unit compiles and preserves applicable tests. No final mega-PR or reopening accepted architecture during routine implementation; surface material deviations for alignment.
+S03. Aim for 300-800 substantive review lines per PR. Mechanical moves should have their own reviewable patch with a source-to-destination map and no incidental clean-up. Split any unit over 1000 substantive lines; count changed tests and glue, not just production code. Do not confuse a move's added+deleted diff count with genuinely new code.
+S04. Before each FSM conversion, review its transition table, accepted inputs, effects, commit boundary, reply/processed obligation, failure policy and test matrix. Each PR description records covered invariants and tests. Stage nothing before user review.
+S05. Validation uses pure state/effect tests, controlled transaction/listener completions and existing runtime integration tests. Cover publication versus update/batch/activation ordering, replay and competing acceptance, pre/post-commit failures, dropped replies, provider cleanup and startup work. Use existing Kompact port testing support and socket broker when needed. Run relevant tests and pedantic Clippy for implementation slices; no tests are required for this planning-only change.
+
+Alternatives
+
+T01. Pure file split is cheaper but leaves ownership and implicit state coupling intact; use only as intermediate review steps.
+T02. One component per domain or per group improves scheduling isolation but adds message/reply/stop/recovery protocols and cross-group coordination. Keep it open for measured throughput or external-wait needs, not a prerequisite for maintainability.
+T03. Build the complete generic FSM framework first: reusable but couples this priority-1 refactor to broader policy choices and can spend 1000+ LOC before improving the runtime. Prefer a small local API proven by publication and batch application, then reassess reuse.
+T04. Fully event-driven execution is the required end state of zop, reached after behaviour-preserving FSM conversion. Keep concurrency policy explicit from the design stage and implement admission, deferral, asynchronous execution and overlap as separate review units. It is not deferred to an optional future task.
+T05. Runtime enums suit dynamic dispatch and persisted recovery; use typestate locally for phase-owned payloads where it prevents real mistakes. Do not impose Session<State> on the shared public API or claim compile-time guarantees against stale aliases and external messages.
+
+Acceptance criteria
+
+Z01. Main component is a thin adapter, domain transition ownership is explicit, and the combined FSM admits compatible operations concurrently with explicit deferred input. Completion requires demonstrated overlap and conflict/order enforcement, not only removal of block_on or smaller files. No impl of ReplicationRuntimeComponent may remain outside component/mod.rs. Domain behaviour belongs to sub-FSMs with colocated types/impls; the component retains only thin dispatch, scheduling, port and lifecycle glue. .24 must verify this source-level invariant before parent acceptance.
+Z02. Preserve transaction boundaries, per-group causal/listener guarantees, processed acknowledgement points, error classifications, persisted record formats and startup reconciliation. The reviewed concurrency contract explicitly defines cross-group order, overload outcomes and shutdown behaviour; any resulting public API additions must be specified before implementation.
+Z03. Every existing workflow has a named owner and inspectable transition coverage; future snapshot fetch, lifecycle and security features have clear extension points.
+Z04. Each extraction/conversion is accepted independently. The parent remains open until the user agrees the complete decomposition is finished.
+
+Child delivery order
+
+flotsync-zop.01: Specify runtime flow contracts and characterisation coverage (R01).
+flotsync-zop.02: Extract runtime messages and API adapters (R02).
+flotsync-zop.03: Extract publication transaction service (R03).
+flotsync-zop.04: Extract inbound update transaction service (R04).
+flotsync-zop.05: Introduce owned publication FSM and blocking driver (R05).
+flotsync-zop.06: Compose inbound and listener flow FSMs (R06/F03/F07).
+flotsync-zop.07: Extract group policy and decision persistence (R07).
+flotsync-zop.08: Convert pending group decision flows (R08).
+flotsync-zop.09: Extract activation transaction and provider boundaries (R09).
+flotsync-zop.10: Convert activation checkpoint FSM (R10).
+flotsync-zop.11: Convert local group creation flow (R11a).
+flotsync-zop.12: Convert membership replacement flow (R11b).
+flotsync-zop.13: Convert recovery and narrow topology dependencies (R12).
+flotsync-zop.14: Complete summary flows and security adapters (F08/R13).
+flotsync-zop.15: Implement flow-owned partition registry (R14/R13).
+flotsync-zop.16: Specify store isolation and revalidate flow phases (R19a).
+flotsync-zop.17: Enforce flow-owned group projection publication (R19b).
+flotsync-zop.18: Implement shared selective mailbox storage (R15a).
+flotsync-zop.19: Implement head-only flow admission and selective scheduling (R15b).
+flotsync-zop.20: Bound ingress effects and notification capacity (R15c/R18).
+flotsync-zop.21: Drive owned flows with asynchronous completions (R16).
+flotsync-zop.22: Enable compatible runtime flow concurrency (R17).
+flotsync-zop.23: Complete concurrent shutdown and terminal event handling (R18).
+flotsync-zop.24: Audit and finish runtime FSM decomposition (R13/Z01-Z04).
+
+Execution instructions for every child
+
+X01. Parent architecture is agreed. Read the child, parent and current code before work; do not overwrite manual changes. Claim only the selected child and do not create/switch branches without explicit permission. Keep all changes unstaged for review and close only after user acceptance.
+X02. Each child body supplies scope, exclusions, validation and size. Give source-to-destination maps for mechanical moves and separate them from semantics. Aim for 300-800 substantive review lines; split over 1000 including tests/glue. If implementation uncovers extra required work, add linked gitrack work and update the holistic parent rather than hiding a TODO.
+X03. Preserve Snafu error classification, Kompact message documentation, protobuf conversion traits and existing paging/provider contracts. Use rustfmt and pedantic Clippy, meaningful focused tests, serial sandbox cargo tests and socket reservations as required. Inspect touched files for newly duplicated helpers. PR validation describes coverage, not local command lists.
+X04. References to source methods/modules are investigation anchors, not fixed line numbers; locate them in the current checkout. Implementation can make routine local choices within the agreed design. Per-input overflow/public API details and backend contracts must be made concrete before enabling their behaviour; material changes require renewed alignment, not an automatic architecture restart."""
+status = "in-progress"
+status_reason = "plan agreed"
 type = "task"
 priority = 1
+assignee = "codex"
+children = [
+    "01a1071b-c612-7091-bfd1-4f885b41735c",
+    "01a1071b-c69e-7381-b14a-0c11abb589c0",
+    "01a1071b-c774-77e1-8d52-ae8c39af0f09",
+    "01a1071b-c84c-7400-9af8-bbbed8c1963e",
+    "01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1",
+    "01a1071b-c9f8-7b52-8ffe-1730696fc09a",
+    "01a1071b-cacb-7752-82c6-f26dd90a71a3",
+    "01a1071b-cba3-7891-bead-8461d5d2b369",
+    "01a1071c-0de1-7ec1-abf0-b825cdb5035a",
+    "01a1071c-0f0c-7612-b9e0-391c0f016207",
+    "01a1071c-102b-7160-9a01-ea553fbc6180",
+    "01a1071c-1144-76f3-b850-24a2404c2d38",
+    "01a1071c-1261-78a2-b6d7-141eff66dc8a",
+    "01a1071c-137e-72c1-b577-8fa871767244",
+    "01a1071c-1499-7af1-bfe0-7ce5bb415139",
+    "01a1071c-15b2-7d43-a152-720069e3e5b6",
+    "01a1071c-5f8e-7110-9a0d-c80ffd2f3325",
+    "01a1071c-60ae-7462-90b1-4604ff307d51",
+    "01a1071c-61c9-7cc3-818c-9aa5544e6fdc",
+    "01a1071c-62e5-7350-9c88-31f940812104",
+    "01a1071c-63fc-7301-abda-8e9449035063",
+    "01a1071c-6519-7f02-99ed-8b6b477df51f",
+    "01a1071c-6637-7470-bd1d-f64411ba59f0",
+    "01a1071c-6752-77e1-b939-6ff6c711399e",
+]
 created_at = "2026-09-01T18:52:17.43323Z"
-updated_at = "2026-09-02T05:34:45.134068Z"
+updated_at = "2026-10-05T08:13:57.360169Z"
+
+[[comments]]
+id = "01a106d2-868c-7f30-9214-1cff929b62d7"
+author = "codex"
+body = """
+Review direction from the user: the original decomposition/review approach is accepted, but explicit concurrency must be delivered by the end of zop. Handled::block_on is an intermediate step only. Added phase-specific used/unused field partitioning plus shared-resource claims, a proposed coordinator-owned deferred-input collection, and separate implementation slices for admission, queue policy, asynchronous completions, compatible overlap and concurrent shutdown. The holistic issue body retains the original goals, workflow boundaries, review sequence and linked future work. The detailed concurrency proposal remains pending alignment; status_reason stays planning and no production code has changed. Important design constraints found in current code: security and replication share the store, group projections replace the full snapshot, and retained activation read providers can participate in store/listener wait cycles. The proposal explicitly handles these rather than treating disjoint fields as sufficient proof of independence.
+"""
+created_at = "2026-10-04T12:10:22.732874Z"
+
+[[comments]]
+id = "01a106e5-65d1-74d3-8e1f-e1ba96fd52fe"
+author = "codex"
+body = "Second concurrency review: replaced blanket runtime store read/write exclusion with transactional isolation requirements, safe intermediate committed states and phase-local revalidation. Explained the metadata/lifecycle projection and proposed affected-group deltas instead of stale whole-map replacement. Refined pending input into global new-work admission plus typed active-flow inboxes with direct routing, event-class readiness and targeted wakeups. Concrete publication/activation and exhaustive field-partition sketches are proposed for discussion; no production implementation. Original decomposition and concurrent end-state remain in scope; status stays planning."
+created_at = "2026-10-04T12:30:59.537533Z"
+
+[[comments]]
+id = "01a106fe-7b48-70a1-98e0-c5b98f6c316d"
+author = "codex"
+body = "Third design review: partition ownership spans a complete FSM flow or consistency interval, permitting private intermediate inconsistency. Transition-only field borrowing is supplementary. Default projection plan now keeps whole-map publication under a flow-owned writer partition; affected-group deltas are an alternative rather than mandatory redesign. Queue proposal is one shared selective mailbox with flow-defined receive patterns and optional internal accumulation, replacing framework-managed global/local event transfers. Finite flows are required but supplemented by fair conflicting admission and explicit stale/unmatchable disposition. Holistic plan and review-unit scopes updated; no production code; awaiting alignment."
+created_at = "2026-10-04T12:58:23.432788Z"
+
+[[comments]]
+id = "01a1071d-a267-7970-8894-81ccc84b19f6"
+author = "codex"
+body = "Plan agreed by the user. Created 24 detailed priority-1 children, flotsync-zop.01 through flotsync-zop.24, with scope, exclusions, acceptance/validation, review instructions and LOC estimates. All are linked to this parent and form a deliberate sequential review dependency chain; only .01 is ready. Final admission rule is head-only new-flow starts with selective receive for existing finite flows; bypass admission and age-based reservations are excluded. Verified all 24 saved bodies against the authored instructions, parent/reverse dependency links, open/unassigned state and readiness with no skipped inventory entries. Detailed cumulative estimate is 6900-11100 edited/new LOC including tests/docs; each child is estimated at 150-700, with code moves counted separately. No production implementation, staging or commit performed."
+created_at = "2026-10-04T13:32:25.063643Z"
+
+[[comments]]
+id = "01a1074c-0edb-7ac1-9c6e-66ab61506aa3"
+author = "codex"
+body = "Accepted and completed flotsync-zop.01 on 2026-10-04. The flow-contract document and controlled listener tests establish the baseline; all 23 sibling plans now include relevant findings and remaining validation obligations. Reliable Summary response completion remains summary-manager-owned, store aliases require more than disjoint component fields, and concurrent safety still needs .16/.20/.22/.23 coverage. Dependency ordering is unchanged. .02 is ready but remains unclaimed; the parent stays in progress. Removed two accidentally captured compiler-output lines from the issue body while updating this progress record."
+created_at = "2026-10-04T14:23:07.483108Z"
+
+[[comments]]
+id = "01a107a3-69c5-7710-9363-1cc374c2dfc5"
+author = "codex"
+body = "Accepted .02 review requirement F02.R2: split component impls are temporary only. All ReplicationRuntimeComponent inherent/trait impls must reside beside the struct in component/mod.rs at parent completion; domain sub-FSM types/impls are colocated. .14 retires summary/security extensions; .24 finishes fixture/message cleanup and audits the source. Integrated into M05 and Z01; source issue .02 links both existing children, preserving the review chain."
+created_at = "2026-10-04T15:58:32.389Z"
+
+[[comments]]
+id = "01a10b04-4814-7a42-9651-de5f8872d040"
+author = "codex"
+body = "User accepted flotsync-zop.02, which was closed before commit 48c1dcf on 2026-10-05. Complete reviewed worktree committed on the existing parent branch. Claimed .03 and stored P03.1-P03.6 concrete publication-service proposal; status_reason planning, awaiting alignment with no production edits. Existing end-of-parent component impl retirement requirements in .14/.24 remain unchanged."
+created_at = "2026-10-05T07:43:12.404127Z"

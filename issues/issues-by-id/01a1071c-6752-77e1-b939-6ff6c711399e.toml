@@ -1,0 +1,39 @@
+id = "01a1071c-6752-77e1-b939-6ff6c711399e"
+ref = "flotsync-zop.24"
+title = "Audit and finish runtime FSM decomposition"
+body = """
+Goal
+Finish the decomposition, remove conversion scaffolding and verify the agreed concurrent end state. Final parent R13/R18/Z01-Z04 audit; follows flotsync-zop.23.
+
+Instructions
+S01. Compare every public API, port event, recovery path and test-only adapter with the parent transition/ownership inventory. Ensure no legacy unrestricted handler bypasses head admission or partition ownership. Remove obsolete conversion adapters and temporary serial-driver scaffolding, not useful reusable test fixtures. Finish retirement of the temporary component/test_support.rs ReplicationRuntimeComponent impl using fixture-local helpers and thin component entry points in mod.rs. Move fixture message constructors beside ReplicationRuntimeMessage in messages.rs or replace the cross-file message impl with fixture-local free builders. Preserve cfg(test)/test-support visibility and useful fixtures.
+S02. Confirm the component is a thin shell, domain algorithms stay in owned workflows, service dependencies are narrow, and combined lifecycle/scheduler behaviour is inspectable. Preserve existing catch-up/summary component and host boundaries and public Kompact exports. Audit the full runtime source for every inherent and trait impl of ReplicationRuntimeComponent: all must reside beside its declaration in component/mod.rs, and no extraction TODO for this invariant may remain. Ensure domain sub-FSM types have colocated impls. Check this progressively in earlier conversion children so .24 does not become a bulk relocation.
+S03. Audit touched modules for duplicated helpers/logic and document intentional duplication. Document ownership intervals, temporary inconsistencies, selective receive, head-only admission, finite-flow progress, overflow limits and external mailbox limitations. Use the OKF skill for any docs/ changes.
+S04. Check that future snapshot/security/group-lifecycle work has clear extension points without implementing it here. Do not create a final giant refactor or demand rereview of accepted children. Record any discovered work as linked gitrack issues rather than hidden TODOs; required acceptance gaps still block parent completion.
+
+Acceptance and validation
+The final matrix demonstrates compatible overlap, conflict exclusion, callback/commit ordering, head fairness, replay/failure cleanup and shutdown. Run the appropriate combined regression coverage and pedantic Clippy; honour serial sandbox test/socket rules. Report test coverage and material limitations, not merely command lists. Source audit must demonstrate zero component impls outside component/mod.rs and retirement of the fixture/message extension scaffolding while preserving test helpers. Unresolved split impls block parent completion; link findings to .02 and the corresponding conversion child.
+
+Review and size
+150-250 edited/new LOC including focused tests/docs; no bulk moves. Every child and the parent remain subject to user completion acceptance. Stage nothing and do not create an aggregate mega-PR.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Use the accepted ten-blocking/four-spawned inventory plus synchronous, host, test-only and separate-manager boundaries as the final completeness matrix. Refresh field-use/alias tables to the actual extracted code, preserving the distinction between flow-owned private inconsistency and externally safe committed states. Retain DataChangeCompletionGate and shared batch submission support as useful regression seams, while removing obsolete conversion adapters.
+
+The baseline new tests establish publication commit/listener/reply and per-input batch transaction/callback order. Existing suites cover partial-prefix retry, ready-chain rollback, accepted-work restart and fatal provider failure. Outbound operation-specific order was source-traced in .01 and requires the later effect/port evidence; concurrency, isolation, capacity and shutdown acceptance are supplied by .16/.20/.22/.23, not implied by the 171 baseline runtime tests. Cross-check those outcomes before parent closure, document remaining limitations and linked future work, and keep the already accepted child reviews independently assessable."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-6637-7470-bd1d-f64411ba59f0"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:04.402532Z"
+updated_at = "2026-10-04T15:59:05.161236Z"
+
+[[comments]]
+id = "01a107a3-69e6-7440-b940-02c72a7cd212"
+author = "codex"
+body = "Follow-up from .02 review F02.R2: finish fixture component/message extension cleanup, preserve useful fixtures and cfg visibility, and verify every ReplicationRuntimeComponent inherent/trait impl is in component/mod.rs beside its declaration. .14 owns summary/security retirement. Enforce this throughout conversion so this audit does not become a bulk relocation; unresolved split impls block parent completion. Source .02 links this audit."
+created_at = "2026-10-04T15:58:32.422205Z"

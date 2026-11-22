@@ -1,0 +1,40 @@
+id = "01a17380-d5d9-74d3-9735-23da355dfa77"
+ref = "flotsync-vu3"
+title = "Classify public API errors by application resolution"
+body = """
+Make public replication API errors distinguish failures that require different application-side resolutions. Requested on 25 October 2026 while planning MaintainRS explicit publication (maintain-rs-m5t.8 in /Users/lkroll/Programming/maintain-rs). This is future work only; do not implement as part of the MaintainRS task.
+
+Problem and baseline
+MaintainRS currently pins 3f575eee43bdd70f6f676329380c8fccb77bff34. At that revision publish_changes returns ApiError; private PublishChangesError variants and post-commit listener failure can both be boxed as ApiExternal. StoreErrorClassification describes a storage problem, not whether the publication committed or the correct application response. StoreAccess also wraps commit() failure, whose outcome cannot be assumed absent. RuntimeUnavailable can arise before sending or while awaiting a submitted request. The current local checkout is refactoring publication/listener/runtime flows; reconcile the actual flow boundaries when this task is claimed rather than editing from the pinned implementation.
+
+Required application responses to preserve
+R01: Group became read-only/replaced and request was definitely rejected before commit: keep pending intent; reconcile it against justified successor/lineage context. Permit this response without requiring a subsystem restart solely because publication was rejected. The error does not supply a valid successor base or guarantee listener health.
+R02: Invalid request definitely rejected before commit: keep pending intent and report the specific failure so the request or application state can be corrected. Restart/retry alone may repeat the same failure. Distinguish any cases needing refreshed context, user action or a caller fix where those resolutions differ.
+R03: Publication committed but listener delivery/application handoff failed: require runtime/application-view recovery before further ordinary work. Without an ordinary successful receipt, MaintainRS leaves the work pending under its at-least-once retry policy.
+R04: Commit outcome or reply delivery is uncertain: do not promise rollback/non-publication. Require recovery of coherent runtime/application context before retrying the existing pending identities/intent.
+R05: Successful receipt: local flotsync persistence plus the existing successful listener-notification contract; the application immediately records receipt cleanup. No peer-acknowledgement or exactly-once guarantee.
+R06: Unknown/new failures: callers can choose conservative recovery without misclassifying them as definitely rejected. Independent listener integrity failure overrides an otherwise cheaper rejection response.
+
+Design direction
+Prefer public named error variants/classifications that clearly describe or classify the appropriate application-side resolution, with contextual diagnostic source chains. Commit certainty and resolution are related but distinct: a non-commit guarantee alone does not establish whether the caller should reconcile, correct a request, repair state or recreate the runtime. Audit public API operations for materially different resolutions hidden behind the same generic wrappers; begin with publication and bound any wider changes explicitly in the agreed plan.
+
+Choose the public shape during planning; no solution is preselected. Options already assessed: additive classification accessor on ApiError; typed publication rejection/resolution variants on ApiError; dedicated publication error type. Exposing private internal enums alone does not solve commit-phase ambiguity, and broadening StoreErrorClassification into a guessed publication outcome is insufficient. Preserve original errors and available storage classifications. Do not require applications to parse display strings, downcast private types, infer an attempt outcome from group snapshots/row equality, or persist an attempt journal. No receipt-on-listener-failure change is assumed.
+
+Validation/acceptance
+Document each public classification's guarantees and required/allowed caller actions. Focused tests cover definite replacement rejection, invalid request, commit failure including possible commit-before-error, listener failure after commit, unavailable runtime/lost reply, successful receipt ordering and conservative handling of unclassified failures. Verify classification at the actual phase boundaries and preserve sources; do not equate every private PublishChangesError with pre-commit failure. Include NoEffectiveChanges in the policy review: it is currently a rejection, not permission for applications to silently clear pending work.
+
+MaintainRS deliberately implements conservative option A now: every publication API error stops the cycle and requests subsystem restart/full resynchronisation, preserving pending work. The local follow-up maintain-rs-0m8 will adopt whichever upstream contract is agreed; this upstream task is not a blocker for maintain-rs-m5t.8.
+
+Planning estimate: roughly 300-650 source/test/documentation LOC for a bounded public-contract survey plus publication implementation; refine against the current refactor before coding. Split broader API work into self-contained children if the agreed scope approaches 1000 LOC. Follow current AGENTS.md and agree a concrete implementation plan before code changes.
+
+MaintainRS sync-issue consumer requirements, 9 November 2026 (maintain-rs-f4i.1; refines application response examples above):
+MaintainRS will move definitely unpublishable pending work into a local durable sync-issues table and remove it from automatic publication. Its later light reconciliation pass may rescue read-only-group edits before that fallback. Flotsync should classify outcomes; it should not prescribe that pending intent must always remain in the automatic retry queue. Capturing intent as an issue is an application policy.
+Clarify which public classes positively establish whole-request non-commit rejection, versus uncertain commit/reply outcomes or committed-but-listener-failed outcomes. Document whether rejection applies to the entire atomic request; applications must not infer per-row failures. Clarify whether a definite rejection leaves the runtime usable to publish other groups, independently of listener health. Include the distinction between read-only/replaced groups, invalid requests, NoEffectiveChanges and operational storage failures. Storage retry/repair labels alone do not establish commit certainty.
+Expose stable machine-readable public labels or class identifiers suitable for recording with issue JSON and later UI interpretation. Preserve diagnostic sources; callers must not need message parsing or private downcasts. Do not prescribe MaintainRS SQL or JSON layout.
+These concerns overlap the existing R01-R06 and acceptance criteria; integrate them into that contract rather than adding a parallel classifier. MaintainRS is authorised to consume currently available classes and leave explicit TODOs where the API remains unclear, even with incomplete interim behaviour. Upstream completion is not a prerequisite for all sync-issue storage work. This does not turn an unknown outcome into a definite rejection.
+"""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-10-25T14:39:45.625988Z"
+updated_at = "2026-11-09T13:00:08.619766Z"

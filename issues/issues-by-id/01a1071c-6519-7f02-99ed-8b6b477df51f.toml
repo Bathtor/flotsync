@@ -1,0 +1,40 @@
+id = "01a1071c-6519-7f02-99ed-8b6b477df51f"
+ref = "flotsync-zop.22"
+title = "Enable compatible runtime flow concurrency"
+body = """
+Goal
+Enable actual overlap between admitted ownership-compatible flows. Implements parent R17; follows flotsync-zop.21.
+
+Instructions
+S01. Relax the serial admission limit incrementally using reviewed owned partitions, not a global database reader/writer lock. Keep head-only admission: demonstrations must distinguish permitted overlap after admission from intentionally blocked younger starts.
+S02. Start with independent identity/security/read/preparation work and unrelated-group operations. Preserve same-group publication/apply order, whole-batch ownership, predecessor/successor exclusion, projection-writer lifetime and serial listener invocation.
+S03. For every admitted pair document permitted intermediate inconsistency, inaccessible partitions, aliased store access, revalidation, listener/provider lifetime, bounded output and the absence of a wait cycle. CPU-parallel execution is not required; overlapping asynchronous waits is. Check runnable effect progress as well as ownership compatibility: backend lock or connection waits must not prevent the holder from resuming and releasing the resource. Use .16's backend contract and .21's execution guarantee; audit summary/security paths sharing the store rather than assuming separate service fields imply independent resources.
+S04. Keep creation, publication and membership dispatch/listener ordering distinct. Do not remove safeguards merely because operations use different group ids. Do not relax whole-map projection-writer exclusion or implement group deltas.
+
+Acceptance and validation
+Controlled futures demonstrate real progress of an independent admitted operation while another waits, in both completion orders. Negative tests prove conflicting operations remain deferred and head fairness holds. Include retained activation provider versus batch/store waits, failure during overlap and projection-publication lag. Require a controlled paused-summary-reader/conflicting-writer regression: admit the compatible flows, establish and pause the actual reader transaction, let the writer reach its resource wait, then prove the reader resumes and releases its transaction and the writer completes. Exercise relevant connection-pool pressure and both completion orders where possible. This replaces .04's temporary serial summary policy only after progress is demonstrated; do not satisfy this positive overlap case by retaining blanket read/write serialisation.
+
+Review and size
+350-550 edited/new LOC including tests; split operation-family enablement into separate review patches if necessary. Removing block_on alone is not acceptance. Follow parent Rust/no-staging rules and user-reviewed closure.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Compatibility must combine owned field/record intervals with aliases, database isolation/revalidation, logical order, notification capacity, retained readers and absence of wait cycles. SecurityStore shares the backend; different group ids do not by themselves prove database independence. SQLite's single writer is a throughput constraint, not a reason for a blanket runtime database reader/writer gate. Demonstrate useful progress while an admitted operation waits, in both completion orders.
+
+Start with compatible read/security/preparation work while preserving group/DecisionSet boundaries, whole-map writer ownership and one listener lane. Batches retain their group/lane through all callbacks. An activation provider can retain a read transaction and wait for a listener already occupied by work awaiting a store writer; reserve the lane before opening the provider where needed to exclude that cycle. Callback re-entry must not await a conflicting new flow. .01's tests characterise current blocking order only: add positive overlap, conflicting deferral, head fairness, provider/writer waits and failure-at-commit/publication/listener tests without claiming the existing gates alone prove concurrency."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-63fc-7301-abda-8e9449035063"]
+blocks = ["01a1071c-6637-7470-bd1d-f64411ba59f0"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:31:03.833158Z"
+updated_at = "2026-10-05T13:57:16.333067Z"
+
+[[comments]]
+id = "01a10c5a-bfad-7613-a44c-90f61b66f1b7"
+author = "codex"
+body = "Review F04.R4 from flotsync-zop.04: require a controlled overlapping summary-reader/conflicting-writer regression, including relevant connection-pool pressure. Resume the established paused read, prove transaction release and writer completion, and audit runnable effects as well as disjoint fields. Replace temporary summary serialisation only after this positive overlap case passes. Full task plan updated."
+created_at = "2026-10-05T13:57:16.333067Z"

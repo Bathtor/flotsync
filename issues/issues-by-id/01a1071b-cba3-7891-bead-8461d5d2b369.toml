@@ -1,0 +1,34 @@
+id = "01a1071b-cba3-7891-bead-8461d5d2b369"
+ref = "flotsync-zop.08"
+title = "Convert pending group decision flows"
+body = """
+Goal
+Convert invitation/proposal decision processing and explicit responses into finite owned flows. Implements parent R08; follows flotsync-zop.07.
+
+Instructions
+S01. Model classify, verify, policy, persist and notify/activation handoff phases with typed payloads. Own the reliable processed or API reply obligation until the existing success/failure boundary.
+S02. A persisted decision awaiting human input ends its finite flow and returns stable partitions. Do not hold partitions while waiting indefinitely for a human response. A later responder starts a resolution flow that validates the stored key.
+S03. Keep predecessor decision-set and relevant group ownership together through acceptance. Preserve stale responder idempotence, exact accepted-direction replay and rejection of conflicting successors.
+S04. Compose the current activation helper as a typed effect temporarily; later activation conversion replaces this adapter. Preserve auto-accept acceptance-before-activation and caller-specific listener/error policies. Keep blocking admission for now.
+
+Acceptance and validation
+Cover auto-reject, persisted ask, auto-accept, explicit accept/reject, duplicate/stale responder, competing targets and reliable processed timing. Confirm listener response routing cannot silently lose a promise and that finite flow termination leaves resumable stored decisions/activation work.
+
+Review and size
+450-700 edited/new LOC including tests, at most 200 moved. Do not add key-discovery protocols, new activation semantics or public session APIs. Follow parent checks/no-staging policy; user acceptance precedes closure.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Keep pending human decisions outside active flow lifetimes. A resumed decision operation owns target, hosted predecessor and competing predecessor decisions for its finite acceptance interval, ending at a documented safe checkpoint or continuing as owned activation work. Do not require a later head-blocked new operation to start before the current owner can finish.
+
+For reliably delivered invitation/proposal input, retain the claimed processed obligation through successful installation/notification; admission alone is not completion. Listener and pre-commit errors retain caller-specific outcomes. Acceptance failure must not fabricate an activated target, and later activation must reload authoritative accepted work by key. Preserve separate Summary manager ownership of reliable response completion when decoding or adapter code is shared."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071b-cacb-7752-82c6-f26dd90a71a3"]
+blocks = ["01a1071c-0de1-7ec1-abf0-b825cdb5035a"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:24.547397Z"
+updated_at = "2026-10-04T14:22:20.632155Z"

@@ -1,0 +1,34 @@
+id = "01a1071c-0f0c-7612-b9e0-391c0f016207"
+ref = "flotsync-zop.10"
+title = "Convert activation checkpoint FSM"
+body = """
+Goal
+Represent activation checkpoints as one reusable owned FSM. Implements parent R10; follows flotsync-zop.09.
+
+Instructions
+S01. Define accepted/preparing, committing, database-committed-but-projection-pending, provider acquisition and notifying states as needed by real invariants. Carry owned projection/group partitions across their consistency intervals; do not require global consistency at every await.
+S02. Compose the extracted transaction/provider functions and listener child operation. Return partitions only after restored consistency or explicit safe cleanup. Post-commit failure must not silently make an inconsistent partition available.
+S03. Reuse this machine from auto-accept and explicit decision resolution now, preserving existing caller-specific terminal policies. Prepare typed entry/return points for creation/membership and recovery children.
+S04. Preserve group/read-token alignment and original acknowledgement/reply points. Keep blocking execution; no snapshot transfer, projection delta redesign or generic recovery machinery.
+
+Acceptance and validation
+Exercise pre-acceptance, post-acceptance/pre-activation, activation-commit and post-commit provider/listener failure boundaries. Verify pending work remains or is removed at the right checkpoint; prior accepted work resumes without another decision. Owned partitions have explicit return/fault paths.
+
+Review and size
+450-700 edited/new LOC including tests, at most 150 relocated. Use contextual Snafu outcomes and relevant existing integration tests; follow parent formatting/Clippy/review rules. No staging or automatic closure.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Represent the accepted checkpoint and post-activation commit separately. Before activation commit, failure retains accepted work and a read-only predecessor; after commit, pending work is removed and a provider-open failure faults the runtime rather than restarting the activation transaction. Listener failure preserves committed activation, with its outcome determined by the caller. Recovery, decisions and membership must share this machine while retaining their different outer obligations.
+
+The whole-map projection writer interval starts before the database read that builds the replacement and ends after commit/publication; DatabaseCommittedButProjectionPending is private owned state. Return ownership only after explicit consistency restoration, otherwise fault it. Keep group ordering through provider snapshot establishment/delivery initially. In later concurrency work reserve the listener lane before opening a retained reader if a writer/listener wait cycle would otherwise arise."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-0de1-7ec1-abf0-b825cdb5035a"]
+blocks = ["01a1071c-102b-7160-9a01-ea553fbc6180"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:41.804965Z"
+updated_at = "2026-10-04T14:22:22.359341Z"

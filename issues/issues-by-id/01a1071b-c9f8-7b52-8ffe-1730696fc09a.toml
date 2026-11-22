@@ -1,0 +1,145 @@
+id = "01a1071b-c9f8-7b52-8ffe-1730696fc09a"
+ref = "flotsync-zop.06"
+title = "Compose inbound and listener flow FSMs"
+body = """
+Goal
+Convert inbound single/batch application and ordered listener delivery into owned composed FSMs. Implements parent R06 and F03/F07; follows accepted flotsync-zop.05.
+
+Status
+User agreed P06-A through P06-E on 2026-10-11 and explicitly requested one task/change, without splitting into review patches or pausing between parts. Implement the complete scope in this child. Current branch: codex/decompose-replication-runtime-component-flotsync-zop. DSL exploration flotsync-oyr remains deferred.
+
+Current-code reconciliation
+inbound_support::persist_and_apply_update already owns the linear transaction and returns committed listener batches and catch-up observations. Preserve its validation precedence, error classification, duplicate/final-cut behaviour and ready-chain atomicity.
+Single apply sends availability then needs before listener delivery. Batch commits one transaction per input, accumulates observations before callbacks, finishes every callback before the next transaction and flushes observations on success or failure.
+The driver already provides component-local IDs, non-cloneable group/listener claims and fault retention. There is no persistent mutable group row/vector cache to partition. Claims are logical runtime ownership markers; block_on supplies current handler exclusion.
+Ordinary empty updates are filtered; empty creation/activation DataChanged events are required. Providers transfer into callback effects and may retain a read transaction. Callback completion is distinct from exhaustion/drop; preserve existing provider cleanup.
+The test-only single-update handler omits catch-up observations today; route it through production orchestration deliberately.
+
+Agreed holistic implementation plan
+P06-A. Add narrow ListenerFlow in component/listener_flow.rs. Named constructors accept filtered ordinary update batches or one required DataChanged event with its position/provider. Own remaining events and continuation through Ready -> Delivering -> Accepted/Failed. Record waiting state before returning callback effect; deliver one callback at a time and stop on rejection. Transfer event/provider to callback effect, preserving exhaustion/release/drop mechanics and existing error types. Do not invent provider-exhaustion acknowledgement. Route existing data-change helpers through this child while keeping caller-specific wrapping and operation-specific ordering. Estimate 160-220 new/edited LOC.
+P06-B. Add concrete composition in component/inbound_flow.rs. Root owns authenticated context and FlowOwnership; reusable ApplyFlow owns input/origin, transaction waiting state and listener child. Expose observations to parent after commit while retaining listener continuation. Single apply sends availability then needs before resuming listener delivery. Persisted causal waits end the flow. Return success, pre-commit failure or committed listener failure with original error/context; component retains inbound drop/fatal classification. Estimate 200-270 LOC.
+P06-C. BatchApplyFlow owns remaining-input cursor, sender, accumulated observations, current ApplyFlow and the entire group/listener interval. Accumulate each committed result before resuming its listener child. Begin next transaction only after callbacks succeed. Flush availability then needs exactly once on exhaustion or transaction/listener failure before terminal release; include observations from committed input whose callback failed. Empty batch opens no transaction. Never replay committed prefix internally. Estimate 160-220 LOC.
+P06-D. Reuse driver and component ID sequence. Replace publication_slot with shared FlowSlot<RuntimeFlow> containing concrete Publication/Inbound variants. Keep async effect execution and thin adapters in mod.rs; children receive typed data rather than component/services access. Retain whole-operation block_on. Validate ID/phase before moving state, restore explicitly after terminal obligations and retain ownership on protocol faults. Route fixture apply entry points through production orchestration, aligning single-update observations. Estimate 140-200 LOC.
+P06-E. Add focused pure transition traces for single/batch effect order, accumulated observation flush, empty inputs, listener failure and invalid completions/ownership. Cover listener continuation/provider drop/drain at the new hand-off where existing tests do not. Extend controlled batch coverage with queued publication/live update work to prove no commit/callback interleaving. Reuse causal-chain, duplicate, prefix preservation, retry and empty activation/creation coverage. Run serial Cargo tests, formatting, pedantic Clippy, Rust instruction and touched-file duplication checks before review. Estimate 240-340 test LOC.
+
+Acceptance and preserved contracts
+Read docs/replication_runtime_flow_contracts.md relevant phase, field-use and evidence tables alongside current code. Keep whole-batch group/listener ownership from before first transaction through callbacks and final observation flush. A single ready causal chain remains atomic; persisted causal waiting terminates finite flow. Earlier committed notifications survive partial failure and accumulated observations flush without reapplication.
+Preserve ordinary empty-update filtering and empty activation/creation notifications, provider lifetimes and transaction cleanup. DataChangeCompletionGate supplies deterministic evidence, without making global cross-group serialisation permanent.
+No transaction-body redesign, mutable database mirror, listener component/inbox, generic DSL or concurrency registry in this child. Registry/asynchronous execution remain .15/.16. Reserve notification capacity before event-producing commit when .20/.22 introduce asynchronous overlap. Preserve publication, creation and replacement effect ordering and error source chains.
+
+Review and size
+Reconciled estimate: 900-1250 substantive new/edited LOC including tests, at most 200 mechanically moved; original 450-700 estimate is superseded. User explicitly accepted implementing this as one task/change despite possible size over 1000 LOC. No staging; set in review after validation. Close only after user acceptance.
+Agreed review refinements, 2026-10-11
+User authorised R06-01/R06-02/R06-03 and a fresh AGENTS.md audit. Implement in this same task and change.
+R06-01 refines P06-B/C: ApplyFlow is a concrete FSM owning its transaction wait, committed listener continuation and callback transitions. It returns committed observations to the parent and classifies transaction/listener failures. BatchApplyFlow owns the current ApplyFlow as well as sender, cursor and accumulated evidence; it advances the cursor only after child success. The root retains authenticated context and resource ownership and handles single observation timing or final batch flush. Inputs move into transaction effects when started; children never receive component services.
+R06-02 refines P06-A: keep the owning SmallVec batch iterator and filter empty ordinary batches when requesting the next event; box only that event's provider. Store a required single notification directly, without a queue allocation. Preserve callback ownership, rejection and continuation semantics.
+R06-03 refines P06-D: compare a closed InboundPhase enum; render static phase names only for contextual protocol diagnostics. Validate before moving state.
+P06-E additionally covers the concrete child independently, batch child ownership, lazy batch retention and required single delivery. Audit every touched Rust file against the actual root AGENTS.md and user instructions, including docs/outcomes, item order, fallible expression placement and control flow; run serial runtime tests, formatting, no-default-features and pedantic Clippy.
+Refinement estimate: replace approximately 250-350 production lines and add 80-140 test lines. Preserve the full original goals, accepted constraints and linked deferrals above. No split, staging, branch change or issue closure.
+
+Agreed second review refinements, 2026-10-11
+User accepted P06-F1 through P06-F6 and instructed implementation. These refine the full P06-A through P06-E plan and previous R06 changes above, in the same task/change.
+P06-F1: Match publication's Advertise/Advertised/Advertising names for inbound catch-up submissions. The batch child retains a distinct parent-permission wait because its evidence is accumulated before callbacks and advertised at batch termination. Preserve single/batch timing.
+P06-F2: Rewrite item documentation to describe the attached type, variant, field or method first, followed by useful invariants and lifecycle context. Replace vague disposition/obligations terminology with outcomes and concrete actions in touched flow code. Document ApplyFlow completion transitions/results/errors and state/event representations. Strengthen this rule in root AGENTS.md; keep implementation-only rationale in ordinary source comments.
+P06-F3: Initialise BatchApplyFlow directly as Running for a first input or Finished for an empty batch, sharing child construction with later advancement.
+P06-F4: Keep IntoIter::find, which consumes each examined batch and drops skipped empties without rescanning. Document next_notification's operation and Some/None meanings; cover interspersed and trailing empties and remaining cursor state.
+P06-F5: Introduce InboundResult with context and InboundOutcome fields; reuse it as the inbound RuntimeOutcome payload and drive_inbound return value. Preserve outer protocol errors and convert the domain outcome at callers. Match all terminal outcomes exhaustively. Box the larger InboundFlow variant and remove the large_enum_variant allowance.
+P06-F6: Extract queued-work setup and final store/callback assertions into named helpers. Keep both callback gates visible in the main batch scenario, preserve queued publication/live-update exclusion evidence and remove the too_many_lines allowance.
+Estimate 250-435 new/edited LOC, including moves. Preserve all accepted goals, contracts and linked deferrals above. The complete change remains one task despite exceeding 1000 LOC. Validate serial runtime tests, formatting, pedantic Clippy and no-default-features compilation; audit touched item documentation and duplicated helpers. Preserve the user's staging state; no branch change or commit requested. Close only after user acceptance.
+"""
+status = "in-progress"
+status_reason = "in review"
+type = "task"
+priority = 1
+assignee = "codex"
+blocked_by = ["01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"]
+blocks = ["01a1071b-cacb-7752-82c6-f26dd90a71a3"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:24.120019Z"
+updated_at = "2026-11-22T13:32:46.11389Z"
+
+[[comments]]
+id = "01a12a35-cd3d-7d32-9624-729f59294dd3"
+author = "codex"
+body = "The DSL exploration flotsync-oyr is deferred at user request. Its blocker has been removed so concrete flow work can continue and inform a later abstraction decision. Both proposals remain available as unselected design references."
+created_at = "2026-10-11T09:05:31.45326Z"
+
+[[comments]]
+id = "01a12a39-eae7-7cc3-bb66-1ae4d2a7cae5"
+author = "codex"
+body = """
+Reconciliation and proposed plan, 2026-10-11. Claimed by codex; planning only, pending user alignment. Current branch is codex/decompose-replication-runtime-component-flotsync-zop. No production edits or staging.
+
+Current code
+C06-A. inbound_support::persist_and_apply_update already owns the complete linear transaction and returns committed event batches, available ranges and needed ranges. It handles applied duplicates, final-cut exclusion and persisted causal waiting. Keep this service and its validation/error precedence.
+C06-B. component/mod.rs handle_update sends availability, then needs, then awaits callbacks. persist_apply_and_notify_update_batch uses one transaction per input, collects observations before item callbacks, awaits those callbacks before the next transaction, and flushes availability then needs at successful exhaustion or transaction/listener failure.
+C06-C. flow_driver.rs already supplies component-local FlowIdAllocator, FlowSlot, FlowEffect/FlowStep, non-cloneable group/listener claims and fault retention. Claims are logical ownership markers; no persistent mutable row/vector cache exists. Current exclusion depends on block_on.
+C06-D. listeners.rs filters empty ordinary update batches but direct creation and activation notifications must still deliver empty DataChanged events. Activation providers can retain a read transaction; existing tests cover drain/release and failure/drop. The event transfers provider ownership into the callback, so callback completion does not independently prove provider exhaustion.
+C06-E. Delivery tests already cover causal waiting/drain, duplicates, causal-chain rollback, prefix preservation, store/listener failure and callback-before-next-transaction. Missing direct evidence for the new design is pure effect/continuation ordering, observation flush on failure, protocol validation and queued publication/live-update exclusion during a held batch callback. The test-only single-update handler currently omits catch-up observations; address this explicitly rather than silently keeping a divergent orchestration.
+
+Proposed holistic plan
+P06-A. Add a narrow ListenerFlow in component/listener_flow.rs. Named constructors accept filtered ordinary update batches or one required DataChanged event with its position/provider. States own remaining events and caller continuation through Ready -> Delivering -> Accepted/Failed; record Delivering before returning the callback effect. Deliver one callback at a time and stop on rejection. Transfer the event/provider into the callback effect; preserve existing provider exhaustion/release/drop mechanics and error types. Do not invent an independent provider-exhaustion acknowledgement. Route existing data-change notification helpers through this child, retaining caller-specific error wrapping and operation-specific ordering. Estimated 160-220 new/edited LOC.
+P06-B. Add concrete inbound composition in component/inbound_flow.rs. The root owns authenticated delivery context and FlowOwnership; a reusable ApplyFlow owns one input/origin, transaction waiting state and listener child. After committed transaction completion, expose observations to the parent while retaining the listener continuation. Single apply emits availability then needs before resuming listener delivery. Finish stored causal waits without waiting for another input. Expected completion returns success, pre-commit failure or committed listener failure with original error/context; the component applies the existing inbound failure classification. Estimated 200-270 LOC.
+P06-C. BatchApplyFlow owns input cursor, sender, accumulated ranges, current ApplyFlow and the entire group/listener ownership interval. On each committed result, accumulate ranges before resuming its listener child. Start the next transaction only after all callbacks for that input succeed. On exhaustion or either transaction/listener failure, send accumulated availability then needs exactly once before returning the terminal result/claims; include observations for an input whose callback failed. Empty batches succeed without opening a transaction. Never replay a committed prefix internally. Estimated 160-220 LOC.
+P06-D. Reuse the existing driver facilities and component-scoped ID sequence. Proposal: one shared FlowSlot<RuntimeFlow> with concrete Publication and Inbound variants, replacing publication_slot, so their group/listener admission remains explicitly exclusive. This is a small tagged owner, not a framework or DSL. Keep async effect execution and thin component adapters in mod.rs; child machines receive typed data, not component/services access. Retain block_on for the complete operation. Validate ID/phase before moving state, restore explicitly after terminal obligations, retain ownership on internal faults and use existing component fault handling. Route test apply entry points through production orchestration, deliberately aligning single-update catch-up effects. Estimated 140-200 LOC.
+P06-E. Add focused pure transition traces for single and batch ordering, observation aggregation/flush, empty inputs, listener rejection and invalid completions/ownership. Add listener continuation and provider drop/drain coverage at the new hand-off where existing provider tests do not cover it. Extend the existing controlled batch test with queued publication and live-update work; verify no later commit/callback begins before release and batch completion. Reuse existing causal-chain/duplicate/prefix/retry integration coverage and activation/creation empty-event coverage. Estimated 240-340 test LOC. Perform serial Cargo tests, formatting, pedantic Clippy, Rust instruction audit and touched-file duplication review before hand-over.
+
+Size and review sequence
+Total estimate 900-1250 substantive new/edited LOC, at most 200 mechanically moved. This may exceed 1000 LOC and exceeds the original estimate. Recommend two self-contained reviewable patches within this child: first listener child plus single apply and shared blocking admission; then batch composition, failure flush and controlled batch exclusion coverage. Pause for review between them. If accepted, integrate this complete plan into the issue body before implementation and set status_reason to plan agreed.
+
+Preserved boundaries
+No transaction-body redesign, mutable database mirror, new listener component/inbox, concurrent effects or scheduler registry. Generic DSL work remains deferred as recorded by the user. Registry/asynchronous execution remain .15/.16; notification-capacity reservations and overlap remain .20/.22. Keep creation/activation/replacement ordering and existing error source chains. Closure remains user-reviewed; no staging."""
+created_at = "2026-10-11T09:10:01.191178Z"
+
+[[comments]]
+id = "01a12a60-179f-7651-8325-13a9794bd0be"
+author = "codex"
+body = """
+Implemented the user-agreed P06-A through P06-E as one change, with no split or intermediate review pause.
+
+ListenerFlow owns ordered narrow data-change payloads and caller continuation; typed delivering state accepts each callback result once. Required empty creation/activation events remain distinct from filtered ordinary empty updates. Provider exhaustion/drop and callback completion are separate boundaries.
+InboundFlow composes a typed ApplyFlow and listener child. Single observations precede callbacks. BatchApplyFlow retains its cursor, sender and accumulated evidence through the full batch; callbacks complete before the next transaction and committed evidence flushes on success or transaction/listener failure. Transaction service behaviour and error source chains remain intact.
+Publication and inbound work share one FlowSlot<RuntimeFlow>, component ID sequence and blocking effect driver. Protocol errors retain faulted ownership; terminal release is explicit. Test single/batch adapters now use production orchestration. Registry, asynchronous overlap and DSL remain in their existing follow-ups.
+
+Validation: all 196 runtime unit/integration tests passed serially, including 11 new focused tests. New coverage exercises effect order, observation accumulation/failure flush, empty input, distinct transaction/committed-callback outcomes, invalid identity/phase/terminal completions, wrong operation kind and provider hand-off/continuation. The strengthened batch regression holds both item callbacks in turn and proves queued publication and live update cannot commit or notify during the batch. Existing causal-chain atomicity, duplicate, prefix/retry, creation/activation, publication and startup tests passed. Library compilation without default features passed. Formatting, diff whitespace, pedantic library/test Clippy with test-support, Rust instruction audit and touched-file duplication checks passed; Clippy retains existing warnings only (11 library with test-support, 66 library-test).
+
+Shared effect execution, transition wrapping, ordinary-update provider construction and fixture orchestration were extracted. Thin notification/error wrappers remain separate to express caller-specific payload and failure policy. Domain identity/phase guards remain local so contextual Snafu locations identify the failing domain; this is deliberate rather than shared validation that obscures the source.
+
+Review footprint is approximately 1750 added and 170 removed Rust lines, including documentation, whitespace and tests, larger than the planning estimate. Kept as one task/change as explicitly requested. No staging, commit, branch change or closure. Ready for user review."""
+created_at = "2026-10-11T09:51:43.007511Z"
+
+[[comments]]
+id = "01a12ae9-0d2a-7dd1-9f89-d6d05641604e"
+author = "codex"
+body = "User agreed review refinements R06-01/R06-02/R06-03: replace the ApplyFlow wrapper with a concrete child FSM owned by the batch parent; retain lazy listener batch iteration and a directly stored required event; use enum phase validation. Repeat the AGENTS.md audit across all touched Rust files. Full holistic plan remains in the issue body; chronological review checklist is .agent_local_docs/tmp/flotsync-zop.06-review.md. Implementation remains one change."
+created_at = "2026-10-11T12:21:18.762438Z"
+
+[[comments]]
+id = "01a12af3-3d97-7d02-8480-c4ffac41b00c"
+author = "codex"
+body = "Completed R06-01/R06-02/R06-03 in the same change. ApplyFlow now owns concrete transaction, observation-continuation and callback transitions; BatchApplyFlow owns and advances its current child. ListenerFlow retains the original SmallVec iterator and constructs only the next provider; required events are stored directly. InboundPhase enum controls validation, with strings used only for diagnostics. Re-read root AGENTS.md and supplied instructions and audited every changed Rust file; fixed missing test-module documentation and field/Option/result lifecycle docs, and extracted repeated fixture execution. All review checklist items resolved. Validation: 200 serial runtime tests passed outside the sandbox after isolating sandbox-only runtime startup timeouts; pedantic lib/tests Clippy with test-support passed with existing warnings and no new flow diagnostics; no-default-features library check, rustfmt across touched files and whitespace check passed. Added direct child/batch ownership and inline listener retention coverage. Unstaged and uncommitted; issue remains open for review."
+created_at = "2026-10-11T12:32:26.519294Z"
+
+[[comments]]
+id = "01a12b27-c579-7030-b1c1-41e5b5fe7297"
+author = "codex"
+body = "User accepted P06-F1 through P06-F6 covering all thirteen second-review comments: publication/inbound advertisement naming, item-first documentation and AGENTS.md rule, direct batch initialisation, consuming iterator explanation/coverage, named inbound result, exhaustive outcome matching, boxed inbound owner and batch-test helper extraction. The full holistic plan is retained in the issue body. Chronological checklist: .agent_local_docs/tmp/flotsync-zop.06-review.md. Preserve current staging state and keep one task/change."
+created_at = "2026-10-11T13:29:49.177351Z"
+
+[[comments]]
+id = "01a12b31-dd93-7c62-8962-f961c2743b57"
+author = "codex"
+body = "Completed all thirteen second-review items under the agreed P06-F1 through P06-F6 plan. Inbound advertisement names now match publication; item documentation was rewritten and the item-first rule added to AGENTS.md. Batch construction uses its actual initial state and shared child setup. Consuming iterator behaviour is documented and covered with interspersed/trailing empties. InboundResult replaces the nested tuple and is reused in runtime outcomes; terminal logging matches every outcome explicitly. The inbound owner is boxed without a large-enum allowance. Named test helpers retain both gates and queued publication/live-update evidence, removing the giant-test allowance. Validation: 201 serial runtime tests passed outside the sandbox, pedantic lib/tests Clippy with test-support passed with the same existing warnings and no new diagnostics, no-default-features check and formatting/whitespace checks passed. Touched item documentation and helper duplication audited against current instructions. Working note contains individual completion evidence for U06-01 through U06-13; no unresolved or deferred review item. Preserved the current staging state, existing contracts and all linked deferrals. Ready for user review; issue remains open."
+created_at = "2026-10-11T13:40:50.707028Z"
+
+[[comments]]
+id = "01a20373-1474-7c52-8f66-c62bac843aac"
+author = "codex"
+body = "Work parked at the user’s request on 2026-11-22. Implementation and review changes are being committed and pushed for safekeeping on branch codex/decompose-replication-runtime-component-flotsync-zop, remote origin (github.com/Bathtor/flotsync), tracking origin/codex/decompose-replication-runtime-component-flotsync-zop. Resume this implementation by checking out that branch. The issue remains open and in review. The user requested switching to main and carrying over agent instruction files and issue changes for ongoing work."
+created_at = "2026-11-22T13:30:03.252993Z"
+
+[[comments]]
+id = "01a20375-90a1-78d1-82a7-000cb90bb2bd"
+author = "codex"
+body = "User approved committing and pushing the carried-over agent instruction and issue changes directly to main on 2026-11-22. Implementation remains parked on codex/decompose-replication-runtime-component-flotsync-zop at commit a07b3e013c985cb8cc343a0d8840b0a1021a4349, pushed to origin. Only agent instructions and issue tracking were copied to main; this issue remains open and in review for resumption on the implementation branch."
+created_at = "2026-11-22T13:32:46.11389Z"

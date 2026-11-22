@@ -1,0 +1,34 @@
+id = "01a1071c-1499-7af1-bfe0-7ce5bb415139"
+ref = "flotsync-zop.15"
+title = "Implement flow-owned partition registry"
+body = """
+Goal
+Generalise the initial single-flow ownership slots into the concrete partition registry needed for concurrency. Implements parent R14 plus the R13 ownership audit; follows flotsync-zop.14.
+
+Instructions
+S01. Inventory actual mutable fields/aliases after extraction. Define explicit Available(value), OwnedBy(flow), and Faulted(context) availability; move owned values into the finite FSM or its in-flight effect for the full consistency interval.
+S02. Implement atomic acquisition of each flow's complete partition set and explicit restoration/fault disposition. No partial hold-and-wait and no unconditional drop-based unlock. A safe subsection may return partitions at a documented stable checkpoint and later re-enter admission.
+S03. Preserve access to separately published immutable snapshots only for consumers whose stale-tolerance is documented. Exclusive partition ownership must not be bypassable via cloned mutable service handles or unrestricted component access.
+S04. Audit finite flow progress: no active owner may require a later queued new flow to start. Keep admission limited to one operation for now. Store descriptors document shared databases/record scopes; they are not a blanket application reader/writer lock.
+
+Acceptance and validation
+Tests show unavailable partitions cannot be acquired, multiple-partition acquisition is all-or-nothing, valid state returns only after cleanup/publication, and cancellation/fault cannot silently return inconsistent state. Audit touched-file duplication and temporary adapters without a repository-wide rewrite.
+
+Review and size
+300-450 edited/new LOC including tests. Follow parent Rust checks and no-staging/review requirements. This establishes ownership mechanics, not concurrent scheduling yet.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Use the field-use tables as an audited baseline, then refresh them after extraction. There is no long-lived mutable per-group row/vector cache to partition: local LoadedGroupMeta, PendingUpdateSet, prepared datasets/payloads and observations become flow/effect-owned values. Group boundary keys, predecessor DecisionSet, whole-map ProjectionWriter and one notification lane encode exclusions; shared immutable identity/configuration and output handles need no automatic exclusive slots.
+
+SecurityStore wraps the same store, and catch-up, reliable delivery and application/provider handles may alias it. Field disjointness therefore requires explicit canonical store identity plus logical record/read-write descriptors, not a blanket database gate. Hold ownership through permitted private inconsistency, with explicit Available/OwnedBy/Faulted outcomes. Acquire complete sets atomically and do not release merely on dropped futures. Check callback/provider dependencies as well as fields: an active owner cannot wait for a conflicting new request behind the head."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-137e-72c1-b577-8fa871767244"]
+blocks = ["01a1071c-15b2-7d43-a152-720069e3e5b6"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:43.225643Z"
+updated_at = "2026-10-04T14:22:26.73622Z"

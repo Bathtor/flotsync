@@ -1,0 +1,138 @@
+id = "01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"
+ref = "flotsync-zop.05"
+title = "Introduce owned publication FSM and blocking driver"
+body = """
+Goal
+Introduce a runtime-local publication state machine and the small driver/ownership facilities it needs, using blocking execution first. Implements parent R05 and follows accepted flotsync-zop.04 (commit 44ed110).
+
+Baseline and constraints
+publication.rs owns request scoping and the complete write transaction, returning CommittedPublication. There is no persistent mutable replication-group row/vector cache to partition. Read the accepted phase and field-use baseline in docs/replication_runtime_flow_contracts.md alongside the current sources. Preserve validation precedence, listener filtering, error source chains and the accepted summary-read blocking correction. Keep all component impls in component/mod.rs. Do not introduce an Any-based framework or depend on flotsync-rok/ct7n.
+
+Agreed holistic implementation plan P05.1–P05.5, including the accepted review corrections
+
+P05.1. PublicationFlow handles one request through Writing -> Broadcasting -> Advertising -> NotifyingListener -> Replying -> Finished. The component executes each returned action and passes its typed result back with the flow ID. Record the waiting state before returning the action. The write action uses the existing linear async transaction helper. Success submits broadcast bytes, advertises availability to catch-up, awaits the listener and attempts the API reply. Port submission does not confirm peer delivery. Write failures skip submission and notification; callback failures report that notification failed after commit. Never retry committed writes automatically.
+
+P05.2. Acquire replication group and listener resource claims together before recording the flow. FlowOwnership is non-cloneable and moves with the operation until the reply attempt finishes. FlowSlot admits only one publication at a time; Handled::block_on excludes other handlers during its execution. Claims are logical runtime ownership markers, not backend locks. Shared identity/schema/store handles do not automatically become exclusive field partitions. Transaction data remains local to the write action; no new database copy is introduced. Explicit release returns the slot to Available. A dropped reply receiver still allows all actions and release to finish.
+
+P05.3. flow_driver.rs contains only the IDs, action/finished results, resource claims and slot facilities demonstrated by publication. FlowState distinguishes Running from Faulted independently of publication's waiting phase. Validate flow identity and expected phase before moving phase data. Contextual Snafu errors report wrong ownership, wrong phase, missing state or unavailable/occupied slots. FlowFault saves the first error and each complete FlowOwnership returned by a failed release. Failed release into an empty slot creates a fault state; subsequent failures preserve the original error and all ownership values. Internal enum visibility remains explicitly accepted by the user.
+
+P05.4. Preserve commit -> broadcast -> catch-up -> listener -> reply order through the component's blocking adapter. Reuse notify_listener_batches and its empty-change filtering, plus the existing ApiExternal/InboundDeliveryError::NotifyListener source chain. Ordinary transaction and callback failures become API error replies. Internal protocol failures stop the slot and keep its flow and ownership for component fault handling. Preserve scope/schema validation precedence.
+
+P05.5. Existing pure FSM/driver tests cover successful action order, write rejection, committed callback rejection, dropped reply receivers, wrong IDs, wrong/repeated results and ownership until reply completion. Existing integration tests cover rejected commit, rejected listener, stale-token rebase, gated callbacks and the dropped-first-receiver/next-publication sequence. Preserve broker-managed socket fixtures and serial Cargo execution. Use formatting, pedantic Clippy, Rust instruction and touched-file duplication checks before review. No staging or closure until user acceptance.
+
+Agreed review plan F05-A through F05-D (2026-10-06)
+
+F05-A. Explain the flow/action/result model before introducing the types, including flow construction, waiting phases, ID checks, reply completion, explicit release and fault handling. Use the publication sequence as the concrete example. Explain the current single-slot/block_on exclusion guarantees.
+
+F05-B. Use ReplyOutcome, FlowState/state and FlowFault throughout the new modules, component adapter and tests. Use ReplicationGroupClaim and ListenerClaim consistently as resource claims; identify Flotsync replication groups precisely. MissingState names the missing reply promise or resource ownership. Comments, helpers, errors and test messages describe actual actions and values in plain language. Ownership lasts until the reply attempt finishes.
+
+F05-C. Use FlowId(u64) with accepted wrapping and the assumption that no old flow or result survives 2^64 subsequent allocations. The original process-wide atomic allocator is superseded by G05-C: allocation belongs to the runtime component scope. No randomness, heap allocation, dependency or exhaustion handling is needed.
+
+F05-D. Apply this terminology across the whole current publication change. The existing registry follow-up TODO names flotsync-zop.15 (Implement flow-owned partition registry) in full, and this issue links to that task. Update and run existing tests; add no new tests for renaming or the standard atomic increment. Check each of the 15 captured comments before review.
+
+Agreed scope/naming review plan G05-A through G05-E (2026-10-10)
+
+G05-A. Move generic complete_reply and ReplyOutcome to private runtime/replies.rs, shared by the runtime component and summary manager. Logging stays in the callers. Outcome documentation contains no flow-specific cleanup rules.
+
+G05-B. Use pub for exposed items, fields and methods in the two new flow modules and matching Snafu selectors; module visibility controls library exposure. Keep implementation-only fields and helpers private. Adjust supporting type visibility only where required by consistent signatures.
+
+G05-C. One FlowIdAllocator field in ReplicationRuntimeComponent owns a plain wrapping u64 sequence. Slot admission uses that shared allocator only on successful admission. Release does not reset it. All flows within the component use the same allocator; numbers may repeat across different components, whose results cannot be exchanged. Preserve the full-cycle lifetime assumption and update existing wrong-ID/owner fixtures to allocate both flows within one scope.
+
+G05-D. Use Broadcast/Broadcasted/Broadcasting for broadcast output, Advertise/Advertised/Advertising for catch-up availability, NotifyListener/ListenerNotified/NotifyingListener for callbacks, and Reply/Replied/Replying for API promise completion. Rename the committed callback failure outcome to CommittedListenerFailed and after_notification to after_listener. Apply terminology across actions, completions, states, diagnostics, helpers, payloads, adapter and tests. Preserve established API/error source types.
+
+G05-E. Update and run existing component, publication and summary-manager tests; add no tests merely for renaming or wrapping arithmetic. Run formatting, pedantic Clippy, Rust instruction and touched-file duplication checks. Estimated 230-380 edited lines for this revision. Preserve staged review state.
+
+Agreed allocator naming/construction review plan H05-A through H05-C (2026-10-10)
+
+H05-A. Rename FlowIdAllocator::allocate to next_id and update its admission call; retain wrapping arithmetic and admission behaviour. Two edited LOC.
+
+H05-B. Document that a fresh allocator is created with FlowIdAllocator::default() when constructing the runtime component and kept for that component's lifetime. Two to four documentation LOC.
+
+H05-C. Run targeted formatting, existing component tests and pedantic Clippy. Add no new tests for this rename/documentation change. Check both captured comments against the final diff. Total production estimate four to six edited LOC in flow_driver.rs; preserve staged review state and keep DSL separate.
+
+Separate DSL follow-up
+P0 flotsync-oyr (Design a typed DSL for owned runtime flows) is linked from this issue and blocks flotsync-zop.06 before further conversions. The user explicitly excluded DSL design and implementation from this revision; handle it as a separate task.
+
+Follow-up boundaries
+Listener composition remains flotsync-zop.06. The shared resource registry remains flotsync-zop.15; asynchronous effects remain flotsync-zop.16. Backend progress and overlap remain flotsync-zop.21 and flotsync-zop.22. This change handles one serial publication flow and does not enable concurrency. Preserve their existing task relationships and the source TODOs describing the summary-lock concern.
+
+Review and validation evidence
+Original implementation validation: seven pure FSM tests, 16 publication integration tests and 24 delivery integration tests passed, including the summary lock-progress regression. Default/test-support library and test pedantic Clippy and no-default library compilation passed with existing warnings. The accepted ownership-on-failed-release correction added driver coverage for wrong-owner and empty-slot release and strengthened the duplicate-result test; all 31 component tests passed.
+
+Current terminology/identity correction validation: 31 component tests and 10 focused publication tests passed. Default library/test pedantic Clippy passed with the same existing 8 library / 66 library-test warnings and no diagnostics in the two new modules. Targeted formatting, diff whitespace, Rust instruction and touched-file duplication checks passed. No new tests were added for this revision. All 15 review comments are addressed.
+
+The original implementation's review footprint exceeded its first estimate, largely due to documented phase/ownership types and protocol tests. This review correction was estimated at 200–300 edited lines, predominantly names and documentation. Scope remains one serial publication operation; the 2026-10-06 revision created no new follow-up issues. The later P0 DSL task is tracked separately as flotsync-oyr.
+
+Scope/naming review validation (2026-10-10): all 53 existing tests passed: 31 component tests, 16 publication/API tests, five summary-manager tests and the remote summary integration test. No new tests were added. Targeted formatting, diff whitespace, Rust instruction and touched-file duplication checks passed. Pedantic library/test Clippy completed with the existing eight library / 66 library-test warnings and no diagnostics in the new flow/reply modules. Caller-specific reply logging wrappers intentionally stay in their components; promise fulfilment is shared. Handwritten flow enum duplication remains for the separate DSL task. All eight captured scope/naming comments are addressed or tracked by that separate P0 task.
+
+Allocator naming/construction review validation: renamed next_id and documented fresh construction with FlowIdAllocator::default(). All 31 existing component tests passed. Targeted formatting and diff whitespace checks passed; pedantic library/test Clippy completed with existing warnings only. No new tests or duplicated helpers/logic. Both captured comments E05-09 and E05-10 are addressed.
+
+Status: G05-A through G05-E and H05-A through H05-C implemented, in review. The user's staged review snapshot is preserved; new edits remain unstaged and uncommitted. DSL design and implementation remain outside this revision. Closure awaits user acceptance.
+"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+blocked_by = ["01a1071b-c84c-7400-9af8-bbbed8c1963e"]
+blocks = ["01a1071b-c9f8-7b52-8ffe-1730696fc09a"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:23.906604Z"
+updated_at = "2026-10-10T14:03:50.104486Z"
+closed_at = "2026-10-10T14:03:50.104486Z"
+
+[[links]]
+target = "01a12607-9cd3-7812-8f4e-0665ae63f0be"
+label = "flow DSL follow-up"
+
+[[links]]
+target = "01a1071c-1499-7af1-bfe0-7ce5bb415139"
+label = "resource registry follow-up"
+
+[[comments]]
+id = "01a10ff5-1fbd-7dd2-b4f4-1e008964bcfe"
+author = "codex"
+body = "Review alignment: user authorised R05-1/P2 claim retention on rejected restoration, with regression coverage. R05-2/P3 internal enum exposure is explicitly accepted; retain it. Full task plan updated before production edits."
+created_at = "2026-10-06T06:44:45.117368Z"
+
+[[comments]]
+id = "01a11022-fc50-7942-bd44-fb29ecfd8bba"
+author = "codex"
+body = "User agreed F05-A through F05-D: explain the flow design, use plain and consistent state/outcome/resource-claim terminology across the publication change, and replace random flow IDs with a wrapping process-wide AtomicU64 counter using Relaxed ordering. Existing tests will be updated and run; no new tests for renames or the standard atomic increment. The shared registry TODO names flotsync-zop.15 (Implement flow-owned partition registry) in full. Preserve the accepted ownership-on-fault correction and internal enum visibility. Full current plan updated before production edits."
+created_at = "2026-10-06T07:34:50.70474Z"
+
+[[comments]]
+id = "01a11028-965f-7d60-8e51-9d80e46df4f4"
+author = "codex"
+body = "F05-A through F05-D implemented across the driver, publication FSM, adapter and tests. Flow IDs now use a wrapping process-wide AtomicU64 counter with Relaxed ordering; the full-cycle lifetime assumption is documented. Plain-language overviews and consistent outcome/state/resource-claim names address all 15 comments. Existing tests only: 31 component and 10 focused publication tests passed. Pedantic Clippy passed with existing warnings only; targeted formatting, instruction and touched-file duplication checks passed. Ready for review, unstaged and uncommitted."
+created_at = "2026-10-06T07:40:57.823507Z"
+
+[[comments]]
+id = "01a12607-ec05-70d2-bbea-25179e2cee6b"
+author = "codex"
+body = "New review delta captured as E05-01 through E05-08 in the temporary working note. Proposed corrections: move generic reply completion to shared runtime support; use pub inside internal flow modules; replace process-wide IDs with one component-local wrapping allocator; rename broadcast/advertise/listener phases and API reply terminology consistently. Full plan update awaits user alignment. Filed P0 flotsync-oyr (Design a typed DSL for owned runtime flows), linked from this source; it blocks flotsync-zop.06 before further flow conversions. Existing ownership/fault, serial ordering and no-retry constraints remain applicable. No production edits or index changes in this planning turn."
+created_at = "2026-10-10T13:36:55.813871Z"
+
+[[comments]]
+id = "01a1260c-549b-7ba0-bf6a-1115390a3ac0"
+author = "codex"
+body = "User agreed G05-A through G05-E: shared runtime reply support, pub inside the internal flow modules, component-scoped wrapping IDs, broadcast/advertise/listener/reply naming, and existing-test validation. The complete task plan was updated before production edits. DSL design and implementation are explicitly excluded from this revision and remain separate P0 flotsync-oyr. Preserve the user-staged review snapshot."
+created_at = "2026-10-10T13:41:44.731154Z"
+
+[[comments]]
+id = "01a12614-2dce-7110-9c4c-481223f9513b"
+author = "codex"
+body = "Completed agreed G05-A through G05-E: generic runtime reply support, component-scoped wrapping flow IDs, pub within internal flow modules, and consistent broadcast/advertise/listener/reply terminology. All 53 existing tests passed; formatting, pedantic Clippy (existing warnings), Rust instruction and touched-file duplication checks completed. The staged review snapshot is preserved and new edits remain unstaged. DSL design and implementation remain separate P0 flotsync-oyr. Ready for review; closure awaits user acceptance."
+created_at = "2026-10-10T13:50:19.086692Z"
+
+[[comments]]
+id = "01a1261e-dcb2-73b3-895b-fdc729968f8a"
+author = "codex"
+body = "User agreed H05-A through H05-C: rename the ID method to next_id, explicitly document construction with FlowIdAllocator::default(), and validate using existing component tests, formatting and pedantic Clippy. Full plan updated before production edits. No new tests or DSL work; preserve the staged review snapshot."
+created_at = "2026-10-10T14:01:59.218264Z"
+
+[[comments]]
+id = "01a12620-8dd8-7141-b847-900fc9e04351"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-10T14:03:50.104486Z"

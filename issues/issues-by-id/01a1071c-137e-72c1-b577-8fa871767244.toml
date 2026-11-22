@@ -1,0 +1,49 @@
+id = "01a1071c-137e-72c1-b577-8fa871767244"
+ref = "flotsync-zop.14"
+title = "Complete summary flows and security adapters"
+body = """
+Goal
+Complete explicit summary/read flow integration and narrow security request adapters. Covers parent F08 and remaining R02/R13 concerns; follows flotsync-zop.13.
+
+Instructions
+S01. Represent local/inbound summary read, reply or delegation and completion as finite operations compatible with the shared driver. Preserve reliable summary processed completion after reply submission.
+S02. Keep remote request correlation, route handling and timeouts in SummaryRequestManagerComponent; NeedRange ownership remains in CatchUpManagerComponent.
+S03. Preserve advisory summary inspection's stale-tolerant semantics and security operations' existing independent execution until scheduler integration. Record store aliases and mutable security assumptions rather than treating different service fields as independent databases.
+S04. Give simple security calls explicit completion/reply ownership without inventing long-lived security FSMs. Preserve public API/message exports and current classification of inbound errors. Replace the temporary ReplicationRuntimeComponent impls introduced in component/summary_api.rs and component/security_api.rs by .02: move summary behaviour to its finite flow types and security behaviour to narrow operation/service owners, with each type's impls colocated. Keep any necessary thin component scheduling/delegation methods in component/mod.rs. Retire the corresponding TODO(flotsync-zop) markers as their conversions complete.
+
+Acceptance and validation
+Test local summary success/failure, remote delegation, reliable reply/processed order, advisory staleness and security reply mapping where coverage is missing. Every runtime input family now has a named owner and a clear future scheduler classification. Neither summary_api.rs nor security_api.rs may contain a ReplicationRuntimeComponent impl after this child; verify colocation of new flow/service impls without changing separate-manager ownership.
+
+Review and size
+200-350 edited/new LOC including tests, at most 150 moved. Do not refactor remote manager protocols or select a permanent gateway architecture. Follow parent Rust/review rules; no staging or premature closure.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Keep remote summary correlation and reliable Summary response processed completion in SummaryRequestManagerComponent. Runtime observation of that same port input is advisory; both receive clones of one claimable promise, so the runtime must not complete the manager's obligation. For an inbound reliable SummaryRequest, runtime reply submission precedes runtime-owned processed completion. NeedRange continues through CatchUpManagerComponent.
+
+Security paths differ: key assessment may read or store candidate evidence; record feedback writes; known-key lookup reads; local public bundle lookup is synchronous; observed summary work is advisory inspection serialised in a blocking turn after the .04 deadlock fix. Classify narrow adapters by their actual effects instead of one exclusive security flag. SecurityStore uses the same underlying store; declare the alias for .15/.16. Preserve security operations' independent semantics initially; retain the corrected serial summary-read boundary until scheduler integration provides independent progress for store-owning flows. Audit all inventory entries before declaring blocking conversion complete.
+
+Current baseline from flotsync-zop.04: observed summary inspection now uses Handled::block_on. A component-local spawn_local read transaction can retain SQLite shared-cache locks while a later blocking writer prevents that read task from resuming. The .04 controlled regression forces the read/update overlap and verifies admission after the read completes. Advisory staleness remains allowed, but asynchronous execution requires progress guarantees for every store-owning flow; disjoint component fields alone do not establish that guarantee. Preserve the corrected boundary and regression during conversion. This is a finding for the already planned scheduler integration, not deferred investigation: the demonstrated stall is fixed in .04.
+"""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-1261-78a2-b6d7-141eff66dc8a"]
+blocks = ["01a1071c-1499-7af1-bfe0-7ce5bb415139"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:42.942827Z"
+updated_at = "2026-10-05T12:11:38.402137Z"
+
+[[comments]]
+id = "01a107a3-69d5-7fc3-8e61-311736241d79"
+author = "codex"
+body = "Follow-up from .02 review F02.R2: retire TODO(flotsync-zop) component impls in security_api.rs and summary_api.rs during this finite summary/security integration. New flow/service impls belong beside their own types; necessary thin component glue belongs in component/mod.rs. Source .02 links this child and .24 performs the final audit. No long-lived security FSM or remote manager redesign is implied."
+created_at = "2026-10-04T15:58:32.405743Z"
+
+[[comments]]
+id = "01a10bfa-0a22-7272-bb3a-81310e37c3a9"
+author = "codex"
+body = "Current .04 finding: observed summary inspection is now blocking to avoid retaining a SQLite read transaction in a spawn_local task which a later blocking writer prevents from resuming. Preserve this corrected baseline and observed_summary_finishes_read_before_admitting_update_batch regression during FSM integration. Independent execution must include progress of store-owning tasks, not just disjoint component fields. Investigation and demonstrated deadlock fix are completed in .04; this comment updates the already planned conversion boundary."
+created_at = "2026-10-05T12:11:38.402137Z"

@@ -1,0 +1,54 @@
+id = "01a12607-9cd3-7812-8f4e-0665ae63f0be"
+ref = "flotsync-oyr"
+title = "Design a typed DSL for owned runtime flows"
+body = """
+Problem
+The publication flow added by flotsync-zop.05 repeats step relationships across PublicationEffect, PublicationCompletion, PublicationState and PublicationPhase and their match arms. Explore a typed owned-flow DSL after gathering experience with more concrete flows. The abstraction should eventually be usable beyond the runtime component, without dependencies on replication, Kompact, listeners, stores or resource admission.
+
+Priority and sequence
+Deferred by the user on 2026-10-11: it is too early to settle on an abstraction. Retain both proposals and implement a few more concrete flows before revisiting them. This supersedes the original P0 prerequisite from the 2026-10-10 review. Keep the issue open, unassigned and at backlog priority with status_reason deferred; remove its blocker relationship on flotsync-zop.06. No macro strategy or production implementation is agreed. When resumed, compare the proposals against the additional flows, align on a design and assess an isolated prototype before any DSL adoption.
+
+Alternatives under review
+Option A is documented in docs/typed_owned_flow_dsl.md: a macro_rules declaration with inline input/waiting/result relationships. Option B is documented in docs/derive_owned_flow_dsl.md: derive OwnedFlow on a real waiting-state enum, helper attributes naming input/result/handler types, and ordinary Rust payload structs and aliases. Compare both before choosing one prototype. User feedback explicitly values ordinary Rust generator structure, maintainability and rustfmt-friendly annotations; a derive is an equal candidate without needing to prove macro_rules inadequate first. The derive proposal separates parsing, validation, a small source model and item generation. Review feedback is captured in .agent_local_docs/tmp/flotsync-oyr-design-feedback.md.
+
+Design requirements
+Declare each waiting step's owned action inputs, typed result, state data and handler relationship once. Generate action/result pairing, result-kind validation and state names; remove the separate phase enum where practical. Keep domain transitions and effect execution ordinary Rust with explicit success/error branches and named helpers. Do not encode scheduling or automatic retries in the DSL.
+
+Preserve ownership lifetimes: the listener action owns ListenerDataChanges while waiting retains PublishReceipt; the reply action owns KPromise and reply value while waiting retains PublicationOutcome. Resource claims are non-cloneable, waiting state is installed before exposing actions, and termination explicitly returns full ownership. Wrong-flow, wrong-step and repeated results remain contextual Snafu errors. Preserve source chains and component fault policy. A dropped reply receiver does not cancel committed work, and committed writes are not retried automatically.
+
+Both proposals explore typed one-shot completion tokens, caller-provided identity with per-invocation correlation, and explicit retention of waiting/result payloads on faults. These are proposed mechanics, not accepted implementation requirements. Validate their ergonomics and cost. The component-local wrapping flow ID allocator remains supported. No Any-based framework, runtime type erasure, unnecessary allocation or automatic Drop release. Scheduling, resource registry, concurrent joins, cancellation and shutdown policy stay outside this task and with the existing decomposition follow-ups.
+
+Acceptance
+Agree syntax and ownership/error rules. Show publication declarations and equivalent generated Rust. Compile-failure checks prove mismatched input/waiting/result types and token reuse fail; runtime tests prove identity/phase/repeated-result validation and ownership retention. State clearly that typed pairing alone does not prove the legal business transition graph. Preserve publication ordering, write/listener failure behaviour, dropped receivers, cleanup and existing runtime boundary coverage. Include branching, sequential child composition and a small non-runtime consumer. Compare readability, debugging, actual diagnostic quality, rustfmt output, navigation, generator maintenance and measured substantive source reduction. Decide explicitly whether to adopt the selected prototype or keep handwritten flows before production conversion.
+
+Sizing and review
+Original 400-700 LOC estimate has been refined: Option A prototype 570-790 LOC; Option B 720-1,010 LOC; subsequent publication adoption 150-250 LOC. Do not build both by default. If derive is selected, split declaration parsing/expansion/diagnostics (300-420 LOC) from execution/ownership fixtures/behaviour (420-590 LOC), with separate reviews; production adoption is a further decision. Broad rollout remains in existing conversion tasks. Preserve staged review state and obtain user acceptance before closing.
+"""
+status = "open"
+status_reason = "deferred"
+type = "task"
+priority = 4
+created_at = "2026-10-10T13:36:35.539748Z"
+updated_at = "2026-10-11T09:05:31.437765Z"
+
+[[links]]
+target = "01a1071b-c922-74b2-b5bf-f9b0eb4ba0c1"
+label = "discovered from"
+
+[[comments]]
+id = "01a12625-e9e6-7b80-9c72-f11049721346"
+author = "codex"
+body = "Draft design proposal recorded in docs/typed_owned_flow_dsl.md, awaiting user alignment. User constraint: eventual use beyond the runtime component. Proposal separates typed step declarations and caller-driven dispatch from replication-specific ownership, execution and scheduling; uses macro_rules!, typed completion tokens, invocation correlation, explicit ownership-preserving faults and ordinary Rust handlers. Includes publication expansion shapes, sequential child composition, a non-runtime fixture, compile-time versus behavioural guarantees, and prototype review criteria. Estimate 570-790 substantive LOC for prototype; subsequent production adoption 150-250 LOC, so keep separately planned/reviewed if adopted. No production implementation started; status remains planning."
+created_at = "2026-10-10T14:09:41.350992Z"
+
+[[comments]]
+id = "01a1265d-f67c-7ef3-af22-2ce104b22c18"
+author = "codex"
+body = "Explored a derive alternative at user request: docs/derive_owned_flow_dsl.md. Feedback favours maintainable ordinary Rust generator structure and rustfmt-friendly declarations. Both options remain available; no strategy selected. Updated the full issue plan to include generalisation beyond runtime, both alternatives, preserved ownership/behaviour constraints, validation and revised sizing. Derive prototype estimate 720-1,010 LOC; proposed separate reviews for declaration/diagnostics and execution/ownership before any production adoption."
+created_at = "2026-10-10T15:10:54.588937Z"
+
+[[comments]]
+id = "01a12a35-cd2d-75f0-a19c-2c0d53520d47"
+author = "codex"
+body = "Deferred at user request on 2026-10-11. Retain both macro_rules and derive proposals; implement a few more concrete flows before settling on the abstraction. Removed the prerequisite on flotsync-zop.06. No approach selected and no prototype implemented."
+created_at = "2026-10-11T09:05:31.437765Z"

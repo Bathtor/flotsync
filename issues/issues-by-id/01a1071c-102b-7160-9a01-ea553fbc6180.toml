@@ -1,0 +1,34 @@
+id = "01a1071c-102b-7160-9a01-ea553fbc6180"
+ref = "flotsync-zop.11"
+title = "Convert local group creation flow"
+body = """
+Goal
+Convert local group creation into a finite owned orchestration flow. First half of parent R11; follows flotsync-zop.10.
+
+Instructions
+S01. Model validation/setup preparation, creation transaction, projection publication, listener notification, invitation dispatch and reply with explicit owned payloads.
+S02. Preserve the current creation order: commit/install group, deliver even an empty initial listener event, then submit peer invitations and return the group id. Do not accidentally reuse publication's outbound-before-listener ordering.
+S03. Reuse narrow setup/security, transaction and listener primitives without making a flag-driven universal group operation. Own the projection-writing interval and any group state until its required consistency is restored.
+S04. Preserve member ordering, name validation, bootstrap material limits and partial-failure/error behaviour. Blocking execution remains the adapter in this child.
+
+Acceptance and validation
+Cover empty/invalid creation, successful persistence across restart, initial event delivery and invitation/listener/reply sequence, including listener failure after commit. No key exchange, new schemas or creation API changes.
+
+Review and size
+250-400 edited/new LOC including tests, 100-200 relocated. Keep independent from membership conversion so it can be accepted alone. Apply parent validation/no-staging rules; close only after user agreement.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+Creation's operation-specific sequence is group commit and projection publication, awaited DataChanged notification even when empty, invitation submission, then reply. A listener failure preserves the committed group and suppresses invitations on that failure path. Do not reuse publication's dispatch-before-listener order merely because both workflows notify.
+
+Existing group tests cover empty creation notification and failure outcomes, but .01's new gates do not directly observe creation invitations versus callback release. Add controlled listener/port evidence for this sequence during conversion, using existing Kompact port-test support and the shared gate. Reserve the notification lane before event-producing commits in the final concurrent design, and keep initial group setup validation separate from write-phase revalidation assigned to .16."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-0f0c-7612-b9e0-391c0f016207"]
+blocks = ["01a1071c-1144-76f3-b850-24a2404c2d38"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:42.091484Z"
+updated_at = "2026-10-04T14:22:23.227484Z"

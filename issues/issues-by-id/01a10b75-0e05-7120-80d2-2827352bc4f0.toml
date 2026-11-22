@@ -1,0 +1,49 @@
+id = "01a10b75-0e05-7120-80d2-2827352bc4f0"
+ref = "flotsync-2x5"
+title = "Investigate intermittent network catch-up stalls"
+body = """
+Investigate intermittent network catch-up stalls observed while validating flotsync-zop.04. Do not assume the failure is pre-existing or caused by the extraction until its waiting dependency is identified.
+
+Evidence (2026-10-05)
+The unchanged runtime::tests::delivery::partial_update_batch_retry_narrows_remaining_need test timed out waiting for two listener data-change events in one delivery-suite rerun and three subsequent isolated captured-output runs. Cleanup then timed out waiting for a test reply/future and aborted during unwinding. The initial 23-test delivery run passed, and a later full 23-test run passed with normal capture. Five isolated runs with --nocapture passed after removing temporary tracing. A temporary copy of committed baseline 261d7fe passed the same isolated captured-output test 24 consecutive times. This comparison leaves a possible timing regression unresolved.
+
+The failure logs show SQLite work progressing before the stall; the last observed statement differs between runs. Reliable delivery later times out awaiting the recipient acknowledgement. No classified inbound failure or component panic preceded the primary listener timeout. Temporary traces demonstrated successful applied-marker, version-vector update and commit continuations in a passing run; those traces have been removed. Reverting the last dependency-range helper refinement to return an owned Vec did not eliminate the captured-output failure, so the final implementation retains direct accumulation.
+
+Reproduction
+Run cargo test -p flotsync_replication --lib runtime::tests::delivery::partial_update_batch_retry_narrows_remaining_need -- --exact --test-threads=1 outside the sandbox. Compare normal capture, --nocapture and the full runtime::tests::delivery:: selection. The fixture declares its two UDP endpoints through the existing socket broker. Keep tests serial and preserve their current timeout/retry semantics during diagnosis.
+
+Investigation and acceptance
+Identify the awaited operation and who must resume it. In particular, inspect interactions between runtime blocking handlers, advisory summary futures, store connections/transactions and delivery acknowledgement; these are hypotheses, not established causes. Obtain a controlled reproduction or an effect trace that distinguishes transaction progress from listener/ack progress, then fix the identified boundary with a focused regression. Also make fixture cleanup preserve the primary diagnostic rather than aborting on a second destructor panic if that is independently reproducible. Do not hide the failure by increasing timeouts, disabling capture or weakening assertions.
+
+Relation to conversion
+flotsync-zop.04 preserves existing blocking single/batch orchestration and commit units. Resolve whether this finding needs a correction before accepting that extraction or supplies an independently justified prerequisite for later FSM/concurrency work. Diagnostic logs and baseline comparison notes are in .agent_local_docs/tmp/zop/04-* on the investigating machine; persistent evidence is summarised here so the issue does not depend on those temporary files.
+"""
+status = "closed"
+status_reason = "duplicate"
+type = "bug"
+priority = 1
+created_at = "2026-10-05T09:46:23.109987Z"
+updated_at = "2026-10-05T14:21:05.182517Z"
+closed_at = "2026-10-05T12:15:53.516971Z"
+
+[[links]]
+target = "01a1071b-c84c-7400-9af8-bbbed8c1963e"
+label = "discovered from"
+
+[[comments]]
+id = "01a10bfd-ee9c-74d1-87b6-e98438f4ed81"
+author = "codex"
+body = "The user requires this investigation and fix within flotsync-zop.04 and rejects an unsolicited follow-up investigation task. The demonstrated summary-read/blocking-write dependency is fixed there, with a failing-before/passing-after controlled regression and 30 consecutive captured-output catch-up passes. Consolidating tracking into .04; retain this record only as duplicate diagnostic history, with no remaining separate work."
+created_at = "2026-10-05T12:15:53.5008Z"
+
+[[comments]]
+id = "01a10bfd-eeac-7361-a0e7-168ba919eca4"
+author = "lkroll"
+body = "duplicate"
+created_at = "2026-10-05T12:15:53.516971Z"
+
+[[comments]]
+id = "01a10c70-8d1e-7680-a475-a8fd78e734ef"
+author = "codex"
+body = "User accepted the completed flotsync-zop.04 fix and requested both task records closed. This issue is already closed as duplicate; the investigation, correction and regression are complete in .04, with no deferred test work remaining."
+created_at = "2026-10-05T14:21:05.182517Z"

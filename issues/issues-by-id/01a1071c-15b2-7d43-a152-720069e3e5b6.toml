@@ -1,0 +1,40 @@
+id = "01a1071c-15b2-7d43-a152-720069e3e5b6"
+ref = "flotsync-zop.16"
+title = "Specify store isolation and revalidate flow phases"
+body = """
+Goal
+Make transaction isolation requirements and cross-phase revalidation explicit before overlap is enabled. Transaction half of parent R19; follows flotsync-zop.15.
+
+Instructions
+S01. Derive the required store guarantees from publication and group acceptance/activation algorithms. Document required atomicity, retained-read snapshot behaviour and conflict/lost-update prevention; do not infer these from Send + Sync. Inspect current SQLite BEGIN IMMEDIATE writes and other store implementations/doubles. Include lock-holder progress and connection-pool exhaustion: establish which reads retain locks or pool connections, which writes wait for them, and what must remain runnable to release those resources. Account for SecurityStore and other components aliasing the backend. Carry these concrete constraints into .21 effect execution and .22 overlap admission; field ownership alone cannot establish store progress.
+S02. Reload authoritative pending activation by key in each activation transaction. Revalidate selected successor/final cut, lifecycle, target material/membership/schema and completion/supersession evidence. Missing pending work alone cannot imply success. Preserve valid observable acceptance and activation commit states for other database users.
+S03. Validate publication lifecycle/progress and mutable security assumptions at the transaction boundary. Use suitable backend isolation or conditional writes; do not add a runtime-global database gate or retry committed effects.
+S04. Ensure activation provider rows, read token and replacement lineage describe the same established read snapshot. Identify transaction creation versus actual snapshot establishment. Keep same-group ownership until this boundary is safe.
+
+Acceptance and validation
+Controlled tests exercise competing acceptance, stale work between phases, conflicting writes and provider/token consistency. Preserve error classifications and transaction-scoped retry boundaries. Add controlled retained-reader/conflicting-writer and exhausted-pool checks where needed to establish the backend's progress contract; a waiting acquisition must not prevent an existing holder from releasing its lock or connection. Distinguish ordinary backend serialisation from a scheduler-induced wait cycle. The demonstrated .04 summary deadlock is already fixed; this requirement guards its replacement during parallelisation. This is focused contract coverage, not implementation of the entire flotsync-uvo store conformance project.
+
+Review and size
+150-350 edited/new LOC including tests; split newly discovered backend work if it threatens 1000 LOC rather than hiding it in this child. Follow parent validation/no-staging policy and user acceptance before closure.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+The generic store interface establishes read-your-own-writes, rollback-on-drop and consistent pagination, but does not fully specify cross-transaction conflict/lost-update guarantees. SQLite uses BEGIN IMMEDIATE writes, BEGIN reads and a pool of eight; one writer can limit throughput, and beginning a read transaction is not necessarily snapshot establishment. SecurityStore and other components may alias that backend, so runtime partition ownership is not isolation for external consumers.
+
+Make concrete the identified repeat-validation points: membership preparation -> acceptance (source lifecycle/final cut/schema/key evidence), group setup validation -> persistence, accepted-work reload -> activation (selected successor/cut/material/schema/lifecycle and completion/supersession), and provider rows -> token/lineage at one established read cut. Missing pending activation alone cannot prove success. Intermediate accepted and activated commits must remain valid externally. Existing checkpoint tests and .01's independent committed-data reads are baseline evidence, not competing-transaction conformance tests; add focused conflict and provider-cut coverage without broadening into the entire flotsync-uvo project."""
+status = "open"
+type = "task"
+priority = 1
+blocked_by = ["01a1071c-1499-7af1-bfe0-7ce5bb415139"]
+blocks = ["01a1071c-5f8e-7110-9a0d-c80ffd2f3325"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:43.50604Z"
+updated_at = "2026-10-05T13:57:16.208956Z"
+
+[[comments]]
+id = "01a10c5a-bf30-75c3-b7df-976b2f206d86"
+author = "codex"
+body = "Review F04.R4 from flotsync-zop.04: include lock-holder and connection-pool progress in the backend contract. The summary-read deadlock is fixed in .04; this existing task must give .21/.22 concrete resource-wait constraints when replacing that serial boundary. Full task plan and acceptance coverage updated."
+created_at = "2026-10-05T13:57:16.208956Z"

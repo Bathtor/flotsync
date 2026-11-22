@@ -1,0 +1,9 @@
+id = "01a124e2-edd7-7931-9f85-a08b6e3baf4e"
+ref = "flotsync-v2i"
+title = "Add UUID as a first-class schema primitive"
+body = "Requested during review of maintain-rs-m5t.4.3 in /Users/lkroll/Programming/maintain-rs. Application list/predecessor references currently have to use Binary or String and repeatedly validate and convert UUIDs. Add a first-class uuid::Uuid schema/value primitive with the same coverage as other primitives. Scope: PrimitiveType, owned and borrowed primitive values, homogeneous arrays and nullable forms; field initial/set operations and supported register/list data types; validation, Display, Rust Encode/Decode and borrowed reads; operation and snapshot protobuf codecs, message definitions and storage roundtrips where these values are supported. Use one documented canonical binary UUID representation at serialisation boundaries and keep typed UUIDs within the data model; do not make callers manage raw byte lengths or textual canonicalisation. Existing GroupId/RowKey identity types remain distinct from UUID-valued application fields. Acceptance: scalar, nullable and array roundtrips through value/operation/snapshot/storage paths; malformed lengths, wrong primitive types and nullability errors are contextual and structured; borrowed decoding does not allocate just to read a UUID; test all supported field kinds and both owned/borrowed conversion paths. Inspect the current implementation and align on a concrete holistic plan before implementation; no migration work is requested. This follow-up is upstream work and should not expand maintain-rs-m5t.4.3."
+status = "open"
+type = "feature"
+priority = 2
+created_at = "2026-10-10T08:16:54.231553Z"
+updated_at = "2026-10-10T08:16:54.231553Z"

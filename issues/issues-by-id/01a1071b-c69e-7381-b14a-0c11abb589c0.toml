@@ -1,0 +1,157 @@
+id = "01a1071b-c69e-7381-b14a-0c11abb589c0"
+ref = "flotsync-zop.02"
+title = "Extract runtime messages and API adapters"
+body = """
+Goal
+Separate the component shell's public messages, test plumbing and narrow API adapters without changing scheduling. Implements parent R02; follows flotsync-zop.01.
+
+Instructions
+S01. Extract ReplicationRuntimeMessage, pending decision response types and test-support commands into cohesive modules while retaining existing public re-exports and cfg visibility.
+S02. Isolate security request handling and summary ingress/delegation behind narrow adapters. Keep current block_on versus spawn_local choices, promise ownership, error mapping and remote SummaryRequestManager routing unchanged.
+S03. Do not create a new component, public gateway contract or general dispatch framework. This is preparatory organisation; lifetime partition ownership will be added by later children.
+S04. Keep moved text mechanically recognisable. Separate relocation from necessary import/visibility changes, provide an old-to-new symbol map, and avoid incidental renaming/formatting across unrelated code. Preserve the repository mod.rs convention when turning a file into a folder module.
+
+Acceptance and validation
+The shell retains the same public API, actor vocabulary and test-support behaviour. Existing downstream boundary tests and affected runtime tests cover the move; no tests that merely mirror module layout. Inspect touched files for duplicated helpers and run formatting/pedantic Clippy as appropriate.
+
+Review and size
+150-250 new/edited LOC, plus 450-700 existing LOC relocated. Split mechanical patches if needed to keep review comprehensible; follow parent constraints, stage nothing and close only after user acceptance.
+
+Findings from accepted flotsync-zop.01
+
+The accepted baseline is docs/replication_runtime_flow_contracts.md. Read its relevant phase, field-use and evidence tables alongside current sources before this child. These findings supplement the instructions above; existing scope, review estimates, dependencies and deferred work remain applicable.
+
+The inventory identifies ten production block_on and four spawn_local paths. Keep security assessment/feedback/known-key requests and advisory observed summaries distinct from exclusive mutation flows. Local public-key bundle lookup, decode/scope checks and host group-state/diagnostic/peer-route/shutdown access also have explicit boundaries; a mechanical extraction must not silently route them all through a new public gateway. NeedRange remains catch-up-manager work.
+
+Reliable delivery fans out to the runtime and SummaryRequestManagerComponent with clones of one KClaimablePromise. Invitation/proposal and inbound SummaryRequest success points are runtime-owned; reliable Summary response completion is summary-manager-owned after correlation, while runtime inspection is advisory. Preserve the existing single completion owner, public exports and cfg(test) submission adapters. The new submit_update_batch_for_test helper in handle.rs is shared by synchronous and controlled tests; retain that delegation rather than duplicating ingress.
+
+Agreed execution plan for flotsync-zop.02 (authorised by the user on 2026-10-04)
+
+F02.1. Extract message vocabulary and preserve existing paths.
+Move ReplicationRuntimeMessage, PendingGroupDecisionResponse and PendingGroupDecisionResponseKind from component/mod.rs to component/messages.rs. Keep runtime::ReplicationRuntimeMessage and component-level imports working through re-exports; preserve derives, variants, payloads and cfg gates. Keep the decision response fields private to the message module, adding a restricted constructor and consuming into_parts helper for group_work.rs and the decision handler rather than exposing those fields publicly. Constructors used by handle.rs/host tests need pub(in crate::runtime), since pub(super) would otherwise shrink their visibility after nesting. Leave Actor, port and lifecycle implementations in component/mod.rs.
+F02.1 scope clarification following user feedback: extract only runtime-owned local actor messages. The delivery request/indication enums already live with GroupBroadcastPort and ReliableDeliveryPort in delivery/contracts.rs; their Deliver payloads remain in the respective delivery modules. Keep those producer-owned event/port contracts together. ReplicationEvent and ReplicationEventListener remain application API contracts in api/groups.rs. This component currently defines no runtime-owned port/event contract to extract. The later shared RuntimeInput union wraps existing ingress indications and owned effect completions; it does not move or redefine delivery ports. The user accepted F02.1-F02.6 including this scope clarification and authorised execution on 2026-10-04.
+
+F02.2. Isolate test command plumbing.
+Create component/test_support.rs behind cfg(any(test, feature = "test-support")). Move ReplicationRuntimeTestMessage, PendingGroupTestInput/Ask, existing test_* message constructors, six handle_test_* handlers and load_group_read_token_for_test. Add one handle_test_message match in this module so the production actor match has one gated Test branch. Preserve InstallGroup under feature = "test-support" and the other variants under cfg(test). Keep the private_interfaces allowance limited to the existing test enum. Existing handle.rs submission helpers, including submit_update_batch_for_test and its synchronous delegate, remain intact. The responder and fixture setup continue through the same mailbox/transaction/listener paths.
+
+F02.3. Extract the security API adapter.
+Create component/security_api.rs containing handle_local_public_key_bundle, handle_known_member_keys, handle_assess_public_key_bundle and handle_record_public_key_bundle_feedback. Keep the local bundle reply synchronous, the other three spawn_local, and existing ApiError classifications and operation names. Use async_self.security directly inside spawned closures instead of the three unnecessary service clones, as required by the Kompact instructions. Retain the shared reply_api helper in the shell. Document that assessment may read or store candidate evidence, feedback writes and known-key reporting reads. Add no component, service bag, protocol or ownership registry.
+
+F02.4. Extract summary adaptation with explicit boundaries.
+Create component/summary_api.rs containing SummaryReplyRoute, validate_summary_request, load_summary_versions_from_store, summary_message_for_request, load_summary_message_from_store, summary_for_request, submit_summary_reply, handle_inbound_summary_request, handle_request_summary, inspect_summary_catch_up and handle_observed_summary. Retain only the three shell-callable handler methods and the reply-route type at component-visible scope; store/payload helpers become module-local functions taking their concrete inputs (store, group id, local member, request/summary), with explicit imports rather than super::*.
+Keep summary request handlers blocking and observed summaries spawned/advisory. Preserve the distinct store semantics: API summaries require readable lifecycle and explicit read release, inbound summaries bound vectors by lifecycle, and advisory inspection ignores unknown groups and reports bounded availability/needs. Do not combine these into a single policy-bearing loader. Reliable inbound SummaryRequest submits its reply before completing processed. Reliable Summary response completion remains in SummaryRequestManagerComponent, not the runtime advisory handler. Remote API delegation transfers the original promise. Keep ingress decoding/scope checks, NeedRange routing and shared update-range/catch-up helpers in their current owners. This child extracts scheduling adapters; owned summary/security flow conversion remains .14 and concurrency remains .15-.23.
+
+F02.5. Make the review incremental and size it honestly.
+Prepare three independently compilable patches in order: vocabulary/test plumbing (approximately 300-340 relocated LOC plus 40-70 edited/new), security adapter (60-80 relocated plus 15-30 edited/new), summary adapter (260-290 relocated plus 50-80 edited/new). Total approximately 620-710 relocated LOC and 105-180 substantive edited/new LOC, excluding duplicated add/delete accounting for moves. This refines the original 450-700 relocated / 150-250 edited estimate. No individual patch or total substantive work is expected to exceed 1000 LOC. Explain source-to-destination symbols and separate mechanical changes from visibility, dispatch, documentation and borrow changes. Keep all changes unstaged; if unexpected work takes the total over 1000 substantive LOC, split it into a linked review unit before broadening. Do not start .03 or commit unless requested.
+
+The adapter modules temporarily retain Kompact handler impls on ReplicationRuntimeComponent, because this child preserves scheduling. This is a deliberate intermediate seam, not a claim that moving impl blocks completes the FSM architecture. Explicit imports and narrow store helpers expose dependencies without prematurely designing the later effect driver. Issue-linked TODOs must mark every out-of-file component impl as temporary: .14 replaces the summary/security impls with finite flow or narrow service owners, and .24 retires the fixture extension and audits the entire component. By parent completion every inherent and trait impl of ReplicationRuntimeComponent must reside in component/mod.rs beside its declaration; domain FSM types and their impls are colocated in their own modules. The split fixture-constructor impl of ReplicationRuntimeMessage must also be colocated with messages.rs or replaced by fixture-local free builders. An alternative of leaving all test dispatch/handlers in mod.rs would save visibility glue but leave about 150 lines of fixture execution in the production shell. Moving complete test plumbing is preferred. Building service-owning adapter structs or domain FSMs now would add ownership choices already assigned to later children.
+
+F02.6. Verify behaviour and configuration boundaries.
+Reuse the 171-test runtime selection, including local/remote summary results, read-only-group reads, decision responder behaviour, security API bundle/known-key/assessment-feedback scenarios, startup/test commands and the .01 publication/batch listener gates. Run the existing downstream application_runtime_boundary target for Send/Sync/future coverage and secure_runtime with feature = "test-support" for feature-only installation, remote summary catch-up and delivery regression. Verify the normal library build, test-support library build and no-default-features library build so cfg(test) cannot hide broken visibility or leaked test variants. Run cargo commands sequentially and tests with -- --test-threads=1 in the sandbox; retain existing socket broker fixtures. Format touched Rust, run pedantic Clippy for the relevant default/test-support targets, and inspect touched files for new duplication.
+No new tests are planned solely to assert file layout. Add focused behavioural coverage only if extraction exposes a real contract gap. Compare the result with the source-to-destination inventory and issue body before setting status_reason to in review. Keep the issue open until user acceptance. Plan alignment is complete; execute the agreed F02.1-F02.6 review unit.
+
+Review hand-over for flotsync-zop.02
+
+Completed the agreed F02.1-F02.6 extraction, including the clarified message-only scope. No delivery event/port or application event/listener definitions moved. Existing public actor variants, payloads, re-exports, cfg visibility, request/reply/error semantics and blocking/spawned scheduling are preserved. The component shell keeps actor, port and lifecycle implementations; the new modules are intermediate scheduling seams for the later owned-flow conversion.
+
+Source-to-destination map
+- component/mod.rs -> component/messages.rs: ReplicationRuntimeMessage and pending-decision response vocabulary. Restricted new/into_parts helpers retain private response fields; group_work.rs uses the constructor and the decision handler consumes the payload.
+- component/mod.rs -> component/test_support.rs: fixture enum/input aliases, six constructors, six handlers and read-token helper. One gated shell branch delegates fixture dispatch. Constructor visibility remains runtime-scoped; InstallGroup remains feature-available and the remaining commands unit-test-only. Existing handle/host submission helpers are unchanged.
+- component/mod.rs -> component/security_api.rs: four key/trust API handlers. Three unnecessary security clones removed; spawned handlers use async_self.security and preserve error classification and reply names. The loaded local bundle still replies synchronously.
+- component/mod.rs -> component/summary_api.rs: API validation/delegation, inbound request/reply routing, protocol builders/read helpers and advisory catch-up inspection. The existing API read body became named load_api_summary_versions. Store helpers take borrowed concrete store/identity inputs. API read/release/readability policy, inbound lifecycle-bounded vectors and advisory unknown-group behaviour remain distinct. Remote delegation transfers the original promise; reliable SummaryRequest processed completion follows submission; reliable Summary response completion stays summary-manager-owned.
+
+Review organisation and size
+Three sequential standard diff patches are available in .agent_local_docs/tmp/zop/02-review-1.patch (vocabulary/test plumbing), 02-review-2.patch (security) and 02-review-3.patch (summary), with 02-review-map.txt explaining mechanical versus semantic edits. Each checkpoint compiled for the test-support library/test targets. Replaying the three patches against the committed source in an isolated working-note directory reproduces all six final Rust files exactly, without staging or changing the checkout baseline.
+Approximately 650-670 existing lines were relocated, with roughly 200 edited/new lines of imports, visibility, documentation and adapter glue. This is slightly above the 105-180 edited/new estimate, but the complete substantive review remains below 1000 lines and each patch is separately inspectable. The four new modules contain 95/326/84/345 lines respectively; component/mod.rs shrank from 4251 to 3579 lines. Net Rust growth is 175 lines; duplicated addition/deletion accounting for moves is not new implementation.
+
+Validation and limits
+All 171 runtime tests passed, including current publication/batch listener boundaries, security API requests, local/remote summaries, responder/recovery and fixture commands. Six feature-enabled secure-runtime integration tests passed, covering installation, membership dispatch, publication, gap/summary catch-up and trust rejection. Both downstream application_runtime_boundary tests passed, including the trybuild future Send coverage. Normal, test-support and no-default-feature library configurations compile. Final rustfmt and diff checks pass; pedantic Clippy completed for default and test-support library/test targets with existing warnings only and none in the touched Rust modules. No new tests were added merely to check file layout.
+The sandbox runtime selection was interrupted after widespread fixture timeouts. A single summary case also timed out there; that same case passed outside the sandbox in 0.14 seconds, followed by the full successful runtime and secure integration suites outside. This is recorded as a validation environment limitation, not a runtime regression or suppressed test failure.
+Touched-file duplication inspection found no duplicated domain algorithm. Existing reply_api, update-range/listener/transaction helpers and shared responder respond are reused. Short typed security scheduling adapters remain explicit rather than adding a higher-ranked async callback framework. The three summary reads intentionally retain separate lifecycle/release/error policies. Documentation explains optional outcomes and processed-promise ownership.
+
+Implementation and validation are complete for user review. Keep changes unstaged and uncommitted, keep flotsync-zop.02 open with status_reason in review, and do not start .03 until this child is accepted. No unresolved feedback, public API addition or extra project work was introduced. Owned FSMs and concurrency remain in the agreed later children.
+
+Ordering review correction F02.O1
+The user requested a specific audit against the Rust item-ordering rules. The initial hand-over did not adequately verify ordering. Complete the existing F02.1-F02.6 scope with mechanical ordering corrections in all touched modules: imports first; public component followed immediately by its local impls; all non-test module declarations after imports regardless of visibility; restricted contexts before private publish types; restricted free functions before restricted types; private test aliases before extension impls; summary route type, private free functions and extension impls in order. Cross-module component/message extension impls remain in the deliberately agreed adapter/test seams; moving them back would reverse this extraction. Preserve all accepted boundaries, behaviours, visibility and deferrals. Add a fourth ordering-only review patch, repeat formatting/compilation/pedantic Clippy and verify that all four patches replay to the final sources. Changes stay unstaged/uncommitted and the child remains open in review.
+
+F02.O1 completion
+Audited all six touched Rust files using the current root AGENTS.md. Corrected top-level ordering in mod.rs, group_work.rs, test_support.rs and summary_api.rs; messages.rs and security_api.rs already complied within the deliberate external-type extension exception. Local type/impl adjacency and ordinary visibility/kind groups were checked, but the module declaration placement and visibility interpretation for cross-file impls required the subsequent F02.R1/R2 correction. Cross-file method ordering is a temporary exception, not full compliance for the final architecture. Patch 4 contains only reorder/blank-line changes: non-blank line-content multisets are unchanged, and the four patches replay exactly to all six final source files. Formatting, diff checks, test-support library/test compilation and pedantic Clippy pass; existing Clippy warnings remain outside touched files. No behaviour, API or scheduling changed, no new duplication was introduced and the runtime suites need no repetition for pure item movement. F02.O1 is resolved. Keep the complete accepted plan and deferrals above; changes remain unstaged/uncommitted and flotsync-zop.02 stays open in review.
+
+Agreed review correction G02.1-G02.4 (2026-10-04)
+F02.R1: clarify AGENTS.md and put imports first, then all non-test module declarations regardless of visibility, then visibility/kind item groups, with tests last. Move the declarations in component/mod.rs accordingly.
+F02.R2: retain the explicitly temporary split for this behaviour-preserving child and add TODO(flotsync-zop) above the three component extension impls and the split message-constructor impl. Their end-of-parent removal is mandatory and assigned to linked .14/.24 work as described in F02.5; ordering an impl as one item does not establish visibility ordering for its methods.
+Validate formatting/diff checks, default and test-support library/test compilation and pedantic Clippy sequentially. Inspect touched files for new duplication, refresh the review follow-up patch and preserve the user's existing staged index exactly. This correction changes only declaration order, comments, instructions and task plans; no FSM conversion or behavioural change. Estimated 15-30 Rust/instruction lines plus nine relocated declaration lines and 40-80 issue-text lines, below 1000 LOC. Keep all original scope, exclusions, ownership boundaries, validation and later concurrency work. .02 remains open in review and .03 is not started; follow-up edits stay unstaged and no commit is authorised.
+"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+blocked_by = ["01a1071b-c612-7091-bfd1-4f885b41735c"]
+blocks = ["01a1071b-c774-77e1-8d52-ae8c39af0f09"]
+parent = "01a05e50-a099-7052-aefe-95c3c71cd02e"
+created_at = "2026-10-04T13:30:23.262303Z"
+updated_at = "2026-10-05T07:36:21.089296Z"
+closed_at = "2026-10-05T07:36:21.089296Z"
+
+[[links]]
+target = "01a1071c-137e-72c1-b577-8fa871767244"
+label = "impl retirement"
+
+[[links]]
+target = "01a1071c-6752-77e1-b939-6ff6c711399e"
+label = "impl retirement audit"
+
+[[comments]]
+id = "01a10755-4850-7502-82dc-93041aeb501d"
+author = "codex"
+body = "Claimed by codex on the existing parent branch. Proposed F02.1-F02.6: preserve message/re-export/cfg paths; isolate complete test command plumbing; extract security and summary scheduling adapters in three independently compilable review patches. Refreshing sources identified nested constructor visibility, API versus inbound summary lifecycle/read differences, three unnecessary security clones and separate Summary manager processed ownership. Estimated 620-710 relocated plus 105-180 substantive edited/new LOC. Awaiting plan alignment; no production edits, staging or commit."
+created_at = "2026-10-04T14:33:12.016861Z"
+
+[[comments]]
+id = "01a1075c-7981-7073-8892-f0f636712e0e"
+author = "codex"
+body = "User accepted the rest of F02.1-F02.6 and asked whether F02.1 includes events/port definitions. Proposed explicit scope: runtime local actor messages only; existing delivery events stay with producer-owned ports in delivery/contracts.rs, while application events/listener stay in api/groups.rs. Later RuntimeInput wraps existing types. Recorded feedback and integrated this clarification into the full proposal; no production edits until final alignment."
+created_at = "2026-10-04T14:41:03.361494Z"
+
+[[comments]]
+id = "01a10760-db0c-7a80-b839-cf6b4d17038e"
+author = "codex"
+body = "User agreed F02.1-F02.6 including the message-only extraction scope and authorised execution on 2026-10-04. Beginning the three review patches on the current branch; delivery event/port and application event definitions remain in their existing owners. Changes will remain unstaged for review."
+created_at = "2026-10-04T14:45:50.476344Z"
+
+[[comments]]
+id = "01a10776-a037-7102-9831-29d67f2432f5"
+author = "codex"
+body = "Completed agreed F02.1-F02.6: message/test plumbing and security/summary adapters, preserving delivery event/port and application event ownership. Three compiled review checkpoints and sequential patches replay exactly to current Rust files. 171 runtime, six secure integration and two downstream API boundary tests passed; default/test-support/no-default builds, rustfmt/diff and final pedantic Clippy passed with existing warnings only. Sandbox fixture timeouts were diagnosed by the same test passing outside, where full runtime/socket suites passed. Approximately 650-670 relocated plus roughly 200 substantive edited/new lines, net 175 Rust lines. Duplication and clarified message-only scope checked. Unstaged/uncommitted, awaiting user acceptance; .03 not started."
+created_at = "2026-10-04T15:09:37.207607Z"
+
+[[comments]]
+id = "01a10781-3ffa-7bf0-be5d-905b923f3917"
+author = "codex"
+body = "F02.O1: user requested the Rust ordering audit. The initial hand-over did not adequately verify it. Correcting item order mechanically in touched files, preserving the agreed cross-module adapter impls and all behaviour/visibility. Original three review patches will gain an ordering-only fourth patch; narrow validation and replay will be repeated. Recorded the feedback and integrated the correction into the full existing task plan before editing Rust."
+created_at = "2026-10-04T15:21:13.466445Z"
+
+[[comments]]
+id = "01a10785-8b0b-7070-beab-7407e6c5a7b8"
+author = "codex"
+body = "F02.O1 resolved: audited all six touched Rust files; corrected imports/grouping/local type-impl adjacency in four files. Kept deliberate cross-module extension impls in the agreed adapter/test modules. Ordering-only patch 4 preserves all non-blank line contents; all four patches replay exactly to the six current sources. rustfmt/diff, test-support library/test compilation and pedantic Clippy pass, existing warnings outside touched files only. Unstaged/uncommitted; child remains in review."
+created_at = "2026-10-04T15:25:54.827882Z"
+
+[[comments]]
+id = "01a107a3-e9d8-7660-b506-82b7f53a5750"
+author = "codex"
+body = "User accepted G02.1-G02.4 for F02.R1/R2. Clarify imports/module/item ordering and move declarations; mark all split component impls and the message fixture constructor impl as temporary. Parent completion requires all component inherent/trait impls colocated in component/mod.rs. Integrated the full .02, parent, .14 and .24 plans before production edits; .14 owns summary/security retirement and .24 owns fixture cleanup and the final source audit. Preserve existing staged review state; follow-up edits stay unstaged."
+created_at = "2026-10-04T15:59:05.176029Z"
+
+[[comments]]
+id = "01a107a6-a049-7df0-aa4e-9b56215741a8"
+author = "codex"
+body = "Completed accepted G02.1-G02.4, resolving F02.R1/R2 for this child. AGENTS.md now explicitly places non-test module declarations after imports, and component/mod.rs follows that order. All three temporary component extensions and the split message fixture constructor have issue-linked TODOs. Full parent/.14/.24 plans and source links make retirement mandatory by parent completion. Formatting/diff checks, default and test-support library/test builds and both pedantic Clippy runs passed with existing warnings outside touched files only. No new duplicate helpers or behaviour changes. Patch 5 replays to final sources; the staged diff is byte-for-byte unchanged. Follow-up edits remain unstaged, .02 stays in review, no commit or .03 work."
+created_at = "2026-10-04T16:02:02.95386Z"
+
+[[comments]]
+id = "01a10afe-0161-7d12-990c-5d9c9f45922c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-10-05T07:36:21.089296Z"

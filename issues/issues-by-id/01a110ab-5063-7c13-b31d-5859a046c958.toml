@@ -1,0 +1,35 @@
+id = "01a110ab-5063-7c13-b31d-5859a046c958"
+ref = "flotsync-lhb"
+title = "Package generated protobuf Rust source for release"
+body = """
+Goal
+
+Allow applications consuming published FlotSync crates to build without installing the buf CLI or regenerating protobuf Rust code.
+
+Preferred direction
+
+Option A: ship generated Rust source in the published flotsync_messages crate. Generate it explicitly during release preparation; the maintainer usually releases from their laptop, so this need not depend on a CI publishing workflow. This is the preferred direction, pending concrete implementation-plan alignment.
+
+Scope
+
+P01. Separate protobuf generation from consumer builds while preserving the existing public generated-type re-exports and unrelated Rust-channel configuration.
+P02. Include all required generated Rust files in the crate package and remove the published build dependency on buf, buffa-build, and protobuf inputs outside the crate directory.
+P03. Provide a repeatable local generation and release-preparation command, retaining the existing Buffa generator settings.
+P04. Decide during planning whether generated files are committed or generated only for packaging; release-time generation is sufficient for the stated consumer requirement. Define how stale generated output is detected.
+
+Acceptance criteria
+
+A01. A freshly extracted release package builds without buf installed and without access to the repository-level protobuf inputs.
+A02. Published consumers do not compile or run buffa-build for this generation step.
+A03. Generated public APIs and protobuf behaviour remain covered by the existing relevant tests, with additional coverage only where the change requires it.
+A04. Document and verify the laptop release workflow, including generation before packaging and inspection of packaged contents.
+
+Planning
+
+Inspect the current generation and release setup, estimate handwritten LOC by sub-part, and align the concrete plan before implementation. Generated output size should be reported separately. Split into smaller self-contained tasks if the handwritten implementation is likely to exceed 1000 LOC."""
+status = "open"
+type = "task"
+priority = 3
+parent = "01a10696-f564-7c42-80c9-4fe0acf4f1dc"
+created_at = "2026-10-06T10:03:45.123603Z"
+updated_at = "2026-10-06T10:03:48.426211Z"

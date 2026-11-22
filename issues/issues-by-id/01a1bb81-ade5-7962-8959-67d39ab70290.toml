@@ -1,0 +1,14 @@
+id = "01a1bb81-ade5-7962-8959-67d39ab70290"
+ref = "flotsync-8hv"
+title = "Make Flotsync core identities usable without runtime dependencies"
+body = """
+MaintainRS needs flotsync_core::GroupId to implement From<GroupId> for its shared Scope type. At the pinned revision, flotsync_core unconditionally depends on flotsync_utils, which brings in async-std and Kompact. Consumers of the shared identity types should be able to choose a Cargo feature set that keeps those runtime dependencies out of their build.
+
+Identify which Core/Utils modules require async or actor runtime support and make those dependencies opt-in for an identity-only consumer. Propose clear feature names and defaults, and wire existing workspace users to request the features they actually use. Keep GroupId the same type across feature sets. Add an external compile fixture using GroupId with the minimal feature set and verify with cargo tree that it excludes async-std and Kompact. Exercise the existing runtime builds with their required features enabled.
+
+Discovered during MaintainRS maintain-rs-m5t.9.2. Once the minimal build is available, use it in maintain_rs_shared and replace the app's scope_for_group helper with From<GroupId> for Scope."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-11-08T14:13:20.485545Z"
+updated_at = "2026-11-08T14:13:20.485545Z"
