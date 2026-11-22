@@ -17,9 +17,7 @@ permissions:
 env:
     CARGO_TERM_COLOR: always
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-    RUST_TEST_TOOLCHAIN: nightly
     RUST_STYLE_TOOLCHAIN: nightly-2026-07-18
-    RUST_MSRV_TOOLCHAIN: 1.96.0
 
 jobs:
     linux-style:
@@ -79,11 +77,13 @@ jobs:
             - name: Run clippy
               run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings -W clippy::pedantic
 
-    linux-tests:
-        name: linux-tests
+    linux-tests-nightly:
+        name: linux-tests (nightly)
         runs-on: ubuntu-latest
+        env:
+            RUST_TEST_TOOLCHAIN: nightly
 
-        steps:
+        steps: &linux-test-steps
             - name: Check out repository
               uses: actions/checkout@v6
 
@@ -98,17 +98,13 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y clang libavahi-compat-libdnssd-dev
 
-            - name: Install floating Rust nightly for tests
+            - name: Install Rust test toolchain
               uses: dtolnay/rust-toolchain@master
               with:
                   toolchain: ${{ env.RUST_TEST_TOOLCHAIN }}
 
-            - name: Install minimum supported Rust version
-              uses: dtolnay/rust-toolchain@master
-              with:
-                  toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
-
             - name: Install Nushell
+              if: github.job == 'linux-tests-msrv'
               uses: hustcer/setup-nu@v3.29
               with:
                   version: "0.117.0"
@@ -123,19 +119,33 @@ jobs:
               uses: Swatinem/rust-cache@v2
 
             - name: Check Core without runtime dependencies
+              if: github.job == 'linux-tests-msrv'
               run: nu scripts/check-core-runtime-deps.nu
               env:
-                  RUSTUP_TOOLCHAIN: ${{ env.RUST_MSRV_TOOLCHAIN }}
+                  RUSTUP_TOOLCHAIN: ${{ env.RUST_TEST_TOOLCHAIN }}
 
-            - name: Run nightly workspace tests
+            - name: Run workspace tests
               run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} test --workspace --locked
 
             # PRs avoid costly optimised builds; scheduled CI compiles and links benchmarks.
-            - name: Check nightly benchmarks
+            - name: Check benchmarks
               run: cargo +${{ env.RUST_TEST_TOOLCHAIN }} check --workspace --benches --locked
 
-            - name: Run MSRV workspace tests
-              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} test --workspace --locked
+    linux-tests-msrv:
+        name: linux-tests (MSRV)
+        runs-on: ubuntu-latest
+        env:
+            RUST_TEST_TOOLCHAIN: "1.96.0"
+        steps: *linux-test-steps
 
-            - name: Check MSRV benchmarks
-              run: cargo +${{ env.RUST_MSRV_TOOLCHAIN }} check --workspace --benches --locked
+    linux-tests:
+        name: linux-tests
+        needs: [linux-tests-nightly, linux-tests-msrv]
+        if: ${{ always() }}
+        runs-on: ubuntu-latest
+        steps:
+            - name: Require both Linux test jobs to pass
+              if: needs.linux-tests-nightly.result != 'success' || needs.linux-tests-msrv.result != 'success'
+              run: |
+                  echo "::error::Nightly and MSRV Linux tests must both pass."
+                  exit 1

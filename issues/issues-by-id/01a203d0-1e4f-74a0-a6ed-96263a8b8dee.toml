@@ -1,0 +1,18 @@
+id = "01a203d0-1e4f-74a0-a6ed-96263a8b8dee"
+ref = "flotsync-r33"
+title = "Parallelise nightly and MSRV tests on CI"
+body = "Run Rust nightly and MSRV tests on separate GitHub Actions runners to shorten feedback time. In Linux PR CI, reuse test steps for both toolchains, run the Core runtime dependency check on MSRV, and preserve linux-tests as the aggregate check. In scheduled native CI, run the existing tests, release build, and benchmark compilation in an OS-by-toolchain matrix with fail-fast disabled. Validate both workflows with actionlint."
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 3
+assignee = "codex"
+created_at = "2026-11-22T15:11:40.623077Z"
+updated_at = "2026-11-22T15:14:07.954558Z"
+closed_at = "2026-11-22T15:14:07.954558Z"
+
+[[comments]]
+id = "01a203d2-5dd2-7c30-9a0a-9006d4fc91ee"
+author = "lkroll"
+body = "completed"
+created_at = "2026-11-22T15:14:07.954558Z"
