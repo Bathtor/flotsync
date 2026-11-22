@@ -1,0 +1,18 @@
+id = "01a1bb2e-0361-7a70-ae9c-e2d2b6e63004"
+ref = "flotsync-pqt"
+title = "Mark group introductions explicitly in DataChanged"
+body = """
+Live DataChanged events currently use DataChangeLineage::Update both for a group's introduction to the application view and for later changes to an existing group. An application that has no local record for the group cannot distinguish a legitimate first event from a missing local base. MaintainRS currently creates a local group record in either case.
+
+Add an explicit DataChangeLineage::GroupIntroduced variant on the same DataChanged event as the initial rows and bound group read token. Emit it for local group creation and for activation of creation-sourced invitations, including automatic acceptance and pending activation resumed at startup. Deliver it even when there are zero rows. The runtime must commit activation before calling the listener, preserve per-group delivery order, and await the callback before returning success from creation or explicit acceptance.
+
+Document that applications can commit their new local group record, initial rows and read token together. Subsequent data changes use Update. Preserve GroupReplacement for membership changes and the separate Snapshot, Changes and Retired entries used during startup reconciliation. Verify that ApplicationReadToken::apply_data_change adds the introduced group without changing other group positions.
+
+Cover empty local creation, an invitation with initial rows, empty invitation activation, resumed activation and a subsequent ordinary update. Check the lineage, bound token, and delivery order, and update consumers that match DataChangeLineage.
+
+Discovered in MaintainRS maintain-rs-m5t.9.1. Once MaintainRS adopts the new lineage, it can remove its missing-group fallback for Update and fail Sync when an ordinary update lacks a local base."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-11-08T12:41:57.345903Z"
+updated_at = "2026-11-08T12:41:57.345903Z"

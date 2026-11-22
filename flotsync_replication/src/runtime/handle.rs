@@ -1417,19 +1417,33 @@ impl ReplicationRuntime {
             .expect("test group should exist in the replication store")
     }
 
+    /// Submit a single input without waiting, allowing tests to queue work at a listener boundary.
+    ///
+    /// The future carries the handler result; a dropped promise means the component stopped.
+    #[cfg(test)]
+    pub(super) fn submit_update_for_test(
+        &self,
+        sender: MemberIdentity,
+        message: UpdateMessage,
+    ) -> KFuture<Result<(), InboundDeliveryError>> {
+        let runtime_ref = self
+            .runtime_ref("injecting test update")
+            .expect("replication runtime lifecycle should be readable during test update injection")
+            .expect("replication runtime should be live during test update injection");
+        runtime_ref.ask_with(|promise| {
+            ReplicationRuntimeMessage::test_apply_update(promise, sender, message)
+        })
+    }
+
+    /// Apply one fixture input through production orchestration and await its classified result.
+    /// Panics if the runtime stops before replying or does not answer within the fixture timeout.
     #[cfg(test)]
     pub(super) fn apply_update_for_test(
         &self,
         sender: MemberIdentity,
         message: UpdateMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let runtime_ref = self
-            .runtime_ref("injecting test update")
-            .expect("replication runtime lifecycle should be readable during test update injection")
-            .expect("replication runtime should be live during test update injection");
-        let future = runtime_ref.ask_with(|promise| {
-            ReplicationRuntimeMessage::test_apply_update(promise, sender, message)
-        });
+        let future = self.submit_update_for_test(sender, message);
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
             Err(error) => {

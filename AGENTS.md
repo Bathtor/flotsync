@@ -38,6 +38,7 @@
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
+- Begin doc comments by describing the attached item's purpose or meaning. Document fields and variants by what they represent. Put relevant invariants, lifecycle details and context afterwards; use ordinary source comments for implementation-only rationale.
 - Document every non-obvious return outcome. For `Option`, state exactly what `Some` and `None` mean; for booleans, state what `true` and `false` mean; for multi-way result types, document every variant. Prefer a named enum when absence or a boolean encodes domain policy, fallback, or failure rather than ordinary optional data or a predicate.
 - Document all modules, even if not public. But especially thoroughly if public.
 - Add loop labels when control flow spans non-trivial nested loops or retries.

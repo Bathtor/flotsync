@@ -122,6 +122,11 @@ pub struct PublicationFlow {
 }
 
 impl PublicationFlow {
+    /// Identify the publication for shared runtime completion validation.
+    pub const fn flow_id(&self) -> FlowId {
+        self.flow_id
+    }
+
     /// Start in Writing and move the scoped request and schema into the first action.
     pub fn new(
         ownership: FlowOwnership,
@@ -348,6 +353,7 @@ impl PublicationPhase {
     }
 }
 
+/// Publication effect ordering, reply outcomes and ownership retention transition tests.
 #[cfg(test)]
 mod tests {
     use super::*;

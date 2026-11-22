@@ -171,6 +171,7 @@ pub(super) fn panic_if_fatal_inbound_failure(
 }
 
 /// Source-specific sender validation for an inbound update.
+#[derive(Debug)]
 pub(super) enum InboundUpdateOrigin {
     /// Direct `Update` delivery where the envelope sender must be the producer.
     Producer { sender: MemberIdentity },

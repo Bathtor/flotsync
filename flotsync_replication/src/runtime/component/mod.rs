@@ -169,6 +169,7 @@ use group_work::{
     ValidatedInboundGroupSetup,
     creator_first_member_order,
 };
+use inbound_flow::{InboundCompletion, InboundEffect, InboundFlow, InboundRequest};
 use inbound_support::{
     InboundDeliveryContext,
     InboundDeliveryFailure,
@@ -186,16 +187,20 @@ use listeners::{
 };
 use publication::ScopedPublication;
 use publication_flow::{PublicationCompletion, PublicationEffect, PublicationFlow};
+use runtime_flow::{InboundResult, RuntimeCompletion, RuntimeEffect, RuntimeFlow, RuntimeOutcome};
 
 mod activation_provider;
 mod flow_driver;
 mod group_work;
+mod inbound_flow;
 mod inbound_support;
+mod listener_flow;
 mod listeners;
 mod messages;
 mod publication;
 mod publication_flow;
 mod row_patches;
+mod runtime_flow;
 mod security_api;
 mod summary_api;
 #[cfg(any(test, feature = "test-support"))]
@@ -221,8 +226,9 @@ pub struct ReplicationRuntimeComponent {
     group_memberships: Arc<SharedGroupState>,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
-    /// Owns publication's replication group and listener claims until its reply finishes.
-    publication_slot: FlowSlot<PublicationFlow>,
+    /// Admission slot for publication and inbound flows.
+    /// Holds group/listener claims through transactions, submissions, callbacks and publication replies.
+    operation_slot: FlowSlot<RuntimeFlow>,
     /// Shared ID sequence for all flows owned by this component; slot release does not reset it.
     flow_ids: FlowIdAllocator,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
@@ -249,7 +255,7 @@ impl ReplicationRuntimeComponent {
             group_memberships: identity.group_memberships,
             summary_request_manager: actors.summary_request_manager,
             catch_up_manager: actors.catch_up_manager,
-            publication_slot: FlowSlot::Available,
+            operation_slot: FlowSlot::Available,
             flow_ids: FlowIdAllocator::default(),
             max_inline_bootstrap_public_key_bundles:
                 DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
@@ -2252,103 +2258,127 @@ impl ReplicationRuntimeComponent {
         .await
     }
 
-    /// Persist one catch-up batch before emitting catch-up notifications.
-    ///
-    /// Each update is still processed in its own store transaction, but the
-    /// derived catch-up notifications are accumulated until the batch finishes
-    /// or fails. Listener notifications still follow each committed update so a
-    /// later batch failure does not hide already-applied data changes.
-    async fn persist_apply_and_notify_update_batch(
-        &mut self,
-        batch_sender: MemberIdentity,
-        message: UpdateBatchMessage,
-    ) -> Result<(), InboundDeliveryError> {
-        let group_id = message.group_id;
-        let mut observed_available = Vec::new();
-        let mut needed_ranges = Vec::new();
-        for update in message.updates {
-            let outcome = match self
-                .persist_and_apply_update(
-                    InboundUpdateOrigin::Forwarder {
-                        sender: batch_sender.clone(),
-                    },
-                    update,
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.notify_catch_up_available(group_id, observed_available);
-                    self.notify_catch_up_needed(group_id, needed_ranges);
-                    return Err(error);
-                }
-            };
-            observed_available.extend(outcome.observed_available);
-            needed_ranges.extend(outcome.needed_ranges);
-            if let Err(error) =
-                notify_listener_batches(self.listener.clone(), outcome.event_batches).await
-            {
-                self.notify_catch_up_available(group_id, observed_available);
-                self.notify_catch_up_needed(group_id, needed_ranges);
-                return Err(error);
-            }
-        }
-        self.notify_catch_up_available(group_id, observed_available);
-        self.notify_catch_up_needed(group_id, needed_ranges);
-        Ok(())
-    }
-
+    /// Apply a direct producer delivery and classify failures with its authenticated envelope.
     fn handle_update(
         &mut self,
         context: InboundDeliveryContext,
         sender: MemberIdentity,
         message: UpdateMessage,
     ) -> HandlerResult {
-        Handled::block_on(self, async move |mut async_self| {
-            let group_id = message.group_id;
-            let reply = async_self
-                .persist_and_apply_update(InboundUpdateOrigin::Producer { sender }, message)
-                .await;
-            let error = match reply {
-                Ok(outcome) => {
-                    async_self.notify_catch_up_available(group_id, outcome.observed_available);
-                    async_self.notify_catch_up_needed(group_id, outcome.needed_ranges);
-                    notify_listener_batches(async_self.listener.clone(), outcome.event_batches)
-                        .await
-                        .err()
-                }
-                Err(error) => Some(error),
-            };
-            if let Some(error) = error {
-                let failure = InboundDeliveryFailure::new(context, error);
-                let action = async_self.record_inbound_failure(&failure);
-                panic_if_fatal_inbound_failure(action, &failure);
-            }
-            Handled::OK
-        })
+        self.handle_inbound_apply(
+            context,
+            InboundRequest::Single {
+                origin: InboundUpdateOrigin::Producer { sender },
+                message,
+            },
+        )
     }
 
+    /// Keep forwarded inputs and callbacks contiguous through the final catch-up observation flush.
     fn handle_update_batch(
         &mut self,
         context: InboundDeliveryContext,
         batch_sender: MemberIdentity,
         message: UpdateBatchMessage,
     ) -> HandlerResult {
-        // Blocking keeps the batch's per-input commits and callbacks contiguous.
-        // Each callback completes before the next transaction begins, and live
-        // updates or publishes wait until accumulated catch-up observations flush.
-        Handled::block_on(self, async move |mut async_self| {
-            let error = async_self
-                .persist_apply_and_notify_update_batch(batch_sender, message)
-                .await
-                .err();
-            if let Some(error) = error {
-                let failure = InboundDeliveryFailure::new(context, error);
-                let action = async_self.record_inbound_failure(&failure);
-                panic_if_fatal_inbound_failure(action, &failure);
+        self.handle_inbound_apply(
+            context,
+            InboundRequest::Batch {
+                sender: batch_sender,
+                message,
+            },
+        )
+    }
+
+    /// Acquire the same group/listener slot used by publication before starting inbound work.
+    ///
+    /// Context is present for authenticated delivery and absent only for direct fixtures.
+    /// An occupied or faulted slot rejects admission without starting transaction work.
+    fn admit_inbound(
+        &mut self,
+        context: Option<InboundDeliveryContext>,
+        request: InboundRequest,
+    ) -> Result<FlowEffect<RuntimeEffect>, FlowProtocolError> {
+        self.operation_slot
+            .admit(&mut self.flow_ids, request.group_id(), |ownership| {
+                let (flow, effect) = InboundFlow::new(ownership, context, request);
+                (
+                    RuntimeFlow::Inbound(Box::new(flow)),
+                    RuntimeEffect::Inbound(effect),
+                )
+            })
+    }
+
+    /// Retain blocking execution for the whole single/batch flow, including its final observations.
+    fn handle_inbound_apply(
+        &mut self,
+        context: InboundDeliveryContext,
+        request: InboundRequest,
+    ) -> HandlerResult {
+        match self.admit_inbound(Some(context), request) {
+            Ok(initial) => Handled::block_on(self, async move |mut async_self| {
+                let flow_id = initial.flow_id;
+                let result = async_self
+                    .drive_inbound(initial)
+                    .await
+                    .whatever_unrecoverable(
+                        "inbound driver violated its ownership/phase protocol",
+                    )?;
+                if let Err(error) = result.outcome.into_result() {
+                    let context = result
+                        .context
+                        .context(flow_driver::protocol::MissingStateSnafu {
+                            flow_id,
+                            field: "inbound delivery context",
+                        })
+                        .whatever_unrecoverable("production inbound flow lost its envelope")?;
+                    let failure = InboundDeliveryFailure::new(context, error);
+                    let action = async_self.record_inbound_failure(&failure);
+                    panic_if_fatal_inbound_failure(action, &failure);
+                }
+                Handled::OK
+            }),
+            Err(error) => {
+                let error = self.operation_slot.fault(error);
+                Err(error).whatever_unrecoverable("inbound admission violated ownership")
             }
-            Handled::OK
-        })
+        }
+    }
+
+    /// Execute an inbound flow and return its application outcome and authenticated context.
+    ///
+    /// Returns the domain result after the shared driver restores ownership, or a protocol
+    /// error if execution or operation-kind routing fails. Context is absent only for fixtures.
+    async fn drive_inbound(
+        &mut self,
+        initial: FlowEffect<RuntimeEffect>,
+    ) -> Result<InboundResult, FlowProtocolError> {
+        let flow_id = initial.flow_id;
+        let outcome = self.drive_flow(initial).await?;
+        match outcome {
+            RuntimeOutcome::Inbound(result) => Ok(result),
+            RuntimeOutcome::Publication { .. } => {
+                let error = flow_driver::protocol::UnexpectedCompletionSnafu {
+                    flow_id,
+                    expected: "Inbound",
+                    received: "Publication",
+                }
+                .build();
+                Err(self.operation_slot.fault(error))
+            }
+        }
+    }
+
+    /// Drive a fixture through production admission, effects and terminal release without an envelope.
+    /// The outer result reports protocol faults; the inner result is the ordinary inbound outcome.
+    #[cfg(test)]
+    async fn apply_inbound_for_test(
+        &mut self,
+        request: InboundRequest,
+    ) -> Result<Result<(), InboundDeliveryError>, FlowProtocolError> {
+        let initial = self.admit_inbound(None, request)?;
+        let result = self.drive_inbound(initial).await?;
+        Ok(result.outcome.into_result())
     }
 
     fn handle_publish_changes(
@@ -2360,14 +2390,19 @@ impl ReplicationRuntimeComponent {
             Ok((scoped, schema)) => {
                 let group_id = scoped.group_id();
                 let admitted =
-                    self.publication_slot
+                    self.operation_slot
                         .admit(&mut self.flow_ids, group_id, |ownership| {
-                            PublicationFlow::new(ownership, scoped, schema, promise)
+                            let (flow, effect) =
+                                PublicationFlow::new(ownership, scoped, schema, promise);
+                            (
+                                RuntimeFlow::Publication(flow),
+                                RuntimeEffect::Publication(effect),
+                            )
                         });
                 match admitted {
                     Ok(initial) => Handled::block_on(self, async move |mut async_self| {
                         async_self
-                            .drive_publication(initial)
+                            .drive_flow(initial)
                             .await
                             .whatever_unrecoverable(
                                 "publication driver violated its ownership/phase protocol",
@@ -2375,7 +2410,7 @@ impl ReplicationRuntimeComponent {
                         Handled::OK
                     }),
                     Err(error) => {
-                        let error = self.publication_slot.fault(error);
+                        let error = self.operation_slot.fault(error);
                         Err(error)
                             .whatever_unrecoverable("publication admission violated ownership")
                     }
@@ -2389,30 +2424,73 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Execute publication actions while the flow owns its replication group and listener claims.
-    async fn drive_publication(
+    /// Execute concrete actions while their recorded owner retains group and listener claims.
+    async fn drive_flow(
         &mut self,
-        initial: FlowEffect<PublicationEffect>,
-    ) -> Result<(), FlowProtocolError> {
-        let mut pending = Some(initial);
-        while let Some(effect) = pending {
-            let completion = self.execute_publication_effect(effect.effect).await;
-            let transition = self
-                .publication_slot
-                .transition(|flow| flow.complete(effect.flow_id, completion))?;
-            match transition {
-                FlowStep::Continue(effect) => pending = Some(effect),
-                FlowStep::Finished(finished) => {
-                    debug!(
-                        self.log(),
-                        "publication finished: {:?}, reply {:?}", finished.outcome, finished.reply
-                    );
-                    self.publication_slot.restore(finished.ownership)?;
-                    pending = None;
+        initial: FlowEffect<RuntimeEffect>,
+    ) -> Result<RuntimeOutcome, FlowProtocolError> {
+        let flow_id = initial.flow_id;
+        let mut step = FlowStep::Continue(initial);
+        while let FlowStep::Continue(effect) = step {
+            let completion = match effect.effect {
+                RuntimeEffect::Publication(effect) => {
+                    RuntimeCompletion::Publication(self.execute_publication_effect(effect).await)
                 }
+                RuntimeEffect::Inbound(effect) => {
+                    RuntimeCompletion::Inbound(self.execute_inbound_effect(effect).await)
+                }
+            };
+            step = self
+                .operation_slot
+                .transition(|flow| flow.complete(effect.flow_id, completion))?;
+        }
+        match step {
+            FlowStep::Finished(finished) => {
+                match &finished.outcome {
+                    RuntimeOutcome::Publication { outcome, reply } => {
+                        debug!(
+                            self.log(),
+                            "publication finished: {:?}, reply {:?}", outcome, reply
+                        );
+                    }
+                    RuntimeOutcome::Inbound(_) => {
+                        // The caller logs inbound failures with their authenticated envelope.
+                    }
+                }
+                self.operation_slot.restore(finished.ownership)?;
+                Ok(finished.outcome)
+            }
+            FlowStep::Continue(_) => {
+                let error = flow_driver::protocol::MissingStateSnafu {
+                    flow_id,
+                    field: "terminal flow result",
+                }
+                .build();
+                Err(self.operation_slot.fault(error))
             }
         }
-        Ok(())
+    }
+
+    /// Execute inbound IO/port effects without giving the child access to component services.
+    async fn execute_inbound_effect(&mut self, effect: InboundEffect) -> InboundCompletion {
+        match effect {
+            InboundEffect::Apply { origin, message } => {
+                let result = self.persist_and_apply_update(origin, message).await;
+                InboundCompletion::Applied(result)
+            }
+            InboundEffect::Advertise {
+                group_id,
+                observations,
+            } => {
+                self.notify_catch_up_available(group_id, observations.available);
+                self.notify_catch_up_needed(group_id, observations.needed);
+                InboundCompletion::Advertised
+            }
+            InboundEffect::NotifyListener(event) => {
+                let result = self.listener.on_event(event.into_event()).await;
+                InboundCompletion::ListenerNotified(result)
+            }
+        }
     }
 
     /// Execute one action using component services; the flow receives only the result.
@@ -2779,6 +2857,7 @@ pub(super) struct RuntimeComponentActors {
     pub(super) catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
 }
 
+/// Pure validation and classification tests for component-level inbound and group policies.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,18 @@
+id = "01a134f1-a29d-7d12-951c-12196603c21b"
+ref = "flotsync-pdk"
+title = "Expose opaque replication token fixtures for application tests"
+body = """
+External consumers such as maintain-rs currently hand-build protobuf bytes to obtain deterministic GroupReadToken fixtures. Its SQL-store tests need group-specific tokens at an initial and later applied version, writable recovered-group fixtures built locally from those tokens, and PublishReceipt fixtures for receipt cleanup tests. A public library-owned test-support API should remove consumer dependence on opaque token encoding and internal version-vector construction.
+
+Add lightweight public helpers under flotsync_replication::test_support, available to dependent crates through the test-support feature. Support an arbitrary GroupId and a deterministic version position, including zero and versions requiring multi-byte varints. Provide the receipt fixture support needed to pair a successful publish result with its group and position. Keep application-specific ReplicationGroupState fixtures in the consuming application. Consumers should not need a replication runtime, backing store, socket allocation or cryptographic provisioning simply to create tokens and receipts.
+
+Use internal typed constructors and production codecs inside flotsync; do not expose private protobuf layout as the consumer contract. Document fixture membership/node assumptions and validate token round-tripping, group identity, initial/later positions and receipt construction. Include a dependent-crate example or integration test proving the helpers are accessible outside cfg(test).
+
+Requested during review of maintain-rs-m5t.4.5. Current workaround: /Users/lkroll/Programming/maintain-rs/src-tauri/src/store/sql_store/test_support.rs token(group, version). Replace the consumer workaround once these helpers are available; no implementation is requested in this issue-filing operation.
+
+Additional consumer requirement from maintain-rs-m5t.6.2 review (25 October 2026): expose lightweight DataChangeReadPosition fixtures for ordinary updates and GroupReplacement events. Allow explicit group identity, deterministic initial/later positions, and old/new group lineage through a MigrationId. The resulting positions must be usable with ApplicationReadToken::apply_data_change and preserve the normal opaque public contract. Include a dependent-crate example covering update/replacement ordering without runtime startup, databases, sockets or secret provisioning. Current consumer workaround is /Users/lkroll/Programming/maintain-rs/src-tauri/src/replication/local_identity/tests/runtime_tests/listener_event_tests.rs positions(), which creates an empty group and a successor through the public runtime solely to obtain these values. Replace it with the upstream fixture when available."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-10-13T11:06:53.469458Z"
+updated_at = "2026-10-25T12:26:04.947508Z"

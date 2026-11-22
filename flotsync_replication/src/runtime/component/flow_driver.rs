@@ -1,4 +1,4 @@
-//! Tracks one request from its first action until its reply finishes or an internal error stops it.
+//! Operation admission, resource ownership and completion tracking for runtime flows.
 //!
 //! A flow is a state machine for one request. Its state records which step, or phase,
 //! it is waiting for. The flow returns an action, called an effect, for the component
@@ -6,20 +6,22 @@
 //! with the same flow ID. The flow checks the ID and phase, then records its next state
 //! before returning another effect. For example, publication writes an update, submits
 //! it for broadcast, advertises its availability, calls the listener, and attempts the
-//! API reply. The publication module defines these actions and states; this module
-//! supplies the slot, IDs and resource ownership shared by those steps.
+//! API reply. Inbound operations instead apply transactions, submit observations
+//! and finish their listener callbacks. Domain modules define these actions and
+//! states; this module supplies the slot, IDs and ownership shared by those steps.
 //!
 //! Starting a flow requires an available slot. The slot creates two resource claims:
 //! ownership markers for sequencing changes to one Flotsync replication group and for
 //! invoking the component's listener. They move together in [`FlowOwnership`] and
-//! cannot be cloned. The flow owns them until the reply attempt finishes, then returns
-//! them to the component, which explicitly releases the slot. Dropping the caller's
-//! reply receiver still allows the flow to finish. An internal protocol error stops
+//! cannot be cloned. The flow owns them through transactions, submissions, callbacks
+//! and replies, then returns them to the component, which explicitly releases the slot.
+//! Dropping the caller's reply receiver still allows the flow to finish. An internal protocol error stops
 //! further actions; the slot keeps the flow, first error and any returned claims for
-//! component fault handling. Ordinary write or callback failures become API replies.
+//! component fault handling. Ordinary transaction/callback failures retain their
+//! domain's API reply or inbound classification policy.
 //!
-//! The current single slot serialises publications for all replication groups.
-//! `Handled::block_on` also prevents other handlers from running during publication.
+//! The shared slot serialises publication and inbound operations for all groups.
+//! `Handled::block_on` also prevents other handlers from running during these flows.
 //! Claims express runtime ownership; they do not lock the store or prevent other
 //! components from reading committed records.
 //!
@@ -75,22 +77,40 @@ pub struct FlowEffect<E> {
 pub enum FlowStep<E, T> {
     /// Execute this action and pass its result back with the same flow ID.
     Continue(FlowEffect<E>),
-    /// The reply attempt has finished; the result contains the claims to release.
+    /// Completed flow result containing the resource claims to release.
     Finished(T),
+}
+
+impl<E, T> FlowStep<E, T> {
+    /// Wrap concrete child effects/results for the shared runtime owner without changing identity.
+    pub fn map<U, V>(
+        self,
+        effect: impl FnOnce(E) -> U,
+        finished: impl FnOnce(T) -> V,
+    ) -> FlowStep<U, V> {
+        match self {
+            Self::Continue(next) => FlowStep::Continue(FlowEffect {
+                flow_id: next.flow_id,
+                effect: effect(next.effect),
+            }),
+            Self::Finished(result) => FlowStep::Finished(finished(result)),
+        }
+    }
 }
 
 /// Resource claims for one Flotsync replication group and the component's listener.
 ///
-/// The flow owns this non-cloneable value until the reply attempt finishes, then returns
-/// it in the finished result. The slot excludes other publications; `block_on` excludes
-/// other handlers. Shared store handles remain usable by other components.
+/// The flow owns this non-cloneable value through its transactions, submissions,
+/// callbacks and replies, then returns it in the finished result. The slot excludes
+/// other publication/inbound flows; `block_on` excludes other handlers. Shared store
+/// handles remain usable by other components.
 #[derive(Debug)]
 pub struct FlowOwnership {
     /// Flow ID checked when accepting an action's result or releasing the slot.
     flow_id: FlowId,
-    /// Flotsync replication group owned until the reply attempt finishes.
+    /// Flotsync replication group owned through callbacks, observations and any reply attempt.
     group: ReplicationGroupClaim,
-    /// Listener ownership, held during writing, callback execution and the reply attempt.
+    /// Listener ownership, held throughout the operation, including complete batches.
     _listener: ListenerClaim,
 }
 
@@ -100,13 +120,13 @@ impl FlowOwnership {
         self.flow_id
     }
 
-    /// Identify the Flotsync replication group owned until the reply attempt finishes.
+    /// Identify the Flotsync replication group held until the flow returns these claims.
     pub const fn group_id(&self) -> GroupId {
         self.group.group_id
     }
 }
 
-/// Single publication slot, recording its owner and whether that flow can continue.
+/// Single operation slot, recording its owner and whether that flow can continue.
 pub enum FlowSlot<F> {
     /// A new flow can acquire the replication group and listener claims.
     Available,
@@ -114,7 +134,7 @@ pub enum FlowSlot<F> {
     Occupied {
         /// Owner's ID, available even when its data moves into an action or result.
         owner: FlowId,
-        /// Request progress, reply promise and resource ownership that have not been returned.
+        /// Operation state, including pending transactions, submissions, callbacks or replies.
         flow: F,
         /// Whether the flow can accept another result or has stopped with an internal error.
         state: FlowState,
@@ -202,7 +222,7 @@ impl<F> FlowSlot<F> {
         error
     }
 
-    /// Release the slot using the claims returned after the flow's reply attempt finishes.
+    /// Release the slot using the resource claims returned by a completed flow.
     ///
     /// Failed release saves the ownership value with the error, including attempts with
     /// another flow's claims or an empty slot. Existing errors and claims remain intact.
@@ -344,7 +364,7 @@ impl FlowFault {
 /// Ownership marker for sequencing changes to one Flotsync replication group.
 #[derive(Debug)]
 struct ReplicationGroupClaim {
-    /// Flotsync replication group whose publication owns this claim.
+    /// Flotsync replication group whose operation owns this claim.
     group_id: GroupId,
 }
 
@@ -352,6 +372,7 @@ struct ReplicationGroupClaim {
 #[derive(Debug)]
 struct ListenerClaim;
 
+/// Admission, explicit release and protocol fault tests for non-cloneable ownership claims.
 #[cfg(test)]
 mod tests {
     use super::*;

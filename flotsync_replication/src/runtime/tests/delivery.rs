@@ -28,6 +28,113 @@ fn load_two_member_inbound_fixture(group_id: GroupId) -> RuntimeFixture<SqliteRe
     fixture
 }
 
+/// Queue a publication and a live input while the first batch callback is suspended.
+///
+/// The live input depends on the second batch input; its transaction must wait until
+/// both batch callbacks finish, even though it has already been submitted.
+fn queue_work_during_batch<'a>(
+    fixture: &'a RuntimeFixture<SqliteReplicationStore>,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    first_versions: &VersionVector,
+    second_update_id: UpdateId,
+) -> QueuedBatchWork<'a> {
+    let publication_row = test_row_id(group_id, dataset_id.clone(), 22_223);
+    let publication = fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: GroupReadToken::from_group_version(group_id, first_versions.clone()),
+        changes: vec![RowMutation::Upsert {
+            row_id: publication_row.clone(),
+            row: crate::row_values! { "title" => "queued publication" },
+        }],
+    });
+    let live_update_id = UpdateId {
+        node_index: 0,
+        version: 3,
+    };
+    let after_batch = first_versions.with_update_applied(second_update_id);
+    let (live_row, live_update) = title_update_message(
+        group_id,
+        dataset_id.clone(),
+        22_224,
+        "queued live update",
+        live_update_id,
+        after_batch,
+    );
+    let live = fixture
+        .runtime
+        .submit_update_for_test(alice_member(), live_update);
+    QueuedBatchWork {
+        publication,
+        publication_row,
+        live,
+        live_row,
+        live_update_id,
+    }
+}
+
+/// Assert the final store versions and that queued work was notified after both batch inputs.
+fn assert_batch_and_queued_work_completed(
+    fixture: &RuntimeFixture<SqliteReplicationStore>,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    batch_row: &RowId,
+    publication_row: RowId,
+    live_row: RowId,
+) {
+    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(persisted_group.version_vector.version_at(0), 3);
+    assert_eq!(persisted_group.version_vector.version_at(1), 1);
+    assert_eq!(
+        snapshot_string_field(
+            fixture.store.as_ref(),
+            group_id,
+            dataset_id,
+            batch_row,
+            "title"
+        ),
+        "second"
+    );
+    let changes = fixture.listener.captured_data_changes();
+    assert_eq!(changes.len(), 4);
+    for (change, title) in changes[..2].iter().zip(["first", "second"]) {
+        assert_eq!(change, &captured_title_upsert(batch_row.clone(), title));
+    }
+    for (row_id, title) in [
+        (publication_row, "queued publication"),
+        (live_row, "queued live update"),
+    ] {
+        assert!(
+            changes[2..].contains(&captured_title_upsert(row_id, title)),
+            "queued work must follow every batch callback"
+        );
+    }
+}
+
+/// Construct the expected listener notification for one title upsert.
+fn captured_title_upsert(row_id: RowId, title: &str) -> CapturedDataChange {
+    CapturedDataChange {
+        rows: vec![CapturedRowChange::Upsert {
+            row_id,
+            title: title.to_owned(),
+        }],
+    }
+}
+
+/// Pending publication and live input used to check exclusion during a paused batch.
+struct QueuedBatchWork<'a> {
+    /// API reply that must remain pending until both batch callbacks finish.
+    publication: BoxFuture<'a, Result<PublishReceipt, ApiError>>,
+    /// Row identifying the publication's eventual listener notification.
+    publication_row: RowId,
+    /// Handler reply that must remain pending until both batch callbacks finish.
+    /// A dropped promise means the component stopped; the handler result classifies inbound failures.
+    live: KFuture<Result<(), InboundDeliveryError>>,
+    /// Row identifying the live input's eventual listener notification.
+    live_row: RowId,
+    /// Producer version that must be absent from the update log while either callback is paused.
+    live_update_id: UpdateId,
+}
+
 #[test]
 fn pending_apply_need_retries_after_route_appears() {
     let _runtime_endpoint_leases =
@@ -903,39 +1010,47 @@ fn update_batch_waits_for_listener_before_committing_next_input() {
         "first"
     );
     assert!(reply.as_mut().now_or_never().is_none());
+    let QueuedBatchWork {
+        mut publication,
+        publication_row,
+        mut live,
+        live_row,
+        live_update_id,
+    } = queue_work_during_batch(
+        &fixture,
+        group_id,
+        &dataset_id,
+        &persisted_group.version_vector,
+        second_update_id,
+    );
+    assert!(publication.as_mut().now_or_never().is_none());
+    assert!((&mut live).now_or_never().is_none());
+    let second_gate = fixture.listener.gate_next_data_change_completion();
     gate.release();
+    second_gate.wait_until_entered();
+    let during_second = load_persisted_group(fixture.store.as_ref(), group_id);
+    assert_eq!(during_second.version_vector.version_at(0), 2);
+    assert_eq!(during_second.version_vector.version_at(1), 0);
+    assert!(load_persisted_update(fixture.store.as_ref(), group_id, live_update_id).is_none());
+    assert!(publication.as_mut().now_or_never().is_none());
+    assert!((&mut live).now_or_never().is_none());
+    assert!(reply.as_mut().now_or_never().is_none());
+    second_gate.release();
     wait_for_test_reply(reply)
         .expect("runtime should answer the batch")
         .expect("batch should complete after listener release");
+    wait_for_test_reply(publication).expect("queued publication should complete after the batch");
+    wait_for_test_reply(live)
+        .expect("queued live update should answer")
+        .expect("queued live update should apply");
 
-    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
-    assert_eq!(persisted_group.version_vector.version_at(0), 2);
-    assert_eq!(
-        snapshot_string_field(
-            fixture.store.as_ref(),
-            group_id,
-            &dataset_id,
-            &row_id,
-            "title"
-        ),
-        "second"
-    );
-    assert_eq!(
-        fixture.listener.captured_data_changes(),
-        vec![
-            CapturedDataChange {
-                rows: vec![CapturedRowChange::Upsert {
-                    row_id: row_id.clone(),
-                    title: "first".to_owned(),
-                }],
-            },
-            CapturedDataChange {
-                rows: vec![CapturedRowChange::Upsert {
-                    row_id,
-                    title: "second".to_owned(),
-                }],
-            },
-        ]
+    assert_batch_and_queued_work_completed(
+        &fixture,
+        group_id,
+        &dataset_id,
+        &row_id,
+        publication_row,
+        live_row,
     );
 }
 

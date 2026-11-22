@@ -5,7 +5,7 @@
 
 use super::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};
 #[cfg(test)]
-use super::{inbound_support::InboundUpdateOrigin, listeners::notify_listener_batches};
+use super::{inbound_flow::InboundRequest, inbound_support::InboundUpdateOrigin};
 use crate::{
     api::{GroupMemberKeys, GroupSchema, MemberKeyId},
     runtime::errors::GroupInstallError,
@@ -256,27 +256,20 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
-    /// Apply and notify one input through the same transaction as production updates.
+    /// Apply one input through production admission, observations, callbacks and terminal release.
     #[cfg(test)]
     fn handle_test_apply_update(
         &mut self,
         ask: Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>,
     ) -> HandlerResult {
         let (promise, (sender, message)) = ask.take();
-        Handled::block_on(self, async move |mut async_self| {
-            let reply = match async_self
-                .persist_and_apply_update(InboundUpdateOrigin::Producer { sender }, message)
-                .await
-            {
-                Ok(outcome) => {
-                    notify_listener_batches(async_self.listener.clone(), outcome.event_batches)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            let _ = promise.fulfil(reply);
-            Handled::OK
-        })
+        self.handle_test_inbound_apply(
+            promise,
+            InboundRequest::Single {
+                origin: InboundUpdateOrigin::Producer { sender },
+                message,
+            },
+        )
     }
 
     /// Run the production per-input commit/callback sequence for a fixture batch.
@@ -286,10 +279,28 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
     ) -> HandlerResult {
         let (promise, (batch_sender, message)) = ask.take();
+        self.handle_test_inbound_apply(
+            promise,
+            InboundRequest::Batch {
+                sender: batch_sender,
+                message,
+            },
+        )
+    }
+
+    /// Drive either fixture input family through the shared production flow and answer its ask.
+    /// A dropped receiver does not interrupt the flow or prevent terminal ownership release.
+    #[cfg(test)]
+    fn handle_test_inbound_apply(
+        &mut self,
+        promise: KPromise<Result<(), InboundDeliveryError>>,
+        request: InboundRequest,
+    ) -> HandlerResult {
         Handled::block_on(self, async move |mut async_self| {
             let reply = async_self
-                .persist_apply_and_notify_update_batch(batch_sender, message)
-                .await;
+                .apply_inbound_for_test(request)
+                .await
+                .whatever_unrecoverable("test inbound driver violated ownership/phase protocol")?;
             let _ = promise.fulfil(reply);
             Handled::OK
         })
